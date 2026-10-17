@@ -256,7 +256,10 @@ impl PolicyGate {
     /// life, 0 during the grace.
     pub fn object(&self, copy_id: &str, manifest_epoch: i64, now: i64) -> Result<i64, VerifyError> {
         self.check(now, Some(manifest_epoch), |lease| {
-            lease.denied_copies.binary_search_by(|id| id.as_str().cmp(copy_id)).is_ok()
+            lease
+                .denied_copies
+                .binary_search_by(|id| id.as_str().cmp(copy_id))
+                .is_ok()
         })
     }
 
@@ -264,7 +267,10 @@ impl PolicyGate {
     /// old merged-away id)?
     pub fn work(&self, work_id: &str, now: i64) -> Result<i64, VerifyError> {
         self.check(now, None, |lease| {
-            lease.denied_works.binary_search_by(|id| id.as_str().cmp(work_id)).is_ok()
+            lease
+                .denied_works
+                .binary_search_by(|id| id.as_str().cmp(work_id))
+                .is_ok()
         })
     }
 
@@ -569,8 +575,11 @@ mod tests {
 
         let mut boundary = lease(6, now + LEASE_CLOCK_SKEW_SECS, &[], &[]);
         boundary.kid = held.kid;
-        gate.accept(verify_lease(&sign(&key, &boundary), &pins(&key)).unwrap(), now)
-            .unwrap();
+        gate.accept(
+            verify_lease(&sign(&key, &boundary), &pins(&key)).unwrap(),
+            now,
+        )
+        .unwrap();
         assert_eq!(gate.work("w_allowed", now), Ok(600 + LEASE_CLOCK_SKEW_SECS));
     }
 
@@ -583,8 +592,11 @@ mod tests {
         boundary.kid = key_id(key.public_key().as_ref());
         boundary.expires_at = now + max_life;
         let mut gate = PolicyGate::default();
-        gate.accept(verify_lease(&sign(&key, &boundary), &pins(&key)).unwrap(), now)
-            .unwrap();
+        gate.accept(
+            verify_lease(&sign(&key, &boundary), &pins(&key)).unwrap(),
+            now,
+        )
+        .unwrap();
         assert_eq!(gate.work("w_allowed", now), Ok(max_life));
 
         for (issued_at, expires_at) in [
@@ -610,7 +622,8 @@ mod tests {
         let mut gate = PolicyGate::default();
         assert_eq!(gate.object("mc_b", 0, 1000), Err(VerifyError::NoLease));
         assert_eq!(gate.work("w_b", 1000), Err(VerifyError::NoLease));
-        gate.accept(lease(5, 1000, &["mc_a"], &["w_a"]), 1000).unwrap();
+        gate.accept(lease(5, 1000, &["mc_a"], &["w_a"]), 1000)
+            .unwrap();
         // Valid lease: s-maxage is the remaining life, down to the last second.
         assert_eq!(gate.object("mc_b", 5, 1000), Ok(600));
         assert_eq!(gate.object("mc_b", 5, 1599), Ok(1));
@@ -649,9 +662,11 @@ mod tests {
         assert_eq!(gate.object("mc_a", 5, late), Ok(600));
         assert_eq!(gate.object("mc_b", 6, late), Err(VerifyError::Denied));
         // The same epoch reissued later extends the life; an earlier copy does not.
-        gate.accept(lease(6, late + 60, &["mc_b"], &[]), late + 60).unwrap();
+        gate.accept(lease(6, late + 60, &["mc_b"], &[]), late + 60)
+            .unwrap();
         assert_eq!(gate.object("mc_a", 6, late + 60), Ok(600));
-        gate.accept(lease(6, late, &["mc_b"], &[]), late + 60).unwrap();
+        gate.accept(lease(6, late, &["mc_b"], &[]), late + 60)
+            .unwrap();
         assert_eq!(gate.object("mc_a", 6, late + 60), Ok(600));
     }
 }

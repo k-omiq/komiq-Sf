@@ -377,7 +377,9 @@ async fn unticks_convert_only_linked_copies_of_the_matching_store() {
         untick_users(&mut tx, &w.id).await.unwrap(),
         [ALICE, BOB, CAROL]
     );
-    let affected = affected_users(&mut tx, &[w.id.clone()]).await.unwrap();
+    let affected = affected_users(&mut tx, std::slice::from_ref(&w.id))
+        .await
+        .unwrap();
     assert_eq!(affected, [ALICE, BOB, CAROL]);
     crate::locks::lock_users(&mut tx, &[ALICE, BOB, CAROL])
         .await
@@ -484,7 +486,7 @@ async fn merge_keeps_truth_values_and_adopts_a_loser_pointer() {
     .await
     .unwrap();
     tx.commit().await.unwrap();
-    let after = snapshot(&pool, &readers, &[survivor.id.clone()]).await;
+    let after = snapshot(&pool, &readers, std::slice::from_ref(&survivor.id)).await;
     for user in [ALICE, BOB] {
         let uid = crate::db_types::uuid(user).unwrap();
         for entry in after.entries.keys() {
@@ -637,7 +639,7 @@ async fn split_new_derives_pointers_and_preserves_every_reader_entry() {
         &mut tx,
         &source_work.id,
         &dest.id,
-        &[source_work.md.clone()],
+        std::slice::from_ref(&source_work.md),
         true,
     )
     .await
@@ -728,7 +730,7 @@ async fn split_existing_keeps_destination_pointer_and_ors_colliding_entries() {
         &mut tx,
         &source_work.id,
         &dest.id,
-        &[source_work.md.clone()],
+        std::slice::from_ref(&source_work.md),
         false,
     )
     .await
@@ -967,7 +969,7 @@ async fn not_ready_snapshot_folds_keys_and_keeps_redundant_marks_untouched() {
         .unwrap();
     crate::locks::lock_works(&mut tx, &[&w.id]).await.unwrap();
     let readers = [ALICE.to_owned(), BOB.to_owned(), CAROL.to_owned()];
-    let before = keep_state_before(&mut tx, &readers, &[w.id.clone()])
+    let before = keep_state_before(&mut tx, &readers, std::slice::from_ref(&w.id))
         .await
         .unwrap();
     for user in [ALICE, BOB] {
@@ -1150,8 +1152,8 @@ async fn affected_users_unions_all_state_stores_without_requiring_mirrored_progr
         [ALICE, BOB, CAROL, mark_user, pointer_user]
     );
     assert!(affected_users(&mut tx, &[]).await.unwrap().is_empty());
-    let readers = lock_identity(&mut tx, &[w.id.clone()]).await;
-    let before = keep_state_before(&mut tx, &readers, &[w.id.clone()])
+    let readers = lock_identity(&mut tx, std::slice::from_ref(&w.id)).await;
+    let before = keep_state_before(&mut tx, &readers, std::slice::from_ref(&w.id))
         .await
         .unwrap();
     assert!(before

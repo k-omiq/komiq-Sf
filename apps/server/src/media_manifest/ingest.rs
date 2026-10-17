@@ -269,7 +269,8 @@ pub(crate) async fn ingest_chapter(app: &AppState, chapter: i64) -> Result<Optio
             engine: regional,
             strict,
         } => {
-            let stored = crate::engine_route::keys_for_chapter(&app.pool, chapter).await?
+            let stored = crate::engine_route::keys_for_chapter(&app.pool, chapter)
+                .await?
                 .ok_or_else(|| anyhow::anyhow!("no active source keys"))?;
             let keys = crate::engine_route::SourceKeys {
                 source_id: identity.source_id.clone(),
@@ -290,7 +291,10 @@ pub(crate) async fn ingest_chapter(app: &AppState, chapter: i64) -> Result<Optio
             match crate::engine_route::prepaid(regional.chapter(&keys)).await {
                 Ok(Some(chapter)) => Some((regional, keys, chapter)),
                 Ok(None) => match crate::engine_route::unavailable::<()>(
-                    &engine.regional, &identity.source_id, &regional, strict,
+                    &engine.regional,
+                    &identity.source_id,
+                    &regional,
+                    strict,
                 ) {
                     crate::engine_route::Routed::Owner => None,
                     _ => bail!("regional chapter missing"),
@@ -334,7 +338,9 @@ pub(crate) async fn ingest_chapter(app: &AppState, chapter: i64) -> Result<Optio
             {
                 crate::engine_route::RegionalPage::Page(bytes, mime) => Ok((bytes, mime)),
                 crate::engine_route::RegionalPage::Missing => bail!("regional page missing"),
-                crate::engine_route::RegionalPage::Busy => Err(crate::suwayomi::PageFetchError::Busy),
+                crate::engine_route::RegionalPage::Busy => {
+                    Err(crate::suwayomi::PageFetchError::Busy)
+                }
             }
         } else {
             engine.fetch_page_now(&path).await

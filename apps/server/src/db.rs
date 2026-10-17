@@ -2196,14 +2196,12 @@ mod observation_scan_tests {
     /// `TODO(wave)`: an unobserved site in another owner's file, to be fixed there
     /// (observe before the conversion: `record_database_error(&e)` for SQLx,
     /// `observe_database_error(&e)` for anyhow) and then deleted here.
-    const ALLOWED: &[(&str, &str, &str)] = &[
-        (
-            "cloudflare/mod.rs",
-            "saving completed Cloudflare state failed",
-            "accepted: the receiver is db::retry_transaction, which counts every attempt \
+    const ALLOWED: &[(&str, &str, &str)] = &[(
+        "cloudflare/mod.rs",
+        "saving completed Cloudflare state failed",
+        "accepted: the receiver is db::retry_transaction, which counts every attempt \
              and marks the error before this closure writes the user text",
-        ),
-    ];
+    )];
 
     /// Same length as the input. Comments and the contents of string/char
     /// literals become spaces (newlines stay), so tokens and braces found later

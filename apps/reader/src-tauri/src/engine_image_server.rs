@@ -244,6 +244,8 @@ mod tests {
     assert_eq!(engine_path(&[0xff, 0xfe, b'\r', b'\n'], TOKEN), Err("400 Bad Request"));
   }
 
+  // The module ships on Android only; `/dev/urandom` does not exist on a Windows test host.
+  #[cfg(unix)]
   #[test]
   fn the_token_is_128_bits_of_hex_and_not_constant() {
     let token = random_token().expect("os randomness");

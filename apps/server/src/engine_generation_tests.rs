@@ -1069,12 +1069,11 @@ async fn new_generation_refuses_a_work_added_after_its_work_set_was_locked() {
     let points = crate::locks::pause_points::PausePoints::default();
     let held = points.arm("generation-works-locked");
     let replacing = fence.clone();
-    let mut replacement = tokio::spawn(crate::catalog::guards::TEST_PAUSE.scope(
-        points,
-        async move {
+    let mut replacement = tokio::spawn(
+        crate::catalog::guards::TEST_PAUSE.scope(points, async move {
             Database::foreground_scope(replacing.start_new_generation(Replace::Force)).await
-        },
-    ));
+        }),
+    );
     tokio::time::timeout(Duration::from_secs(5), held.reached())
         .await
         .expect("replacement did not lock the initial work set");

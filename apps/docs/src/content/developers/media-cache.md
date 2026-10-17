@@ -73,20 +73,20 @@ One owner fetch per object hash can run at a time. Concurrent misses wait on the
 
 Successful objects answer `200` with these headers:
 
-| Header | Value |
-| --- | --- |
-| `Cache-Control` | `public, max-age=31536000, immutable, s-maxage=<remaining lease seconds>`; `s-maxage=0` during grace. |
-| `Access-Control-Allow-Origin` | `*`, so readers from other origins can fetch and check the bytes. |
-| `X-Komika-Cache` | `hit` for a verified disk hit, `miss` when the request entered the miss path. |
-| `Content-Security-Policy` | `sandbox; default-src 'none'`, restricting bytes opened as a document. |
+| Header                        | Value                                                                                                 |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `Cache-Control`               | `public, max-age=31536000, immutable, s-maxage=<remaining lease seconds>`; `s-maxage=0` during grace. |
+| `Access-Control-Allow-Origin` | `*`, so readers from other origins can fetch and check the bytes.                                     |
+| `X-Komika-Cache`              | `hit` for a verified disk hit, `miss` when the request entered the miss path.                         |
+| `Content-Security-Policy`     | `sandbox; default-src 'none'`, restricting bytes opened as a document.                                |
 
 The helper also sends the manifest's `Content-Type` and the body's `Content-Length`. A request that waits behind another miss can still report `miss` after using the filled file.
 
-| Status | Object request result |
-| --- | --- |
-| `404` | Invalid copy or hash, unknown copy or object, hash absent from the copy's manifest, or a denied copy. |
-| `502` | Owner manifest fails verification or copy binding, or object exceeds its declared length or fails its byte checks. |
-| `503` | No usable lease after renewal, or a needed owner fetch fails for another reason. |
+| Status | Object request result                                                                                              |
+| ------ | ------------------------------------------------------------------------------------------------------------------ |
+| `404`  | Invalid copy or hash, unknown copy or object, hash absent from the copy's manifest, or a denied copy.              |
+| `502`  | Owner manifest fails verification or copy binding, or object exceeds its declared length or fails its byte checks. |
+| `503`  | No usable lease after renewal, or a needed owner fetch fails for another reason.                                   |
 
 Object errors send `Cache-Control: no-store, must-revalidate` and `Access-Control-Allow-Origin: *`.
 

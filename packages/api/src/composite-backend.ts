@@ -104,10 +104,7 @@ import { isNumericChapterId, isStaleNumericEpoch } from './numeric-epoch.js';
 /** A progress write the server refused as from an earlier engine generation: dropped
  *  with a log line, never retried (the id may now name another chapter). */
 function dropStaleProgress(chapterId: Id): void {
-	console.warn(
-		'[offline-queue] dropping progress from an earlier engine generation:',
-		chapterId,
-	);
+	console.warn('[offline-queue] dropping progress from an earlier engine generation:', chapterId);
 }
 
 /**
@@ -510,7 +507,11 @@ export class CompositeBackend implements Backend {
 			throw err;
 		}
 	}
-	setLibraryStatus(seriesId: Id, status: LibraryStatus | null, numericEpoch?: number | null): Promise<Series> {
+	setLibraryStatus(
+		seriesId: Id,
+		status: LibraryStatus | null,
+		numericEpoch?: number | null,
+	): Promise<Series> {
 		return this.opts.hosted.setLibraryStatus!(seriesId, status, numericEpoch);
 	}
 	setFavorite(seriesId: Id, favorite: boolean, numericEpoch?: number | null): Promise<Series> {

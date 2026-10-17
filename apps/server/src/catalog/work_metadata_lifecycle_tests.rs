@@ -160,7 +160,8 @@ async fn admin_split_preserves_mapping_rows_and_projects_both_works() -> Result<
     observe(&pool, &detached, "Detached").await?;
     observe(&pool, &kept, "Kept").await?;
     let before = contributions(&pool).await?;
-    let split = split_source_series(&pool, &original, &[detached.clone()], None).await?;
+    let split =
+        split_source_series(&pool, &original, std::slice::from_ref(&detached), None).await?;
     assert_eq!(split.title, "Detached");
     assert_eq!(contributions(&pool).await?, before);
     let owners: Vec<(String, String)> = sqlx::query_as(
@@ -731,8 +732,7 @@ async fn cover_bar_refreshes_stored_thumbnail_fallbacks_and_unbar_restores_them(
         for (source, barred, expected, writes) in steps {
             let before = versions(pool.clone(), work.clone()).await?;
             // No explicit re-projection: the bar change itself refreshes the cards.
-            work_metadata::set_bar(&pool, source, work_metadata::FieldGroup::Cover, barred)
-                .await?;
+            work_metadata::set_bar(&pool, source, work_metadata::FieldGroup::Cover, barred).await?;
             for table in tables {
                 assert_eq!(
                     card_thumbnail(&pool, table, &work).await?.as_deref(),

@@ -64,7 +64,6 @@ struct Copy {
     external_id: String,
     number: Option<String>,
     title: Option<String>,
-    chapter_key: Option<String>,
     label: Option<String>,
     released: Option<DateTime<Utc>>,
     source_type: String,
@@ -72,7 +71,7 @@ struct Copy {
 }
 
 const UNLINKED_COPY_SELECT: &str = "SELECT c.id, c.external_id, c.number, c.title, \
-        c.chapter_key, c.label, COALESCE(c.readable_at, c.published_at) AS released, \
+        c.label, COALESCE(c.readable_at, c.published_at) AS released, \
         ss.source_type, ss.source_id \
    FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
   WHERE NOT EXISTS (SELECT 1 FROM work_chapter_link l WHERE l.chapter_id = c.id)";
@@ -839,6 +838,7 @@ pub(crate) async fn merge_entries_on(
 ///   * every copy moves: the entry moves;
 ///   * copies on both sides: the entry stays, and the destination gets a new entry with
 ///     the same key, order and flags for the moving copies.
+///
 /// Entries with no copies stay. Aliases follow their entry: a moved entry takes them, and
 /// the destination entry of a joined or cloned one gets a copy, while the staying entry
 /// keeps its own (unless the destination has the key as an entry or alias already).
@@ -997,6 +997,15 @@ pub(crate) async fn split_entries_on(
     Ok(map)
 }
 
+/// A linked copy's `work_chapter_id, number, title, label, released`.
+type LinkedCopy = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<DateTime<Utc>>,
+);
+
 /// Relink a copy within its work, or give it an independent admin entry. The old
 /// entry stays because other copies and readers may still name it. Caller holds the
 /// work lock; bumps list_rev.
@@ -1007,13 +1016,7 @@ pub(crate) async fn relink_copy_on(
     target: Option<&str>,
 ) -> Result<(String, String)> {
     crate::catalog::guards::assert_in_transaction(conn, "work_chapter::relink_copy_on");
-    let copy: Option<(
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<DateTime<Utc>>,
-    )> = sqlx::query_as(
+    let copy: Option<LinkedCopy> = sqlx::query_as(
         "SELECT l.work_chapter_id, c.number, c.title, c.label, \
                     COALESCE(c.readable_at, c.published_at) \
                FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \

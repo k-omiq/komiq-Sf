@@ -120,7 +120,10 @@ pub(crate) fn parse_engines(
         .filter(|(_, e)| !e.is_empty())
     {
         let Some((id, url)) = entry.split_once('=') else {
-            return Err(format!("{ENGINES_ENV}: entry {} is not `id=url`", position + 1));
+            return Err(format!(
+                "{ENGINES_ENV}: entry {} is not `id=url`",
+                position + 1
+            ));
         };
         let (id, url) = (id.trim(), url.trim());
         if !valid_engine_id(id) {
@@ -138,8 +141,8 @@ pub(crate) fn parse_engines(
                 "engine `{id}`: set {var} to a file holding `user:password` (a regional engine needs Basic auth)"
             ));
         };
-        let contents = read_file(path.trim())
-            .map_err(|e| format!("engine `{id}`: cannot read {var}: {e}"))?;
+        let contents =
+            read_file(path.trim()).map_err(|e| format!("engine `{id}`: cannot read {var}: {e}"))?;
         let authorization = basic_authorization(&contents)
             .ok_or_else(|| format!("engine `{id}`: {var} must hold one `user:password` line"))?;
         engines.push(EngineSpec {
@@ -152,8 +155,7 @@ pub(crate) fn parse_engines(
 }
 
 fn engine_base_url(id: &str, raw: &str) -> std::result::Result<String, String> {
-    let url = reqwest::Url::parse(raw)
-        .map_err(|e| format!("engine `{id}`: invalid URL: {e}"))?;
+    let url = reqwest::Url::parse(raw).map_err(|e| format!("engine `{id}`: invalid URL: {e}"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!("engine `{id}`: the URL must be http or https"));
     }
@@ -352,7 +354,10 @@ impl RegionalEngine {
     pub(crate) fn clear(&self) {
         self.manga.clear();
         self.chapters.clear();
-        self.missing.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.missing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Forget what was resolved for one chapter and its manga, after a read that the
@@ -841,12 +846,11 @@ pub(crate) async fn owner_extension(
     pool: &Database,
     source_id: &str,
 ) -> Result<Option<InstalledExtension>> {
-    let row: Option<(String, Option<i64>)> = sqlx::query_as(
-        "SELECT pkg_name, version_code FROM source_extension WHERE source_id=$1",
-    )
-    .bind(source_id)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(String, Option<i64>)> =
+        sqlx::query_as("SELECT pkg_name, version_code FROM source_extension WHERE source_id=$1")
+            .bind(source_id)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.map(|(pkg_name, version_code)| InstalledExtension {
         pkg_name,
         version_code,
@@ -863,8 +867,11 @@ pub(crate) struct Route {
     pub owner_extension: Option<InstalledExtension>,
 }
 
+/// `source_id, engine_id, strict, pkg_name, version_code`.
+type RouteRow = (String, String, bool, Option<String>, Option<i64>);
+
 pub(crate) async fn load_routes(pool: &Database) -> Result<HashMap<String, Route>> {
-    let rows: Vec<(String, String, bool, Option<String>, Option<i64>)> = sqlx::query_as(
+    let rows: Vec<RouteRow> = sqlx::query_as(
         "SELECT r.source_id, r.engine_id, r.strict, e.pkg_name, e.version_code \
          FROM source_engine_route r LEFT JOIN source_extension e ON e.source_id=r.source_id",
     )
@@ -927,7 +934,10 @@ pub(crate) async fn store_route(
 // ---- the owner's stored keys ----------------------------------------------------------
 
 /// The source keys of an owner chapter id, from the active generation's bindings.
-pub(crate) async fn keys_for_chapter(pool: &Database, chapter_id: i64) -> Result<Option<SourceKeys>> {
+pub(crate) async fn keys_for_chapter(
+    pool: &Database,
+    chapter_id: i64,
+) -> Result<Option<SourceKeys>> {
     let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT m.source_id, m.manga_key, c.chapter_key, m.title FROM engine_chapter_key c \
          JOIN engine_manga_key m ON m.generation=c.generation AND m.manga_id=c.manga_id \
@@ -997,10 +1007,7 @@ pub(crate) enum Routed<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PageTarget {
     Chapter(i64),
-    Order {
-        manga_id: i64,
-        source_order: i32,
-    },
+    Order { manga_id: i64, source_order: i32 },
 }
 
 type OwnerKeys = HashMap<(Option<uuid::Uuid>, PageTarget), (Instant, SourceKeys)>;
@@ -1012,7 +1019,10 @@ async fn page_keys(
 ) -> Result<Option<SourceKeys>> {
     let chapter_id = match target {
         PageTarget::Chapter(id) => id,
-        PageTarget::Order { manga_id, source_order } => {
+        PageTarget::Order {
+            manga_id,
+            source_order,
+        } => {
             return keys_for_order(pool, manga_id, source_order).await;
         }
     };
@@ -1050,7 +1060,11 @@ async fn page_keys(
 pub(crate) fn regional_pages_cached(owner: &SuwayomiClient, chapter_id: i64) -> bool {
     let key = (owner.read_generation().0, PageTarget::Chapter(chapter_id));
     let keys = {
-        let memo = owner.regional.owner_keys.lock().unwrap_or_else(|e| e.into_inner());
+        let memo = owner
+            .regional
+            .owner_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match memo.get(&key) {
             Some((at, keys)) if at.elapsed() < Duration::from_secs(60) => keys.clone(),
             _ => return false,
@@ -1102,7 +1116,9 @@ pub(crate) async fn route_page(
         Decision::Regional { engine, strict } => match engine.fetch_page(&keys, index).await {
             Ok(RegionalPage::Page(bytes, mime)) => Routed::Served((bytes, mime)),
             Ok(RegionalPage::Busy) => Routed::Busy,
-            Ok(RegionalPage::Missing) => unavailable(&owner.regional, &keys.source_id, &engine, strict),
+            Ok(RegionalPage::Missing) => {
+                unavailable(&owner.regional, &keys.source_id, &engine, strict)
+            }
             Err(_) => {
                 tracing::warn!(engine = %engine.id, "regional page failed");
                 unavailable(&owner.regional, &keys.source_id, &engine, strict)
@@ -1142,7 +1158,10 @@ pub(crate) async fn page_urls(
             if result.is_err() {
                 tracing::warn!(engine = %engine.id, "regional page list failed");
             }
-            if matches!(unavailable::<()>(&owner.regional, &keys.source_id, &engine, strict), Routed::Refuse) {
+            if matches!(
+                unavailable::<()>(&owner.regional, &keys.source_id, &engine, strict),
+                Routed::Refuse
+            ) {
                 bail!("regional engine unavailable");
             }
             return Ok(None);
@@ -1163,7 +1182,9 @@ pub(crate) async fn page_urls(
         (0..chapter.pages.len())
             .map(|i| {
                 owner.page_locator_url(chapter_id, i).unwrap_or_else(|| {
-                    owner.abs(Some(&format!("/api/v1/manga/{manga}/chapter/{order}/page/{i}")))
+                    owner.abs(Some(&format!(
+                        "/api/v1/manga/{manga}/chapter/{order}/page/{i}"
+                    )))
                 })
             })
             .collect(),
@@ -1343,7 +1364,9 @@ pub(crate) async fn provision(
                 engine.client.install_extension(&owner.pkg_name).await?;
                 "installed"
             }
-            Some(regional) if compare_versions(Some(&owner), Some(regional)) == VersionCheck::Match => {
+            Some(regional)
+                if compare_versions(Some(&owner), Some(regional)) == VersionCheck::Match =>
+            {
                 "already the same version"
             }
             Some(regional)
@@ -1385,7 +1408,9 @@ pub(crate) async fn route_refusal(
     engine_id: &str,
 ) -> Result<Option<String>> {
     let Some(engine) = engines.engine(engine_id) else {
-        return Ok(Some(format!("engine `{engine_id}` is not configured on this server")));
+        return Ok(Some(format!(
+            "engine `{engine_id}` is not configured on this server"
+        )));
     };
     let health = engine.probe().await;
     if !health.reachable {
@@ -1448,7 +1473,11 @@ pub(crate) async fn reconcile_versions(engines: &Engines) {
         let Some(health) = engine.health() else {
             continue;
         };
-        let Some(regional) = health.installed.values().find(|e| e.pkg_name == owner.pkg_name) else {
+        let Some(regional) = health
+            .installed
+            .values()
+            .find(|e| e.pkg_name == owner.pkg_name)
+        else {
             continue;
         };
         if !matches!((regional.version_code, owner.version_code), (Some(a), Some(b)) if a < b)
@@ -1474,7 +1503,10 @@ pub(crate) async fn reconcile_versions(engines: &Engines) {
 #[derive(Clone)]
 pub(crate) enum Decision {
     Owner,
-    Regional { engine: Arc<RegionalEngine>, strict: bool },
+    Regional {
+        engine: Arc<RegionalEngine>,
+        strict: bool,
+    },
     /// Strict route, engine cannot serve: answer 503.
     Refuse,
 }

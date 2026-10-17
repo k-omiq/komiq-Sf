@@ -380,9 +380,9 @@ mod tests {
     #[tokio::test]
     async fn cancelled_shared_lookup_is_removed_after_last_caller() {
         let locator = PageLocator::default();
-        let mut leader = Box::pin(locator.lookup(8, || std::future::pending()));
+        let mut leader = Box::pin(locator.lookup(8, std::future::pending));
         assert!(futures::poll!(&mut leader).is_pending());
-        let mut follower = Box::pin(locator.lookup(8, || std::future::pending()));
+        let mut follower = Box::pin(locator.lookup(8, std::future::pending));
         assert!(futures::poll!(&mut follower).is_pending());
         drop(leader);
         assert_eq!(locator.lookups.lock().unwrap().len(), 1);

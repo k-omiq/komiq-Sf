@@ -129,8 +129,7 @@
 		sp: boolean,
 		cur: CommentView[],
 		opts: CommentOpts,
-	) =>
-		SUBMIT[targetType](id, key, body, sp, cur, opts);
+	) => SUBMIT[targetType](id, key, body, sp, cur, opts);
 
 	// (Re)load when the target or sign-in state changes.
 	$effect(() => {
@@ -317,7 +316,10 @@
 </script>
 
 <div class="c-head">
-	<h3><Icon name="comment" size={20} />{commentCount} {commentCount === 1 ? 'comment' : 'comments'}</h3>
+	<h3>
+		<Icon name="comment" size={20} />{commentCount}
+		{commentCount === 1 ? 'comment' : 'comments'}
+	</h3>
 </div>
 
 {#if needsAuth}

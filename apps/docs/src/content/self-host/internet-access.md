@@ -137,15 +137,15 @@ A fallback address is a second way in for when your main address or its proxy is
 
 You need a second host name that points straight at your server, a publicly trusted certificate and its private key in PEM files (the usual text format for certificates), and an open port. Mount the certificate folder read-only into the server container, publish the port, and set these variables:
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `KOMIKA_FALLBACK_CERT_FILE` | unset | Certificate chain file. Unset or empty turns the listener off. |
-| `KOMIKA_FALLBACK_KEY_FILE` | unset | The matching private key file. Required when the listener is on. |
-| `KOMIKA_FALLBACK_HOSTS` | unset | Required. Comma-separated host names, each with an optional `:port`. |
-| `KOMIKA_FALLBACK_PORT` | `8443` | The listener's port inside the container. |
-| `KOMIKA_FALLBACK_BIND_ADDR` | the `BIND_ADDR` value | The address the listener binds. |
-| `KOMIKA_FALLBACK_READER_DIR` | `KOMIKA_WEB_DIR` plus `/reader` | The reader build folder with `index.html`. |
-| `KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY` | `50000000000` | The daily media budget in bytes (50 GB). |
+| Variable                              | Default                         | Meaning                                                              |
+| ------------------------------------- | ------------------------------- | -------------------------------------------------------------------- |
+| `KOMIKA_FALLBACK_CERT_FILE`           | unset                           | Certificate chain file. Unset or empty turns the listener off.       |
+| `KOMIKA_FALLBACK_KEY_FILE`            | unset                           | The matching private key file. Required when the listener is on.     |
+| `KOMIKA_FALLBACK_HOSTS`               | unset                           | Required. Comma-separated host names, each with an optional `:port`. |
+| `KOMIKA_FALLBACK_PORT`                | `8443`                          | The listener's port inside the container.                            |
+| `KOMIKA_FALLBACK_BIND_ADDR`           | the `BIND_ADDR` value           | The address the listener binds.                                      |
+| `KOMIKA_FALLBACK_READER_DIR`          | `KOMIKA_WEB_DIR` plus `/reader` | The reader build folder with `index.html`.                           |
+| `KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY` | `50000000000`                   | The daily media budget in bytes (50 GB).                             |
 
 The server refuses to start when the listener is on and a required value is missing or the files are not a valid pair.
 

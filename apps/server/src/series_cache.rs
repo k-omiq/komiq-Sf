@@ -1163,9 +1163,9 @@ mod tests {
         }
         let read = || {
             sqlx::query_as::<_, (String, String, String, String, String, String)>(
-            "SELECT s.title, m.title, m.manga_key, m.web_url, s.xmin::text, m.xmin::text \
+                "SELECT s.title, m.title, m.manga_key, m.web_url, s.xmin::text, m.xmin::text \
              FROM suwayomi_series s JOIN engine_manga_key m ON m.manga_id = s.id WHERE s.id = 1",
-        )
+            )
         };
         let during = read().fetch_one(&pool).await.unwrap();
         assert_eq!(during.0, "Initial");

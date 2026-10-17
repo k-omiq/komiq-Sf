@@ -24,11 +24,11 @@ Add a work takedown:
 
 ```graphql
 mutation {
-  takeDownMedia(
-    kind: WORK
-    subjectId: "w_example"
-    reason: "Rights request received by the server owner"
-  )
+	takeDownMedia(
+		kind: WORK
+		subjectId: "w_example"
+		reason: "Rights request received by the server owner"
+	)
 }
 ```
 
@@ -38,14 +38,14 @@ Review the recorded takedowns:
 
 ```graphql
 query {
-  mediaTakedowns {
-    kind
-    subjectId
-    reason
-    createdBy
-    createdAt
-    viaWork
-  }
+	mediaTakedowns {
+		kind
+		subjectId
+		reason
+		createdBy
+		createdAt
+		viaWork
+	}
 }
 ```
 
@@ -53,7 +53,7 @@ query {
 
 ```graphql
 mutation {
-  liftMediaTakedown(kind: WORK, subjectId: "w_example")
+	liftMediaTakedown(kind: WORK, subjectId: "w_example")
 }
 ```
 

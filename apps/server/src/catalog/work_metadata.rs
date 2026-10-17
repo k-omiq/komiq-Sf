@@ -600,6 +600,7 @@ pub struct Projection {
 }
 
 impl Projection {
+    #[cfg(test)]
     pub fn any(self) -> bool {
         self.title || self.aliases || self.description || self.credits || self.tags || self.status
     }
@@ -1178,6 +1179,7 @@ impl Drop for RunningBar {
 /// with a mapping of that source: [`record_bar`] followed by [`reproject_bar`].
 /// Returns how many works were re-projected, plus source covers removed after a
 /// cover bar (a work may count in both).
+#[cfg(test)]
 pub async fn set_bar(
     pool: &Database,
     source_id: &str,

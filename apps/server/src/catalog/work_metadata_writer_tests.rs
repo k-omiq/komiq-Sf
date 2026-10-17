@@ -438,7 +438,15 @@ async fn new_mangadex_work_is_seeded_unmasked_even_when_source_is_barred() -> Re
         work_metadata::set_bar(&pool, "mangadex", group, true).await?;
     }
     let work = upsert_work_from_mangadex(&pool, "md-new-barred", &mangadex_input()).await?;
-    let row: (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>) =
+    type Scalars = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: Scalars =
         sqlx::query_as("SELECT primary_title, primary_lang, description, author, artist, status FROM work WHERE id = $1")
             .bind(&work).fetch_one(&pool).await?;
     assert_eq!(

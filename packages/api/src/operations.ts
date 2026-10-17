@@ -632,12 +632,7 @@ export const SET_FAVORITE = /* GraphQL */ `
 `;
 
 export const SET_PROGRESS = /* GraphQL */ `
-	mutation SetProgress(
-		$chapterId: ID!
-		$lastPageRead: Int!
-		$read: Boolean!
-		$numericEpoch: Int
-	) {
+	mutation SetProgress($chapterId: ID!, $lastPageRead: Int!, $read: Boolean!, $numericEpoch: Int) {
 		setProgress(
 			chapterId: $chapterId
 			lastPageRead: $lastPageRead

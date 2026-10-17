@@ -289,7 +289,10 @@ pub fn server_config(cert_pem: &str, pkcs8: &[u8]) -> Result<Arc<rustls::ServerC
 }
 
 /// A PEM chain and any supported PEM private key (PKCS#8, SEC1 or PKCS#1).
-pub fn server_config_pem(cert_pem: &str, key_pem: &[u8]) -> Result<Arc<rustls::ServerConfig>, String> {
+pub fn server_config_pem(
+    cert_pem: &str,
+    key_pem: &[u8],
+) -> Result<Arc<rustls::ServerConfig>, String> {
     let key = PrivateKeyDer::from_pem_slice(key_pem)
         .map_err(|_| "The private key is not valid PEM (PKCS#8, SEC1 or PKCS#1).".to_string())?;
     server_config_key(cert_pem, key)

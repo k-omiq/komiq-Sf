@@ -3365,6 +3365,16 @@ pub async fn mangadex_owner_on(
     )
 }
 
+/// A work's stored `primary_title, primary_lang, description, author, artist, status`.
+type StoredScalars = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 /// [`upsert_work_from_mangadex`] inside the caller's transaction. Never commits and
 /// never retries: the caller owns BEGIN through COMMIT and wraps that whole unit in
 /// `db::retry_transaction`.
@@ -3435,14 +3445,7 @@ pub async fn upsert_work_from_mangadex_on(
         if masked_groups.is_empty() {
             input
         } else {
-            let stored: (
-                Option<String>,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-            ) = sqlx::query_as(
+            let stored: StoredScalars = sqlx::query_as(
                 "SELECT primary_title, primary_lang, description, author, artist, status \
                  FROM work WHERE id = $1",
             )
@@ -3582,8 +3585,13 @@ pub async fn upsert_work_from_mangadex_on(
     insert_descriptions_and_credits(tx, &work_id, input).await?;
     // A mapping that cannot give tags (barred or outranked) refreshes only its links
     // and stamp: an empty list would delete the tags the chosen mapping gave.
-    replace_mangadex_details(tx, &work_id, input, !masked_groups.contains(&FieldGroup::Tags))
-        .await?;
+    replace_mangadex_details(
+        tx,
+        &work_id,
+        input,
+        !masked_groups.contains(&FieldGroup::Tags),
+    )
+    .await?;
     let mapping_id = ensure_source_series(
         tx,
         &work_id,
@@ -4036,8 +4044,11 @@ pub async fn refresh_mangadex_details(
         replace_mangadex_details(&mut tx, work_id, input, gives_tags).await?;
         if let Some(mapping) = mapping {
             let mut observation = Observation::from_mangadex(input);
-            observation.groups.retain(|group, _| *group == FieldGroup::Tags);
-            work_metadata::record_on(&mut tx, &mapping, &observation, Attribution::Observed).await?;
+            observation
+                .groups
+                .retain(|group, _| *group == FieldGroup::Tags);
+            work_metadata::record_on(&mut tx, &mapping, &observation, Attribution::Observed)
+                .await?;
             work_metadata::project_on(&mut tx, work_id, &[FieldGroup::Tags]).await?;
         }
         tx.commit().await?;
@@ -4332,7 +4343,8 @@ pub async fn unpin_work_field(
     sqlx::query(&format!(
         "UPDATE work SET {column} = {}, updated_at = $2 WHERE id = $3 \
          AND {column} IS DISTINCT FROM {}",
-        field.typed_value(), field.typed_value()
+        field.typed_value(),
+        field.typed_value()
     ))
     .bind(source_value)
     .bind(Utc::now())
@@ -4983,6 +4995,7 @@ pub struct MergeOutcome {
     pub moved_source_series: u64,
     /// Every entry of the losing work's chapter list and where it went (W3a): onto the
     /// survivor's entry with the same key, or moved as it is (`from == to`).
+    #[cfg(test)]
     pub entry_map: Vec<work_chapter::EntryMove>,
 }
 
@@ -5789,8 +5802,13 @@ pub(crate) async fn merge_works_on(
         .execute(&mut **tx)
         .await?;
 
-    use work_metadata::FieldGroup::{Title, Description, Credits, Tags, Status};
-    work_metadata::project_on(tx, target_work, &[Title, Description, Credits, Tags, Status]).await?;
+    use work_metadata::FieldGroup::{Credits, Description, Status, Tags, Title};
+    work_metadata::project_on(
+        tx,
+        target_work,
+        &[Title, Description, Credits, Tags, Status],
+    )
+    .await?;
     reproject_work_caches_on(tx, target_work).await?;
     reproject_work_caches_on(tx, source_work).await?;
 
@@ -5802,6 +5820,7 @@ pub(crate) async fn merge_works_on(
     // a crash in this window already leaves behind, so log it and carry on.
     Ok(MergeOutcome {
         moved_source_series: moved,
+        #[cfg(test)]
         entry_map,
     })
 }
@@ -5950,6 +5969,7 @@ pub struct SplitOutcome {
     /// Distinct readers whose progress follows the detached sources.
     pub progress_readers_moved: i64,
     /// Chapter-list entries that followed the detached copies (W3a).
+    #[cfg(test)]
     pub entry_map: Vec<work_chapter::EntryMove>,
 }
 
@@ -6265,9 +6285,19 @@ async fn split_source_series_attempt(
 
     // Source ownership, navigation and both projections publish together. A failed
     // projection leaves the original split request safe to retry.
-    use work_metadata::FieldGroup::{Title, Description, Credits, Tags, Status};
-    work_metadata::project_on(&mut tx, work_id, &[Title, Description, Credits, Tags, Status]).await?;
-    work_metadata::project_on(&mut tx, &new_work_id, &[Title, Description, Credits, Tags, Status]).await?;
+    use work_metadata::FieldGroup::{Credits, Description, Status, Tags, Title};
+    work_metadata::project_on(
+        &mut tx,
+        work_id,
+        &[Title, Description, Credits, Tags, Status],
+    )
+    .await?;
+    work_metadata::project_on(
+        &mut tx,
+        &new_work_id,
+        &[Title, Description, Credits, Tags, Status],
+    )
+    .await?;
     reproject_work_caches_on(&mut tx, work_id).await?;
     reproject_work_caches_on(&mut tx, &new_work_id).await?;
     let title: String = sqlx::query_scalar("SELECT primary_title FROM work WHERE id = $1")
@@ -6282,6 +6312,7 @@ async fn split_source_series_attempt(
         title,
         moved_sources: moved,
         progress_readers_moved,
+        #[cfg(test)]
         entry_map,
     })
 }
@@ -10560,9 +10591,17 @@ mod tests {
         };
         let stamped = stamps().await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        upsert_work_from_mangadex(&pool, "md-slime", &input).await.unwrap();
-        refresh_mangadex_details(&pool, &id, "md-slime", &input).await.unwrap();
-        assert_eq!(metadata_row_versions(&pool, &id).await, before, "nothing new, nothing written");
+        upsert_work_from_mangadex(&pool, "md-slime", &input)
+            .await
+            .unwrap();
+        refresh_mangadex_details(&pool, &id, "md-slime", &input)
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata_row_versions(&pool, &id).await,
+            before,
+            "nothing new, nothing written"
+        );
         let restamped = stamps().await;
         assert!(
             restamped.0 > stamped.0 && restamped.1 > stamped.1 && restamped.2 > stamped.2,
@@ -10658,7 +10697,9 @@ mod tests {
             external_ids: vec![("al".into(), "86399".into())],
             ..renamed.clone()
         };
-        refresh_mangadex_details(&pool, &id, "md-slime", &retagged).await.unwrap();
+        refresh_mangadex_details(&pool, &id, "md-slime", &retagged)
+            .await
+            .unwrap();
         let after = metadata_row_versions(&pool, &id).await;
         let kept = |v: &[String], prefix: &str| v.iter().find(|r| r.starts_with(prefix)).cloned();
         assert_eq!(
@@ -10708,7 +10749,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        refresh_mangadex_details(&pool, &id, "md-slime", &rich_slime_input()).await.unwrap();
+        refresh_mangadex_details(&pool, &id, "md-slime", &rich_slime_input())
+            .await
+            .unwrap();
         let rows = crate::db_types::query_tuple::<(String, String, i64, Option<String>)>(
             "SELECT tag, source, ord, tag_id FROM work_tag WHERE work_id = $1 ORDER BY tag",
         )
@@ -10728,9 +10771,17 @@ mod tests {
                 ("Isekai".into(), "admin".into(), 7, None),
             ]
         );
-        refresh_mangadex_details(&pool, &id, "md-slime", &WorkInput { tags: Vec::new(), ..rich_slime_input() })
-            .await
-            .unwrap();
+        refresh_mangadex_details(
+            &pool,
+            &id,
+            "md-slime",
+            &WorkInput {
+                tags: Vec::new(),
+                ..rich_slime_input()
+            },
+        )
+        .await
+        .unwrap();
         let left: Vec<String> =
             crate::db_types::query_scalar("SELECT source FROM work_tag WHERE work_id = $1")
                 .bind(&id)
@@ -13872,9 +13923,12 @@ mod tests {
 
 #[cfg(test)]
 mod production_safety_tests;
-#[cfg(test)] mod work_metadata_matcher_tests;
-#[cfg(test)] mod work_metadata_writer_tests;
-#[cfg(test)] mod work_metadata_lifecycle_tests;
+#[cfg(test)]
+mod work_metadata_lifecycle_tests;
+#[cfg(test)]
+mod work_metadata_matcher_tests;
+#[cfg(test)]
+mod work_metadata_writer_tests;
 
 #[cfg(test)]
 pub(crate) mod phase4_tests;

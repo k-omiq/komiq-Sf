@@ -17,12 +17,12 @@ A **copy** is one upload of one chapter by one source, identified by source id, 
 
 Four PostgreSQL tables hold the data:
 
-| Table | Holds |
-| --- | --- |
-| `media_object` | One row per byte hash: length, MIME type (content type), width and height when known. |
-| `media_copy` | One row per copy identity. No foreign key to the catalogue. |
-| `media_manifest` | One row per revision of a copy: page count, policy epoch, creation time, `superseded_at`, `stale`. |
-| `media_manifest_page` | The ordered page hashes of each revision. |
+| Table                 | Holds                                                                                              |
+| --------------------- | -------------------------------------------------------------------------------------------------- |
+| `media_object`        | One row per byte hash: length, MIME type (content type), width and height when known.              |
+| `media_copy`          | One row per copy identity. No foreign key to the catalogue.                                        |
+| `media_manifest`      | One row per revision of a copy: page count, policy epoch, creation time, `superseded_at`, `stale`. |
+| `media_manifest_page` | The ordered page hashes of each revision.                                                          |
 
 A **revision** is one ordered list of page hashes. Changed pages produce revision n+1; an unchanged list writes nothing. A replaced revision stays for 7 days as a signed record. Cleanup then removes it and any unused hashes.
 
@@ -60,21 +60,25 @@ The key id (`kid`) is the hex of the first 8 bytes of the SHA-256 of the raw pub
 A signed document is an envelope:
 
 ```json
-{ "payload": "<canonical JSON text>", "kid": "<key id>", "sig": "<base64url signature of the payload bytes>" }
+{
+	"payload": "<canonical JSON text>",
+	"kid": "<key id>",
+	"sig": "<base64url signature of the payload bytes>"
+}
 ```
 
 A manifest payload holds `v`, `copy_id`, `copy` (source id, manga key, chapter key), `revision`, `policy_epoch`, `issued_at`, `pages` (`sha256`, `length`, `mime`, `width`, `height`) and `kid`. `issued_at` is the revision's creation time, so a revision always signs to the same bytes. It never holds source URLs, engine ids, cookies or account data.
 
 ## Routes
 
-| Route | Answers | Cache-Control |
-| --- | --- | --- |
-| `/media/v1/o/{copyId}/{sha256}` | the page bytes, after hash and policy checks. Every answer, errors too, has `Access-Control-Allow-Origin: *` | `public, max-age=31536000, immutable, s-maxage=<remaining lease seconds>` (at most 600) |
-| `/media/v1/p/{copyId}/{rev}` | an experimental chapter pack, read [Media packs](/developers/media-packs) | as for objects |
-| `/media/v1/manifest/{copyId}[?rev=n]` | the signed manifest | `public, max-age=60` |
-| `/media/v1/keys` | the signed key set | `public, max-age=60` |
-| `/media/v1/policy` | the signed policy lease | `public, max-age=60` |
-| `/media/v1/ready` | `204`, for route probes, also with the feature off | `no-store`, `Access-Control-Allow-Origin: *` |
+| Route                                 | Answers                                                                                                      | Cache-Control                                                                           |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `/media/v1/o/{copyId}/{sha256}`       | the page bytes, after hash and policy checks. Every answer, errors too, has `Access-Control-Allow-Origin: *` | `public, max-age=31536000, immutable, s-maxage=<remaining lease seconds>` (at most 600) |
+| `/media/v1/p/{copyId}/{rev}`          | an experimental chapter pack, read [Media packs](/developers/media-packs)                                    | as for objects                                                                          |
+| `/media/v1/manifest/{copyId}[?rev=n]` | the signed manifest                                                                                          | `public, max-age=60`                                                                    |
+| `/media/v1/keys`                      | the signed key set                                                                                           | `public, max-age=60`                                                                    |
+| `/media/v1/policy`                    | the signed policy lease                                                                                      | `public, max-age=60`                                                                    |
+| `/media/v1/ready`                     | `204`, for route probes, also with the feature off                                                           | `no-store`, `Access-Control-Allow-Origin: *`                                            |
 
 The server keeps no page bytes. For an object request it finds the newest kept revision naming the hash, checks site-wide block rules and takedowns for the copy's own series, fetches the page and hashes it. It checks the current policy again after the fetch, so a takedown noticed during a slow fill also refuses that response. A denied copy, a copy of a denied series or a taken-down chapter answers `404` with `no-store, must-revalidate`, even if another copy has identical bytes. The manifest route also refuses a denied copy.
 

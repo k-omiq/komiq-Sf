@@ -2378,6 +2378,7 @@ async fn record_scan_policy(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_scan_policy_in_generation(
     pool: &Database,
     series_id: &str,
@@ -2398,6 +2399,7 @@ async fn record_scan_policy_in_generation(
 }
 
 /// One attempt at the scan-state read-modify-write. See `record_scan_policy` for retries.
+#[allow(clippy::too_many_arguments)]
 async fn record_scan_once(
     pool: &Database,
     series_id: &str,
@@ -2427,6 +2429,7 @@ enum ScanAdminInput<'a> {
     Supplied(&'a ScanAdmin),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_scan_with_admin_once(
     pool: &Database,
     series_id: &str,
@@ -8222,11 +8225,21 @@ mod tests {
                 .unwrap();
             }
             assert_eq!(upsert_feed_series_update(&pool, "7").await.unwrap(), 1);
-            assert_eq!(thumbnail(pool.clone()).await.as_deref(), expected, "{bars:?}");
+            assert_eq!(
+                thumbnail(pool.clone()).await.as_deref(),
+                expected,
+                "{bars:?}"
+            );
             // Only the fallback depends on the bars, and the rebuild agrees with it.
             assert_eq!(row(pool.clone()).await, unbarred, "{bars:?}");
-            crate::catalog::refresh_feed_series_updates(&pool).await.unwrap();
-            assert_eq!(thumbnail(pool.clone()).await.as_deref(), expected, "{bars:?}");
+            crate::catalog::refresh_feed_series_updates(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                thumbnail(pool.clone()).await.as_deref(),
+                expected,
+                "{bars:?}"
+            );
         }
     }
 }

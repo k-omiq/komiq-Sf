@@ -119,7 +119,7 @@ The repository in one look:
 | ---------------- | ---------------------------------------------------------------- |
 | `apps/reader`    | The reader app (SvelteKit, with a Tauri shell for native builds) |
 | `apps/admin`     | The admin console and the desktop app that starts the server     |
-| `apps/server`    | The komiq server (Rust, GraphQL, PostgreSQL; SQLite covers)       |
+| `apps/server`    | The komiq server (Rust, GraphQL, PostgreSQL; SQLite covers)      |
 | `apps/worker`    | The optional image proxy (Cloudflare Worker)                     |
 | `apps/docs`      | The docs site, docs.komiq.cc                                     |
 | `packages/api`   | The data layer the apps share                                    |

@@ -184,7 +184,10 @@ impl Fence {
             }
             Err(_) => {
                 // A slow check proves nothing about reachability: say "being checked".
-                self.gate.write().unwrap_or_else(|e| e.into_inner()).unreachable = false;
+                self.gate
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .unreachable = false;
                 tracing::debug!("engine generation check timed out; keeping the current gate")
             }
         }

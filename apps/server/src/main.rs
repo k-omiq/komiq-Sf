@@ -8,9 +8,9 @@ mod chapter_label;
 mod cloudflare;
 mod config;
 mod cover;
-mod cover_copy;
 #[cfg(test)]
 mod cover_bar_tests;
+mod cover_copy;
 #[cfg(test)]
 mod cover_files_tests;
 mod cover_recompress;
@@ -40,9 +40,9 @@ mod mangadex;
 mod media;
 mod media_cache;
 #[cfg(test)]
-mod media_cache_tests;
-#[cfg(test)]
 mod media_cache_pack_tests;
+#[cfg(test)]
+mod media_cache_tests;
 mod media_manifest;
 #[cfg(test)]
 mod media_manifest_tests;
@@ -1449,18 +1449,25 @@ async fn serve_suwayomi_image_inner(
     let path = format!("/api/v1/manga/{rest}");
     let parts: Vec<_> = rest.split('/').collect();
     if let [manga, "chapter", order, "page", page] = parts.as_slice() {
-        if let (Ok(manga_id), Ok(source_order), Ok(index)) =
-            (manga.parse::<i64>(), order.parse::<i32>(), page.parse::<usize>())
-        {
+        if let (Ok(manga_id), Ok(source_order), Ok(index)) = (
+            manga.parse::<i64>(),
+            order.parse::<i32>(),
+            page.parse::<usize>(),
+        ) {
             match engine_route::route_page(
                 &app.suwayomi,
                 &app.pool,
-                engine_route::PageTarget::Order { manga_id, source_order },
+                engine_route::PageTarget::Order {
+                    manga_id,
+                    source_order,
+                },
                 index,
             )
             .await
             {
-                engine_route::Routed::Served((bytes, mime)) => return raw_image_response(mime, bytes),
+                engine_route::Routed::Served((bytes, mime)) => {
+                    return raw_image_response(mime, bytes)
+                }
                 engine_route::Routed::Busy | engine_route::Routed::Refuse => {
                     return page_busy_response();
                 }
@@ -3323,9 +3330,9 @@ async fn main() -> anyhow::Result<()> {
     if argv.first().map(String::as_str) == Some("engine") {
         let pool = db::connect_existing(&cfg.database_url).await?;
         if argv.get(1).map(String::as_str) == Some("provision") {
-            let id = argv.get(2).ok_or_else(|| {
-                anyhow::anyhow!("usage: engine provision <id> [source_id ...]")
-            })?;
+            let id = argv
+                .get(2)
+                .ok_or_else(|| anyhow::anyhow!("usage: engine provision <id> [source_id ...]"))?;
             let specs = engine_route::engines_from_env().map_err(|e| anyhow::anyhow!(e))?;
             let engines = engine_route::Engines::new(&specs);
             let engine = engines
@@ -3351,7 +3358,10 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             pool.close().await;
-            if results.iter().any(|r| r.check != engine_route::VersionCheck::Match) {
+            if results
+                .iter()
+                .any(|r| r.check != engine_route::VersionCheck::Match)
+            {
                 return Err(anyhow::anyhow!("some sources could not be provisioned"));
             }
             return Ok(());
@@ -3576,7 +3586,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Background adaptive scan scheduler, sharing the same AppState.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    engine_route::spawn_monitor(state.suwayomi.regional.clone(), pool.clone(), shutdown_tx.subscribe());
+    engine_route::spawn_monitor(
+        state.suwayomi.regional.clone(),
+        pool.clone(),
+        shutdown_tx.subscribe(),
+    );
     scanner::spawn(state.clone(), cfg.scan_tick_seconds, shutdown_rx);
     engine_keys::spawn(
         pool.clone(),

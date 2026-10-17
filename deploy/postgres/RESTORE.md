@@ -223,11 +223,11 @@ step would leave less than the floor (`KOMIKA_REHEARSAL_MIN_FREE_GB`, default
 3 GiB). Every refusal prints the needed and the available bytes; every pass
 prints one `disk_gate` line per filesystem.
 
-| Step | Estimated need on Docker's data root | Estimated need on the rehearsal root |
-| --- | --- | --- |
-| `up`, `backup` | floor | floor |
-| `restore` | floor | floor + 1.3 x the database size of the backup it will use (`backup[].info.size` of `pgbackrest info`) |
-| `drill` | floor | floor + 1.3 x that size, while the source still fills the disk |
+| Step           | Estimated need on Docker's data root | Estimated need on the rehearsal root                                                                  |
+| -------------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| `up`, `backup` | floor                                | floor                                                                                                 |
+| `restore`      | floor                                | floor + 1.3 x the database size of the backup it will use (`backup[].info.size` of `pgbackrest info`) |
+| `drill`        | floor                                | floor + 1.3 x that size, while the source still fills the disk                                        |
 
 When both are one filesystem the two needs are added to one floor.
 
@@ -377,11 +377,11 @@ host's owner:
 - The operator window of your own earlier run on this host shows the load
   (`Loaded image: komika-postgres:18.6-pgbackrest-2.59`).
 - `docker image inspect --format '{{.Id}}'
-  komika-postgres:18.6-pgbackrest-2.59` prints the ID in `image-id.txt` of
+komika-postgres:18.6-pgbackrest-2.59` prints the ID in `image-id.txt` of
   that run. Read that file on the BUILD machine (`$out/image-id.txt`); the
   host's copy went with the run's directory.
 - `docker ps -a --filter ancestor=komika-postgres:18.6-pgbackrest-2.59
-  --format '{{.Names}}'` prints no line.
+--format '{{.Names}}'` prints no line.
 
 Then remove that one tag by its name (`docker image rm
 komika-postgres:18.6-pgbackrest-2.59`), paste block A again, and let block C
@@ -634,10 +634,10 @@ The abort action, in this order:
    `operation recorded: subcommand=... pid=N since=... process=...`. Send
    SIGTERM (`kill -TERM N`) only if that line ends in `process=running` for
    that pid and `ps -o args= -p N` shows `rehearsal`. With `process=NOT
-   running (it ended without cleanup; the lock itself is free)` the step has
+running (it ended without cleanup; the lock itself is free)` the step has
    already ended and the number may belong to another process by now: send
    nothing and go on to steps 2 and 3. With `process=running as another
-   user` or `operation recorded: none` send nothing either. The kit unwinds
+user` or `operation recorded: none` send nothing either. The kit unwinds
    and removes its job container. Do not press Ctrl-C a second time, never
    use `kill -9` (the job container would keep running without its client),
    and never `docker rm` anything by hand.
@@ -647,7 +647,7 @@ The abort action, in this order:
 4. `r destroy-source-volumes --yes-delete-rehearsal-volumes` (this returns
    the disk space).
 5. Only if `stanza-create` has already run: `r repo-destroy
-   --yes-delete-rehearsal-repo`. Before `stanza-create` the rehearsal prefix
+--yes-delete-rehearsal-repo`. Before `stanza-create` the rehearsal prefix
    holds nothing.
 6. `r down`, then `r status` (everything absent), then `after abort`.
 7. The removal of the run's directory with its identity check, as at the end
@@ -702,29 +702,29 @@ r status ; echo "exit=$?"
 
 What to check after each step:
 
-| Step | Check |
-| --- | --- |
-| `preflight --init-root` | Last line `PREFLIGHT OK`; `new_project=` line (nothing of this project existed); seven image files identical; both prefixes as intended; `source_storage=` line; both subnets free; the root's owner, mode and mount. |
-| `up` | `postgres state=running health=healthy`; a new cluster was initialized (first `up` on a new prefix). `up` itself has compared the created container's real limits, environment and mount sources with the model. Then set `KOMIKA_PG_INIT_NEW=0` in the env file with an editor. |
-| `psql-check` | `application_health=ok`; PostgreSQL 18.6; data checksums on; SCRAM; the role is no superuser; locale and `pg_trgm` as expected. |
-| `stanza-create` | Exit 0. |
-| `backup full --first` | Exit 0; the wall time. |
-| the `grep -ci 'dropped'` line | A number, kept in `records/dropped-wal-lines.txt`. It counts lines of the PostgreSQL log that mention dropped WAL. With `archive-push-queue-max` (1 GiB) pgBackRest may drop queued segments once the stanza exists when uploads fall behind. That is harmless for the drill (the base of the point-in-time restore is the full backup taken afterwards) and explains an `archive_bytes` below the estimate; record the number. |
-| `info --json --out`, `repo-usage --out` | Both files exist under the root: per-backup database and repository sizes, and the object count and bytes under the rehearsal prefix. |
-| `check` | Exit 0. |
-| `sql-marker --label before-pitr` | `T=` printed, a UTC time; it is also in `records/target-time.txt`. If the shell is lost, read it from there. |
-| `record-settings` | The file exists; it must be written before the source volumes are destroyed. |
-| `sql-marker --label after-pitr` | Exit 0: a commit after T exists. |
-| `backup incr` | Exit 0; the wall time. |
-| second `info` and `repo-usage` | The incremental backup is listed; WAL bytes (`archive_bytes`) and backup bytes are separate numbers. |
-| `archive-status` | `ready_segments=0`; `last_archived_time` later than `last_failed_time`; `pg_wal_bytes` stable. |
-| `status` | Free bytes above the floor on both filesystems; no job container, no `UNRESOLVED` line, no kept restore. |
-| `stop-source` | Only the rehearsal's containers were removed; `after` says the other containers are unchanged. |
-| `destroy-source-volumes` | Both volumes removed; `after` shows the space is back; the rehearsal network is still there. |
-| `restore` | Exit 0; the wall time; `marker expectations met: present=before-pitr absent=after-pitr`; `operator_markers=before-pitr`; `pitr.json` holds `restore_seconds`, `recovery_seconds`, `restored_bytes`, the per-backup sizes and `repository_usage`. |
-| `restore-cleanup` | `removed_containers=1 removed_networks=1`; the restored directory stays. |
-| `repo-destroy` | Exit 0; `repository_files_after=0`. |
-| `down`, `status` | Services, volumes, network, jobs and kept restores of the project are all absent. |
+| Step                                    | Check                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `preflight --init-root`                 | Last line `PREFLIGHT OK`; `new_project=` line (nothing of this project existed); seven image files identical; both prefixes as intended; `source_storage=` line; both subnets free; the root's owner, mode and mount.                                                                                                                                                                                                           |
+| `up`                                    | `postgres state=running health=healthy`; a new cluster was initialized (first `up` on a new prefix). `up` itself has compared the created container's real limits, environment and mount sources with the model. Then set `KOMIKA_PG_INIT_NEW=0` in the env file with an editor.                                                                                                                                                |
+| `psql-check`                            | `application_health=ok`; PostgreSQL 18.6; data checksums on; SCRAM; the role is no superuser; locale and `pg_trgm` as expected.                                                                                                                                                                                                                                                                                                 |
+| `stanza-create`                         | Exit 0.                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `backup full --first`                   | Exit 0; the wall time.                                                                                                                                                                                                                                                                                                                                                                                                          |
+| the `grep -ci 'dropped'` line           | A number, kept in `records/dropped-wal-lines.txt`. It counts lines of the PostgreSQL log that mention dropped WAL. With `archive-push-queue-max` (1 GiB) pgBackRest may drop queued segments once the stanza exists when uploads fall behind. That is harmless for the drill (the base of the point-in-time restore is the full backup taken afterwards) and explains an `archive_bytes` below the estimate; record the number. |
+| `info --json --out`, `repo-usage --out` | Both files exist under the root: per-backup database and repository sizes, and the object count and bytes under the rehearsal prefix.                                                                                                                                                                                                                                                                                           |
+| `check`                                 | Exit 0.                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `sql-marker --label before-pitr`        | `T=` printed, a UTC time; it is also in `records/target-time.txt`. If the shell is lost, read it from there.                                                                                                                                                                                                                                                                                                                    |
+| `record-settings`                       | The file exists; it must be written before the source volumes are destroyed.                                                                                                                                                                                                                                                                                                                                                    |
+| `sql-marker --label after-pitr`         | Exit 0: a commit after T exists.                                                                                                                                                                                                                                                                                                                                                                                                |
+| `backup incr`                           | Exit 0; the wall time.                                                                                                                                                                                                                                                                                                                                                                                                          |
+| second `info` and `repo-usage`          | The incremental backup is listed; WAL bytes (`archive_bytes`) and backup bytes are separate numbers.                                                                                                                                                                                                                                                                                                                            |
+| `archive-status`                        | `ready_segments=0`; `last_archived_time` later than `last_failed_time`; `pg_wal_bytes` stable.                                                                                                                                                                                                                                                                                                                                  |
+| `status`                                | Free bytes above the floor on both filesystems; no job container, no `UNRESOLVED` line, no kept restore.                                                                                                                                                                                                                                                                                                                        |
+| `stop-source`                           | Only the rehearsal's containers were removed; `after` says the other containers are unchanged.                                                                                                                                                                                                                                                                                                                                  |
+| `destroy-source-volumes`                | Both volumes removed; `after` shows the space is back; the rehearsal network is still there.                                                                                                                                                                                                                                                                                                                                    |
+| `restore`                               | Exit 0; the wall time; `marker expectations met: present=before-pitr absent=after-pitr`; `operator_markers=before-pitr`; `pitr.json` holds `restore_seconds`, `recovery_seconds`, `restored_bytes`, the per-backup sizes and `repository_usage`.                                                                                                                                                                                |
+| `restore-cleanup`                       | `removed_containers=1 removed_networks=1`; the restored directory stays.                                                                                                                                                                                                                                                                                                                                                        |
+| `repo-destroy`                          | Exit 0; `repository_files_after=0`.                                                                                                                                                                                                                                                                                                                                                                                             |
+| `down`, `status`                        | Services, volumes, network, jobs and kept restores of the project are all absent.                                                                                                                                                                                                                                                                                                                                               |
 
 After an interruption (Ctrl-C, a lost session, a refused step), run `r status`
 first. If it shows a job container or an `UNRESOLVED` line, run `r
@@ -888,7 +888,7 @@ Notes on single steps:
   before Compose starts whenever the host can read the repository (the data
   volume is absent and the rehearsal network exists), and in every other case
   by the image itself before PostgreSQL starts; both refusals name `restore
-  --target NEWDIR --json-out FILE`. A new drill uses a new prefix, whose
+--target NEWDIR --json-out FILE`. A new drill uses a new prefix, whose
   repository is empty.
 - `restore` and `drill` need a Linux Docker host. `restore` works after the
   source containers and volumes are gone, from the local image, the env file,
@@ -947,7 +947,7 @@ Three things keep the storage and request numbers of a drill:
 
 - `r info --json --out FILE` writes pgBackRest's own `info` JSON to a new
   file under the root (the same allowlisted, read-only command as `r info
-  --json`). Per backup it holds the database size (`info.size`), what the
+--json`). Per backup it holds the database size (`info.size`), what the
   backup added (`info.delta`) and the repository sizes
   (`info.repository.size` and `.delta`). Store it after the full and after
   the incremental backup.

@@ -19,58 +19,58 @@ On a self-hosted installation where `KOMIKA_WEB_DIR` is set (Docker Compose or t
 
 The Compose file in `deploy/selfhost/docker-compose.yml` requires `KOMIQ_DB_PASSWORD` in `.env`. Run `deploy/selfhost/install.sh` to generate it and preserve existing settings. Other variables are optional. Keep the file private with `chmod 600 deploy/selfhost/.env`.
 
-| Setting                | Default   | Description                                                                                                                            |
-| ---------------------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `KOMIQ_DB_PASSWORD`    | required  | Random URL-safe database password. Generated once by the installer. Keep it unchanged on an initialized cluster.                       |
-| `KOMIQ_PORT`           | `8080`    | Host port on which komiq listens.                                                                                                      |
-| `KOMIQ_BIND`           | `0.0.0.0` | Host address to bind (`0.0.0.0` for local network access, `127.0.0.1` for this machine only).                                          |
-| `COMPOSE_FILE`         | unset     | Extra Compose files that publish port 443 (`docker-compose.https.yml`) and port 80 (`docker-compose.acme.yml`). The installer sets it. |
-| `TZ`                   | `UTC`     | Time zone used for container logs.                                                                                                     |
-| `COMPOSE_PROFILES`     | empty     | Optional containers to start: `flaresolverr`, `warp`, or both as `flaresolverr,warp`.                                                  |
-| `FLARESOLVERR_ENABLED` | `false`   | Set to `true` with `COMPOSE_PROFILES=flaresolverr` to enable the solver.                                                               |
+| Setting                | Default   | Description                                                                                                                                 |
+| ---------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KOMIQ_DB_PASSWORD`    | required  | Random URL-safe database password. Generated once by the installer. Keep it unchanged on an initialized cluster.                            |
+| `KOMIQ_PORT`           | `8080`    | Host port on which komiq listens.                                                                                                           |
+| `KOMIQ_BIND`           | `0.0.0.0` | Host address to bind (`0.0.0.0` for local network access, `127.0.0.1` for this machine only).                                               |
+| `COMPOSE_FILE`         | unset     | Extra Compose files that publish port 443 (`docker-compose.https.yml`) and port 80 (`docker-compose.acme.yml`). The installer sets it.      |
+| `TZ`                   | `UTC`     | Time zone used for container logs.                                                                                                          |
+| `COMPOSE_PROFILES`     | empty     | Optional containers to start: `flaresolverr`, `warp`, or both as `flaresolverr,warp`.                                                       |
+| `FLARESOLVERR_ENABLED` | `false`   | Set to `true` with `COMPOSE_PROFILES=flaresolverr` to enable the solver.                                                                    |
 | `WARP_ENABLED`         | `false`   | Set to `true` with the `warp` profile to send the engine's source requests through Cloudflare WARP. Read [Add sources](/self-host/sources). |
 
 ## Server network and web settings
 
 These variables configure network listeners, web applications, and proxy endpoints.
 
-| Variable              | Default       | Description                                                                                                                                                                                                                           |
-| --------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BIND_ADDR`           | `0.0.0.0`     | Internal IP address the server listener binds.                                                                                                                                                                                        |
-| `PORT`                | `8080`        | Internal HTTP port the server listener binds.                                                                                                                                                                                         |
-| `KOMIKA_METRICS_PORT` | `9090`        | Port for Prometheus metrics output on loopback.                                                                                                                                                                                       |
+| Variable                   | Default       | Description                                                                                                                                                                                                                           |
+| -------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BIND_ADDR`                | `0.0.0.0`     | Internal IP address the server listener binds.                                                                                                                                                                                        |
+| `PORT`                     | `8080`        | Internal HTTP port the server listener binds.                                                                                                                                                                                         |
+| `KOMIKA_METRICS_PORT`      | `9090`        | Port for Prometheus metrics output on loopback.                                                                                                                                                                                       |
 | `KOMIKA_METRICS_BIND_ADDR` | `127.0.0.1`   | IP address the metrics listener binds. Keep the default outside a container. In Docker, set `0.0.0.0` and publish the port on host `127.0.0.1` only.                                                                                  |
-| `KOMIKA_WEB_DIR`      | unset         | Path to web assets. Serves reader at `/` and console at `/admin`.                                                                                                                                                                     |
-| `KOMIKA_IMG_PROXY`    | auto          | Controls `/img` proxy. Enabled when `KOMIKA_WEB_DIR` is set.                                                                                                                                                                          |
-| `CORS_ORIGINS`        | local origins | Comma-separated allowed Cross-Origin Resource Sharing (CORS) origins. The native reader apps need `tauri://localhost,http://tauri.localhost,https://tauri.localhost`; the self-host Docker image and the admin desktop app set these. |
-| `LOG_FORMAT`          | unset         | `json` for structured JSON logs; unset for text, coloured only at a terminal without `NO_COLOR`.                                                                                                                                      |
-| `GRAPHIQL_ENABLED`    | `false`       | Enables interactive GraphiQL query explorer at `/graphql`.                                                                                                                                                                            |
+| `KOMIKA_WEB_DIR`           | unset         | Path to web assets. Serves reader at `/` and console at `/admin`.                                                                                                                                                                     |
+| `KOMIKA_IMG_PROXY`         | auto          | Controls `/img` proxy. Enabled when `KOMIKA_WEB_DIR` is set.                                                                                                                                                                          |
+| `CORS_ORIGINS`             | local origins | Comma-separated allowed Cross-Origin Resource Sharing (CORS) origins. The native reader apps need `tauri://localhost,http://tauri.localhost,https://tauri.localhost`; the self-host Docker image and the admin desktop app set these. |
+| `LOG_FORMAT`               | unset         | `json` for structured JSON logs; unset for text, coloured only at a terminal without `NO_COLOR`.                                                                                                                                      |
+| `GRAPHIQL_ENABLED`         | `false`       | Enables interactive GraphiQL query explorer at `/graphql`.                                                                                                                                                                            |
 
 ### Fallback listener
 
 These variables turn on a second HTTPS listener for a fallback address. Read [Fallback address](/self-host/internet-access#fallback-address).
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `KOMIKA_FALLBACK_CERT_FILE` | unset | PEM certificate chain file. Unset or empty turns the listener off. |
-| `KOMIKA_FALLBACK_KEY_FILE` | unset | The matching PEM private key file. Required when the listener is on. |
-| `KOMIKA_FALLBACK_HOSTS` | unset | Required. Comma-separated host names, each with an optional `:port`. |
-| `KOMIKA_FALLBACK_PORT` | `8443` | HTTPS port of the listener. |
-| `KOMIKA_FALLBACK_BIND_ADDR` | the `BIND_ADDR` value | Address the listener binds. |
-| `KOMIKA_FALLBACK_READER_DIR` | `KOMIKA_WEB_DIR` plus `/reader` | Reader build folder with `index.html`. |
-| `KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY` | `50000000000` | Media bytes the listener sends per UTC day before media gets `503`. |
+| Variable                              | Default                         | Description                                                          |
+| ------------------------------------- | ------------------------------- | -------------------------------------------------------------------- |
+| `KOMIKA_FALLBACK_CERT_FILE`           | unset                           | PEM certificate chain file. Unset or empty turns the listener off.   |
+| `KOMIKA_FALLBACK_KEY_FILE`            | unset                           | The matching PEM private key file. Required when the listener is on. |
+| `KOMIKA_FALLBACK_HOSTS`               | unset                           | Required. Comma-separated host names, each with an optional `:port`. |
+| `KOMIKA_FALLBACK_PORT`                | `8443`                          | HTTPS port of the listener.                                          |
+| `KOMIKA_FALLBACK_BIND_ADDR`           | the `BIND_ADDR` value           | Address the listener binds.                                          |
+| `KOMIKA_FALLBACK_READER_DIR`          | `KOMIKA_WEB_DIR` plus `/reader` | Reader build folder with `index.html`.                               |
+| `KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY` | `50000000000`                   | Media bytes the listener sends per UTC day before media gets `503`.  |
 
 ## Database and storage settings
 
 These variables configure database connections and file storage paths.
 
-| Variable                    | Default                       | Description                                                                                                                |
-| --------------------------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`              | `postgres://localhost/komika` | PostgreSQL URL for accounts, libraries and settings. Compose supplies the private `postgres` service and application role. |
-| `COVERS_DATABASE_URL`       | `sqlite://covers.sqlite3`     | Places the data-directory lock, default covers directory and old cache read by the one-time copy. |
-| `KOMIKA_COVERS_DIR`         | `covers` beside the covers SQLite file | Cover and extension icon file cache. Docker uses `/data/covers`; the desktop app uses `server/covers` in its data folder. |
-| `EXT_ICONS_DIR`             | `/srv/ext-icons`              | Directory of bundled extension icons. Fetched icons are cached under `KOMIKA_COVERS_DIR`. |
-| `KOMIKA_BACKGROUND_WRITERS` | `1`                           | Database connections for background jobs. With `1`, every background job writes on one connection, one at a time. A higher number keeps one connection for that and lets the jobs that are safe to overlap use the others. |
+| Variable                    | Default                                | Description                                                                                                                                                                                                                |
+| --------------------------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`              | `postgres://localhost/komika`          | PostgreSQL URL for accounts, libraries and settings. Compose supplies the private `postgres` service and application role.                                                                                                 |
+| `COVERS_DATABASE_URL`       | `sqlite://covers.sqlite3`              | Places the data-directory lock, default covers directory and old cache read by the one-time copy.                                                                                                                          |
+| `KOMIKA_COVERS_DIR`         | `covers` beside the covers SQLite file | Cover and extension icon file cache. Docker uses `/data/covers`; the desktop app uses `server/covers` in its data folder.                                                                                                  |
+| `EXT_ICONS_DIR`             | `/srv/ext-icons`                       | Directory of bundled extension icons. Fetched icons are cached under `KOMIKA_COVERS_DIR`.                                                                                                                                  |
+| `KOMIKA_BACKGROUND_WRITERS` | `1`                                    | Database connections for background jobs. With `1`, every background job writes on one connection, one at a time. A higher number keeps one connection for that and lets the jobs that are safe to overlap use the others. |
 
 Each long background job (a catalogue sync, a source import, a cover crawl) also holds one extra database connection while it runs, to mark that it owns the job. Leave a few spare connections in PostgreSQL for them.
 
@@ -82,11 +82,11 @@ The main database lives in `postgres-data`; cover files and other server files l
 
 These variables configure connections to the Suwayomi source engine.
 
-| Variable              | Default                 | Description                                              |
-| --------------------- | ----------------------- | -------------------------------------------------------- |
-| `SUWAYOMI_URL`        | `http://localhost:4567` | URL of the internal Suwayomi API.                        |
-| `SUWAYOMI_PUBLIC_URL` | unset                   | Public base URL for page and cover URLs. See below.      |
-| `SUWAYOMI_SOURCE_ID`  | unset                   | Pins requests to a specific Suwayomi source identifier.  |
+| Variable              | Default                 | Description                                             |
+| --------------------- | ----------------------- | ------------------------------------------------------- |
+| `SUWAYOMI_URL`        | `http://localhost:4567` | URL of the internal Suwayomi API.                       |
+| `SUWAYOMI_PUBLIC_URL` | unset                   | Public base URL for page and cover URLs. See below.     |
+| `SUWAYOMI_SOURCE_ID`  | unset                   | Pins requests to a specific Suwayomi source identifier. |
 
 Set `SUWAYOMI_PUBLIC_URL` to this komiq server's public address, or to `/` as the Docker image does. Readers then fetch pages and covers through komiq. When the variable is unset, or names the same address as `SUWAYOMI_URL`, page and cover URLs point at Suwayomi itself, and readers must be able to reach it. A user name and password in `SUWAYOMI_URL` do not count as a different address.
 
@@ -96,11 +96,11 @@ Most pages use a chapter address (`/media/v1/c/...`) that only komiq answers. Th
 
 These variables turn on signed media manifests: a list of the exact bytes of each chapter page, signed by your server. They are for a server that feeds other caches. A server that serves only its own readers leaves them unset.
 
-| Variable                        | Default                                | Description                                                                                                                   |
-| ------------------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `KOMIKA_MEDIA_MANIFESTS`        | off                                    | `on` makes the signing key, files opened chapters under their byte hashes and serves `/media/v1/` objects and manifests.     |
-| `KOMIKA_MEDIA_ROUTES`           | one owner route on the server's own origin | A JSON list of `owner`, `regional` and `helper` origins that serve exact objects, for a web reader built with a matching `PUBLIC_KOMIKA_MEDIA_HOSTS`. The server refuses to start when it is not valid. Read [Media routes](/developers/media-routes) and [Run a media cache](/self-host/media-cache). |
-| `KOMIKA_MEDIA_SIGNING_KEY_FILE` | `media-signing.key` in the working folder (`/data` in Docker) | The Ed25519 signing key. The server creates it with owner-only access when it is missing. Back it up: every cache that trusts the old key must be given a new one. |
+| Variable                        | Default                                                       | Description                                                                                                                                                                                                                                                                                            |
+| ------------------------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `KOMIKA_MEDIA_MANIFESTS`        | off                                                           | `on` makes the signing key, files opened chapters under their byte hashes and serves `/media/v1/` objects and manifests.                                                                                                                                                                               |
+| `KOMIKA_MEDIA_ROUTES`           | one owner route on the server's own origin                    | A JSON list of `owner`, `regional` and `helper` origins that serve exact objects, for a web reader built with a matching `PUBLIC_KOMIKA_MEDIA_HOSTS`. The server refuses to start when it is not valid. Read [Media routes](/developers/media-routes) and [Run a media cache](/self-host/media-cache). |
+| `KOMIKA_MEDIA_SIGNING_KEY_FILE` | `media-signing.key` in the working folder (`/data` in Docker) | The Ed25519 signing key. The server creates it with owner-only access when it is missing. Back it up: every cache that trusts the old key must be given a new one.                                                                                                                                     |
 
 With `KOMIKA_MEDIA_MANIFESTS` off, the server makes no key file and writes nothing new. Read [Exact media and signing](/developers/media-manifests).
 

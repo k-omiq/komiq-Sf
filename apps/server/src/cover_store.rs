@@ -100,6 +100,15 @@ pub struct ObjectRow {
 }
 
 type RawRow = (Vec<u8>, i32, Option<i64>, Option<Vec<u8>>, DateTime<Utc>);
+/// A [`RawRow`] plus the sha256 of the matching derivative, if any.
+type IndexedRow = (
+    Vec<u8>,
+    i32,
+    Option<i64>,
+    Option<Vec<u8>>,
+    DateTime<Utc>,
+    Option<Vec<u8>>,
+);
 
 fn to_sha(bytes: Vec<u8>) -> Result<Sha> {
     Sha::try_from(bytes.as_slice()).map_err(|_| anyhow::anyhow!("cover index hash is not 32 bytes"))
@@ -709,14 +718,7 @@ impl CoverStore {
         width: Option<u32>,
     ) -> Result<Option<(ObjectRow, Option<Sha>)>, StoreError> {
         let kind = width.map(|w| Kind::Width(w).as_str());
-        let raw: Option<(
-            Vec<u8>,
-            i32,
-            Option<i64>,
-            Option<Vec<u8>>,
-            DateTime<Utc>,
-            Option<Vec<u8>>,
-        )> = sqlx::query_as(
+        let raw: Option<IndexedRow> = sqlx::query_as(
             "SELECT m.sha256, m.byte_length, m.version, m.master_sha256, m.updated_at, d.sha256 \
                  FROM cover_object m \
                  LEFT JOIN cover_object d ON d.asset_key = m.asset_key AND d.kind = $2 \

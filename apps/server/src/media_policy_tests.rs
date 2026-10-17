@@ -310,9 +310,13 @@ async fn policy_snapshot_reloads_site_rules_on_replace_and_clear() {
     assert!(empty.site_rules.is_empty());
 
     let rule = crate::block::BlockRule::new(["action"], Vec::<&str>::new()).unwrap();
-    crate::block::replace(&pool, crate::block::Scope::Site, &[rule.clone()])
-        .await
-        .unwrap();
+    crate::block::replace(
+        &pool,
+        crate::block::Scope::Site,
+        std::slice::from_ref(&rule),
+    )
+    .await
+    .unwrap();
     policy.invalidate();
     let blocked = policy.current(&pool).await.unwrap();
     assert!(blocked.epoch > empty.epoch);

@@ -500,9 +500,13 @@ for (const [name, respond] of [
 		const { pages, chosen } = packPages();
 		const failed = packFailure(t);
 		t.mock.method(globalThis, 'fetch', respond);
-		const { reader, dispose } = open(view('chapter', pages), async () => assert.fail('no refresh'), {
-			router: chosen,
-		});
+		const { reader, dispose } = open(
+			view('chapter', pages),
+			async () => assert.fail('no refresh'),
+			{
+				router: chosen,
+			},
+		);
 		t.after(dispose);
 		reader.enablePacks();
 		flush();

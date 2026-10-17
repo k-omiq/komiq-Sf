@@ -2464,7 +2464,8 @@ pub async fn backfill_missing_catalogue(
                     {
                         // No retry here: the catalogue function is one whole guarded
                         // transaction that retries itself.
-                        let res = catalog::refresh_mangadex_details(pool, &work_id, &id, &input).await;
+                        let res =
+                            catalog::refresh_mangadex_details(pool, &work_id, &id, &input).await;
                         match res {
                             Ok(()) => out.tagged += 1,
                             Err(e) => {

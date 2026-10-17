@@ -3,7 +3,12 @@
 	import type { SourceHealthStat, SourceScanHealth } from '@komika/types';
 	import type { EngineGeneration as Generation, EngineStatus } from '@komika/api';
 	import { auth } from '$lib/auth.svelte';
-	import { loadEngineGenerations, loadEngines, loadSourceScanHealth, startNewEngineGeneration } from '$lib/data';
+	import {
+		loadEngineGenerations,
+		loadEngines,
+		loadSourceScanHealth,
+		startNewEngineGeneration,
+	} from '$lib/data';
 	import { engineGenerationView } from '$lib/engine-generation';
 	import Button from '$lib/components/Button.svelte';
 	import EngineGeneration from '$lib/components/EngineGeneration.svelte';
@@ -282,7 +287,11 @@
 		description="Which sources fail when the server checks them for new chapters, and why."
 	>
 		{#snippet actions()}
-			<Button icon="refresh" busy={healthLoading || enginesLoading || engineLoading} onclick={refreshAll}>Refresh</Button>
+			<Button
+				icon="refresh"
+				busy={healthLoading || enginesLoading || engineLoading}
+				onclick={refreshAll}>Refresh</Button
+			>
 		{/snippet}
 		A failing source is often one extension release behind.
 		<a class="k-link" href={href('/settings#updates')}>Check extension updates in Settings</a>
@@ -295,7 +304,9 @@
 	{#if hasRegional}
 		<section class="engines" aria-labelledby="engines-title">
 			<h2 id="engines-title">Engines</h2>
-			<p class="k-muted">Regional engines fetch pages and covers for their routed sources. Times are UTC.</p>
+			<p class="k-muted">
+				Regional engines fetch pages and covers for their routed sources. Times are UTC.
+			</p>
 			{#if enginesError}<p class="bad" role="alert">{enginesError}</p>{/if}
 			<div class="engine-list">
 				{#each engines as engine (engine.id)}
@@ -305,7 +316,12 @@
 							<span class="engine-status" class:bad={!engine.reachable}>
 								{engine.reachable ? 'Reachable' : 'Unreachable'}
 							</span>
-							<span class="k-muted">Last check: {shortDate(engine.checkedAt, engine.id === 'owner' ? 'Generation state' : 'Never')}</span>
+							<span class="k-muted"
+								>Last check: {shortDate(
+									engine.checkedAt,
+									engine.id === 'owner' ? 'Generation state' : 'Never',
+								)}</span
+							>
 						</div>
 						{#if engine.error}<p class="bad">{engine.error}</p>{/if}
 						<p class="engine-counts k-muted k-num">
@@ -321,11 +337,19 @@
 							<ul class="engine-routes">
 								{#each engine.routedSources as route (route.sourceId)}
 									<li>
-										<a class="k-link" href={href(`/sources/browse?source=${encodeURIComponent(route.sourceId)}`)}>
+										<a
+											class="k-link"
+											href={href(`/sources/browse?source=${encodeURIComponent(route.sourceId)}`)}
+										>
 											{health.find((h) => h.id === route.sourceId)?.name ?? route.sourceId}
 										</a>
-										<span>{route.active ? 'Active' : 'Inactive'}{route.strict ? ' · Strict' : ''}</span>
-										<span class="k-muted">{route.versionCheck.replaceAll('_', ' ')} · Owner {route.ownerVersion ?? 'unknown'} / Regional {route.regionalVersion ?? 'unknown'}</span>
+										<span
+											>{route.active ? 'Active' : 'Inactive'}{route.strict ? ' · Strict' : ''}</span
+										>
+										<span class="k-muted"
+											>{route.versionCheck.replaceAll('_', ' ')} · Owner {route.ownerVersion ??
+												'unknown'} / Regional {route.regionalVersion ?? 'unknown'}</span
+										>
 									</li>
 								{/each}
 							</ul>

@@ -53,20 +53,20 @@ Add `--duration 5 --warmup 1` for a short smoke run of the same suite. A suite s
 sets its own scenario and load (`vus`, `rate` or `users`). Run-wide options go on the
 command line or in the suite's `defaults`.
 
-| Flag | Meaning |
-| --- | --- |
-| `--scenario` | `read`, `write`, `session`, `image-warm`, `image-cold`, `mixed`, `release-burst` |
-| `--seed <s>` | Same seed, same pool and the same path for every virtual user. Recorded. |
-| `--metrics-url <url>` | Scraped when the measured window opens and closes, and every `--metrics-interval` s |
-| `--host-cmd '<cmd>'` | Run once per load step; `{label}` and `{seconds}` are filled in; JSON stdout is kept. The window opens when it prints `READY` (`--host-ready-timeout`) |
-| `--image-digest`, `--settings-file` | The server image and its effective environment, recorded |
-| `--progress-pattern sequential\|random` | `write`: page n+1 of one chapter, or a random chapter and page |
-| `--hot-works N` | Every virtual user works on the same N works |
-| `--fixture-images <file or URL with {n}>` | Fixture images: page stand-ins, then cold addresses. Needed by `image-cold`, `mixed` and `release-burst` |
-| `--real-source-sample N` | Real-source image fetches allowed in the whole run, at most 200. Default 0 |
-| `--image-chapters`, `--image-urls` | The bounded set of page lists and image addresses for image steps |
-| `--img-base`, `--own-hosts` | Where foreign images are proxied; hosts that count as the server itself |
-| `--burst-works`, `--bursts`, `--burst-gap` | `release-burst` shape |
+| Flag                                       | Meaning                                                                                                                                                |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--scenario`                               | `read`, `write`, `session`, `image-warm`, `image-cold`, `mixed`, `release-burst`                                                                       |
+| `--seed <s>`                               | Same seed, same pool and the same path for every virtual user. Recorded.                                                                               |
+| `--metrics-url <url>`                      | Scraped when the measured window opens and closes, and every `--metrics-interval` s                                                                    |
+| `--host-cmd '<cmd>'`                       | Run once per load step; `{label}` and `{seconds}` are filled in; JSON stdout is kept. The window opens when it prints `READY` (`--host-ready-timeout`) |
+| `--image-digest`, `--settings-file`        | The server image and its effective environment, recorded                                                                                               |
+| `--progress-pattern sequential\|random`    | `write`: page n+1 of one chapter, or a random chapter and page                                                                                         |
+| `--hot-works N`                            | Every virtual user works on the same N works                                                                                                           |
+| `--fixture-images <file or URL with {n}>`  | Fixture images: page stand-ins, then cold addresses. Needed by `image-cold`, `mixed` and `release-burst`                                               |
+| `--real-source-sample N`                   | Real-source image fetches allowed in the whole run, at most 200. Default 0                                                                             |
+| `--image-chapters`, `--image-urls`         | The bounded set of page lists and image addresses for image steps                                                                                      |
+| `--img-base`, `--own-hosts`                | Where foreign images are proxied; hosts that count as the server itself                                                                                |
+| `--burst-works`, `--bursts`, `--burst-gap` | `release-burst` shape                                                                                                                                  |
 
 `host/measure.sh --json <label> <seconds>` prints one JSON object: CPU cores per
 container, host busy cores, memory per container, WAL bytes, FPI and records,

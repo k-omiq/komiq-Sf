@@ -1041,16 +1041,27 @@ mod tests {
     async fn a_rating_drift_below_four_decimals_leaves_browse_alone() {
         let pool = pool().await;
         anchored(&pool, "w_1", U1, "2026-02-01T00:00:00Z").await;
-        let pending = works_needing_stats(&pool, 100, "2026-03-25T00:00:00Z").await.unwrap();
+        let pending = works_needing_stats(&pool, 100, "2026-03-25T00:00:00Z")
+            .await
+            .unwrap();
         let answer = |rating: f64| {
             HashMap::from([(
                 U1.to_string(),
-                MdStats { follows: Some(5), rating: Some(rating), rating_avg: Some(rating) },
+                MdStats {
+                    follows: Some(5),
+                    rating: Some(rating),
+                    rating_avg: Some(rating),
+                },
             )])
         };
-        write_work_stats(&pool, &pending, &answer(8.123456789), "2026-04-01T00:00:00Z")
-            .await
-            .unwrap();
+        write_work_stats(
+            &pool,
+            &pending,
+            &answer(8.123456789),
+            "2026-04-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let read = || async {
             crate::db_types::query_tuple::<(Option<f64>, Option<f64>, String)>(
                 "SELECT s.rating, s.rating_avg, b.xmin::text FROM work_stats s \
@@ -1062,10 +1073,19 @@ mod tests {
         };
         let first = read().await;
         assert_eq!((first.0, first.1), (Some(8.1235), Some(8.1235)));
-        write_work_stats(&pool, &pending, &answer(8.123456789 + 1e-9), "2026-04-08T00:00:00Z")
-            .await
-            .unwrap();
-        assert_eq!(read().await, first, "the drift writes no Browse row version");
+        write_work_stats(
+            &pool,
+            &pending,
+            &answer(8.123456789 + 1e-9),
+            "2026-04-08T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read().await,
+            first,
+            "the drift writes no Browse row version"
+        );
         write_work_stats(&pool, &pending, &answer(8.2), "2026-04-15T00:00:00Z")
             .await
             .unwrap();

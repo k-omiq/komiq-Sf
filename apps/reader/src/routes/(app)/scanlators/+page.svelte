@@ -100,7 +100,8 @@
 	$effect(() => {
 		if (!list || list.status !== 'ok' || list.items.length || list.page <= 1 || !list.total) return;
 		const last = lastPage(list.total, SCANLATOR_PAGE_SIZE);
-		if (last < applied.page) void goto(scanlatorsHref({ ...applied, page: last }), { replaceState: true });
+		if (last < applied.page)
+			void goto(scanlatorsHref({ ...applied, page: last }), { replaceState: true });
 	});
 
 	// Signing in or out changes every row's `myScore`.
@@ -218,23 +219,24 @@
 	{@const open = openId === s.id}
 	<article class="item" class:open>
 		<h2 class="row-h">
-			<button
-				class="row"
-				aria-expanded={open}
-				onclick={(e) => void toggle(s.id, e.currentTarget)}
-			>
+			<button class="row" aria-expanded={open} onclick={(e) => void toggle(s.id, e.currentTarget)}>
 				<span class="rank">
 					<span class="vh">{s.rank ? 'Rank' : 'Not ranked'}</span>{s.rank ?? '–'}
 				</span>
-				<span class="av" aria-hidden="true"><Avatar name={s.name} colorKey={s.id} size={40} /></span>
+				<span class="av" aria-hidden="true"><Avatar name={s.name} colorKey={s.id} size={40} /></span
+				>
 				<span class="who">
 					<span class="name">
 						<span class="name-t">{s.name}</span>
 						<AiBadge group={s.kind === 'GROUP' ? s.name : null} sourceId={siteSourceId(s)} />
 					</span>
 					<span class="meta">
-						{kindLabel(s)} · {countLabel(s.seriesCount, 'series', 'series')}{#if s.chapterCount != null}<span
-								class="wide">{` · ${countLabel(s.chapterCount, 'chapter', 'chapters')}`}</span
+						{kindLabel(s)} · {countLabel(
+							s.seriesCount,
+							'series',
+							'series',
+						)}{#if s.chapterCount != null}<span class="wide"
+								>{` · ${countLabel(s.chapterCount, 'chapter', 'chapters')}`}</span
 							>{/if}
 					</span>
 				</span>
@@ -288,9 +290,12 @@
 						{#each [...s.distribution.entries()].reverse() as [i, n] (i)}
 							<li class="bar" class:mine={s.myScore === i + 1}>
 								<span class="bar-k">{i + 1}</span>
-								<span class="track"><span class="fill" style:translate={barShift(n, s.distribution)}></span></span>
+								<span class="track"
+									><span class="fill" style:translate={barShift(n, s.distribution)}></span></span
+								>
 								<span class="bar-n"
-									>{n.toLocaleString('en-US')}{#if s.myScore === i + 1}<span class="vh">, with yours</span
+									>{n.toLocaleString('en-US')}{#if s.myScore === i + 1}<span class="vh"
+											>, with yours</span
 										>{/if}</span
 								>
 							</li>

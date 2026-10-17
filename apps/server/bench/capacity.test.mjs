@@ -48,7 +48,18 @@ setProductionAddresses([PROD]);
 // Mock server
 // ---------------------------------------------------------------------------
 
-const WORDS = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel', 'india', 'juliet'];
+const WORDS = [
+	'alpha',
+	'bravo',
+	'charlie',
+	'delta',
+	'echo',
+	'foxtrot',
+	'golf',
+	'hotel',
+	'india',
+	'juliet',
+];
 const WORK_COUNT = 40;
 const SLOW_WORK = 'w_7'; // series page slower than the test's --prewarm-max-ms
 const BROKEN_WORK = 'w_8'; // series page answers a GraphQL error
@@ -60,7 +71,8 @@ function work(i) {
 		workId: `w_${i}`,
 		title: `${WORDS[i % WORDS.length]} ${WORDS[(i * 3 + 1) % WORDS.length]} story ${i}`,
 		// Every fifth cover is a foreign MangaDex address, which goes through /img.
-		coverUrl: i % 5 === 0 ? `https://uploads.mangadex.org/covers/m${i}/c.jpg` : `/covers/w_${i}.webp`,
+		coverUrl:
+			i % 5 === 0 ? `https://uploads.mangadex.org/covers/m${i}/c.jpg` : `/covers/w_${i}.webp`,
 		chapterCount: 3,
 	};
 }
@@ -94,13 +106,31 @@ function startMock() {
 		const slice = (list) => list.slice((page - 1) * 20, page * 20);
 		switch (op) {
 			case 'Discovery':
-				return { discovery: [{ kind: 'trending', title: 'Trending', genre: null, items: WORKS.slice(0, 10) }] };
+				return {
+					discovery: [
+						{ kind: 'trending', title: 'Trending', genre: null, items: WORKS.slice(0, 10) },
+					],
+				};
 			case 'UpdatesFeed':
-				return { updatesFeed: { items: slice(WORKS), page, hasNextPage: page * 20 < WORKS.length, total: WORKS.length } };
+				return {
+					updatesFeed: {
+						items: slice(WORKS),
+						page,
+						hasNextPage: page * 20 < WORKS.length,
+						total: WORKS.length,
+					},
+				};
 			case 'Search': {
 				const q = String(vars?.query ?? '');
 				const list = q ? WORKS.filter((w) => w.title.includes(q.split(' ')[0])) : WORKS;
-				return { search: { items: slice(list), page, hasNextPage: page * 20 < list.length, total: list.length } };
+				return {
+					search: {
+						items: slice(list),
+						page,
+						hasNextPage: page * 20 < list.length,
+						total: list.length,
+					},
+				};
 			}
 			case 'SeriesPage': {
 				const id = vars.workId;
@@ -109,7 +139,11 @@ function startMock() {
 					seriesPage: {
 						workId: id,
 						series: { ...WORKS[i] },
-						spineChapters: [1, 2, 3].map((n) => ({ id: `${id}-c${n}`, number: String(n), pageCount: 4 })),
+						spineChapters: [1, 2, 3].map((n) => ({
+							id: `${id}-c${n}`,
+							number: String(n),
+							pageCount: 4,
+						})),
 						sources: [],
 					},
 				};
@@ -118,16 +152,31 @@ function startMock() {
 			case 'Pages': {
 				const [wid, c] = String(vars.chapterId).split('-c');
 				const mid = Number(String(wid).slice(2));
-				const list = [0, 1, 2, 3].map((p) => ({ index: p, sourceUrl: `/api/v1/manga/${mid}/chapter/${c}/page/${p}` }));
+				const list = [0, 1, 2, 3].map((p) => ({
+					index: p,
+					sourceUrl: `/api/v1/manga/${mid}/chapter/${c}/page/${p}`,
+				}));
 				return op === 'Pages' ? { pages: list } : { canonicalPages: list };
 			}
 			case 'Register':
-				return { register: { token: `t-${vars.input.username}`, user: { id: vars.input.username, username: vars.input.username } } };
+				return {
+					register: {
+						token: `t-${vars.input.username}`,
+						user: { id: vars.input.username, username: vars.input.username },
+					},
+				};
 			case 'Login':
-				return { login: { token: `t-${vars.username}`, user: { id: vars.username, username: vars.username } } };
+				return {
+					login: {
+						token: `t-${vars.username}`,
+						user: { id: vars.username, username: vars.username },
+					},
+				};
 			case 'Session': {
 				const name = String(auth ?? '').replace(/^Bearer t-/, '');
-				return { session: name ? { token: `t-${name}`, user: { id: name, username: name } } : null };
+				return {
+					session: name ? { token: `t-${name}`, user: { id: name, username: name } } : null,
+				};
 			}
 			case 'SetProgress':
 				return { setProgress: true };
@@ -137,7 +186,14 @@ function startMock() {
 				return { recordView: true };
 			case 'Comments':
 			case 'Reviews':
-				return { [op === 'Comments' ? 'comments' : 'reviews']: { items: [], page: 1, hasNextPage: false, total: 0 } };
+				return {
+					[op === 'Comments' ? 'comments' : 'reviews']: {
+						items: [],
+						page: 1,
+						hasNextPage: false,
+						total: 0,
+					},
+				};
 			case 'MyReview':
 				return { myReview: null };
 			case 'PostComment':
@@ -162,7 +218,9 @@ function startMock() {
 			`komika_admission_refused_total{lane="local"} ${Math.floor(m.graphql / 5)}`,
 			'komika_admission_refused_total{lane="global"} 0',
 			'# TYPE komika_media_bytes_total counter',
-			...Object.entries(m.imageBytes).map(([route, n]) => `komika_media_bytes_total{route="${route}"} ${n}`),
+			...Object.entries(m.imageBytes).map(
+				([route, n]) => `komika_media_bytes_total{route="${route}"} ${n}`,
+			),
 			'# TYPE komika_inflight gauge',
 			`komika_inflight{lane="graphql"} ${m.inflight}`,
 			`komika_inflight_max ${m.maxInflight}`,
@@ -252,7 +310,10 @@ function startMock() {
 			}
 			const data = answer(op, vars, req.headers.authorization);
 			const delay = op === 'SeriesPage' && vars?.workId === SLOW_WORK ? 250 : 0;
-			setTimeout(() => reply(200, data ? { data } : { errors: [{ message: `unknown operation ${op}` }] }), delay);
+			setTimeout(
+				() => reply(200, data ? { data } : { errors: [{ message: `unknown operation ${op}` }] }),
+				delay,
+			);
 		});
 	});
 	return new Promise((resolve) => {
@@ -266,9 +327,16 @@ function startMock() {
 }
 
 /** Run the probe; resolves with { code, stdout, stderr }. */
-function runTool(argv, timeoutMs = 60_000, { tool = TOOL, env = { ...process.env, KOMIKA_PRODUCTION_IPS: PROD } } = {}) {
+function runTool(
+	argv,
+	timeoutMs = 60_000,
+	{ tool = TOOL, env = { ...process.env, KOMIKA_PRODUCTION_IPS: PROD } } = {},
+) {
 	return new Promise((resolve, reject) => {
-		const child = spawn(process.execPath, [tool, ...argv], { stdio: ['ignore', 'pipe', 'pipe'], env });
+		const child = spawn(process.execPath, [tool, ...argv], {
+			stdio: ['ignore', 'pipe', 'pipe'],
+			env,
+		});
 		let stdout = '';
 		let stderr = '';
 		child.stdout.on('data', (c) => (stdout += c));
@@ -286,7 +354,16 @@ function runTool(argv, timeoutMs = 60_000, { tool = TOOL, env = { ...process.env
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'capacity-test-'));
 // Fast setup against the mock: no pacing to speak of, one slow work left out.
-const FAST = ['--setup-rate', '2000', '--setup-concurrency', '4', '--prewarm-max-ms', '120', '--pool', '16'];
+const FAST = [
+	'--setup-rate',
+	'2000',
+	'--setup-concurrency',
+	'4',
+	'--prewarm-max-ms',
+	'120',
+	'--pool',
+	'16',
+];
 
 // ---------------------------------------------------------------------------
 // Pure functions
@@ -361,7 +438,13 @@ test('metrics window: counter deltas, resets, gauge first/last/min/max, derived'
 	// 50 -> 4 is a restart: the delta is the last value, and it is listed.
 	assert.equal(w.counters.komika_restarts_total, 4);
 	assert.deepEqual(w.resets, ['komika_restarts_total']);
-	assert.deepEqual(w.gauges['komika_inflight{lane="graphql"}'], { first: 3, last: 1, min: 1, max: 9, samples: 3 });
+	assert.deepEqual(w.gauges['komika_inflight{lane="graphql"}'], {
+		first: 3,
+		last: 1,
+		min: 1,
+		max: 9,
+		samples: 3,
+	});
 
 	const d = w.derived;
 	const byKey = Object.fromEntries(d.hitRatios.map((h) => [h.key, h]));
@@ -387,12 +470,22 @@ test('metrics window: counter deltas, resets, gauge first/last/min/max, derived'
 	assert.equal(bd.hitRatios[0].ratio, 0.9);
 	// A refusal told by a label value, not by the name.
 	const lk = 'komika_admission_total{lane="upstream",outcome="refused"}';
-	const ld = deriveMetrics({ [lk]: 3 }, new Map([[lk, { name: 'komika_admission_total', labels: { lane: 'upstream', outcome: 'refused' } }]]));
+	const ld = deriveMetrics(
+		{ [lk]: 3 },
+		new Map([
+			[lk, { name: 'komika_admission_total', labels: { lane: 'upstream', outcome: 'refused' } }],
+		]),
+	);
 	assert.deepEqual(ld.refusingLanes, ['upstream']);
 
 	// A reset BETWEEN samples: 100 -> 150 -> 20 -> 120 is 50 + 20 + 100, and flagged.
 	const c = (v) => `# TYPE c_total counter\nc_total ${v}`;
-	const mid = metricsWindow([scrape('before', 1, c(100)), scrape('sample', 2, c(150)), scrape('sample', 3, c(20)), scrape('after', 4, c(120))]);
+	const mid = metricsWindow([
+		scrape('before', 1, c(100)),
+		scrape('sample', 2, c(150)),
+		scrape('sample', 3, c(20)),
+		scrape('after', 4, c(120)),
+	]);
 	assert.equal(mid.counters.c_total, 170);
 	assert.equal(mid.reset, true);
 	assert.deepEqual(mid.resets, ['c_total']);
@@ -427,20 +520,44 @@ test('production hosts are recognised in every form', () => {
 		'0313.0.0161.0317',
 	])
 		assert.equal(isProductionHost(h), true, h);
-	for (const h of ['komiq.cc.example.org', 'notkomiq.cc', '198.51.100.6', '127.0.0.1', 'localhost', '[::1]', '::ffff:cb00:71ce', '203.0.113.206'])
+	for (const h of [
+		'komiq.cc.example.org',
+		'notkomiq.cc',
+		'198.51.100.6',
+		'127.0.0.1',
+		'localhost',
+		'[::1]',
+		'::ffff:cb00:71ce',
+		'203.0.113.206',
+	])
 		assert.equal(isProductionHost(h), false, h);
 	// The URL parser really does rewrite the mapped address; the check must still see it.
 	assert.equal(new URL('http://[::ffff:203.0.113.207]/').hostname, '[::ffff:cb00:71cf]');
 	const base = { target: 'http://127.0.0.1:8080' };
 	assert.equal(productionRefusal(base), null);
 	assert.match(productionRefusal({ ...base, target: 'https://api.komiq.cc' }), /--target/);
-	assert.match(productionRefusal({ ...base, target: 'http://3405803983:8080' }), /203\.0\.113\.207/);
-	assert.match(productionRefusal({ ...base, target: 'http://[::ffff:203.0.113.207]:8080/' }), /--target/);
-	assert.match(productionRefusal({ ...base, metricsUrl: 'http://komiq.cc/metrics' }), /--metrics-url/);
+	assert.match(
+		productionRefusal({ ...base, target: 'http://3405803983:8080' }),
+		/203\.0\.113\.207/,
+	);
+	assert.match(
+		productionRefusal({ ...base, target: 'http://[::ffff:203.0.113.207]:8080/' }),
+		/--target/,
+	);
+	assert.match(
+		productionRefusal({ ...base, metricsUrl: 'http://komiq.cc/metrics' }),
+		/--metrics-url/,
+	);
 	assert.match(productionRefusal({ ...base, imgBase: 'https://img.komiq.cc' }), /--img-base/);
-	assert.match(productionRefusal({ ...base, fixtureImages: 'https://x.komiq.cc/f/{n}.webp' }), /--fixture-images/);
+	assert.match(
+		productionRefusal({ ...base, fixtureImages: 'https://x.komiq.cc/f/{n}.webp' }),
+		/--fixture-images/,
+	);
 	assert.match(productionRefusal(base, ['http://[::ffff:cb00:71cf]']), /--fixture-images/);
-	assert.match(productionRefusal(base, ['http://fixtures.test/?src=https://api.komiq.cc/x']), /query/);
+	assert.match(
+		productionRefusal(base, ['http://fixtures.test/?src=https://api.komiq.cc/x']),
+		/query/,
+	);
 	for (const cmd of [
 		'ssh ubuntu@203.0.113.207 ./measure.sh',
 		'ssh api.komiq.cc true',
@@ -449,8 +566,14 @@ test('production hosts are recognised in every form', () => {
 		'curl http://0313.0.0161.0317:9091/metrics',
 	])
 		assert.match(productionRefusal({ ...base, hostCmd: cmd }) ?? '', /--host-cmd/, cmd);
-	assert.equal(productionRefusal({ ...base, hostCmd: 'ssh testhost ~/measure.sh --json {label} {seconds}' }), null);
-	assert.equal(productionRefusal({ ...base, hostCmd: 'ssh ubuntu@203.0.113.206 ./measure.sh' }), null);
+	assert.equal(
+		productionRefusal({ ...base, hostCmd: 'ssh testhost ~/measure.sh --json {label} {seconds}' }),
+		null,
+	);
+	assert.equal(
+		productionRefusal({ ...base, hostCmd: 'ssh ubuntu@203.0.113.206 ./measure.sh' }),
+		null,
+	);
 });
 
 test('production addresses come from the environment and the local file, joined', () => {
@@ -459,41 +582,74 @@ test('production addresses come from the environment and the local file, joined'
 	const file = join(dir, 'production-ips.local');
 	try {
 		// The default file sits in deploy/, next to watch.sh, which reads the same one.
-		assert.equal(PRODUCTION_IPS_FILE, join(HERE, '..', '..', '..', 'deploy', 'production-ips.local'));
+		assert.equal(
+			PRODUCTION_IPS_FILE,
+			join(HERE, '..', '..', '..', 'deploy', 'production-ips.local'),
+		);
 		// Environment: commas and/or whitespace, duplicates once.
-		assert.deepEqual(readProductionAddresses({ env: { KOMIKA_PRODUCTION_IPS: ' 203.0.113.1, 203.0.113.2\t203.0.113.3,,203.0.113.1\n' }, file: none }), [
-			'203.0.113.1',
-			'203.0.113.2',
-			'203.0.113.3',
-		]);
+		assert.deepEqual(
+			readProductionAddresses({
+				env: { KOMIKA_PRODUCTION_IPS: ' 203.0.113.1, 203.0.113.2\t203.0.113.3,,203.0.113.1\n' },
+				file: none,
+			}),
+			['203.0.113.1', '203.0.113.2', '203.0.113.3'],
+		);
 		assert.deepEqual(readProductionAddresses({ env: {}, file: none }), []);
-		assert.deepEqual(readProductionAddresses({ env: { KOMIKA_PRODUCTION_IPS: '  ' }, file: none }), []);
+		assert.deepEqual(
+			readProductionAddresses({ env: { KOMIKA_PRODUCTION_IPS: '  ' }, file: none }),
+			[],
+		);
 		// File: one per line, # comments, blank lines, CRLF.
-		writeFileSync(file, '# the production host\n198.51.100.7\r\n\n  198.51.100.8  # second\n#198.51.100.9\n');
+		writeFileSync(
+			file,
+			'# the production host\n198.51.100.7\r\n\n  198.51.100.8  # second\n#198.51.100.9\n',
+		);
 		assert.deepEqual(readProductionAddresses({ env: {}, file }), ['198.51.100.7', '198.51.100.8']);
 		// Both: the union.
-		assert.deepEqual(readProductionAddresses({ env: { KOMIKA_PRODUCTION_IPS: '203.0.113.1,198.51.100.7' }, file }), [
-			'203.0.113.1',
-			'198.51.100.7',
-			'198.51.100.8',
-		]);
+		assert.deepEqual(
+			readProductionAddresses({ env: { KOMIKA_PRODUCTION_IPS: '203.0.113.1,198.51.100.7' }, file }),
+			['203.0.113.1', '198.51.100.7', '198.51.100.8'],
+		);
 		// Anything that is not a plain IPv4 address fails closed, naming the entry.
-		for (const bad of ['komiq.cc', '203.0.113', '203.0.113.256', '203.0.113.07', '0xcb0071cf', '::ffff:cb00:71cf', '203.0.113.1/32'])
-			assert.throws(() => readProductionAddresses({ env: { KOMIKA_PRODUCTION_IPS: `203.0.113.1,${bad}` }, file: none }), (e) => {
-				assert.ok(e instanceof ProductionConfigError, String(e));
-				assert.ok(e.message.includes(`'${bad}'`), e.message);
-				return true;
-			});
+		for (const bad of [
+			'komiq.cc',
+			'203.0.113',
+			'203.0.113.256',
+			'203.0.113.07',
+			'0xcb0071cf',
+			'::ffff:cb00:71cf',
+			'203.0.113.1/32',
+		])
+			assert.throws(
+				() =>
+					readProductionAddresses({
+						env: { KOMIKA_PRODUCTION_IPS: `203.0.113.1,${bad}` },
+						file: none,
+					}),
+				(e) => {
+					assert.ok(e instanceof ProductionConfigError, String(e));
+					assert.ok(e.message.includes(`'${bad}'`), e.message);
+					return true;
+				},
+			);
 		writeFileSync(file, '198.51.100.7\n198.51.100.8 198.51.100.9\n');
-		assert.throws(() => readProductionAddresses({ env: {}, file }), /production-ips\.local:2: '198\.51\.100\.8 198\.51\.100\.9'/);
+		assert.throws(
+			() => readProductionAddresses({ env: {}, file }),
+			/production-ips\.local:2: '198\.51\.100\.8 198\.51\.100\.9'/,
+		);
 		// A file that exists but cannot be read is not "no addresses".
 		assert.throws(() => readProductionAddresses({ env: {}, file: dir }), ProductionConfigError);
 		// Use it: the configured addresses are refused, and nothing is warned.
 		const warned = [];
 		writeFileSync(file, '198.51.100.7\n');
-		loadProductionConfig({ env: { KOMIKA_PRODUCTION_IPS: '203.0.113.1' }, file, warn: (m) => warned.push(m) });
+		loadProductionConfig({
+			env: { KOMIKA_PRODUCTION_IPS: '203.0.113.1' },
+			file,
+			warn: (m) => warned.push(m),
+		});
 		assert.deepEqual(warned, []);
-		for (const h of ['198.51.100.7', '203.0.113.1', '[::ffff:c633:6407]']) assert.equal(isProductionHost(h), true, h);
+		for (const h of ['198.51.100.7', '203.0.113.1', '[::ffff:c633:6407]'])
+			assert.equal(isProductionHost(h), true, h);
 		assert.equal(isProductionHost(PROD), false);
 		// Nothing configured: komiq.cc names are still refused, and one warning says so.
 		loadProductionConfig({ env: {}, file: none, warn: (m) => warned.push(m) });
@@ -512,7 +668,8 @@ test('host command text is redacted before it is recorded', () => {
 	const r = redactCommand(
 		'PGPASSWORD=hunter3 sshpass -p s3cret ssh x; curl https://u:pw9@h/m --password=abc API_TOKEN="q w" keep=me',
 	);
-	for (const secret of ['hunter3', 's3cret', 'pw9', 'abc', 'q w']) assert.ok(!r.includes(secret), `${secret} in ${r}`);
+	for (const secret of ['hunter3', 's3cret', 'pw9', 'abc', 'q w'])
+		assert.ok(!r.includes(secret), `${secret} in ${r}`);
 	assert.match(r, /PGPASSWORD=<redacted>/);
 	assert.match(r, /sshpass -p <redacted>/);
 	assert.match(r, /https:\/\/u:<redacted>@h\/m/);
@@ -534,15 +691,37 @@ test('image policy: store covers and fixtures; everything else is real-source', 
 	const foreign = resolveImage('https://uploads.mangadex.org/covers/a/b.jpg', target, img);
 	assert.equal(foreign.route, 'img-proxy');
 	assert.equal(foreign.cls, 'real');
-	assert.equal(foreign.url, `http://127.0.0.1:9000/img?src=${encodeURIComponent('https://uploads.mangadex.org/covers/a/b.jpg')}&cache_policy=2`);
+	assert.equal(
+		foreign.url,
+		`http://127.0.0.1:9000/img?src=${encodeURIComponent('https://uploads.mangadex.org/covers/a/b.jpg')}&cache_policy=2`,
+	);
 	// A cover route with a nested source in its query is not a store read.
-	assert.equal(resolveImage('/covers/w_1.webp?src=https://uploads.mangadex.org/x', target, img).cls, 'real');
+	assert.equal(
+		resolveImage('/covers/w_1.webp?src=https://uploads.mangadex.org/x', target, img).cls,
+		'real',
+	);
 	// A production host anywhere in the query is never fetched, proxied or not.
-	assert.equal(resolveImage(`/img?src=${encodeURIComponent('https://api.komiq.cc/api/v1/manga/1/thumbnail')}`, target, img).skip, 'production-in-query');
-	assert.equal(resolveImage('https://uploads.mangadex.org/x.jpg?u=203.0.113.207', target, img).skip, 'production-in-query');
-	assert.equal(resolveImage('https://uploads.mangadex.org/x.jpg?u=203.0.113.206', target, img).skip, undefined);
+	assert.equal(
+		resolveImage(
+			`/img?src=${encodeURIComponent('https://api.komiq.cc/api/v1/manga/1/thumbnail')}`,
+			target,
+			img,
+		).skip,
+		'production-in-query',
+	);
+	assert.equal(
+		resolveImage('https://uploads.mangadex.org/x.jpg?u=203.0.113.207', target, img).skip,
+		'production-in-query',
+	);
+	assert.equal(
+		resolveImage('https://uploads.mangadex.org/x.jpg?u=203.0.113.206', target, img).skip,
+		undefined,
+	);
 	// A production page address is rewritten to the target, and is still real-source.
-	assert.equal(resolveImage('https://api.komiq.cc/api/v1/manga/7/chapter/1/page/0', target, img).cls, 'real');
+	assert.equal(
+		resolveImage('https://api.komiq.cc/api/v1/manga/7/chapter/1/page/0', target, img).cls,
+		'real',
+	);
 	// An own-asset address on production is loaded from the target, never from production.
 	const prod = resolveImage('https://api.komiq.cc/api/v1/manga/7/thumbnail', target, img);
 	assert.equal(prod.url, 'http://127.0.0.1:9000/api/v1/manga/7/thumbnail?cache_policy=2');
@@ -564,7 +743,10 @@ test('fixtures: fragment-only templates refused, file addresses deduplicated on 
 	const dir = tmp();
 	try {
 		const f = join(dir, 'f.txt');
-		writeFileSync(f, '/fixture/1.webp\n/fixture/1.webp#again\nhttp://127.0.0.1:9000/fixture/1.webp\n/fixture/2.webp\n# comment\n/fixture/3.webp\n/fixture/4.webp\n');
+		writeFileSync(
+			f,
+			'/fixture/1.webp\n/fixture/1.webp#again\nhttp://127.0.0.1:9000/fixture/1.webp\n/fixture/2.webp\n# comment\n/fixture/3.webp\n/fixture/4.webp\n',
+		);
 		const fx = loadFixtures(f, 'r', target);
 		fx.setStandIns(10);
 		const rep = fx.report();
@@ -572,7 +754,10 @@ test('fixtures: fragment-only templates refused, file addresses deduplicated on 
 		assert.equal(rep.duplicatesDropped, 2);
 		assert.equal(rep.standIns, 2); // at most half, so cold addresses remain
 		const cold = [fx.coldNext(), fx.coldNext(), fx.coldNext()];
-		assert.deepEqual(cold.map((c) => c?.url ?? null), ['http://127.0.0.1:9000/fixture/3.webp', 'http://127.0.0.1:9000/fixture/4.webp', null]);
+		assert.deepEqual(
+			cold.map((c) => c?.url ?? null),
+			['http://127.0.0.1:9000/fixture/3.webp', 'http://127.0.0.1:9000/fixture/4.webp', null],
+		);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -598,8 +783,14 @@ test('seeded randomness repeats', () => {
 	const b = makeRng('42', 'pool');
 	const c = makeRng('43', 'pool');
 	const xs = Array.from({ length: 5 }, () => a());
-	assert.deepEqual(xs, Array.from({ length: 5 }, () => b()));
-	assert.notDeepEqual(xs, Array.from({ length: 5 }, () => c()));
+	assert.deepEqual(
+		xs,
+		Array.from({ length: 5 }, () => b()),
+	);
+	assert.notDeepEqual(
+		xs,
+		Array.from({ length: 5 }, () => c()),
+	);
 	assert.ok(xs.every((x) => x >= 0 && x < 1));
 });
 
@@ -622,9 +813,15 @@ test('settings capture keeps secrets out', () => {
 		assert.ok(!JSON.stringify(s).includes('abc123'));
 		assert.match(s.sha256, /^[0-9a-f]{64}$/);
 		// Same settings in another order and layout: same hash. A changed value: another.
-		writeFileSync(f, 'DATABASE_READ_POOL_SIZE=4\nSESSION_SECRET=abc123\nKOMIKA_REGISTRATION_OPEN=on\nDATABASE_URL=postgres://komika:hunter2@db:5432/komika\n');
+		writeFileSync(
+			f,
+			'DATABASE_READ_POOL_SIZE=4\nSESSION_SECRET=abc123\nKOMIKA_REGISTRATION_OPEN=on\nDATABASE_URL=postgres://komika:hunter2@db:5432/komika\n',
+		);
 		assert.equal(readSettings(f).sha256, s.sha256);
-		writeFileSync(f, 'DATABASE_READ_POOL_SIZE=8\nSESSION_SECRET=abc123\nKOMIKA_REGISTRATION_OPEN=on\nDATABASE_URL=postgres://komika:hunter2@db:5432/komika\n');
+		writeFileSync(
+			f,
+			'DATABASE_READ_POOL_SIZE=8\nSESSION_SECRET=abc123\nKOMIKA_REGISTRATION_OPEN=on\nDATABASE_URL=postgres://komika:hunter2@db:5432/komika\n',
+		);
 		assert.notEqual(readSettings(f).sha256, s.sha256);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
@@ -675,7 +872,8 @@ test('the tool reads the production addresses from the environment and deploy/pr
 	const env = { ...process.env };
 	delete env.KOMIKA_PRODUCTION_IPS;
 	// --list exits after the production checks, before any request or lookup.
-	const list = (target, extra = {}) => runTool(['--target', target, '--list'], 30_000, { tool, env: { ...env, ...extra } });
+	const list = (target, extra = {}) =>
+		runTool(['--target', target, '--list'], 30_000, { tool, env: { ...env, ...extra } });
 	const warning = /warning: no production address is configured/g;
 	try {
 		// Nothing configured: the tool runs, komiq.cc is still refused, one warning.
@@ -695,14 +893,19 @@ test('the tool reads the production addresses from the environment and deploy/pr
 		r = await list('http://203.0.113.206:8080');
 		assert.equal(r.code, 0, r.stderr);
 		// The environment adds to the file.
-		r = await list('http://198.51.100.6:8080', { KOMIKA_PRODUCTION_IPS: '198.51.100.5, 198.51.100.6' });
+		r = await list('http://198.51.100.6:8080', {
+			KOMIKA_PRODUCTION_IPS: '198.51.100.5, 198.51.100.6',
+		});
 		assert.equal(r.code, 3, r.stderr);
 		r = await list('http://[::ffff:203.0.113.207]:8080', { KOMIKA_PRODUCTION_IPS: '198.51.100.6' });
 		assert.equal(r.code, 3, r.stderr);
 		// A bad entry stops the tool, whatever the target.
 		r = await list('http://127.0.0.1:9', { KOMIKA_PRODUCTION_IPS: 'production.example' });
 		assert.equal(r.code, 3, r.stderr);
-		assert.match(r.stderr, /refusing to run: production address configuration: not an IPv4 address: KOMIKA_PRODUCTION_IPS: 'production\.example'/);
+		assert.match(
+			r.stderr,
+			/refusing to run: production address configuration: not an IPv4 address: KOMIKA_PRODUCTION_IPS: 'production\.example'/,
+		);
 		writeFileSync(file, '203.0.113.207\n203.0.113.300 # typo\n');
 		r = await list('http://127.0.0.1:9');
 		assert.equal(r.code, 3, r.stderr);
@@ -718,7 +921,17 @@ test('bad options are refused before anything is sent', async () => {
 		for (const [extra, why] of [
 			[['--vus', '1', '--real-source-sample', '201'], /real-source-sample/],
 			[['--vus', '1', '--real-source-sample', '2.5'], /real-source-sample/],
-			[['--vus', '1', '--scenario', 'image-cold', '--fixture-images', `${mock.url}/fixture/a.webp#{n}`], /fragment/],
+			[
+				[
+					'--vus',
+					'1',
+					'--scenario',
+					'image-cold',
+					'--fixture-images',
+					`${mock.url}/fixture/a.webp#{n}`,
+				],
+				/fragment/,
+			],
 			[['--users', '1', '--scenario', 'mixed'], /page images need --fixture-images/],
 		]) {
 			const r = await runTool(['--target', mock.url, '--duration', '0.2', ...extra]);
@@ -738,9 +951,25 @@ test('HTML and redirect answers to GraphQL are errors, not successes', async () 
 		mock.bad = true;
 		const out = join(dir, 'run.json');
 		const r = await runTool([
-			'--target', mock.url, ...FAST, '--seed', 'b', '--scenario', 'read', '--vus', '2',
-			'--warmup', '0', '--duration', '0.5', '--max-errors', '1',
-			'--mix', 'discovery=1,updates=1,latestAdded=0,browse=0,series=0,search=0', '--json', out,
+			'--target',
+			mock.url,
+			...FAST,
+			'--seed',
+			'b',
+			'--scenario',
+			'read',
+			'--vus',
+			'2',
+			'--warmup',
+			'0',
+			'--duration',
+			'0.5',
+			'--max-errors',
+			'1',
+			'--mix',
+			'discovery=1,updates=1,latestAdded=0,browse=0,series=0,search=0',
+			'--json',
+			out,
 		]);
 		assert.equal(r.code, 0, r.stderr + r.stdout);
 		const p = JSON.parse(readFileSync(out, 'utf8')).steps[0].loads[0];
@@ -757,7 +986,16 @@ test('HTML and redirect answers to GraphQL are errors, not successes', async () 
 test('image-cold refuses to start without --fixture-images', async () => {
 	const mock = await startMock();
 	try {
-		const r = await runTool(['--target', mock.url, '--scenario', 'image-cold', '--vus', '1', '--duration', '0.2']);
+		const r = await runTool([
+			'--target',
+			mock.url,
+			'--scenario',
+			'image-cold',
+			'--vus',
+			'1',
+			'--duration',
+			'0.2',
+		]);
 		assert.equal(r.code, 2);
 		assert.match(r.stderr, /image-cold requires --fixture-images/);
 		assert.equal(mock.requests, 0);
@@ -772,7 +1010,20 @@ test('the same seed picks the same pool; another seed does not', async () => {
 	try {
 		const run = async (seed, name) => {
 			const out = join(dir, name);
-			const r = await runTool(['--target', mock.url, ...FAST, '--pool', '12', '--sample', '10', '--seed', seed, '--setup-only', '--json', out]);
+			const r = await runTool([
+				'--target',
+				mock.url,
+				...FAST,
+				'--pool',
+				'12',
+				'--sample',
+				'10',
+				'--seed',
+				seed,
+				'--setup-only',
+				'--json',
+				out,
+			]);
 			assert.equal(r.code, 0, r.stderr + r.stdout);
 			return JSON.parse(readFileSync(out, 'utf8'));
 		};
@@ -804,10 +1055,22 @@ test('a suite writes one JSON: manifest, pool report, steps, metrics, host, omit
 			suite,
 			JSON.stringify({
 				name: 'test-suite',
-				defaults: { warmup: 0.2, duration: 0.8, 'metrics-interval': 0.3, 'image-chapters': 3, 'image-urls': 30 },
+				defaults: {
+					warmup: 0.2,
+					duration: 0.8,
+					'metrics-interval': 0.3,
+					'image-chapters': 3,
+					'image-urls': 30,
+				},
 				steps: [
 					{ name: 'metadata', scenario: 'read', vus: [2] },
-					{ name: 'writes-seq-hot', scenario: 'write', vus: [2], 'progress-pattern': 'sequential', 'hot-works': 2 },
+					{
+						name: 'writes-seq-hot',
+						scenario: 'write',
+						vus: [2],
+						'progress-pattern': 'sequential',
+						'hot-works': 2,
+					},
 					{ name: 'warm-images', scenario: 'image-warm', vus: [2] },
 					{ name: 'cold-images', scenario: 'image-cold', vus: [2], requires: ['fixture-images'] },
 				],
@@ -815,24 +1078,34 @@ test('a suite writes one JSON: manifest, pool report, steps, metrics, host, omit
 		);
 		const out = join(dir, 'run.json');
 		const r = await runTool([
-			'--target', mock.url,
+			'--target',
+			mock.url,
 			...FAST,
-			'--suite', suite,
-			'--seed', 'suite-seed',
-			'--state', join(dir, 'state.json'),
-			'--metrics-url', `${mock.url}/metrics`,
+			'--suite',
+			suite,
+			'--seed',
+			'suite-seed',
+			'--state',
+			join(dir, 'state.json'),
+			'--metrics-url',
+			`${mock.url}/metrics`,
 			// Secrets in the command must never reach the JSON; READY opens the window.
 			'--host-cmd',
 			`PGPASSWORD=hunter3 true sshpass -p s3cret x://u:pw9@h; printf 'READY\\n' >&2; printf '{"label":"%s","seconds":%s,"host":{"busy_cores":0.5}}\\n' {label} {seconds}`,
-			'--real-source-sample', '5',
-			'--image-digest', 'sha256:feedface',
-			'--settings-file', settings,
-			'--json', out,
+			'--real-source-sample',
+			'5',
+			'--image-digest',
+			'sha256:feedface',
+			'--settings-file',
+			settings,
+			'--json',
+			out,
 		]);
 		assert.equal(r.code, 0, r.stderr + r.stdout);
 		const raw = readFileSync(out, 'utf8');
 		assert.ok(!raw.includes('secretpw'), 'a secret from the settings file leaked');
-		for (const secret of ['hunter3', 's3cret', 'pw9']) assert.ok(!raw.includes(secret), `${secret} from --host-cmd leaked`);
+		for (const secret of ['hunter3', 's3cret', 'pw9'])
+			assert.ok(!raw.includes(secret), `${secret} from --host-cmd leaked`);
 		assert.ok(!r.stdout.includes('hunter3') && !r.stderr.includes('hunter3'));
 		const j = JSON.parse(raw);
 		assert.equal(j.schema, 'komika-capacity/2');
@@ -855,15 +1128,26 @@ test('a suite writes one JSON: manifest, pool report, steps, metrics, host, omit
 
 		// Pool report: excluded works with their reason, dataset totals.
 		assert.deepEqual(
-			j.pool.excluded.map((e) => [e.id, e.reason]).filter(([id]) => id === SLOW_WORK || id === BROKEN_WORK).sort(),
-			[[SLOW_WORK, 'slow'], [BROKEN_WORK, 'error']].filter(([id]) => j.pool.workIds.includes(id)).sort(),
+			j.pool.excluded
+				.map((e) => [e.id, e.reason])
+				.filter(([id]) => id === SLOW_WORK || id === BROKEN_WORK)
+				.sort(),
+			[
+				[SLOW_WORK, 'slow'],
+				[BROKEN_WORK, 'error'],
+			]
+				.filter(([id]) => j.pool.workIds.includes(id))
+				.sort(),
 		);
 		assert.equal(j.pool.dataset.updatesFeedTotal, WORK_COUNT);
 		assert.equal(j.pool.dataset.browseTotal, WORK_COUNT);
 
 		// Steps: three ran, the cold one is omitted with its reason.
 		assert.equal(j.steps.length, 4);
-		assert.deepEqual(j.omitted.map((o) => o.step), ['cold-images']);
+		assert.deepEqual(
+			j.omitted.map((o) => o.step),
+			['cold-images'],
+		);
 		assert.match(j.omitted[0].reason, /fixture-images/);
 		const [read, write, warm, cold] = j.steps;
 		assert.equal(cold.skipped, j.omitted[0].reason);
@@ -889,7 +1173,10 @@ test('a suite writes one JSON: manifest, pool report, steps, metrics, host, omit
 		assert.equal(typeof p.afterBoundary.inflightAtBoundary, 'number');
 		assert.equal(p.afterBoundary.completedAfterBoundary, p.afterBoundary.inflightAtBoundary);
 		// The last scrape starts at the boundary, not after the drain.
-		assert.ok(Math.abs(Date.parse(p.metrics.to) - Date.parse(p.endedAt)) < 25, `${p.metrics.to} vs ${p.endedAt}`);
+		assert.ok(
+			Math.abs(Date.parse(p.metrics.to) - Date.parse(p.endedAt)) < 25,
+			`${p.metrics.to} vs ${p.endedAt}`,
+		);
 		assert.ok(Date.parse(p.endedAt) - Date.parse(p.startedAt) >= 790);
 		assert.equal(p.costInputs.hostBusyCores, 0.5);
 
@@ -899,7 +1186,10 @@ test('a suite writes one JSON: manifest, pool report, steps, metrics, host, omit
 		assert.equal(write.hotWorks.ids.length, 2);
 		const wp = write.loads[0];
 		assert.ok(wp.write.requests > 0, JSON.stringify(wp.errorsByKind));
-		assert.ok(Object.keys(wp.ops).some((k) => k.startsWith('setProgress(seq')), Object.keys(wp.ops).join(','));
+		assert.ok(
+			Object.keys(wp.ops).some((k) => k.startsWith('setProgress(seq')),
+			Object.keys(wp.ops).join(','),
+		);
 		assert.ok(wp.works.top.every((w) => write.hotWorks.ids.includes(w.id)));
 		assert.equal(write.cacheState.earlierSteps[0], 'metadata');
 
@@ -921,7 +1211,11 @@ test('a suite writes one JSON: manifest, pool report, steps, metrics, host, omit
 		assert.equal(ip.image.xCache.HIT, ip.image.requests); // warm: every one was fetched before
 		assert.equal(ip.image.contentTypes['image/webp'], ip.image.requests);
 		assert.equal(ip.image.magic.webp, ip.image.requests);
-		assert.ok(ip.metrics.derived.hitRatios.some((h) => h.key === 'komika_image_cache_*_total{cache="pages"}' && h.ratio === 1));
+		assert.ok(
+			ip.metrics.derived.hitRatios.some(
+				(h) => h.key === 'komika_image_cache_*_total{cache="pages"}' && h.ratio === 1,
+			),
+		);
 		assert.ok(ip.metrics.derived.bytes.some((b) => b.delta > 0));
 	} finally {
 		await mock.close();
@@ -939,32 +1233,60 @@ test('mixed, release-burst and image-cold run; failing metrics and host do not s
 	try {
 		const fixtures = join(dir, 'fixtures.txt');
 		// 12 addresses plus a duplicate that differs only by its fragment.
-		writeFileSync(fixtures, [...Array.from({ length: 12 }, (_, i) => `/fixture/${i}.webp`), '/fixture/0.webp#dup'].join('\n'));
+		writeFileSync(
+			fixtures,
+			[...Array.from({ length: 12 }, (_, i) => `/fixture/${i}.webp`), '/fixture/0.webp#dup'].join(
+				'\n',
+			),
+		);
 		const suite = join(dir, 'suite.json');
-		const fast = { 'page-seconds': 0.05, think: 0.05, 'next-seconds': 0.05, 'chapter-pages': 2, chapters: 1, 'quit-share': 0, 'search-share': 0 };
+		const fast = {
+			'page-seconds': 0.05,
+			think: 0.05,
+			'next-seconds': 0.05,
+			'chapter-pages': 2,
+			chapters: 1,
+			'quit-share': 0,
+			'search-share': 0,
+		};
 		writeFileSync(
 			suite,
 			JSON.stringify({
 				defaults: { warmup: 0.1, duration: 0.9, 'image-chapters': 4, 'image-urls': 40 },
 				steps: [
 					{ name: 'mixed', scenario: 'mixed', users: [2], ...fast },
-					{ name: 'burst', scenario: 'release-burst', users: [3], warmup: 0.1, 'page-seconds': 0.05 },
+					{
+						name: 'burst',
+						scenario: 'release-burst',
+						users: [3],
+						warmup: 0.1,
+						'page-seconds': 0.05,
+					},
 					{ name: 'cold', scenario: 'image-cold', vus: [2], warmup: 0.2 },
 				],
 			}),
 		);
 		const out = join(dir, 'run.json');
 		const r = await runTool([
-			'--target', mock.url,
+			'--target',
+			mock.url,
 			...FAST,
-			'--suite', suite,
-			'--seed', 'x',
-			'--state', join(dir, 'state.json'),
-			'--fixture-images', fixtures,
-			'--metrics-url', `http://127.0.0.1:${deadPort}/metrics`,
-			'--host-cmd', 'echo nothing useful; exit 3',
-			'--host-ready-timeout', '0.3',
-			'--json', out,
+			'--suite',
+			suite,
+			'--seed',
+			'x',
+			'--state',
+			join(dir, 'state.json'),
+			'--fixture-images',
+			fixtures,
+			'--metrics-url',
+			`http://127.0.0.1:${deadPort}/metrics`,
+			'--host-cmd',
+			'echo nothing useful; exit 3',
+			'--host-ready-timeout',
+			'0.3',
+			'--json',
+			out,
 		]);
 		assert.equal(r.code, 0, r.stderr + r.stdout);
 		const j = JSON.parse(readFileSync(out, 'utf8'));

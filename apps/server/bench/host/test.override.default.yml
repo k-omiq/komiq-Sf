@@ -1,18 +1,19 @@
 # Test host only. Not for production.
 services:
   suwayomi:
-    restart: "no"
+    restart: 'no'
     healthcheck:
-      test: ['CMD-SHELL', 'curl -fsS http://localhost:4567/api/v1/settings/about >/dev/null || exit 1']
+      test:
+        ['CMD-SHELL', 'curl -fsS http://localhost:4567/api/v1/settings/about >/dev/null || exit 1']
   flaresolverr:
-    restart: "no"
+    restart: 'no'
   postgres:
-    restart: "no"
+    restart: 'no'
     volumes:
       - ./pgconf/postgresql.conf:/opt/komika-postgres/postgresql.conf:ro
   server:
     image: komika-server:pg-71b96aacb501
-    restart: "no"
+    restart: 'no'
     mem_limit: ${TEST_SERVER_MEMORY:-4g}
     environment:
       COVER_CACHE: 'off'

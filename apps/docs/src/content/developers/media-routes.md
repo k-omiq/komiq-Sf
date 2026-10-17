@@ -95,12 +95,12 @@ An `<img>` never sends an `Authorization` header. Probes and checked fetches use
 
 ## Classification
 
-| URL | Loaded |
-| --- | --- |
-| An exact object (`MediaUrl`) | from its route, never through the image provider |
-| The API origin, relative `/media/`, `/covers/`, `/avatars/` | direct |
-| An origin on `PUBLIC_KOMIKA_MEDIA_HOSTS` | direct, never Worker-wrapped |
-| Any other host | through the image proxy Worker in proxy mode |
+| URL                                                         | Loaded                                           |
+| ----------------------------------------------------------- | ------------------------------------------------ |
+| An exact object (`MediaUrl`)                                | from its route, never through the image provider |
+| The API origin, relative `/media/`, `/covers/`, `/avatars/` | direct                                           |
+| An origin on `PUBLIC_KOMIKA_MEDIA_HOSTS`                    | direct, never Worker-wrapped                     |
+| Any other host                                              | through the image proxy Worker in proxy mode     |
 
 The image provider compares origins in normal form: host names are lower case and default ports are removed.
 

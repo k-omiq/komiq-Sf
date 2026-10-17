@@ -140,8 +140,11 @@
 						<a class="menu-item" role="menuitem" href="/library" onclick={() => (menuOpen = false)}
 							>Library</a
 						>
-						<a class="menu-item" role="menuitem" href="/scanlators" onclick={() => (menuOpen = false)}
-							>Scanlators</a
+						<a
+							class="menu-item"
+							role="menuitem"
+							href="/scanlators"
+							onclick={() => (menuOpen = false)}>Scanlators</a
 						>
 						<a class="menu-item" role="menuitem" href="/settings" onclick={() => (menuOpen = false)}
 							>Settings</a
@@ -181,8 +184,11 @@
 					<button class="backdrop" aria-label="Close menu" onclick={() => (menuOpen = false)}
 					></button>
 					<div class="menu" role="menu">
-						<a class="menu-item" role="menuitem" href="/scanlators" onclick={() => (menuOpen = false)}
-							>Scanlators</a
+						<a
+							class="menu-item"
+							role="menuitem"
+							href="/scanlators"
+							onclick={() => (menuOpen = false)}>Scanlators</a
 						>
 						<a class="menu-item" role="menuitem" href="/settings" onclick={() => (menuOpen = false)}
 							>Settings</a

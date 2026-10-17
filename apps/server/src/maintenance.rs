@@ -168,7 +168,11 @@ pub async fn run_update_pass(state: &AppState, origin: &'static str) {
                     tracing::warn!(error = %error, "engine routes: reload after extension update failed");
                 }
                 for attempt in attempts.iter().filter(|a| a.error.is_none()) {
-                    crate::engine_route::update_regional(&state.suwayomi.regional, &attempt.pkg_name).await;
+                    crate::engine_route::update_regional(
+                        &state.suwayomi.regional,
+                        &attempt.pkg_name,
+                    )
+                    .await;
                 }
                 if let Err(error) = state.suwayomi.regional.reload_routes(&state.pool).await {
                     tracing::warn!(error = %error, "engine routes: reload after regional update failed");
@@ -417,8 +421,12 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let mut regional_state = crate::engine_route::tests::FakeState::default();
-        regional_state.extensions.push(("b-updates".into(), 7, vec!["source".into()]));
-        regional_state.available.push(("b-updates".into(), 8, vec!["source".into()]));
+        regional_state
+            .extensions
+            .push(("b-updates".into(), 7, vec!["source".into()]));
+        regional_state
+            .available
+            .push(("b-updates".into(), 8, vec!["source".into()]));
         let regional = crate::engine_route::tests::FakeRegional::spawn(regional_state).await;
         let mut client = SuwayomiClient::new(url, None, None);
         client.regional = Arc::new(crate::engine_route::Engines::new(&[regional.spec("sg")]));
@@ -431,7 +439,17 @@ mod tests {
         }
         assert_eq!(regional.calls("refresh_extensions"), 1);
         assert_eq!(regional.calls("update"), 1);
-        assert_eq!(client.regional.engine("sg").unwrap().health().unwrap().installed["source"].version_code, Some(8));
+        assert_eq!(
+            client
+                .regional
+                .engine("sg")
+                .unwrap()
+                .health()
+                .unwrap()
+                .installed["source"]
+                .version_code,
+            Some(8)
+        );
         let outcome: Vec<_> = attempts
             .iter()
             .map(|a| {

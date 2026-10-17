@@ -1048,7 +1048,10 @@ mod tests {
     async fn social_schema(
         pool: &Database,
         user: &str,
-    ) -> (cover_store::test_support::TestDir, crate::graphql::ApiSchema) {
+    ) -> (
+        cover_store::test_support::TestDir,
+        crate::graphql::ApiSchema,
+    ) {
         use crate::graphql::{AppState, RateLimiter};
         use std::sync::Arc;
 

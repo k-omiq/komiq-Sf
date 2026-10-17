@@ -136,24 +136,41 @@ import { monitorEventLoopDelay } from 'node:perf_hooks';
 // so the server validates and executes exactly what the reader ships (fragments,
 // comments and all). Do not trim: SeriesFields is the expensive part of every feed.
 let Q = {
-	DISCOVERY: "\n\t\n\tfragment SeriesFields on Series {\n\t\tid\n\t\ttitle\n\t\taltTitles\n\t\tauthor\n\t\tartist\n\t\tdescription\n\t\tgenres\n\t\ttype\n\t\tstatus\n\t\tcoverUrl\n\t\tsourceId\n\t\tchapterCount\n\t\tisMarked\n\t\tisNsfw\n\t\trating {\n\t\t\taverage\n\t\t\tcount\n\t\t\tdistribution\n\t\t}\n\t\tmangadexRating\n\t\tscan {\n\t\t\tavgIntervalHours\n\t\t\toverrideIntervalHours\n\t\t\tpollEveryMinutes\n\t\t\tpaused\n\t\t\tstatusOverride\n\t\t\tpausedOverride\n\t\t\tpollEveryMinutesOverride\n\t\t\tlastScannedAt\n\t\t\tnextScanAt\n\t\t}\n\t\tcreatedAt\n\t\tupdatedAt\n\t\t# Chapter recency. `updatedAt` is a metadata touch that moves on every poll,\n\t\t# so it can never be the \"· 4h\" label; `latestChapterAt` is the real publish\n\t\t# time and `detectedAt` is when we found it. Keep `detectedAt` on its own\n\t\t# line — the unknown-field fallback strips it by line (OPTIONAL_SERIES_FIELDS).\n\t\tlatestChapterAt\n\t\tdetectedAt\n\t\t# The newest chapter's NUMBER (\"151\"), which is NOT `chapterCount` (\"12 ch\") —\n\t\t# printing the count under a \"Ch.\" label is the F4 bug the chapter-number contract\n\t\t# exists to prevent, so a null here means print the count ALONE. Own line, no alias\n\t\t# and no arguments, because the unknown-field fallback strips it by line\n\t\t# (OPTIONAL_SERIES_FIELDS) — this field is newer than the deployed API, and without\n\t\t# that entry a reader shipped first would fail EVERY series query rather than lose\n\t\t# one label.\n\t\tlatestChapter\n\t}\n\n\tquery Discovery {\n\t\tdiscovery {\n\t\t\tkind\n\t\t\ttitle\n\t\t\tgenre\n\t\t\titems {\n\t\t\t\t...SeriesFields\n\t\t\t}\n\t\t}\n\t}\n",
-	UPDATES_FEED: "\n\tquery UpdatesFeed($page: Int, $type: ComicType) {\n\t\tupdatesFeed(page: $page, type: $type) {\n\t\t\titems {\n\t\t\t\tid\n\t\t\t\tworkId\n\t\t\t\ttitle\n\t\t\t\tcoverUrl\n\t\t\t\ttype\n\t\t\t\tstatus\n\t\t\t\tlatestChapter\n\t\t\t\tlatestChapterTitle\n\t\t\t\tchapterCount\n\t\t\t\treleasedAt\n\t\t\t\t# The feed's sort key, so also the clock the card labels with. Own line for\n\t\t\t\t# the unknown-field fallback (OPTIONAL_SERIES_FIELDS).\n\t\t\t\tannouncedAt\n\t\t\t\tdetectedAt\n\t\t\t\trating\n\t\t\t\treaderRating\n\t\t\t\tmangadexRating\n\t\t\t\tisNsfw\n\t\t\t}\n\t\t\tpage\n\t\t\thasNextPage\n\t\t\ttotal\n\t\t}\n\t}\n",
-	SEARCH: "\n\t\n\tfragment SeriesFields on Series {\n\t\tid\n\t\ttitle\n\t\taltTitles\n\t\tauthor\n\t\tartist\n\t\tdescription\n\t\tgenres\n\t\ttype\n\t\tstatus\n\t\tcoverUrl\n\t\tsourceId\n\t\tchapterCount\n\t\tisMarked\n\t\tisNsfw\n\t\trating {\n\t\t\taverage\n\t\t\tcount\n\t\t\tdistribution\n\t\t}\n\t\tmangadexRating\n\t\tscan {\n\t\t\tavgIntervalHours\n\t\t\toverrideIntervalHours\n\t\t\tpollEveryMinutes\n\t\t\tpaused\n\t\t\tstatusOverride\n\t\t\tpausedOverride\n\t\t\tpollEveryMinutesOverride\n\t\t\tlastScannedAt\n\t\t\tnextScanAt\n\t\t}\n\t\tcreatedAt\n\t\tupdatedAt\n\t\t# Chapter recency. `updatedAt` is a metadata touch that moves on every poll,\n\t\t# so it can never be the \"· 4h\" label; `latestChapterAt` is the real publish\n\t\t# time and `detectedAt` is when we found it. Keep `detectedAt` on its own\n\t\t# line — the unknown-field fallback strips it by line (OPTIONAL_SERIES_FIELDS).\n\t\tlatestChapterAt\n\t\tdetectedAt\n\t\t# The newest chapter's NUMBER (\"151\"), which is NOT `chapterCount` (\"12 ch\") —\n\t\t# printing the count under a \"Ch.\" label is the F4 bug the chapter-number contract\n\t\t# exists to prevent, so a null here means print the count ALONE. Own line, no alias\n\t\t# and no arguments, because the unknown-field fallback strips it by line\n\t\t# (OPTIONAL_SERIES_FIELDS) — this field is newer than the deployed API, and without\n\t\t# that entry a reader shipped first would fail EVERY series query rather than lose\n\t\t# one label.\n\t\tlatestChapter\n\t}\n\n\tquery Search(\n\t\t$query: String!\n\t\t$page: Int\n\t\t$genres: [String!]\n\t\t$minRating: Float\n\t\t$maxRating: Float\n\t\t$types: [ComicType!]\n\t\t$status: SeriesStatus\n\t\t$sort: BrowseSort\n\t\t$contentRating: ContentRatingFilter\n\t\t$includeNsfw: Boolean\n\t\t$hasChapters: Boolean\n\t\t$filter: BrowseFilter\n\t) {\n\t\tsearch(\n\t\t\tquery: $query\n\t\t\tpage: $page\n\t\t\tgenres: $genres\n\t\t\tminRating: $minRating\n\t\t\tmaxRating: $maxRating\n\t\t\ttypes: $types\n\t\t\tstatus: $status\n\t\t\tsort: $sort\n\t\t\tcontentRating: $contentRating\n\t\t\tincludeNsfw: $includeNsfw\n\t\t\thasChapters: $hasChapters\n\t\t\tfilter: $filter\n\t\t) {\n\t\t\titems {\n\t\t\t\t...SeriesFields\n\t\t\t}\n\t\t\tpage\n\t\t\thasNextPage\n\t\t\ttotal\n\t\t}\n\t}\n",
-	SERIES_PAGE: "\n\t\n\tfragment SeriesFields on Series {\n\t\tid\n\t\ttitle\n\t\taltTitles\n\t\tauthor\n\t\tartist\n\t\tdescription\n\t\tgenres\n\t\ttype\n\t\tstatus\n\t\tcoverUrl\n\t\tsourceId\n\t\tchapterCount\n\t\tisMarked\n\t\tisNsfw\n\t\trating {\n\t\t\taverage\n\t\t\tcount\n\t\t\tdistribution\n\t\t}\n\t\tmangadexRating\n\t\tscan {\n\t\t\tavgIntervalHours\n\t\t\toverrideIntervalHours\n\t\t\tpollEveryMinutes\n\t\t\tpaused\n\t\t\tstatusOverride\n\t\t\tpausedOverride\n\t\t\tpollEveryMinutesOverride\n\t\t\tlastScannedAt\n\t\t\tnextScanAt\n\t\t}\n\t\tcreatedAt\n\t\tupdatedAt\n\t\t# Chapter recency. `updatedAt` is a metadata touch that moves on every poll,\n\t\t# so it can never be the \"· 4h\" label; `latestChapterAt` is the real publish\n\t\t# time and `detectedAt` is when we found it. Keep `detectedAt` on its own\n\t\t# line — the unknown-field fallback strips it by line (OPTIONAL_SERIES_FIELDS).\n\t\tlatestChapterAt\n\t\tdetectedAt\n\t\t# The newest chapter's NUMBER (\"151\"), which is NOT `chapterCount` (\"12 ch\") —\n\t\t# printing the count under a \"Ch.\" label is the F4 bug the chapter-number contract\n\t\t# exists to prevent, so a null here means print the count ALONE. Own line, no alias\n\t\t# and no arguments, because the unknown-field fallback strips it by line\n\t\t# (OPTIONAL_SERIES_FIELDS) — this field is newer than the deployed API, and without\n\t\t# that entry a reader shipped first would fail EVERY series query rather than lose\n\t\t# one label.\n\t\tlatestChapter\n\t}\n\n\t\n\tfragment ChapterFields on Chapter {\n\t\tid\n\t\tseriesId\n\t\tnumber\n\t\tlabel\n\t\texternalUrl\n\t\ttitle\n\t\tpageCount\n\t\tuploadedAt\n\t\t# When WE first had it, as against uploadedAt's \"when the source published it\". On its\n\t\t# own line, no alias/args/sub-selection, and not the only selection here — the three\n\t\t# conditions the line-based unknown-field fallback needs (OPTIONAL_SERIES_FIELDS).\n\t\t# (No backticks in this comment: it is inside a JS template literal.)\n\t\tfoundAt\n\t\tscanlator\n\t\tread\n\t\tlastPageRead\n\t\tbookmarked\n\t\tisDownloaded\n\t}\n\n\t\n\tfragment WorkSourceFields on WorkSource {\n\t\tsourceType\n\t\tsourceId\n\t\tsourceKey\n\t\tsourceUrl\n\t\tisNsfw\n\t\tlang\n\t\textension {\n\t\t\tpkgName\n\t\t\trepoUrl\n\t\t\tapkName\n\t\t\tversionCode\n\t\t\tlang\n\t\t}\n\t}\n\n\tquery SeriesPage($workId: ID!, $withAggregated: Boolean! = false) {\n\t\tseriesPage(workId: $workId) {\n\t\t\tworkId\n\t\t\tseries {\n\t\t\t\t...SeriesFields\n\t\t\t\tmetadata {\n\t\t\t\t\tyear\n\t\t\t\t\toriginalLanguage\n\t\t\t\t\tdemographic\n\t\t\t\t\tcontentRating\n\t\t\t\t\ttags {\n\t\t\t\t\t\tid\n\t\t\t\t\t\tname\n\t\t\t\t\t\tgroup\n\t\t\t\t\t}\n\t\t\t\t\ttrackers {\n\t\t\t\t\t\tprovider\n\t\t\t\t\t\texternalId\n\t\t\t\t\t\turl\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t\tlibraryStatus\n\t\t\t\tisFavorite\n\t\t\t\tviews {\n\t\t\t\t\ttotal\n\t\t\t\t\tlast7d\n\t\t\t\t\tlast24h\n\t\t\t\t}\n\t\t\t\tlocalizedDescriptions {\n\t\t\t\t\tlang\n\t\t\t\t\tdescription\n\t\t\t\t}\n\t\t\t\tcredits {\n\t\t\t\t\trole\n\t\t\t\t\tname\n\t\t\t\t}\n\t\t\t\tcovers {\n\t\t\t\t\tfileName\n\t\t\t\t\turl\n\t\t\t\t\tthumbnailUrl\n\t\t\t\t\tlang\n\t\t\t\t\tvolume\n\t\t\t\t\tisPrimary\n\t\t\t\t}\n\t\t\t}\n\t\t\tspineChapters {\n\t\t\t\t...ChapterFields\n\t\t\t}\n\t\t\tsources {\n\t\t\t\tsource {\n\t\t\t\t\t...WorkSourceFields\n\t\t\t\t}\n\t\t\t\tchapters {\n\t\t\t\t\t...ChapterFields\n\t\t\t\t}\n\t\t\t\tseries {\n\t\t\t\t\t...SeriesFields\n\t\t\t\t\tlibraryStatus\n\t\t\t\t\tisFavorite\n\t\t\t\t\tviews {\n\t\t\t\t\t\ttotal\n\t\t\t\t\t\tlast7d\n\t\t\t\t\t\tlast24h\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t\taggregated @include(if: $withAggregated) {\n\t\t\t\tnumber\n\t\t\t\tlabel\n\t\t\t\ttitle\n\t\t\t\t# Own line, no alias — the unknown-field fallback strips it by line.\n\t\t\t\tfirstReleasedAt\n\t\t\t\tchapterVolume\n\t\t\t\t# One entry per COPY: every (source, scanlation group) upload of the number.\n\t\t\t\t# The two copy… fields are opportunistic (OPTIONAL_SERIES_FIELDS).\n\t\t\t\tsources {\n\t\t\t\t\tsourceType\n\t\t\t\t\tsourceId\n\t\t\t\t\tsuwayomiMangaId\n\t\t\t\t\tchapterId\n\t\t\t\t\tscanlator\n\t\t\t\t\tcopyReleasedAt\n\t\t\t\t\tcopyExternalUrl\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n",
-	SET_PROGRESS: "\n\tmutation SetProgress($chapterId: ID!, $lastPageRead: Int!, $read: Boolean!) {\n\t\tsetProgress(chapterId: $chapterId, lastPageRead: $lastPageRead, read: $read)\n\t}\n",
-	MARK: "\n\t\n\tfragment SeriesFields on Series {\n\t\tid\n\t\ttitle\n\t\taltTitles\n\t\tauthor\n\t\tartist\n\t\tdescription\n\t\tgenres\n\t\ttype\n\t\tstatus\n\t\tcoverUrl\n\t\tsourceId\n\t\tchapterCount\n\t\tisMarked\n\t\tisNsfw\n\t\trating {\n\t\t\taverage\n\t\t\tcount\n\t\t\tdistribution\n\t\t}\n\t\tmangadexRating\n\t\tscan {\n\t\t\tavgIntervalHours\n\t\t\toverrideIntervalHours\n\t\t\tpollEveryMinutes\n\t\t\tpaused\n\t\t\tstatusOverride\n\t\t\tpausedOverride\n\t\t\tpollEveryMinutesOverride\n\t\t\tlastScannedAt\n\t\t\tnextScanAt\n\t\t}\n\t\tcreatedAt\n\t\tupdatedAt\n\t\t# Chapter recency. `updatedAt` is a metadata touch that moves on every poll,\n\t\t# so it can never be the \"· 4h\" label; `latestChapterAt` is the real publish\n\t\t# time and `detectedAt` is when we found it. Keep `detectedAt` on its own\n\t\t# line — the unknown-field fallback strips it by line (OPTIONAL_SERIES_FIELDS).\n\t\tlatestChapterAt\n\t\tdetectedAt\n\t\t# The newest chapter's NUMBER (\"151\"), which is NOT `chapterCount` (\"12 ch\") —\n\t\t# printing the count under a \"Ch.\" label is the F4 bug the chapter-number contract\n\t\t# exists to prevent, so a null here means print the count ALONE. Own line, no alias\n\t\t# and no arguments, because the unknown-field fallback strips it by line\n\t\t# (OPTIONAL_SERIES_FIELDS) — this field is newer than the deployed API, and without\n\t\t# that entry a reader shipped first would fail EVERY series query rather than lose\n\t\t# one label.\n\t\tlatestChapter\n\t}\n\n\tmutation Mark($seriesId: ID!, $marked: Boolean!) {\n\t\tmark(seriesId: $seriesId, marked: $marked) {\n\t\t\t...SeriesFields\n\t\t\tlibraryStatus\n\t\t\tisFavorite\n\t\t}\n\t}\n",
-	RECORD_VIEW: "\n\tmutation RecordView($seriesId: ID!) {\n\t\trecordView(seriesId: $seriesId)\n\t}\n",
-	POST_COMMENT: "\n\t\n\tfragment UserRefFields on UserRef {\n\t\tid\n\t\tusername\n\t\tavatarUrl\n\t}\n\n\tmutation PostComment($input: PostCommentInput!) {\n\t\tpostComment(input: $input) {\n\t\t\tid\n\t\t\ttargetType\n\t\t\ttargetId\n\t\t\tparentId\n\t\t\tauthor {\n\t\t\t\t...UserRefFields\n\t\t\t}\n\t\t\tbody\n\t\t\thasSpoiler\n\t\t\tmediaUrl\n\t\t\tmediaWidth\n\t\t\tmediaHeight\n\t\t\tcreatedAt\n\t\t\tlikes\n\t\t\tdislikes\n\t\t\tmyVote\n\t\t}\n\t}\n",
-	DELETE_COMMENT: "\n\tmutation DeleteComment($commentId: ID!) {\n\t\tdeleteComment(commentId: $commentId)\n\t}\n",
-	COMMENTS: "\n\t\n\tfragment UserRefFields on UserRef {\n\t\tid\n\t\tusername\n\t\tavatarUrl\n\t}\n\n\tquery Comments($targetType: String!, $targetId: ID!, $page: Int) {\n\t\tcomments(targetType: $targetType, targetId: $targetId, page: $page) {\n\t\t\titems {\n\t\t\t\tid\n\t\t\t\ttargetType\n\t\t\t\ttargetId\n\t\t\t\tparentId\n\t\t\t\tdeletedBy\n\t\t\t\tauthor {\n\t\t\t\t\t...UserRefFields\n\t\t\t\t}\n\t\t\t\tbody\n\t\t\t\thasSpoiler\n\t\t\t\tmediaUrl\n\t\t\t\tmediaWidth\n\t\t\t\tmediaHeight\n\t\t\t\tcreatedAt\n\t\t\t\tlikes\n\t\t\t\tdislikes\n\t\t\t\tmyVote\n\t\t\t}\n\t\t\tpage\n\t\t\thasNextPage\n\t\t\ttotal\n\t\t}\n\t}\n",
-	REVIEWS: "\n\t\n\tfragment UserRefFields on UserRef {\n\t\tid\n\t\tusername\n\t\tavatarUrl\n\t}\n\n\tquery Reviews($seriesId: ID!, $page: Int) {\n\t\treviews(seriesId: $seriesId, page: $page) {\n\t\t\titems {\n\t\t\t\tid\n\t\t\t\tseriesId\n\t\t\t\tauthor {\n\t\t\t\t\t...UserRefFields\n\t\t\t\t}\n\t\t\t\tscore\n\t\t\t\tbody\n\t\t\t\thasSpoiler\n\t\t\t\tcreatedAt\n\t\t\t\tupdatedAt\n\t\t\t}\n\t\t\tpage\n\t\t\thasNextPage\n\t\t\ttotal\n\t\t}\n\t}\n",
-	MY_REVIEW: "\n\t\n\tfragment UserRefFields on UserRef {\n\t\tid\n\t\tusername\n\t\tavatarUrl\n\t}\n\n\tquery MyReview($seriesId: ID!) {\n\t\tmyReview(seriesId: $seriesId) {\n\t\t\tid\n\t\t\tseriesId\n\t\t\tauthor {\n\t\t\t\t...UserRefFields\n\t\t\t}\n\t\t\tscore\n\t\t\tbody\n\t\t\thasSpoiler\n\t\t\tcreatedAt\n\t\t\tupdatedAt\n\t\t}\n\t}\n",
-	CANONICAL_PAGES: "\n\tquery CanonicalPages($chapterId: ID!) {\n\t\tcanonicalPages(chapterId: $chapterId) {\n\t\t\tindex\n\t\t\tsourceUrl\n\t\t\twidth\n\t\t\theight\n\t\t}\n\t}\n",
-	PAGES: "\n\tquery Pages($chapterId: ID!) {\n\t\tpages(chapterId: $chapterId) {\n\t\t\tindex\n\t\t\tsourceUrl\n\t\t\twidth\n\t\t\theight\n\t\t}\n\t}\n",
-	SESSION: "\n\t\n\t\n\tfragment SessionUserFields on SessionUser {\n\t\tid\n\t\tusername\n\t\tdisplayName\n\t\tbio\n\t\tavatarUrl\n\t\tisAdmin\n\t\tshowNsfw\n\t\tjoinedAt\n\t\tmustChangePassword\n\t}\n\n\tfragment SessionFields on Session {\n\t\ttoken\n\t\tuser {\n\t\t\t...SessionUserFields\n\t\t}\n\t}\n\n\tquery Session {\n\t\tsession {\n\t\t\t...SessionFields\n\t\t}\n\t}\n",
-	LOGIN: "\n\t\n\t\n\tfragment SessionUserFields on SessionUser {\n\t\tid\n\t\tusername\n\t\tdisplayName\n\t\tbio\n\t\tavatarUrl\n\t\tisAdmin\n\t\tshowNsfw\n\t\tjoinedAt\n\t\tmustChangePassword\n\t}\n\n\tfragment SessionFields on Session {\n\t\ttoken\n\t\tuser {\n\t\t\t...SessionUserFields\n\t\t}\n\t}\n\n\tmutation Login($username: String!, $password: String!) {\n\t\tlogin(username: $username, password: $password) {\n\t\t\t...SessionFields\n\t\t}\n\t}\n",
-	REGISTER: "\n\t\n\t\n\tfragment SessionUserFields on SessionUser {\n\t\tid\n\t\tusername\n\t\tdisplayName\n\t\tbio\n\t\tavatarUrl\n\t\tisAdmin\n\t\tshowNsfw\n\t\tjoinedAt\n\t\tmustChangePassword\n\t}\n\n\tfragment SessionFields on Session {\n\t\ttoken\n\t\tuser {\n\t\t\t...SessionUserFields\n\t\t}\n\t}\n\n\tmutation Register($input: RegisterInput!) {\n\t\tregister(input: $input) {\n\t\t\t...SessionFields\n\t\t}\n\t}\n",
-	UNREAD_NOTIFICATION_COUNT: "\n\tquery UnreadNotificationCount {\n\t\tunreadNotificationCount\n\t}\n",
+	DISCOVERY:
+		'\n\t\n\tfragment SeriesFields on Series {\n\t\tid\n\t\ttitle\n\t\taltTitles\n\t\tauthor\n\t\tartist\n\t\tdescription\n\t\tgenres\n\t\ttype\n\t\tstatus\n\t\tcoverUrl\n\t\tsourceId\n\t\tchapterCount\n\t\tisMarked\n\t\tisNsfw\n\t\trating {\n\t\t\taverage\n\t\t\tcount\n\t\t\tdistribution\n\t\t}\n\t\tmangadexRating\n\t\tscan {\n\t\t\tavgIntervalHours\n\t\t\toverrideIntervalHours\n\t\t\tpollEveryMinutes\n\t\t\tpaused\n\t\t\tstatusOverride\n\t\t\tpausedOverride\n\t\t\tpollEveryMinutesOverride\n\t\t\tlastScannedAt\n\t\t\tnextScanAt\n\t\t}\n\t\tcreatedAt\n\t\tupdatedAt\n\t\t# Chapter recency. `updatedAt` is a metadata touch that moves on every poll,\n\t\t# so it can never be the "· 4h" label; `latestChapterAt` is the real publish\n\t\t# time and `detectedAt` is when we found it. Keep `detectedAt` on its own\n\t\t# line — the unknown-field fallback strips it by line (OPTIONAL_SERIES_FIELDS).\n\t\tlatestChapterAt\n\t\tdetectedAt\n\t\t# The newest chapter\'s NUMBER ("151"), which is NOT `chapterCount` ("12 ch") —\n\t\t# printing the count under a "Ch." label is the F4 bug the chapter-number contract\n\t\t# exists to prevent, so a null here means print the count ALONE. Own line, no alias\n\t\t# and no arguments, because the unknown-field fallback strips it by line\n\t\t# (OPTIONAL_SERIES_FIELDS) — this field is newer than the deployed API, and without\n\t\t# that entry a reader shipped first would fail EVERY series query rather than lose\n\t\t# one label.\n\t\tlatestChapter\n\t}\n\n\tquery Discovery {\n\t\tdiscovery {\n\t\t\tkind\n\t\t\ttitle\n\t\t\tgenre\n\t\t\titems {\n\t\t\t\t...SeriesFields\n\t\t\t}\n\t\t}\n\t}\n',
+	UPDATES_FEED:
+		"\n\tquery UpdatesFeed($page: Int, $type: ComicType) {\n\t\tupdatesFeed(page: $page, type: $type) {\n\t\t\titems {\n\t\t\t\tid\n\t\t\t\tworkId\n\t\t\t\ttitle\n\t\t\t\tcoverUrl\n\t\t\t\ttype\n\t\t\t\tstatus\n\t\t\t\tlatestChapter\n\t\t\t\tlatestChapterTitle\n\t\t\t\tchapterCount\n\t\t\t\treleasedAt\n\t\t\t\t# The feed's sort key, so also the clock the card labels with. Own line for\n\t\t\t\t# the unknown-field fallback (OPTIONAL_SERIES_FIELDS).\n\t\t\t\tannouncedAt\n\t\t\t\tdetectedAt\n\t\t\t\trating\n\t\t\t\treaderRating\n\t\t\t\tmangadexRating\n\t\t\t\tisNsfw\n\t\t\t}\n\t\t\tpage\n\t\t\thasNextPage\n\t\t\ttotal\n\t\t}\n\t}\n",
+	SEARCH:
+		'\n\t\n\tfragment SeriesFields on Series {\n\t\tid\n\t\ttitle\n\t\taltTitles\n\t\tauthor\n\t\tartist\n\t\tdescription\n\t\tgenres\n\t\ttype\n\t\tstatus\n\t\tcoverUrl\n\t\tsourceId\n\t\tchapterCount\n\t\tisMarked\n\t\tisNsfw\n\t\trating {\n\t\t\taverage\n\t\t\tcount\n\t\t\tdistribution\n\t\t}\n\t\tmangadexRating\n\t\tscan {\n\t\t\tavgIntervalHours\n\t\t\toverrideIntervalHours\n\t\t\tpollEveryMinutes\n\t\t\tpaused\n\t\t\tstatusOverride\n\t\t\tpausedOverride\n\t\t\tpollEveryMinutesOverride\n\t\t\tlastScannedAt\n\t\t\tnextScanAt\n\t\t}\n\t\tcreatedAt\n\t\tupdatedAt\n\t\t# Chapter recency. `updatedAt` is a metadata touch that moves on every poll,\n\t\t# so it can never be the "· 4h" label; `latestChapterAt` is the real publish\n\t\t# time and `detectedAt` is when we found it. Keep `detectedAt` on its own\n\t\t# line — the unknown-field fallback strips it by line (OPTIONAL_SERIES_FIELDS).\n\t\tlatestChapterAt\n\t\tdetectedAt\n\t\t# The newest chapter\'s NUMBER ("151"), which is NOT `chapterCount` ("12 ch") —\n\t\t# printing the count under a "Ch." label is the F4 bug the chapter-number contract\n\t\t# exists to prevent, so a null here means print the count ALONE. Own line, no alias\n\t\t# and no arguments, because the unknown-field fallback strips it by line\n\t\t# (OPTIONAL_SERIES_FIELDS) — this field is newer than the deployed API, and without\n\t\t# that entry a reader shipped first would fail EVERY series query rather than lose\n\t\t# one label.\n\t\tlatestChapter\n\t}\n\n\tquery Search(\n\t\t$query: String!\n\t\t$page: Int\n\t\t$genres: [String!]\n\t\t$minRating: Float\n\t\t$maxRating: Float\n\t\t$types: [ComicType!]\n\t\t$status: SeriesStatus\n\t\t$sort: BrowseSort\n\t\t$contentRating: ContentRatingFilter\n\t\t$includeNsfw: Boolean\n\t\t$hasChapters: Boolean\n\t\t$filter: BrowseFilter\n\t) {\n\t\tsearch(\n\t\t\tquery: $query\n\t\t\tpage: $page\n\t\t\tgenres: $genres\n\t\t\tminRating: $minRating\n\t\t\tmaxRating: $maxRating\n\t\t\ttypes: $types\n\t\t\tstatus: $status\n\t\t\tsort: $sort\n\t\t\tcontentRating: $contentRating\n\t\t\tincludeNsfw: $includeNsfw\n\t\t\thasChapters: $hasChapters\n\t\t\tfilter: $filter\n\t\t) {\n\t\t\titems {\n\t\t\t\t...SeriesFields\n\t\t\t}\n\t\t\tpage\n\t\t\thasNextPage\n\t\t\ttotal\n\t\t}\n\t}\n',
+	SERIES_PAGE:
+		'\n\t\n\tfragment SeriesFields on Series {\n\t\tid\n\t\ttitle\n\t\taltTitles\n\t\tauthor\n\t\tartist\n\t\tdescription\n\t\tgenres\n\t\ttype\n\t\tstatus\n\t\tcoverUrl\n\t\tsourceId\n\t\tchapterCount\n\t\tisMarked\n\t\tisNsfw\n\t\trating {\n\t\t\taverage\n\t\t\tcount\n\t\t\tdistribution\n\t\t}\n\t\tmangadexRating\n\t\tscan {\n\t\t\tavgIntervalHours\n\t\t\toverrideIntervalHours\n\t\t\tpollEveryMinutes\n\t\t\tpaused\n\t\t\tstatusOverride\n\t\t\tpausedOverride\n\t\t\tpollEveryMinutesOverride\n\t\t\tlastScannedAt\n\t\t\tnextScanAt\n\t\t}\n\t\tcreatedAt\n\t\tupdatedAt\n\t\t# Chapter recency. `updatedAt` is a metadata touch that moves on every poll,\n\t\t# so it can never be the "· 4h" label; `latestChapterAt` is the real publish\n\t\t# time and `detectedAt` is when we found it. Keep `detectedAt` on its own\n\t\t# line — the unknown-field fallback strips it by line (OPTIONAL_SERIES_FIELDS).\n\t\tlatestChapterAt\n\t\tdetectedAt\n\t\t# The newest chapter\'s NUMBER ("151"), which is NOT `chapterCount` ("12 ch") —\n\t\t# printing the count under a "Ch." label is the F4 bug the chapter-number contract\n\t\t# exists to prevent, so a null here means print the count ALONE. Own line, no alias\n\t\t# and no arguments, because the unknown-field fallback strips it by line\n\t\t# (OPTIONAL_SERIES_FIELDS) — this field is newer than the deployed API, and without\n\t\t# that entry a reader shipped first would fail EVERY series query rather than lose\n\t\t# one label.\n\t\tlatestChapter\n\t}\n\n\t\n\tfragment ChapterFields on Chapter {\n\t\tid\n\t\tseriesId\n\t\tnumber\n\t\tlabel\n\t\texternalUrl\n\t\ttitle\n\t\tpageCount\n\t\tuploadedAt\n\t\t# When WE first had it, as against uploadedAt\'s "when the source published it". On its\n\t\t# own line, no alias/args/sub-selection, and not the only selection here — the three\n\t\t# conditions the line-based unknown-field fallback needs (OPTIONAL_SERIES_FIELDS).\n\t\t# (No backticks in this comment: it is inside a JS template literal.)\n\t\tfoundAt\n\t\tscanlator\n\t\tread\n\t\tlastPageRead\n\t\tbookmarked\n\t\tisDownloaded\n\t}\n\n\t\n\tfragment WorkSourceFields on WorkSource {\n\t\tsourceType\n\t\tsourceId\n\t\tsourceKey\n\t\tsourceUrl\n\t\tisNsfw\n\t\tlang\n\t\textension {\n\t\t\tpkgName\n\t\t\trepoUrl\n\t\t\tapkName\n\t\t\tversionCode\n\t\t\tlang\n\t\t}\n\t}\n\n\tquery SeriesPage($workId: ID!, $withAggregated: Boolean! = false) {\n\t\tseriesPage(workId: $workId) {\n\t\t\tworkId\n\t\t\tseries {\n\t\t\t\t...SeriesFields\n\t\t\t\tmetadata {\n\t\t\t\t\tyear\n\t\t\t\t\toriginalLanguage\n\t\t\t\t\tdemographic\n\t\t\t\t\tcontentRating\n\t\t\t\t\ttags {\n\t\t\t\t\t\tid\n\t\t\t\t\t\tname\n\t\t\t\t\t\tgroup\n\t\t\t\t\t}\n\t\t\t\t\ttrackers {\n\t\t\t\t\t\tprovider\n\t\t\t\t\t\texternalId\n\t\t\t\t\t\turl\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t\tlibraryStatus\n\t\t\t\tisFavorite\n\t\t\t\tviews {\n\t\t\t\t\ttotal\n\t\t\t\t\tlast7d\n\t\t\t\t\tlast24h\n\t\t\t\t}\n\t\t\t\tlocalizedDescriptions {\n\t\t\t\t\tlang\n\t\t\t\t\tdescription\n\t\t\t\t}\n\t\t\t\tcredits {\n\t\t\t\t\trole\n\t\t\t\t\tname\n\t\t\t\t}\n\t\t\t\tcovers {\n\t\t\t\t\tfileName\n\t\t\t\t\turl\n\t\t\t\t\tthumbnailUrl\n\t\t\t\t\tlang\n\t\t\t\t\tvolume\n\t\t\t\t\tisPrimary\n\t\t\t\t}\n\t\t\t}\n\t\t\tspineChapters {\n\t\t\t\t...ChapterFields\n\t\t\t}\n\t\t\tsources {\n\t\t\t\tsource {\n\t\t\t\t\t...WorkSourceFields\n\t\t\t\t}\n\t\t\t\tchapters {\n\t\t\t\t\t...ChapterFields\n\t\t\t\t}\n\t\t\t\tseries {\n\t\t\t\t\t...SeriesFields\n\t\t\t\t\tlibraryStatus\n\t\t\t\t\tisFavorite\n\t\t\t\t\tviews {\n\t\t\t\t\t\ttotal\n\t\t\t\t\t\tlast7d\n\t\t\t\t\t\tlast24h\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t\taggregated @include(if: $withAggregated) {\n\t\t\t\tnumber\n\t\t\t\tlabel\n\t\t\t\ttitle\n\t\t\t\t# Own line, no alias — the unknown-field fallback strips it by line.\n\t\t\t\tfirstReleasedAt\n\t\t\t\tchapterVolume\n\t\t\t\t# One entry per COPY: every (source, scanlation group) upload of the number.\n\t\t\t\t# The two copy… fields are opportunistic (OPTIONAL_SERIES_FIELDS).\n\t\t\t\tsources {\n\t\t\t\t\tsourceType\n\t\t\t\t\tsourceId\n\t\t\t\t\tsuwayomiMangaId\n\t\t\t\t\tchapterId\n\t\t\t\t\tscanlator\n\t\t\t\t\tcopyReleasedAt\n\t\t\t\t\tcopyExternalUrl\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n',
+	SET_PROGRESS:
+		'\n\tmutation SetProgress($chapterId: ID!, $lastPageRead: Int!, $read: Boolean!) {\n\t\tsetProgress(chapterId: $chapterId, lastPageRead: $lastPageRead, read: $read)\n\t}\n',
+	MARK: '\n\t\n\tfragment SeriesFields on Series {\n\t\tid\n\t\ttitle\n\t\taltTitles\n\t\tauthor\n\t\tartist\n\t\tdescription\n\t\tgenres\n\t\ttype\n\t\tstatus\n\t\tcoverUrl\n\t\tsourceId\n\t\tchapterCount\n\t\tisMarked\n\t\tisNsfw\n\t\trating {\n\t\t\taverage\n\t\t\tcount\n\t\t\tdistribution\n\t\t}\n\t\tmangadexRating\n\t\tscan {\n\t\t\tavgIntervalHours\n\t\t\toverrideIntervalHours\n\t\t\tpollEveryMinutes\n\t\t\tpaused\n\t\t\tstatusOverride\n\t\t\tpausedOverride\n\t\t\tpollEveryMinutesOverride\n\t\t\tlastScannedAt\n\t\t\tnextScanAt\n\t\t}\n\t\tcreatedAt\n\t\tupdatedAt\n\t\t# Chapter recency. `updatedAt` is a metadata touch that moves on every poll,\n\t\t# so it can never be the "· 4h" label; `latestChapterAt` is the real publish\n\t\t# time and `detectedAt` is when we found it. Keep `detectedAt` on its own\n\t\t# line — the unknown-field fallback strips it by line (OPTIONAL_SERIES_FIELDS).\n\t\tlatestChapterAt\n\t\tdetectedAt\n\t\t# The newest chapter\'s NUMBER ("151"), which is NOT `chapterCount` ("12 ch") —\n\t\t# printing the count under a "Ch." label is the F4 bug the chapter-number contract\n\t\t# exists to prevent, so a null here means print the count ALONE. Own line, no alias\n\t\t# and no arguments, because the unknown-field fallback strips it by line\n\t\t# (OPTIONAL_SERIES_FIELDS) — this field is newer than the deployed API, and without\n\t\t# that entry a reader shipped first would fail EVERY series query rather than lose\n\t\t# one label.\n\t\tlatestChapter\n\t}\n\n\tmutation Mark($seriesId: ID!, $marked: Boolean!) {\n\t\tmark(seriesId: $seriesId, marked: $marked) {\n\t\t\t...SeriesFields\n\t\t\tlibraryStatus\n\t\t\tisFavorite\n\t\t}\n\t}\n',
+	RECORD_VIEW:
+		'\n\tmutation RecordView($seriesId: ID!) {\n\t\trecordView(seriesId: $seriesId)\n\t}\n',
+	POST_COMMENT:
+		'\n\t\n\tfragment UserRefFields on UserRef {\n\t\tid\n\t\tusername\n\t\tavatarUrl\n\t}\n\n\tmutation PostComment($input: PostCommentInput!) {\n\t\tpostComment(input: $input) {\n\t\t\tid\n\t\t\ttargetType\n\t\t\ttargetId\n\t\t\tparentId\n\t\t\tauthor {\n\t\t\t\t...UserRefFields\n\t\t\t}\n\t\t\tbody\n\t\t\thasSpoiler\n\t\t\tmediaUrl\n\t\t\tmediaWidth\n\t\t\tmediaHeight\n\t\t\tcreatedAt\n\t\t\tlikes\n\t\t\tdislikes\n\t\t\tmyVote\n\t\t}\n\t}\n',
+	DELETE_COMMENT:
+		'\n\tmutation DeleteComment($commentId: ID!) {\n\t\tdeleteComment(commentId: $commentId)\n\t}\n',
+	COMMENTS:
+		'\n\t\n\tfragment UserRefFields on UserRef {\n\t\tid\n\t\tusername\n\t\tavatarUrl\n\t}\n\n\tquery Comments($targetType: String!, $targetId: ID!, $page: Int) {\n\t\tcomments(targetType: $targetType, targetId: $targetId, page: $page) {\n\t\t\titems {\n\t\t\t\tid\n\t\t\t\ttargetType\n\t\t\t\ttargetId\n\t\t\t\tparentId\n\t\t\t\tdeletedBy\n\t\t\t\tauthor {\n\t\t\t\t\t...UserRefFields\n\t\t\t\t}\n\t\t\t\tbody\n\t\t\t\thasSpoiler\n\t\t\t\tmediaUrl\n\t\t\t\tmediaWidth\n\t\t\t\tmediaHeight\n\t\t\t\tcreatedAt\n\t\t\t\tlikes\n\t\t\t\tdislikes\n\t\t\t\tmyVote\n\t\t\t}\n\t\t\tpage\n\t\t\thasNextPage\n\t\t\ttotal\n\t\t}\n\t}\n',
+	REVIEWS:
+		'\n\t\n\tfragment UserRefFields on UserRef {\n\t\tid\n\t\tusername\n\t\tavatarUrl\n\t}\n\n\tquery Reviews($seriesId: ID!, $page: Int) {\n\t\treviews(seriesId: $seriesId, page: $page) {\n\t\t\titems {\n\t\t\t\tid\n\t\t\t\tseriesId\n\t\t\t\tauthor {\n\t\t\t\t\t...UserRefFields\n\t\t\t\t}\n\t\t\t\tscore\n\t\t\t\tbody\n\t\t\t\thasSpoiler\n\t\t\t\tcreatedAt\n\t\t\t\tupdatedAt\n\t\t\t}\n\t\t\tpage\n\t\t\thasNextPage\n\t\t\ttotal\n\t\t}\n\t}\n',
+	MY_REVIEW:
+		'\n\t\n\tfragment UserRefFields on UserRef {\n\t\tid\n\t\tusername\n\t\tavatarUrl\n\t}\n\n\tquery MyReview($seriesId: ID!) {\n\t\tmyReview(seriesId: $seriesId) {\n\t\t\tid\n\t\t\tseriesId\n\t\t\tauthor {\n\t\t\t\t...UserRefFields\n\t\t\t}\n\t\t\tscore\n\t\t\tbody\n\t\t\thasSpoiler\n\t\t\tcreatedAt\n\t\t\tupdatedAt\n\t\t}\n\t}\n',
+	CANONICAL_PAGES:
+		'\n\tquery CanonicalPages($chapterId: ID!) {\n\t\tcanonicalPages(chapterId: $chapterId) {\n\t\t\tindex\n\t\t\tsourceUrl\n\t\t\twidth\n\t\t\theight\n\t\t}\n\t}\n',
+	PAGES:
+		'\n\tquery Pages($chapterId: ID!) {\n\t\tpages(chapterId: $chapterId) {\n\t\t\tindex\n\t\t\tsourceUrl\n\t\t\twidth\n\t\t\theight\n\t\t}\n\t}\n',
+	SESSION:
+		'\n\t\n\t\n\tfragment SessionUserFields on SessionUser {\n\t\tid\n\t\tusername\n\t\tdisplayName\n\t\tbio\n\t\tavatarUrl\n\t\tisAdmin\n\t\tshowNsfw\n\t\tjoinedAt\n\t\tmustChangePassword\n\t}\n\n\tfragment SessionFields on Session {\n\t\ttoken\n\t\tuser {\n\t\t\t...SessionUserFields\n\t\t}\n\t}\n\n\tquery Session {\n\t\tsession {\n\t\t\t...SessionFields\n\t\t}\n\t}\n',
+	LOGIN:
+		'\n\t\n\t\n\tfragment SessionUserFields on SessionUser {\n\t\tid\n\t\tusername\n\t\tdisplayName\n\t\tbio\n\t\tavatarUrl\n\t\tisAdmin\n\t\tshowNsfw\n\t\tjoinedAt\n\t\tmustChangePassword\n\t}\n\n\tfragment SessionFields on Session {\n\t\ttoken\n\t\tuser {\n\t\t\t...SessionUserFields\n\t\t}\n\t}\n\n\tmutation Login($username: String!, $password: String!) {\n\t\tlogin(username: $username, password: $password) {\n\t\t\t...SessionFields\n\t\t}\n\t}\n',
+	REGISTER:
+		'\n\t\n\t\n\tfragment SessionUserFields on SessionUser {\n\t\tid\n\t\tusername\n\t\tdisplayName\n\t\tbio\n\t\tavatarUrl\n\t\tisAdmin\n\t\tshowNsfw\n\t\tjoinedAt\n\t\tmustChangePassword\n\t}\n\n\tfragment SessionFields on Session {\n\t\ttoken\n\t\tuser {\n\t\t\t...SessionUserFields\n\t\t}\n\t}\n\n\tmutation Register($input: RegisterInput!) {\n\t\tregister(input: $input) {\n\t\t\t...SessionFields\n\t\t}\n\t}\n',
+	UNREAD_NOTIFICATION_COUNT:
+		'\n\tquery UnreadNotificationCount {\n\t\tunreadNotificationCount\n\t}\n',
 };
 
 // ---------------------------------------------------------------------------
@@ -240,14 +257,34 @@ const FLAGS = {
 	'--max-image-p95': ['maxImageP95', 'num', 5000, 'stop the ramp above this image p95, ms'],
 	'--max-errors': ['maxErrors', 'num', 0.01, 'stop the ramp above this error share'],
 	'--timeout': ['timeout', 'num', 30, 'request timeout, seconds'],
-	'--json': ['json', 'str', null, 'write the full result to this file (suite default: ./capacity-<run>.json)'],
+	'--json': [
+		'json',
+		'str',
+		null,
+		'write the full result to this file (suite default: ./capacity-<run>.json)',
+	],
 	'--ops': ['ops', 'bool', false, 'print a per-operation table after each step'],
-	'--seed': ['seed', 'str', null, 'seed for pool choice and user paths (default: random, recorded)'],
+	'--seed': [
+		'seed',
+		'str',
+		null,
+		'seed for pool choice and user paths (default: random, recorded)',
+	],
 	'--metrics-url': ['metricsUrl', 'str', null, 'Prometheus text endpoint scraped around each step'],
 	'--metrics-interval': ['metricsInterval', 'num', 5, 'seconds between metrics samples in a step'],
-	'--host-cmd': ['hostCmd', 'str', null, 'shell command per step, {label} {seconds}; JSON stdout kept'],
+	'--host-cmd': [
+		'hostCmd',
+		'str',
+		null,
+		'shell command per step, {label} {seconds}; JSON stdout kept',
+	],
 	'--host-timeout': ['hostTimeout', 'num', 120, 'seconds a host command may run past its window'],
-	'--host-ready-timeout': ['hostReadyTimeout', 'num', 30, 'seconds to wait for the host command READY line'],
+	'--host-ready-timeout': [
+		'hostReadyTimeout',
+		'num',
+		30,
+		'seconds to wait for the host command READY line',
+	],
 	'--image-digest': ['imageDigest', 'str', null, 'server image digest, recorded in the manifest'],
 	'--settings-file': ['settingsFile', 'str', null, "the server's effective environment, recorded"],
 	'--accounts': ['accounts', 'num', null, 'test accounts (default: the largest step)'],
@@ -262,7 +299,12 @@ const FLAGS = {
 	'--prewarm-max-ms': ['prewarmMax', 'num', 3000, 'leave out works whose series page stays slower'],
 	'--setup-only': ['setupOnly', 'bool', false, 'do the setup, print it, send no load'],
 	'--hot-works': ['hotWorks', 'num', null, 'concentrate every virtual user on this many works'],
-	'--progress-pattern': ['progressPattern', 'str', 'random', 'write: sequential | random progress writes'],
+	'--progress-pattern': [
+		'progressPattern',
+		'str',
+		'random',
+		'write: sequential | random progress writes',
+	],
 	'--typo-share': ['typoShare', 'num', 0.1, 'share of searches with a one-letter typo'],
 	'--mix': ['mix', 'str', null, 'weights, e.g. discovery=4,series=5 (see --list)'],
 	'--anon-method': ['anonMethod', 'str', 'get', 'get | post for anonymous reads'],
@@ -271,21 +313,76 @@ const FLAGS = {
 	'--chapter-pages': ['chapterPages', 'num', 20, 'session: pages when a chapter reports none'],
 	'--chapters': ['chapters', 'num', 3, 'session: chapters read per series visit'],
 	'--think': ['think', 'num', 8, 'session: seconds between page opens'],
-	'--next-seconds': ['nextSeconds', 'num', 3, "session: seconds from a chapter's last page to the next chapter"],
+	'--next-seconds': [
+		'nextSeconds',
+		'num',
+		3,
+		"session: seconds from a chapter's last page to the next chapter",
+	],
 	'--quit-share': ['quitShare', 'num', 0.15, 'session: chapters left half-way'],
 	'--mark-share': ['markShare', 'num', 0.1, 'session: series opens followed by a library mark'],
 	'--search-share': ['searchShare', 'num', 0.2, 'session: home opens followed by a search'],
-	'--comment-share': ['commentShare', 'num', 0.02, 'session: chapters with a comment (posted, then deleted)'],
-	'--with-pages': ['withPages', 'bool', false, 'session: also request the page list (calls upstream)'],
-	'--img-base': ['imgBase', 'str', null, 'image proxy origin for foreign image URLs (default --target)'],
-	'--own-hosts': ['ownHosts', 'str', null, "hosts whose own-asset URLs load from --target (comma list)"],
-	'--image-chapters': ['imageChapters', 'num', 12, 'image steps: chapters whose page list is fetched'],
-	'--image-urls': ['imageUrls', 'num', 400, 'image steps: cap on harvested image URLs (= warm pass)'],
-	'--prefetch-pages': ['prefetchPages', 'num', 3, 'mixed/release-burst: page images loaded at chapter open'],
-	'--fixture-images': ['fixtureImages', 'str', null, 'fixture images: URL file, or a URL template with {n} / {run}'],
+	'--comment-share': [
+		'commentShare',
+		'num',
+		0.02,
+		'session: chapters with a comment (posted, then deleted)',
+	],
+	'--with-pages': [
+		'withPages',
+		'bool',
+		false,
+		'session: also request the page list (calls upstream)',
+	],
+	'--img-base': [
+		'imgBase',
+		'str',
+		null,
+		'image proxy origin for foreign image URLs (default --target)',
+	],
+	'--own-hosts': [
+		'ownHosts',
+		'str',
+		null,
+		'hosts whose own-asset URLs load from --target (comma list)',
+	],
+	'--image-chapters': [
+		'imageChapters',
+		'num',
+		12,
+		'image steps: chapters whose page list is fetched',
+	],
+	'--image-urls': [
+		'imageUrls',
+		'num',
+		400,
+		'image steps: cap on harvested image URLs (= warm pass)',
+	],
+	'--prefetch-pages': [
+		'prefetchPages',
+		'num',
+		3,
+		'mixed/release-burst: page images loaded at chapter open',
+	],
+	'--fixture-images': [
+		'fixtureImages',
+		'str',
+		null,
+		'fixture images: URL file, or a URL template with {n} / {run}',
+	],
 	'--fixture-start': ['fixtureStart', 'num', 1, 'first {n} of a --fixture-images template'],
-	'--real-source-sample': ['realSourceSample', 'num', 0, `real-source image fetches allowed in the whole run (max ${200})`],
-	'--burst-works': ['burstWorks', 'num', 1, 'release-burst: works whose newest chapter everyone opens'],
+	'--real-source-sample': [
+		'realSourceSample',
+		'num',
+		0,
+		`real-source image fetches allowed in the whole run (max ${200})`,
+	],
+	'--burst-works': [
+		'burstWorks',
+		'num',
+		1,
+		'release-burst: works whose newest chapter everyone opens',
+	],
 	'--bursts': ['bursts', 'num', 1, 'release-burst: openings per user'],
 	'--burst-gap': ['burstGap', 'num', 60, 'release-burst: seconds between openings'],
 	'--stop-file': ['stopFile', 'str', null, 'stop sending as soon as this file exists'],
@@ -297,12 +394,40 @@ const KEY_TO_FLAG = Object.fromEntries(Object.entries(FLAGS).map(([flag, [key]])
 // Run-wide options: one value for the whole run. A suite may set them in `defaults`,
 // never in a step, and an explicit command-line flag wins.
 const GLOBAL_KEYS = new Set([
-	'target', 'suite', 'json', 'seed', 'metricsUrl', 'metricsInterval', 'hostCmd', 'hostTimeout',
-	'imageDigest', 'settingsFile', 'accounts', 'prefix', 'password', 'state', 'shareAccounts', 'pool',
-	'sample', 'setupRate', 'setupConcurrency', 'prewarmMax', 'setupOnly', 'imgBase', 'ownHosts',
-	'imageChapters', 'imageUrls', 'fixtureImages', 'fixtureStart', 'stopFile', 'queries', 'list',
-	'realSourceSample', 'hostReadyTimeout',
-	'anonMethod', 'noGzip',
+	'target',
+	'suite',
+	'json',
+	'seed',
+	'metricsUrl',
+	'metricsInterval',
+	'hostCmd',
+	'hostTimeout',
+	'imageDigest',
+	'settingsFile',
+	'accounts',
+	'prefix',
+	'password',
+	'state',
+	'shareAccounts',
+	'pool',
+	'sample',
+	'setupRate',
+	'setupConcurrency',
+	'prewarmMax',
+	'setupOnly',
+	'imgBase',
+	'ownHosts',
+	'imageChapters',
+	'imageUrls',
+	'fixtureImages',
+	'fixtureStart',
+	'stopFile',
+	'queries',
+	'list',
+	'realSourceSample',
+	'hostReadyTimeout',
+	'anonMethod',
+	'noGzip',
 ]);
 // What a suite step defines; the command line may not set these next to --suite.
 const STEP_ONLY_KEYS = new Set(['scenario', 'label', 'vus', 'rate', 'users']);
@@ -317,7 +442,8 @@ function die(msg, code = 1) {
 function usage() {
 	console.log('komika capacity probe\n');
 	for (const [flag, [, type, def, help]] of Object.entries(FLAGS)) {
-		const arg = type === 'bool' ? '' : type === 'list' ? ' a,b,c' : type === 'num' ? ' <n>' : ' <s>';
+		const arg =
+			type === 'bool' ? '' : type === 'list' ? ' a,b,c' : type === 'num' ? ' <n>' : ' <s>';
 		const d = def === null || def === false ? '' : `  (default ${def})`;
 		console.log(`  ${(flag + arg).padEnd(26)} ${help}${d}`);
 	}
@@ -380,7 +506,9 @@ function suiteOptions(obj, where, allowGlobal) {
 		if (!flag) throw new UsageError(`${where}unknown option: ${k}`);
 		const key = setOption(out, flag, v, where);
 		if (!allowGlobal && GLOBAL_KEYS.has(key))
-			throw new UsageError(`${where}${flag} is run-wide: put it in the suite's "defaults" or on the command line`);
+			throw new UsageError(
+				`${where}${flag} is run-wide: put it in the suite's "defaults" or on the command line`,
+			);
 	}
 	return out;
 }
@@ -393,15 +521,19 @@ function validateStep(o) {
 	if (!['sequential', 'random'].includes(o.progressPattern))
 		throw new UsageError('--progress-pattern is sequential or random');
 	if (!Number.isInteger(o.realSourceSample) || o.realSourceSample > REAL_SOURCE_MAX)
-		throw new UsageError(`--real-source-sample is a whole number from 0 to ${REAL_SOURCE_MAX} (real-source image fetches in the whole run)`);
+		throw new UsageError(
+			`--real-source-sample is a whole number from 0 to ${REAL_SOURCE_MAX} (real-source image fetches in the whole run)`,
+		);
 	if (!/^[A-Za-z0-9_.-]{1,24}$/.test(o.prefix))
 		throw new UsageError('--prefix: 1-24 characters from letters, digits and _ - .');
 	if (sc.shape === 'users' && (o.vus || o.rate))
 		throw new UsageError(`${o.scenario} is driven by --users, not --vus/--rate`);
-	if (sc.shape === 'loop' && o.users) throw new UsageError(`--users belongs to session, mixed and release-burst`);
+	if (sc.shape === 'loop' && o.users)
+		throw new UsageError(`--users belongs to session, mixed and release-burst`);
 	if (o.vus && o.rate) throw new UsageError('--vus and --rate are mutually exclusive');
 	if (o.hotWorks !== null && o.hotWorks < 1) throw new UsageError('--hot-works needs at least 1');
-	if (o.mix && !['read', 'write'].includes(o.scenario)) throw new UsageError('--mix applies to read and write');
+	if (o.mix && !['read', 'write'].includes(o.scenario))
+		throw new UsageError('--mix applies to read and write');
 	if (o.mix) mixFor(o);
 }
 
@@ -422,13 +554,15 @@ function mixFor(o) {
 			table[k] = Number(v);
 		}
 	}
-	if (!Object.values(table).some((w) => w > 0)) throw new UsageError('every weight in the mix is zero');
+	if (!Object.values(table).some((w) => w > 0))
+		throw new UsageError('every weight in the mix is zero');
 	return table;
 }
 
 function loadsFor(o) {
 	const sc = SCENARIOS[o.scenario];
-	if (sc.shape === 'users') return (o.users ?? [10, 25, 50, 100]).map((n) => ({ users: Math.round(n) }));
+	if (sc.shape === 'users')
+		return (o.users ?? [10, 25, 50, 100]).map((n) => ({ users: Math.round(n) }));
 	if (o.rate) return o.rate.map((n) => ({ rate: n }));
 	return (o.vus ?? [1, 2, 4, 8, 16, 32, 64]).map((n) => ({ vus: Math.round(n) }));
 }
@@ -440,7 +574,10 @@ function loadsFor(o) {
 // The production addresses come from configuration, never from the source:
 // KOMIKA_PRODUCTION_IPS and deploy/production-ips.local (see SAFETY at the top).
 export const PRODUCTION_IPS_ENV = 'KOMIKA_PRODUCTION_IPS';
-export const PRODUCTION_IPS_FILE = resolvePath(dirname(fileURLToPath(import.meta.url)), '../../../deploy/production-ips.local');
+export const PRODUCTION_IPS_FILE = resolvePath(
+	dirname(fileURLToPath(import.meta.url)),
+	'../../../deploy/production-ips.local',
+);
 export const PRODUCTION_UNCONFIGURED_WARNING =
 	`warning: no production address is configured (${PRODUCTION_IPS_ENV} or deploy/production-ips.local);\n` +
 	'         only komiq.cc and *.komiq.cc are refused.';
@@ -468,12 +605,14 @@ export function readProductionAddresses({ env = process.env, file = PRODUCTION_I
 		if (b) found.add(b.join('.'));
 		else bad.push(`${where}: '${entry}'`);
 	};
-	for (const entry of String(env[PRODUCTION_IPS_ENV] ?? '').split(/[\s,]+/)) if (entry) add(entry, PRODUCTION_IPS_ENV);
+	for (const entry of String(env[PRODUCTION_IPS_ENV] ?? '').split(/[\s,]+/))
+		if (entry) add(entry, PRODUCTION_IPS_ENV);
 	let text = null;
 	try {
 		text = readFileSync(file, 'utf8');
 	} catch (e) {
-		if (e.code !== 'ENOENT') throw new ProductionConfigError(`${file} cannot be read: ${e.code || e.message}`);
+		if (e.code !== 'ENOENT')
+			throw new ProductionConfigError(`${file} cannot be read: ${e.code || e.message}`);
 	}
 	if (text !== null)
 		text.split(/\r?\n/).forEach((line, i) => {
@@ -496,14 +635,20 @@ export function setProductionAddresses(list) {
 	});
 	productionBytes = bytes;
 	const escaped = bytes.map((b) => b.join('\\.'));
-	productionAddressText = escaped.length ? new RegExp(`(^|[^a-z0-9-])(${escaped.join('|')})(?![a-z0-9-])`, 'i') : null;
+	productionAddressText = escaped.length
+		? new RegExp(`(^|[^a-z0-9-])(${escaped.join('|')})(?![a-z0-9-])`, 'i')
+		: null;
 }
 
 /**
  * Read the configuration, use it, and warn once (through `warn`) when it names no
  * address. Throws ProductionConfigError on a bad entry.
  */
-export function loadProductionConfig({ env = process.env, file = PRODUCTION_IPS_FILE, warn = (m) => console.error(m) } = {}) {
+export function loadProductionConfig({
+	env = process.env,
+	file = PRODUCTION_IPS_FILE,
+	warn = (m) => console.error(m),
+} = {}) {
 	const list = readProductionAddresses({ env, file });
 	setProductionAddresses(list);
 	if (!list.length) warn(PRODUCTION_UNCONFIGURED_WARNING);
@@ -520,7 +665,9 @@ const isProductionBytes = (b) => !!b && productionAddresses().some((p) => sameBy
 
 /** 16 bytes of an IPv6 address (with or without brackets), or null. */
 function ipv6Bytes(text) {
-	let h = String(text).replace(/^\[|\]$/g, '').split('%')[0];
+	let h = String(text)
+		.replace(/^\[|\]$/g, '')
+		.split('%')[0];
 	if (!h.includes(':')) return null;
 	let tail = [];
 	const v4 = /(\d+\.\d+\.\d+\.\d+)$/.exec(h);
@@ -554,7 +701,8 @@ function embeddedIpv4(b) {
 	if (zero(0, 10) && b[10] === 0xff && b[11] === 0xff) return b.slice(12); // ::ffff:a.b.c.d
 	if (zero(0, 12)) return b.slice(12); // ::a.b.c.d (compatible)
 	if (zero(0, 8) && b[8] === 0xff && b[9] === 0xff && zero(10, 12)) return b.slice(12); // ::ffff:0:a.b.c.d
-	if (b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b && zero(4, 12)) return b.slice(12); // 64:ff9b::/96
+	if (b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b && zero(4, 12))
+		return b.slice(12); // 64:ff9b::/96
 	if (b[0] === 0x20 && b[1] === 0x02) return b.slice(2, 6); // 2002:AABB:CCDD::/16
 	return null;
 }
@@ -645,7 +793,8 @@ export function productionRefusal(o, fixtureOrigins = []) {
 		const host = hostOfUrl(value);
 		if (host === null) continue; // not a URL: the normal validation reports it
 		if (isProductionHost(host)) return `${flag} ${redactUrl(value)} is production (${host})`;
-		if (urlQueryNamesProduction(value)) return `${flag} ${redactUrl(value)} carries a production address in its query`;
+		if (urlQueryNamesProduction(value))
+			return `${flag} ${redactUrl(value)} carries a production address in its query`;
 	}
 	for (const h of String(o.ownHosts ?? '').split(',')) {
 		if (h.trim() && isProductionHost(h)) return `--own-hosts names production (${h.trim()})`;
@@ -676,7 +825,8 @@ export function redactUrl(value) {
 	return String(value ?? '').replace(/(\/\/[^:/@\s]+:)[^@\s/]+@/g, '$1<redacted>@');
 }
 
-const SECRET_ASSIGNMENT = /\b([A-Za-z0-9_]*(?:pass|secret|token|key|credential|auth|private|pwd)[A-Za-z0-9_]*)=("[^"]*"|'[^']*'|\S+)/gi;
+const SECRET_ASSIGNMENT =
+	/\b([A-Za-z0-9_]*(?:pass|secret|token|key|credential|auth|private|pwd)[A-Za-z0-9_]*)=("[^"]*"|'[^']*'|\S+)/gi;
 
 /**
  * Command text safe to record: secret-looking assignments (PGPASSWORD=…, TOKEN=…), the
@@ -688,7 +838,10 @@ export function redactCommand(cmd) {
 	return redactUrl(String(cmd))
 		.replace(SECRET_ASSIGNMENT, '$1=<redacted>')
 		.replace(/(\bsshpass\b(?:\s+-[a-oq-zA-Z]+)*\s+-p)\s*("[^"]*"|'[^']*'|\S+)/g, '$1 <redacted>')
-		.replace(/(--?(?:password|passwd|pass|token|secret)(?:=|\s+))("[^"]*"|'[^']*'|\S+)/gi, '$1<redacted>');
+		.replace(
+			/(--?(?:password|passwd|pass|token|secret)(?:=|\s+))("[^"]*"|'[^']*'|\S+)/gi,
+			'$1<redacted>',
+		);
 }
 
 function refuseProduction(why) {
@@ -823,7 +976,14 @@ function compiled(name) {
 function gql(vu, name, label, kind, variables, o = {}) {
 	const c = compiled(name);
 	const token = o.anonymous ? null : vu.token;
-	const req = { label, kind, xff: vu.xff, want: !!o.want, timeoutMs: o.timeoutMs, work: o.work ?? null };
+	const req = {
+		label,
+		kind,
+		xff: vu.xff,
+		want: !!o.want,
+		timeoutMs: o.timeoutMs,
+		work: o.work ?? null,
+	};
 	if (!token && kind === 'read' && GLOBAL.anonMethod === 'get' && !o.post) {
 		req.method = 'GET';
 		req.path = `${GQL_PATH}?query=${c.enc}`;
@@ -845,7 +1005,10 @@ function magicOf(head) {
 	if (head[0] === 0xff && head[1] === 0xd8) return 'jpeg';
 	if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) return 'png';
 	if (head.subarray(0, 4).toString('latin1') === 'GIF8') return 'gif';
-	if (head.subarray(0, 4).toString('latin1') === 'RIFF' && head.subarray(8, 12).toString('latin1') === 'WEBP')
+	if (
+		head.subarray(0, 4).toString('latin1') === 'RIFF' &&
+		head.subarray(8, 12).toString('latin1') === 'WEBP'
+	)
 		return 'webp';
 	if (head.subarray(4, 8).toString('latin1') === 'ftyp') return 'isobmff';
 	return 'unknown';
@@ -902,12 +1065,19 @@ function send(req) {
 				res.on('data', (c) => {
 					if (req.image) {
 						if (!head) head = Buffer.from(c.subarray(0, 16));
-						else if (head.length < 16) head = Buffer.concat([head, c.subarray(0, 16 - head.length)]);
+						else if (head.length < 16)
+							head = Buffer.concat([head, c.subarray(0, 16 - head.length)]);
 					} else chunks.push(c);
 					n += c.length;
 				});
 				res.on('error', (e) =>
-					settle({ ms: elapsed(), status: 0, bytes: n, kind: `net_${e.code || 'ERR'}`, messages: [] }),
+					settle({
+						ms: elapsed(),
+						status: 0,
+						bytes: n,
+						kind: `net_${e.code || 'ERR'}`,
+						messages: [],
+					}),
 				);
 				res.on('end', () => {
 					const ms = elapsed();
@@ -957,11 +1127,16 @@ export function inspect(req, status, ms, bytes, body) {
 		json = undefined;
 	}
 	const envelope =
-		parsed && json !== null && typeof json === 'object' && !Array.isArray(json) && ('data' in json || 'errors' in json);
+		parsed &&
+		json !== null &&
+		typeof json === 'object' &&
+		!Array.isArray(json) &&
+		('data' in json || 'errors' in json);
 	const listed = Array.isArray(json?.errors)
 		? json.errors.map((e) => String(e?.message ?? '(no message)'))
 		: [];
-	const snippet = () => body.subarray(0, 160).toString('utf8').replace(/\s+/g, ' ').trim() || '(empty body)';
+	const snippet = () =>
+		body.subarray(0, 160).toString('utf8').replace(/\s+/g, ' ').trim() || '(empty body)';
 	let kind = null;
 	let messages = [];
 	if (status < 200 || status >= 300) {
@@ -980,7 +1155,10 @@ export function inspect(req, status, ms, bytes, body) {
 function inspectImage(req, res, ms, bytes, head) {
 	const status = res.statusCode;
 	const h = res.headers;
-	const contentType = String(h['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+	const contentType = String(h['content-type'] ?? '')
+		.split(';')[0]
+		.trim()
+		.toLowerCase();
 	let kind = null;
 	let messages = [];
 	if (status >= 300 && status !== 304) {
@@ -1091,8 +1269,10 @@ class Stats {
 		tally(s.magic, i.magic);
 		if (i.cfCacheStatus) tally(s.cfCacheStatus, i.cfCacheStatus);
 		if (i.xCache) tally(s.xCache, i.xCache);
-		if (i.cacheControl && Object.keys(s.cacheControl).length < 12) tally(s.cacheControl, i.cacheControl);
-		else if (i.cacheControl && s.cacheControl[i.cacheControl]) tally(s.cacheControl, i.cacheControl);
+		if (i.cacheControl && Object.keys(s.cacheControl).length < 12)
+			tally(s.cacheControl, i.cacheControl);
+		else if (i.cacheControl && s.cacheControl[i.cacheControl])
+			tally(s.cacheControl, i.cacheControl);
 		if (i.age !== null) s.withAge++;
 		if (i.etag) s.withEtag++;
 	}
@@ -1127,7 +1307,8 @@ function classSummary(b) {
 function workDistribution(map) {
 	const rows = [...map].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
 	const total = rows.reduce((s, [, n]) => s + n, 0);
-	const share = (k) => (total ? +(rows.slice(0, k).reduce((s, [, n]) => s + n, 0) / total).toFixed(4) : 0);
+	const share = (k) =>
+		total ? +(rows.slice(0, k).reduce((s, [, n]) => s + n, 0) / total).toFixed(4) : 0;
 	return {
 		requests: total,
 		distinctWorks: rows.length,
@@ -1278,11 +1459,17 @@ export function parsePrometheus(text) {
 	}
 	const series = new Map();
 	for (const s of samples)
-		series.set(seriesKey(s.name, s.labels), { name: s.name, labels: s.labels, value: s.value, type: sampleType(s.name, types) });
+		series.set(seriesKey(s.name, s.labels), {
+			name: s.name,
+			labels: s.labels,
+			value: s.value,
+			type: sampleType(s.name, types),
+		});
 	return { series, types };
 }
 
-const num = (v) => (Number.isFinite(v) ? +v.toFixed(6) : v === Infinity ? '+Inf' : v === -Infinity ? '-Inf' : null);
+const num = (v) =>
+	Number.isFinite(v) ? +v.toFixed(6) : v === Infinity ? '+Inf' : v === -Infinity ? '-Inf' : null;
 
 /**
  * One measured window from its scrapes (ordered by time): counter deltas between the
@@ -1295,7 +1482,9 @@ export function metricsWindow(scrapes) {
 	const out = {
 		scrapes: scrapes.length,
 		good: good.length,
-		failures: scrapes.filter((s) => !s.ok).map((s) => ({ phase: s.phase, at: s.at, error: s.error })),
+		failures: scrapes
+			.filter((s) => !s.ok)
+			.map((s) => ({ phase: s.phase, at: s.at, error: s.error })),
 		from: good[0] ? new Date(good[0].at).toISOString() : null,
 		to: good.length ? new Date(good[good.length - 1].at).toISOString() : null,
 		counters: null,
@@ -1345,7 +1534,8 @@ export function metricsWindow(scrapes) {
 			if (s.type !== 'gauge') continue;
 			const v = s.value;
 			const e = out.gauges[key];
-			if (!e) out.gauges[key] = { first: num(v), last: num(v), min: num(v), max: num(v), samples: 1 };
+			if (!e)
+				out.gauges[key] = { first: num(v), last: num(v), min: num(v), max: num(v), samples: 1 };
 			else {
 				e.last = num(v);
 				if (Number.isFinite(v)) {
@@ -1384,7 +1574,10 @@ export function deriveMetrics(counters, meta) {
 				const missName = [...tokens.slice(0, at), miss, ...tokens.slice(at + 1)].join('_');
 				const missKey = seriesKey(missName, s.labels);
 				if (!(missKey in counters)) continue;
-				const id = seriesKey([...tokens.slice(0, at), '*', ...tokens.slice(at + 1)].join('_'), s.labels);
+				const id = seriesKey(
+					[...tokens.slice(0, at), '*', ...tokens.slice(at + 1)].join('_'),
+					s.labels,
+				);
 				if (seen.has(id)) continue;
 				seen.add(id);
 				hitRatios.push(ratio(id, s.name, counters[key], counters[missKey]));
@@ -1442,7 +1635,13 @@ function fetchText(url, timeoutMs = 5000) {
 			return;
 		}
 		const r = (u.protocol === 'https:' ? https : http).get(
-			{ hostname: u.hostname.replace(/^\[|\]$/g, ''), port: u.port || undefined, path: `${u.pathname}${u.search}`, protocol: u.protocol, timeout: timeoutMs },
+			{
+				hostname: u.hostname.replace(/^\[|\]$/g, ''),
+				port: u.port || undefined,
+				path: `${u.pathname}${u.search}`,
+				protocol: u.protocol,
+				timeout: timeoutMs,
+			},
 			(res) => {
 				const chunks = [];
 				res.on('data', (c) => chunks.push(c));
@@ -1536,7 +1735,9 @@ function lastJson(stdout) {
  */
 function hostCommand(label, seconds) {
 	const safeLabel = label.replace(/[^A-Za-z0-9_.-]/g, '_');
-	const command = GLOBAL.hostCmd.replaceAll('{label}', safeLabel).replaceAll('{seconds}', String(Math.ceil(seconds)));
+	const command = GLOBAL.hostCmd
+		.replaceAll('{label}', safeLabel)
+		.replaceAll('{seconds}', String(Math.ceil(seconds)));
 	const shown = redactCommand(command);
 	const started = Date.now();
 	let readyResolve;
@@ -1595,7 +1796,9 @@ function hostCommand(label, seconds) {
 				ok,
 				exitCode: code,
 				signal,
-				...(json !== null ? { json } : { error: code === 0 ? 'no JSON on stdout' : `exit ${code ?? signal}` }),
+				...(json !== null
+					? { json }
+					: { error: code === 0 ? 'no JSON on stdout' : `exit ${code ?? signal}` }),
 				...(ok ? {} : { stderrTail: redactCommand(err.slice(-1000)) }),
 			});
 		});
@@ -1722,7 +1925,9 @@ async function pace() {
 /** A setup request: paced, POST, parsed, never part of a measurement. */
 async function call(vu, name, variables, kind = 'read') {
 	await pace();
-	return send(gql(vu, name, name, kind, variables, { want: true, post: true, timeoutMs: SETUP_TIMEOUT_MS }));
+	return send(
+		gql(vu, name, name, kind, variables, { want: true, post: true, timeoutMs: SETUP_TIMEOUT_MS }),
+	);
 }
 
 async function pmap(items, concurrency, fn) {
@@ -1733,7 +1938,9 @@ async function pmap(items, concurrency, fn) {
 			await fn(items[i], i);
 		}
 	};
-	await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, worker));
+	await Promise.all(
+		Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, worker),
+	);
 }
 
 function loadState() {
@@ -1829,11 +2036,18 @@ async function setupAccounts(accountsWanted, largestStep) {
 	};
 	await pmap(fresh, 3, async (a) => {
 		if (stop) return;
-		const login = () => attempt(a, 'LOGIN', { username: a.username, password: state.password }, 'login');
+		const login = () =>
+			attempt(a, 'LOGIN', { username: a.username, password: state.password }, 'login');
 		let r = await attempt(
 			a,
 			'REGISTER',
-			{ input: { username: a.username, email: `${a.username}@capacity.invalid`, password: state.password } },
+			{
+				input: {
+					username: a.username,
+					email: `${a.username}@capacity.invalid`,
+					password: state.password,
+				},
+			},
 			'register',
 		);
 		let how = 'registered';
@@ -1872,14 +2086,18 @@ async function setupAccounts(accountsWanted, largestStep) {
 	if (stop) {
 		console.error(`\nsetup stopped: ${stop}`);
 		if (!ready.length || !GLOBAL.shareAccounts) {
-			if (ready.length) console.error('       (--share-accounts runs with the accounts that are ready)');
+			if (ready.length)
+				console.error('       (--share-accounts runs with the accounts that are ready)');
 			process.exit(2);
 		}
 	}
 	if (ready.length < largestStep) {
 		const msg = `${ready.length} accounts for up to ${largestStep} users`;
 		if (!GLOBAL.shareAccounts)
-			die(`${msg}: raise --accounts, or pass --share-accounts (users then queue on the per-user write lock).`, 2);
+			die(
+				`${msg}: raise --accounts, or pass --share-accounts (users then queue on the per-user write lock).`,
+				2,
+			);
 		console.log(`          ! ${msg}: accounts are shared, writes of one account run one at a time`);
 	}
 	return { accounts: ready, counts, problem: stop };
@@ -1916,7 +2134,12 @@ async function buildPool() {
 	const anon = () => ({ token: null, xff: xffFor(0xf00000 + setupClient++) });
 	const works = new Map();
 	const problems = [];
-	const dataset = { updatesFeedTotal: null, latestAddedTotal: null, browseTotal: null, discoveryRows: null };
+	const dataset = {
+		updatesFeedTotal: null,
+		latestAddedTotal: null,
+		browseTotal: null,
+		discoveryRows: null,
+	};
 	let other = 0;
 	const take = (items, fromFeed = false) => {
 		for (const it of items ?? []) {
@@ -1963,7 +2186,9 @@ async function buildPool() {
 		if (!res?.hasNextPage) break;
 	}
 	if (!works.size) {
-		die(`no work ids came back from discovery / updatesFeed / search.\n       ${problems.join('\n       ')}`);
+		die(
+			`no work ids came back from discovery / updatesFeed / search.\n       ${problems.join('\n       ')}`,
+		);
 	}
 
 	// Feed works first, so a pool or sample smaller than what came back keeps them.
@@ -1976,7 +2201,10 @@ async function buildPool() {
 	// Search words: what people type is the start of a title.
 	const terms = new Set();
 	for (const w of all) {
-		const words = w.title.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((x) => x.length >= 2);
+		const words = w.title
+			.toLowerCase()
+			.split(/[^\p{L}\p{N}]+/u)
+			.filter((x) => x.length >= 2);
 		if (words[0]?.length >= 4) terms.add(words[0]);
 		if (words.length >= 2) terms.add(`${words[0]} ${words[1]}`);
 		const long = words.find((x) => x.length >= 6);
@@ -2010,19 +2238,34 @@ async function buildPool() {
 		times.push(r.ms);
 		const seen = new Set();
 		const chapters = [];
-		const lists = [bundle.spineChapters ?? [], ...(bundle.sources ?? []).map((s) => s.chapters ?? [])];
+		const lists = [
+			bundle.spineChapters ?? [],
+			...(bundle.sources ?? []).map((s) => s.chapters ?? []),
+		];
 		for (const list of lists) {
 			for (const c of list) {
 				if (!c?.id || seen.has(c.id) || chapters.length >= 120) continue;
 				seen.add(c.id);
-				chapters.push({ id: String(c.id), pages: Number(c.pageCount) || 0, number: c.number ?? null });
+				chapters.push({
+					id: String(c.id),
+					pages: Number(c.pageCount) || 0,
+					number: c.number ?? null,
+				});
 			}
 		}
 		const covers = new Set();
 		if (bundle.series?.coverUrl) covers.add(bundle.series.coverUrl);
 		else if (w.cover) covers.add(w.cover);
-		const newest = chapters.length ? chapters.reduce((a, c) => (chapterNumber(c) > chapterNumber(a) ? c : a)) : null;
-		opened[idx] = { id: bundle.workId || w.id, fromFeed: w.fromFeed, chapters, covers: [...covers], newest };
+		const newest = chapters.length
+			? chapters.reduce((a, c) => (chapterNumber(c) > chapterNumber(a) ? c : a))
+			: null;
+		opened[idx] = {
+			id: bundle.workId || w.id,
+			fromFeed: w.fromFeed,
+			chapters,
+			covers: [...covers],
+			newest,
+		};
 	});
 	// In sample order, not in the order the answers arrived: picks by index stay seeded.
 	const series = opened.filter(Boolean);
@@ -2048,7 +2291,12 @@ async function buildPool() {
 		dataset,
 		workIds,
 		hotOrder: hotOrder.map((w) => w.id),
-		digest: sha256(JSON.stringify({ workIds, chapters: readable.map((s) => [s.id, s.chapters.map((c) => c.id)]) })),
+		digest: sha256(
+			JSON.stringify({
+				workIds,
+				chapters: readable.map((s) => [s.id, s.chapters.map((c) => c.id)]),
+			}),
+		),
 		problems,
 	};
 	console.log(
@@ -2124,7 +2372,8 @@ export function resolveImage(raw, target, imgBase, ownHosts = new Set()) {
 	const elsewhere = !onTarget && (ownHosts.has(abs.hostname) || isProductionHost(abs.hostname));
 	if (onTarget || elsewhere) {
 		const route = imageRoute(abs.pathname);
-		if (!onTarget && !route) return { skip: isProductionHost(abs.hostname) ? 'production-host' : 'unknown-own' };
+		if (!onTarget && !route)
+			return { skip: isProductionHost(abs.hostname) ? 'production-host' : 'unknown-own' };
 		const u = new URL(`${abs.pathname}${abs.search}`, target);
 		return done(u, onTarget ? {} : { rewrittenFrom: abs.hostname });
 	}
@@ -2135,7 +2384,14 @@ export function resolveImage(raw, target, imgBase, ownHosts = new Set()) {
 
 function imageItem(resolved, label, work) {
 	const u = new URL(resolved.url);
-	return { url: resolved.url, u, route: resolved.route, cls: resolved.cls ?? imageClass(resolved.route, u), label, work };
+	return {
+		url: resolved.url,
+		u,
+		route: resolved.route,
+		cls: resolved.cls ?? imageClass(resolved.route, u),
+		label,
+		work,
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -2183,9 +2439,18 @@ const canonicalUrl = (u) => `${u.origin}${u.pathname}${u.search}`;
 export function loadFixtures(spec, runId, target, start = 1) {
 	const item = (href) => {
 		const u = new URL(href, target);
-		if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new UsageError(`--fixture-images: not http(s): ${href}`);
-		if (urlQueryNamesProduction(u.href)) refuseProduction(`--fixture-images address carries production in its query`);
-		return { url: canonicalUrl(u), u: new URL(canonicalUrl(u)), route: 'fixture', cls: 'fixture', label: 'image:fixture', work: null };
+		if (u.protocol !== 'http:' && u.protocol !== 'https:')
+			throw new UsageError(`--fixture-images: not http(s): ${href}`);
+		if (urlQueryNamesProduction(u.href))
+			refuseProduction(`--fixture-images address carries production in its query`);
+		return {
+			url: canonicalUrl(u),
+			u: new URL(canonicalUrl(u)),
+			route: 'fixture',
+			cls: 'fixture',
+			label: 'image:fixture',
+			work: null,
+		};
 	};
 	const isTemplate = spec.includes('{n}');
 	if (/^https?:\/\//i.test(spec) && !isTemplate)
@@ -2194,9 +2459,12 @@ export function loadFixtures(spec, runId, target, start = 1) {
 		const expand = (n) => spec.replaceAll('{n}', String(n)).replaceAll('{run}', runId);
 		const a = new URL(expand(1), target);
 		const b = new URL(expand(2), target);
-		if (a.origin !== b.origin) throw new UsageError('--fixture-images: {n} must not be in the host or port');
+		if (a.origin !== b.origin)
+			throw new UsageError('--fixture-images: {n} must not be in the host or port');
 		if (canonicalUrl(a) === canonicalUrl(b))
-			throw new UsageError('--fixture-images: {n} only changes the #fragment, which is never sent; put it in the path or query');
+			throw new UsageError(
+				'--fixture-images: {n} only changes the #fragment, which is never sent; put it in the path or query',
+			);
 		let standIns = 0;
 		let next = null;
 		const sent = new Set();
@@ -2221,7 +2489,16 @@ export function loadFixtures(spec, runId, target, start = 1) {
 					return { ...it, label: 'image:cold' };
 				}
 			},
-			report: () => ({ source: 'template', spec: redactUrl(spec), origins: [a.origin], standIns, coldFirstN: start + standIns, coldNextN: next, coldUsed: sent.size, duplicates }),
+			report: () => ({
+				source: 'template',
+				spec: redactUrl(spec),
+				origins: [a.origin],
+				standIns,
+				coldFirstN: start + standIns,
+				coldNextN: next,
+				coldUsed: sent.size,
+				duplicates,
+			}),
 		};
 	}
 	let text;
@@ -2235,7 +2512,10 @@ export function loadFixtures(spec, runId, target, start = 1) {
 	try {
 		lines = trimmed.startsWith('[')
 			? JSON.parse(trimmed).map(String)
-			: trimmed.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+			: trimmed
+					.split('\n')
+					.map((l) => l.trim())
+					.filter((l) => l && !l.startsWith('#'));
 	} catch (e) {
 		throw new UsageError(`--fixture-images ${spec}: ${e.message}`);
 	}
@@ -2331,15 +2611,19 @@ async function harvestImages(maxBurstWorks, needPages) {
 	await pmap(chosen, GLOBAL.setupConcurrency, async ({ ch }) => {
 		const numeric = /^\d+$/.test(ch.id);
 		const r = await call(anon(), numeric ? 'PAGES' : 'CANONICAL_PAGES', { chapterId: ch.id });
-		const list = r.kind === null ? (numeric ? r.json?.data?.pages : r.json?.data?.canonicalPages) : null;
+		const list =
+			r.kind === null ? (numeric ? r.json?.data?.pages : r.json?.data?.canonicalPages) : null;
 		if (!Array.isArray(list)) {
 			pageLists.failed++;
-			if (pageLists.problems.length < 8) pageLists.problems.push(`${ch.id}: ${r.kind} ${r.messages[0] ?? ''}`.trim());
+			if (pageLists.problems.length < 8)
+				pageLists.problems.push(`${ch.id}: ${r.kind} ${r.messages[0] ?? ''}`.trim());
 			return;
 		}
 		if (!list.length) pageLists.empty++;
 		else pageLists.ok++;
-		ch.pageSources = [...list].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)).map((p) => p.sourceUrl);
+		ch.pageSources = [...list]
+			.sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+			.map((p) => p.sourceUrl);
 	});
 
 	// Covers: the master, and the card size for a resizable store cover.
@@ -2354,7 +2638,9 @@ async function harvestImages(maxBurstWorks, needPages) {
 			if (r.route === 'covers' && coverItems.length < coverCap) {
 				const card = new URL(r.url);
 				card.searchParams.set('w', '192');
-				coverItems.push(imageItem({ ...r, url: card.href, route: 'covers:w192' }, 'image:cover-card', w.id));
+				coverItems.push(
+					imageItem({ ...r, url: card.href, route: 'covers:w192' }, 'image:cover-card', w.id),
+				);
 			}
 		}
 	}
@@ -2395,7 +2681,17 @@ async function harvestImages(maxBurstWorks, needPages) {
 	// Real-source addresses count against --real-source-sample here too.
 	const all = [...coverItems, ...pageItems];
 	const unique = [...new Map(all.map((i) => [i.url, i])).values()];
-	const warm = { urls: unique.length, ok: 0, failed: 0, notFetchedRealCap: 0, bytes: 0, byKind: {}, byRoute: {}, byClass: {}, ms: [] };
+	const warm = {
+		urls: unique.length,
+		ok: 0,
+		failed: 0,
+		notFetchedRealCap: 0,
+		bytes: 0,
+		byKind: {},
+		byRoute: {},
+		byClass: {},
+		ms: [],
+	};
 	const started = Date.now();
 	await pmap(unique, Math.max(2, GLOBAL.setupConcurrency * 2), async (img) => {
 		if (img.cls === 'real' && !takeReal()) {
@@ -2403,7 +2699,14 @@ async function harvestImages(maxBurstWorks, needPages) {
 			return;
 		}
 		await pace();
-		const r = await send({ image: true, url: img.u, route: img.route, label: img.label, xff: xffFor(0xd00000 + (setupClient++ % 4096)), timeoutMs: SETUP_TIMEOUT_MS });
+		const r = await send({
+			image: true,
+			url: img.u,
+			route: img.route,
+			label: img.label,
+			xff: xffFor(0xd00000 + (setupClient++ % 4096)),
+			timeoutMs: SETUP_TIMEOUT_MS,
+		});
 		const route = (warm.byRoute[img.route] ??= { urls: 0, ok: 0, bytes: 0 });
 		const cls = (warm.byClass[img.cls] ??= { urls: 0, ok: 0, bytes: 0 });
 		route.urls++;
@@ -2424,7 +2727,12 @@ async function harvestImages(maxBurstWorks, needPages) {
 	});
 	const okUrls = new Set(unique.filter((i) => i.warm).map((i) => i.url));
 	const isWarm = (i) => okUrls.has(i.url);
-	const warmPass = { ...warm, ms: dist(warm.ms), seconds: +((Date.now() - started) / 1000).toFixed(2), at: new Date().toISOString() };
+	const warmPass = {
+		...warm,
+		ms: dist(warm.ms),
+		seconds: +((Date.now() - started) / 1000).toFixed(2),
+		at: new Date().toISOString(),
+	};
 	for (const { ch } of chosen) if (ch.pageImgs) ch.pageImgs = ch.pageImgs.filter(isWarm);
 	const list = unique.filter(isWarm);
 	const byClass = {};
@@ -2433,7 +2741,11 @@ async function harvestImages(maxBurstWorks, needPages) {
 		policy:
 			'store covers and fixture addresses only; real-source addresses (engine pages, /img, nested ' +
 			'sources) only under --real-source-sample, counted against it everywhere',
-		chaptersChosen: chosen.map(({ work, ch }) => ({ work: work.id, chapter: ch.id, pages: ch.pageImgs?.length ?? 0 })),
+		chaptersChosen: chosen.map(({ work, ch }) => ({
+			work: work.id,
+			chapter: ch.id,
+			pages: ch.pageImgs?.length ?? 0,
+		})),
 		pageLists,
 		coverUrls: coverItems.length,
 		pageUrls: pageItems.length,
@@ -2497,7 +2809,8 @@ const R = {
 		const work = id ?? pickOf(CTX.series, vu.rand).id;
 		return gql(vu, 'SERIES_PAGE', 'seriesPage', 'read', VARS.series(work), { work });
 	},
-	reviews: (vu, id) => gql(vu, 'REVIEWS', 'reviews', 'read', { seriesId: id, page: 1 }, { work: id }),
+	reviews: (vu, id) =>
+		gql(vu, 'REVIEWS', 'reviews', 'read', { seriesId: id, page: 1 }, { work: id }),
 	myReview: (vu, id) => gql(vu, 'MY_REVIEW', 'myReview', 'read', { seriesId: id }, { work: id }),
 	comments: (vu, type, id, work) =>
 		gql(vu, 'COMMENTS', 'comments', 'read', { targetType: type, targetId: id, page: 1 }, { work }),
@@ -2506,7 +2819,8 @@ const R = {
 		/^\d+$/.test(id)
 			? gql(vu, 'PAGES', 'pages', 'read', { chapterId: id }, { work })
 			: gql(vu, 'CANONICAL_PAGES', 'canonicalPages', 'read', { chapterId: id }, { work }),
-	recordView: (vu, id) => gql(vu, 'RECORD_VIEW', 'recordView', 'write', { seriesId: id }, { work: id }),
+	recordView: (vu, id) =>
+		gql(vu, 'RECORD_VIEW', 'recordView', 'write', { seriesId: id }, { work: id }),
 	progress: (vu, chapterId, lastPageRead, read, work, label) =>
 		gql(
 			vu,
@@ -2581,11 +2895,14 @@ async function postComment(vu, run, work, ch) {
 	vu.pace.lastCommentAt = Date.now();
 	const onChapter = ch && !work.noChapterThread;
 	const r = await run.perform(
-		onChapter ? R.postComment(vu, 'chapter', ch.id, work.id) : R.postComment(vu, 'series', work.id, work.id),
+		onChapter
+			? R.postComment(vu, 'chapter', ch.id, work.id)
+			: R.postComment(vu, 'series', work.id, work.id),
 	);
 	const made = r.json?.data?.postComment?.id;
 	if (made) vu.comments.push(made);
-	else if (onChapter && r.messages.some((m) => /no such chapter/i.test(m))) work.noChapterThread = true;
+	else if (onChapter && r.messages.some((m) => /no such chapter/i.test(m)))
+		work.noChapterThread = true;
 }
 
 function deleteComment(vu, run) {
@@ -2614,7 +2931,11 @@ function progressWrite(vu, run) {
 		const ch = c.work.chapters[c.idx];
 		const last = (ch.pages > 0 ? ch.pages : args.chapterPages) - 1;
 		const done = c.page >= last;
-		const label = done ? 'setProgress(seq:read)' : c.fresh ? 'setProgress(seq:new)' : 'setProgress(seq)';
+		const label = done
+			? 'setProgress(seq:read)'
+			: c.fresh
+				? 'setProgress(seq:new)'
+				: 'setProgress(seq)';
 		const req = R.progress(vu, ch.id, Math.min(c.page, last), done, c.work.id, label);
 		c.fresh = false;
 		if (done) {
@@ -2628,7 +2949,9 @@ function progressWrite(vu, run) {
 	const ch = pickOf(work.chapters, r);
 	const pages = ch.pages > 0 ? ch.pages : args.chapterPages;
 	return r() < 0.3
-		? run.perform(R.progress(vu, ch.id, Math.max(0, pages - 1), true, work.id, 'setProgress(random:read)'))
+		? run.perform(
+				R.progress(vu, ch.id, Math.max(0, pages - 1), true, work.id, 'setProgress(random:read)'),
+			)
 		: run.perform(R.progress(vu, ch.id, randInt(pages, r), false, work.id, 'setProgress(random)'));
 }
 
@@ -2703,7 +3026,11 @@ async function openLoop(run, rps, vus, action) {
 }
 
 const pagesOf = (ch) =>
-	ch.pageImgs?.length ? ch.pageImgs.length : ch.pages > 0 ? Math.min(ch.pages, 80) : args.chapterPages;
+	ch.pageImgs?.length
+		? ch.pageImgs.length
+		: ch.pages > 0
+			? Math.min(ch.pages, 80)
+			: args.chapterPages;
 
 /**
  * Read `share` of a chapter over `readingMs`. Without images that is one sleep. With
@@ -2740,7 +3067,8 @@ async function sessionUser(run, vu) {
 	// spends there. Otherwise every user opens home at second 0 and a short window
 	// sees mostly page opens and almost no reading.
 	const browseMs = args.think * 1000 * (3 + args.searchShare);
-	const readMs = args.chapters * (args.chapterPages * args.pageSeconds * 1000 + args.nextSeconds * 1000);
+	const readMs =
+		args.chapters * (args.chapterPages * args.pageSeconds * 1000 + args.nextSeconds * 1000);
 	let resumeAt = r() < readMs / (readMs + browseMs) ? r() : null;
 	if (resumeAt === null && !(await run.nap(r() * args.think * 1000))) return;
 
@@ -2790,7 +3118,8 @@ async function sessionUser(run, vu) {
 			if (r() < args.quitShare) {
 				// Left half-way: beforeNavigate + onDestroy, both with read: false.
 				const share = r();
-				if (!(await (resumed ? run.nap(reading * share) : readPages(vu, run, ch, reading, share)))) return;
+				if (!(await (resumed ? run.nap(reading * share) : readPages(vu, run, ch, reading, share))))
+					return;
 				const at = randInt(last + 1, r);
 				await run.perform(R.progress(vu, ch.id, at, false, work.id));
 				await run.perform(R.progress(vu, ch.id, at, false, work.id));
@@ -2897,7 +3226,8 @@ async function loadPoint(spec, accounts, stepName, pointIndex) {
 	};
 	const opener = (async () => {
 		const warmEnd = Date.now() + args.warmup * 1000;
-		while (Date.now() < warmEnd && !stopRequested() && !loadDone) await sleep(Math.min(100, warmEnd - Date.now()));
+		while (Date.now() < warmEnd && !stopRequested() && !loadDone)
+			await sleep(Math.min(100, warmEnd - Date.now()));
 		if (GLOBAL.hostCmd && !stopRequested() && !loadDone) {
 			host = hostCommand(label, args.duration);
 			hostReady = await host.ready;
@@ -2947,7 +3277,13 @@ async function loadPoint(spec, accounts, stepName, pointIndex) {
 		},
 		...(args.scenario === 'image-cold' ? { coldExhausted: !!CTX.coldExhausted } : {}),
 		...(CTX.withImages || args.scenario === 'image-warm'
-			? { realSource: { cap: REAL.cap, usedSoFar: REAL.used, refusedAfterCapSoFar: REAL.refusedAfterCap } }
+			? {
+					realSource: {
+						cap: REAL.cap,
+						usedSoFar: REAL.used,
+						refusedAfterCapSoFar: REAL.refusedAfterCap,
+					},
+				}
 			: {}),
 		metrics: metricsOut,
 		host: hostOut ? { ...hostOut, ready: hostReady } : null,
@@ -2964,14 +3300,17 @@ function costInputs(s, m, h) {
 		responseBytes: { read: s.read.bytes, write: s.write.bytes, image: s.image.bytes },
 		serverByteCounters: m?.derived?.bytes ?? null,
 		hostBusyCores: hj?.host?.busy_cores ?? null,
-		hostCpuCoreSeconds: Number.isFinite(hj?.host?.busy_cores) ? +(hj.host.busy_cores * s.seconds).toFixed(2) : null,
+		hostCpuCoreSeconds: Number.isFinite(hj?.host?.busy_cores)
+			? +(hj.host.busy_cores * s.seconds).toFixed(2)
+			: null,
 		walBytes: hj?.wal?.bytes ?? null,
 		archivedSegments: hj?.archiver?.archived ?? null,
 		databaseBytesDelta: hj?.database?.bytes_delta ?? null,
 	};
 }
 
-const ms = (v) => (v === null || v === undefined ? '-' : v < 100 ? v.toFixed(1) : String(Math.round(v)));
+const ms = (v) =>
+	v === null || v === undefined ? '-' : v < 100 ? v.toFixed(1) : String(Math.round(v));
 const COLS = [
 	['load', 9],
 	['req/s', 9],
@@ -3007,7 +3346,11 @@ function printRow(r) {
 		(r.errorShare * 100).toFixed(2),
 		ms(r.generatorLagP99Ms),
 	];
-	console.log(cells.map((c, i) => (i === 0 ? String(c).padEnd(COLS[i][1]) : String(c).padStart(COLS[i][1]))).join(''));
+	console.log(
+		cells
+			.map((c, i) => (i === 0 ? String(c).padEnd(COLS[i][1]) : String(c).padStart(COLS[i][1])))
+			.join(''),
+	);
 	if (r.image.requests) {
 		const mibs = (r.image.bytes / 1048576 / r.seconds).toFixed(2);
 		console.log(
@@ -3018,7 +3361,8 @@ function printRow(r) {
 	if (r.errors) {
 		const kinds = Object.entries(r.errorsByKind).map(([k, n]) => `${k}=${n}`);
 		console.log(`          errors ${r.errors}/${r.requests}: ${kinds.join(' ')}`);
-		for (const m of r.errorMessages.slice(0, 5)) console.log(`            ${m.count}x ${m.message}`);
+		for (const m of r.errorMessages.slice(0, 5))
+			console.log(`            ${m.count}x ${m.message}`);
 	}
 	if (r.users) {
 		const perMin = (v) => ((v / r.users) * 60).toFixed(2);
@@ -3031,7 +3375,8 @@ function printRow(r) {
 		const d = r.metrics.derived;
 		const parts = [`metrics ${r.metrics.good}/${r.metrics.scrapes} scrapes`];
 		if (d?.refusingLanes.length) parts.push(`refused by ${d.refusingLanes.join(', ')}`);
-		for (const h of d?.hitRatios.slice(0, 4) ?? []) if (h.ratio !== null) parts.push(`${h.key} ${(h.ratio * 100).toFixed(1)}%`);
+		for (const h of d?.hitRatios.slice(0, 4) ?? [])
+			if (h.ratio !== null) parts.push(`${h.key} ${(h.ratio * 100).toFixed(1)}%`);
 		console.log(`          ${parts.join('; ')}`);
 	}
 	if (r.host) console.log(`          host ${r.host.ok ? 'ok' : `failed: ${r.host.error}`}`);
@@ -3108,13 +3453,19 @@ export function readSettings(path) {
 		const j = JSON.parse(t);
 		if (Array.isArray(j) && j[0]?.Config?.Env) {
 			format = 'docker-inspect';
-			entries = j[0].Config.Env.map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]);
+			entries = j[0].Config.Env.map((l) => [
+				l.slice(0, l.indexOf('=')),
+				l.slice(l.indexOf('=') + 1),
+			]);
 		} else if (Array.isArray(j)) {
 			format = 'json-list';
 			entries = j.map((l) => [String(l).split('=')[0], String(l).split('=').slice(1).join('=')]);
 		} else {
 			format = 'json';
-			entries = Object.entries(j).map(([k, v]) => [k, typeof v === 'string' ? v : JSON.stringify(v)]);
+			entries = Object.entries(j).map(([k, v]) => [
+				k,
+				typeof v === 'string' ? v : JSON.stringify(v),
+			]);
 		}
 	} else {
 		for (const line of raw.split('\n')) {
@@ -3141,15 +3492,26 @@ export function readSettings(path) {
 	}
 	// Hash the sorted entries, not the file: a recreated container lists the same
 	// environment in another order, and that must not make two runs look different.
-	const canonical = entries.map(([k, v]) => `${k}=${v}`).sort().join('\n');
-	return { file: resolvePath(path), sha256: sha256(canonical), format, entries: entries.length, values, redactedKeys };
+	const canonical = entries
+		.map(([k, v]) => `${k}=${v}`)
+		.sort()
+		.join('\n');
+	return {
+		file: resolvePath(path),
+		sha256: sha256(canonical),
+		format,
+		entries: entries.length,
+		values,
+		redactedKeys,
+	};
 }
 
 /** Options safe to write: no password, command text and URLs with secrets replaced. */
 function recordable(o) {
 	const { password: _never, ...rest } = o;
 	if (rest.hostCmd) rest.hostCmd = redactCommand(rest.hostCmd);
-	for (const k of ['target', 'metricsUrl', 'imgBase', 'fixtureImages']) if (rest[k]) rest[k] = redactUrl(rest[k]);
+	for (const k of ['target', 'metricsUrl', 'imgBase', 'fixtureImages'])
+		if (rest[k]) rest[k] = redactUrl(rest[k]);
 	return rest;
 }
 
@@ -3223,7 +3585,8 @@ function loadSuite(path) {
 	} catch (e) {
 		throw new UsageError(`--suite ${path}: not JSON (${e.message})`);
 	}
-	if (!Array.isArray(s.steps) || !s.steps.length) throw new UsageError(`--suite ${path}: "steps" must be a non-empty list`);
+	if (!Array.isArray(s.steps) || !s.steps.length)
+		throw new UsageError(`--suite ${path}: "steps" must be a non-empty list`);
 	return { raw, s };
 }
 
@@ -3235,7 +3598,10 @@ function planSteps(cli, suite) {
 		return { global: o, steps: [{ name: o.label ?? o.scenario, requires: [], opts: o }] };
 	}
 	for (const k of Object.keys(cli.explicit))
-		if (STEP_ONLY_KEYS.has(k)) throw new UsageError(`${KEY_TO_FLAG[k]} belongs inside the suite's steps, not next to --suite`);
+		if (STEP_ONLY_KEYS.has(k))
+			throw new UsageError(
+				`${KEY_TO_FLAG[k]} belongs inside the suite's steps, not next to --suite`,
+			);
 	const sd = suiteOptions(suite.s.defaults, 'suite defaults: ', true);
 	const global = { ...base0, ...sd, ...cli.explicit };
 	const names = new Set();
@@ -3245,7 +3611,10 @@ function planSteps(cli, suite) {
 		const own = suiteOptions(st, where, false);
 		const opts = { ...base0, ...sd, ...own, ...cli.explicit };
 		for (const k of GLOBAL_KEYS) opts[k] = global[k];
-		const name = String(st.name ?? own.label ?? `${i + 1}-${st.scenario}`).replace(/[^A-Za-z0-9_.-]/g, '_');
+		const name = String(st.name ?? own.label ?? `${i + 1}-${st.scenario}`).replace(
+			/[^A-Za-z0-9_.-]/g,
+			'_',
+		);
 		if (names.has(name)) throw new UsageError(`${where}name '${name}' is used twice`);
 		names.add(name);
 		const requires = Array.isArray(st.requires) ? st.requires.map(String) : [];
@@ -3262,7 +3631,11 @@ function requirementMissing(step) {
 	}
 	if (SCENARIOS[step.opts.scenario].fixture && !GLOBAL.fixtureImages)
 		return 'image-cold requires --fixture-images: sustained cold load must hit fixtures, not real sources';
-	if (['mixed', 'release-burst'].includes(step.opts.scenario) && !GLOBAL.fixtureImages && !(GLOBAL.realSourceSample > 0))
+	if (
+		['mixed', 'release-burst'].includes(step.opts.scenario) &&
+		!GLOBAL.fixtureImages &&
+		!(GLOBAL.realSourceSample > 0)
+	)
 		return `${step.opts.scenario} page images need --fixture-images (or a bounded --real-source-sample)`;
 	return null;
 }
@@ -3293,7 +3666,8 @@ function stepContext(o) {
 			used: hot.length,
 			ids: hot.map((w) => w.id),
 			distribution: 'uniform over the hot works',
-			shortfall: hot.length < o.hotWorks ? `only ${hot.length} works with chapters in the pool` : null,
+			shortfall:
+				hot.length < o.hotWorks ? `only ${hot.length} works with chapters in the pool` : null,
 		};
 	}
 	if (sc.images) {
@@ -3307,7 +3681,8 @@ function stepContext(o) {
 		ctx.readable = ctx.readable
 			.map((w) => ({ ...w, chapters: w.chapters.filter((c) => c.pageImgs?.length) }))
 			.filter((w) => w.chapters.length);
-		if (!ctx.readable.length) return { ctx, skip: 'no chapter with a warm page list (raise --image-chapters)' };
+		if (!ctx.readable.length)
+			return { ctx, skip: 'no chapter with a warm page list (raise --image-chapters)' };
 	}
 	if (o.scenario === 'release-burst') {
 		ctx.burst = IMAGES.burst
@@ -3356,7 +3731,11 @@ async function main(argv) {
 			return 0;
 		}
 		for (const st of plan.steps) validateStep(st.opts);
-		for (const [flag, u] of [['--target', GLOBAL.target], ['--metrics-url', GLOBAL.metricsUrl], ['--img-base', GLOBAL.imgBase]]) {
+		for (const [flag, u] of [
+			['--target', GLOBAL.target],
+			['--metrics-url', GLOBAL.metricsUrl],
+			['--img-base', GLOBAL.imgBase],
+		]) {
 			if (!u) continue;
 			try {
 				new URL(u);
@@ -3367,7 +3746,12 @@ async function main(argv) {
 		// Fixtures are read (a local file or a template) so every origin is checked like
 		// the target before anything is sent.
 		if (GLOBAL.fixtureImages) {
-			FIXTURES = loadFixtures(GLOBAL.fixtureImages, RUN_ID, new URL(GLOBAL.target), GLOBAL.fixtureStart);
+			FIXTURES = loadFixtures(
+				GLOBAL.fixtureImages,
+				RUN_ID,
+				new URL(GLOBAL.target),
+				GLOBAL.fixtureStart,
+			);
 			const why = productionRefusal(GLOBAL, FIXTURES.origins);
 			if (why) refuseProduction(why);
 		}
@@ -3405,16 +3789,24 @@ async function main(argv) {
 	REAL.cap = GLOBAL.realSourceSample;
 	const runId = RUN_ID;
 	const suiteInfo = suite
-		? { file: resolvePath(cli.explicit.suite), name: suite.s.name ?? null, sha256: sha256(suite.raw), steps: plan.steps.length }
+		? {
+				file: resolvePath(cli.explicit.suite),
+				name: suite.s.name ?? null,
+				sha256: sha256(suite.raw),
+				steps: plan.steps.length,
+			}
 		: null;
 	const manifest = buildManifest(runId, suiteInfo, looked);
 	const jsonPath = GLOBAL.json ?? (suite ? `capacity-${runId}.json` : null);
 
 	console.log(`target    ${redactUrl(GLOBAL.target)}`);
-	console.log(`run       ${runId}, seed ${GLOBAL.seed}, git ${manifest.git.head?.slice(0, 12) ?? '-'}` +
-		`${manifest.git.dirtyFiles ? ` (+${manifest.git.dirtyFiles} dirty)` : ''}`);
+	console.log(
+		`run       ${runId}, seed ${GLOBAL.seed}, git ${manifest.git.head?.slice(0, 12) ?? '-'}` +
+			`${manifest.git.dirtyFiles ? ` (+${manifest.git.dirtyFiles} dirty)` : ''}`,
+	);
 	if (suite) console.log(`suite     ${suiteInfo.file} (${plan.steps.length} steps)`);
-	if (GLOBAL.metricsUrl) console.log(`metrics   ${redactUrl(GLOBAL.metricsUrl)} every ${GLOBAL.metricsInterval}s`);
+	if (GLOBAL.metricsUrl)
+		console.log(`metrics   ${redactUrl(GLOBAL.metricsUrl)} every ${GLOBAL.metricsInterval}s`);
 
 	const omitted = [];
 	const runnable = [];
@@ -3441,7 +3833,12 @@ async function main(argv) {
 	if (runnable.some((st) => SCENARIOS[st.opts.scenario].pool)) POOL = await buildPool();
 	const imageSteps = runnable.filter((st) => SCENARIOS[st.opts.scenario].images);
 	if (imageSteps.length) {
-		const maxBurst = Math.max(0, ...imageSteps.filter((s) => s.opts.scenario === 'release-burst').map((s) => Math.round(s.opts.burstWorks)));
+		const maxBurst = Math.max(
+			0,
+			...imageSteps
+				.filter((s) => s.opts.scenario === 'release-burst')
+				.map((s) => Math.round(s.opts.burstWorks)),
+		);
 		const needPages = !!FIXTURES || REAL.cap > 0;
 		IMAGES = await harvestImages(maxBurst, needPages);
 	}
@@ -3450,7 +3847,12 @@ async function main(argv) {
 	const out = {
 		schema: 'komika-capacity/2',
 		manifest,
-		accounts: { wanted: accountsWanted, ready: setup.accounts.length, ...setup.counts, problem: setup.problem },
+		accounts: {
+			wanted: accountsWanted,
+			ready: setup.accounts.length,
+			...setup.counts,
+			problem: setup.problem,
+		},
 		pool: POOL?.info ?? null,
 		images: IMAGES?.info ?? null,
 		fixtures: null,
@@ -3462,7 +3864,12 @@ async function main(argv) {
 		if (!jsonPath) return;
 		manifest.finishedAt = new Date().toISOString();
 		out.fixtures = FIXTURES?.report() ?? null;
-		out.realSource = { cap: REAL.cap, used: REAL.used, refusedAfterCap: REAL.refusedAfterCap, capHitAt: REAL.capHitAt };
+		out.realSource = {
+			cap: REAL.cap,
+			used: REAL.used,
+			refusedAfterCap: REAL.refusedAfterCap,
+			capHitAt: REAL.capHitAt,
+		};
 		const tmp = `${jsonPath}.tmp`;
 		writeFileSync(tmp, JSON.stringify(out, null, 2));
 		renameSync(tmp, jsonPath);
@@ -3501,7 +3908,13 @@ async function main(argv) {
 				: null;
 			record.cacheState = {
 				seriesPagesPrewarmed: POOL?.info.seriesPagesWarm ?? 0,
-				imageWarmPass: IMAGES ? { urls: IMAGES.info.warmPass.urls, ok: IMAGES.info.warmPass.ok, at: IMAGES.info.warmPass.at } : null,
+				imageWarmPass: IMAGES
+					? {
+							urls: IMAGES.info.warmPass.urls,
+							ok: IMAGES.info.warmPass.ok,
+							at: IMAGES.info.warmPass.at,
+						}
+					: null,
 				earlierSteps: [...done],
 				fixturesBefore: cold ? cold.report() : null,
 				realSourceUsedBefore: REAL.used,
@@ -3553,9 +3966,10 @@ async function main(argv) {
 			const passed = record.loads.filter((r) => !stopReason(r) && r.requests > 0);
 			if (!passed.length) console.log('result    no load stayed inside the limits');
 			else {
-				const best = SCENARIOS[o.scenario].shape === 'users'
-					? passed[passed.length - 1]
-					: passed.reduce((a, b) => (b.okPerSec > a.okPerSec ? b : a));
+				const best =
+					SCENARIOS[o.scenario].shape === 'users'
+						? passed[passed.length - 1]
+						: passed.reduce((a, b) => (b.okPerSec > a.okPerSec ? b : a));
 				console.log(
 					`result    ${loadLabel(best)}: ${best.okPerSec} ok req/s (reads p95 ${ms(best.read.p95)} ms, ` +
 						`writes p95 ${ms(best.write.p95)} ms, images p95 ${ms(best.image.p95)} ms)` +

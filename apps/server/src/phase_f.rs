@@ -1169,8 +1169,15 @@ pub async fn delete_redundant(
                 .bind(&r.source_series_id)
                 .execute(&mut *tx)
                 .await?;
-            use crate::catalog::work_metadata::FieldGroup::{Title, Description, Credits, Tags, Status};
-            crate::catalog::work_metadata::project_on(&mut tx, &current.work_id, &[Title, Description, Credits, Tags, Status]).await?;
+            use crate::catalog::work_metadata::FieldGroup::{
+                Credits, Description, Status, Tags, Title,
+            };
+            crate::catalog::work_metadata::project_on(
+                &mut tx,
+                &current.work_id,
+                &[Title, Description, Credits, Tags, Status],
+            )
+            .await?;
             sqlx::query(
                 "UPDATE all_mangadex_uuid SET disposition = 'deleted', disposed_at = $1 \
               WHERE source_series_id = $2",

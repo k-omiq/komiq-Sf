@@ -35,25 +35,25 @@ A failed session lookup remains an error. GraphQL GET errors are never publicly 
 
 Modules in `apps/server/src/`:
 
-| Module         | Responsibility                                                      |
-| -------------- | ------------------------------------------------------------------- |
-| `main.rs`      | Application entry point, router assembly and shutdown handling      |
-| `config.rs`    | Environment variable parsing, validation and defaults               |
-| `db.rs`        | Boot safety, migrations, retries and database configuration         |
-| `database.rs`  | Separate read and write pools and bounded cache-write queue         |
-| `auth.rs`      | Password hashing with Argon2id, token creation and session lookup   |
-| `suwayomi.rs`  | HTTP client communicating with the internal Suwayomi instance       |
-| `mangadex.rs`  | MangaDex API client, rate limiting and catalog synchronization      |
-| `scanner.rs`   | Adaptive chapter scan scheduler for library series                  |
-| `browse.rs`    | Multi-criteria catalog filtering, facets and sorting logic          |
-| `web_dir.rs`   | Static file delivery and SPA fallback routing for web apps          |
-| `setup_cli.rs` | `komika-server setup`: first-run setup in a terminal                |
-| `lan.rs`       | Home network addresses of the server, for the console to show       |
-| `cover.rs`     | Cover fetching, WebP encoding, variant resizing and caching         |
-| `cover_store.rs` | Cover files, PostgreSQL index and upload recovery                  |
-| `cover_copy.rs` | Resumable background copy from the old SQLite cover cache          |
-| `gc.rs`        | Cleanup of orphaned covers, staged media and old read notifications |
-| `instance.rs`  | Instance settings, setup code generation and access modes           |
+| Module           | Responsibility                                                      |
+| ---------------- | ------------------------------------------------------------------- |
+| `main.rs`        | Application entry point, router assembly and shutdown handling      |
+| `config.rs`      | Environment variable parsing, validation and defaults               |
+| `db.rs`          | Boot safety, migrations, retries and database configuration         |
+| `database.rs`    | Separate read and write pools and bounded cache-write queue         |
+| `auth.rs`        | Password hashing with Argon2id, token creation and session lookup   |
+| `suwayomi.rs`    | HTTP client communicating with the internal Suwayomi instance       |
+| `mangadex.rs`    | MangaDex API client, rate limiting and catalog synchronization      |
+| `scanner.rs`     | Adaptive chapter scan scheduler for library series                  |
+| `browse.rs`      | Multi-criteria catalog filtering, facets and sorting logic          |
+| `web_dir.rs`     | Static file delivery and SPA fallback routing for web apps          |
+| `setup_cli.rs`   | `komika-server setup`: first-run setup in a terminal                |
+| `lan.rs`         | Home network addresses of the server, for the console to show       |
+| `cover.rs`       | Cover fetching, WebP encoding, variant resizing and caching         |
+| `cover_store.rs` | Cover files, PostgreSQL index and upload recovery                   |
+| `cover_copy.rs`  | Resumable background copy from the old SQLite cover cache           |
+| `gc.rs`          | Cleanup of orphaned covers, staged media and old read notifications |
+| `instance.rs`    | Instance settings, setup code generation and access modes           |
 
 `komika-server setup` calls the running server without opening its database. It matches `/admin/setup` and refuses plain HTTP over the internet.
 

@@ -391,6 +391,8 @@ struct CopyProgress {
 type UserWork = (Uuid, String);
 type UserEntry = (Uuid, String);
 type Pointer = (Option<String>, Option<String>, i64);
+/// `user_id, work_id, through_entry_id, sort_key, revision`.
+type ProgressRow = (Uuid, String, Option<String>, Option<String>, i64);
 
 /// A transaction-local snapshot. Callers hold user locks before taking work locks.
 pub struct Before {
@@ -423,7 +425,7 @@ pub async fn keep_state_before(
            FROM work_chapter e LEFT JOIN work_chapter_state s ON s.work_id = e.work_id \
           WHERE e.work_id = ANY($1)",
     ).bind(works).fetch_all(&mut *conn).await?;
-    let progress: Vec<(Uuid, String, Option<String>, Option<String>, i64)> = sqlx::query_as(
+    let progress: Vec<ProgressRow> = sqlx::query_as(
         "SELECT p.user_id, p.work_id, p.through_entry_id, e.sort_key::text, p.revision \
            FROM work_progress p LEFT JOIN work_chapter e ON e.id = p.through_entry_id \
           WHERE p.user_id = ANY($1) AND p.work_id = ANY($2)",

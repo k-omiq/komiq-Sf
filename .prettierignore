@@ -14,3 +14,19 @@ pnpm-lock.yaml
 # GraphQL SDL uses `//` header comments (house style); prettier's graphql
 # parser only accepts `#`, so it errors on this file. Skip it.
 packages/api/src/schema/*.graphql
+
+# Exact bytes are part of hashed test baselines or recorded results.
+apps/server/tests/postgres_golden/
+apps/server/bench/results/
+
+# Git-ignored local build output. Prettier reads only the root .gitignore, so the
+# nested .gitignore files and .git/info/exclude that hide these do not apply to it.
+**/.impeccable/
+apps/admin/src-tauri/gen/schemas/
+apps/admin/src-tauri/postgres/
+apps/admin/src-tauri/web/
+apps/reader/src-tauri/.android-jvm-build/
+apps/reader/src-tauri/.ios-jvm-build/
+apps/reader/src-tauri/jre-android/
+apps/reader/src-tauri/gen/android/app/src/main/assets/tauri.conf.json
+apps/server/*.sqlite3

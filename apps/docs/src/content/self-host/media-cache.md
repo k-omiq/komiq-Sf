@@ -83,8 +83,8 @@ The owner adds a helper entry to `KOMIKA_MEDIA_ROUTES`, alongside its owner entr
 
 ```json
 [
-  { "id": "owner", "kind": "owner" },
-  { "id": "helper", "kind": "helper", "base": "https://media-helper.example.com" }
+	{ "id": "owner", "kind": "owner" },
+	{ "id": "helper", "kind": "helper", "base": "https://media-helper.example.com" }
 ]
 ```
 

@@ -605,11 +605,7 @@ export async function deleteComment(
 		}
 	}
 	if (!socialLive() && localTarget) {
-		saveLocalComments(
-			LOCAL_BUCKET[localTarget.targetType],
-			localTarget.storageKey,
-			next,
-		);
+		saveLocalComments(LOCAL_BUCKET[localTarget.targetType], localTarget.storageKey, next);
 	}
 	return next;
 }

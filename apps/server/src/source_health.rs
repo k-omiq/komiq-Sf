@@ -589,7 +589,16 @@ mod tests {
             };
             a.unwrap();
             b.unwrap();
-            let rows: Vec<(String, String, i64, String, i64, Option<String>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+            type BucketRow = (
+                String,
+                String,
+                i64,
+                String,
+                i64,
+                Option<String>,
+                chrono::DateTime<chrono::Utc>,
+            );
+            let rows: Vec<BucketRow> = sqlx::query_as(
                 "SELECT source_id,surface,hour_ts,reason,count,last_message,last_at FROM source_health_bucket ORDER BY hour_ts",
             ).fetch_all(&pool).await.unwrap();
             let expected = if flush_first {

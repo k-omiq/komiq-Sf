@@ -50,7 +50,12 @@ function fakeServer() {
 			server.epochReads++;
 			return (server.known = server.epoch);
 		},
-		setProgress: async (chapterId: string, _page: number, _read: boolean, epoch?: number | null) => {
+		setProgress: async (
+			chapterId: string,
+			_page: number,
+			_read: boolean,
+			epoch?: number | null,
+		) => {
 			if (/^[0-9]+$/.test(chapterId) && epoch === undefined) epoch = server.known ?? null;
 			server.sent.push({ chapterId, epoch });
 			if (!server.online) throw new Error('offline');
@@ -122,7 +127,9 @@ test('a write queued before an engine change is dropped on replay, never filed o
 		'replayed once with its own epoch, never re-read and never retried',
 	);
 	assert.equal(server.epochReads, 1, 'the replay did not read the new epoch');
-	assert.ok(warnings.some((line) => line.includes('earlier engine generation') && line.includes('42')));
+	assert.ok(
+		warnings.some((line) => line.includes('earlier engine generation') && line.includes('42')),
+	);
 });
 
 test('a live write refused as stale is dropped, not queued', async (t) => {
@@ -165,7 +172,9 @@ test('an ordinary failure still stays queued for retry', async () => {
 	await composite.setProgress('42', 5, true);
 	await composite.setProgress('43', 1, false);
 	assert.deepEqual(
-		writes.peekAll().map((op) => op.kind === 'progress' && [op.chapterId, op.numericEpoch, op.tries]),
+		writes
+			.peekAll()
+			.map((op) => op.kind === 'progress' && [op.chapterId, op.numericEpoch, op.tries]),
 		[
 			['42', 3, 0],
 			['43', 3, 0],
@@ -178,7 +187,15 @@ test('an op persisted before epochs existed replays with no epoch', async () => 
 	const storage = createMemoryStorageAdapter();
 	storage.save(
 		JSON.stringify([
-			{ kind: 'progress', chapterId: '42', lastPageRead: 5, read: true, ts: 1, tries: 0, userId: 'A' },
+			{
+				kind: 'progress',
+				chapterId: '42',
+				lastPageRead: 5,
+				read: true,
+				ts: 1,
+				tries: 0,
+				userId: 'A',
+			},
 		]),
 	);
 	const writes = new OfflineWriteQueue(storage);
@@ -199,7 +216,9 @@ test('an op persisted before epochs existed replays with no epoch', async () => 
 let endpointNumber = 0;
 const endpoint = () => 'https://epoch-' + ++endpointNumber + '.test/graphql';
 
-function recordingBackend(answer: (body: { query: string; variables?: Record<string, unknown> }) => unknown) {
+function recordingBackend(
+	answer: (body: { query: string; variables?: Record<string, unknown> }) => unknown,
+) {
 	const bodies: { query: string; variables?: Record<string, unknown> }[] = [];
 	const backend = new GraphQLBackend({
 		endpoint: endpoint(),
@@ -217,7 +236,9 @@ const isEpochRead = (b: { query: string }) => /query NumericEpoch/.test(b.query)
 
 test('numeric writes carry one epoch read; uuid writes read and send none', async () => {
 	const { backend, bodies } = recordingBackend((b) =>
-		isEpochRead(b) ? { data: { numericEpoch: 9 } } : { data: { setProgress: true, setChapterRead: true } },
+		isEpochRead(b)
+			? { data: { numericEpoch: 9 } }
+			: { data: { setProgress: true, setChapterRead: true } },
 	);
 	await backend.setProgress('12', 3, false);
 	await backend.setProgress('13', 1, true);
@@ -246,10 +267,16 @@ test('a replayed write sends exactly the epoch it was queued with, or none for n
 
 test('an old server: the epoch field is unknown and the argument is stripped', async () => {
 	const { backend, bodies } = recordingBackend((b) => {
-		if (isEpochRead(b)) return { errors: [{ message: 'Unknown field "numericEpoch" on type "QueryRoot".' }] };
+		if (isEpochRead(b))
+			return { errors: [{ message: 'Unknown field "numericEpoch" on type "QueryRoot".' }] };
 		if (/numericEpoch/.test(b.query))
 			return {
-				errors: [{ message: 'Unknown argument "numericEpoch" on field "setProgress" of type "MutationRoot".' }],
+				errors: [
+					{
+						message:
+							'Unknown argument "numericEpoch" on field "setProgress" of type "MutationRoot".',
+					},
+				],
 			};
 		return { data: { setProgress: true } };
 	});
@@ -335,7 +362,14 @@ test('M1 a failed epoch read leaves content available and pins no epoch for writ
 			if (++reads === 1) throw new Error('offline');
 			return { data: { numericEpoch: epoch } };
 		}
-		return { data: { chapters: [{ id: '42' }], setProgress: true, setChapterRead: true, mark: { id: '7' } } };
+		return {
+			data: {
+				chapters: [{ id: '42' }],
+				setProgress: true,
+				setChapterRead: true,
+				mark: { id: '7' },
+			},
+		};
 	});
 	assert.deepEqual(await backend.chapters('7'), [{ id: '42' }]);
 	epoch = 4;
@@ -367,7 +401,10 @@ test('M1 anonymous reads skip the epoch and keep cacheable GET documents', async
 	const backend = new GraphQLBackend({
 		endpoint: endpoint(),
 		fetch: async (input, init) => {
-			requests.push({ query: new URL(String(input)).searchParams.get('query')!, method: init?.method });
+			requests.push({
+				query: new URL(String(input)).searchParams.get('query')!,
+				method: init?.method,
+			});
 			return Response.json({ data: { chapters: [{ id: '42' }] } });
 		},
 	});
@@ -446,7 +483,7 @@ test("M1 a failed epoch read from a signed-out account does not pin the next acc
 	await pending;
 	await backend.chapters('7');
 	await backend.setProgress('42', 1, false);
-	assert.equal(epochReads, 2, "B reads its own epoch");
+	assert.equal(epochReads, 2, 'B reads its own epoch');
 	assert.equal(bodies.at(-1)!.variables?.numericEpoch, 3);
 });
 
@@ -460,21 +497,31 @@ test('M2 numeric writes cannot cross an account switch during the first epoch re
 				token: 'A',
 				fetch: async (_url, init) => {
 					const body = JSON.parse(String(init?.body));
-					requests.push({ query: body.query, token: new Headers(init?.headers).get('authorization') });
+					requests.push({
+						query: body.query,
+						token: new Headers(init?.headers).get('authorization'),
+					});
 					if (isEpochRead(body)) return new Promise<Response>((resolve) => (finish = resolve));
 					return Response.json({ data: { [method]: true } });
 				},
 			});
-			const pending = method === 'setProgress'
-				? backend.setProgress('42', 1, false)
-				: backend[method]('42', true);
-			const outcome = pending.then(() => null, (e: unknown) => e);
+			const pending =
+				method === 'setProgress'
+					? backend.setProgress('42', 1, false)
+					: backend[method]('42', true);
+			const outcome = pending.then(
+				() => null,
+				(e: unknown) => e,
+			);
 			assert.ok(isEpochRead(requests[0]));
 			backend.setToken(null);
 			backend.setToken('B');
 			finish(Response.json({ data: { numericEpoch: 3 } }));
 			assert.match(String(await outcome), /Session changed/);
-			assert.deepEqual(requests.map((r) => r.token), ['Bearer A']);
+			assert.deepEqual(
+				requests.map((r) => r.token),
+				['Bearer A'],
+			);
 		});
 	}
 });
@@ -485,7 +532,9 @@ test('M2 composite progress stops after an account switch during the epoch read'
 	const hosted = {
 		setToken: () => {},
 		numericEpoch: () => new Promise<number>((resolve) => (finish = resolve)),
-		setProgress: async () => { sent++; },
+		setProgress: async () => {
+			sent++;
+		},
 	} as unknown as Backend;
 	const { composite, writes } = signedIn(hosted);
 	const pending = composite.setProgress('42', 1, false);
@@ -501,7 +550,9 @@ test('M3 stale live progress notifies once across fetch views while replays stay
 	const { onStaleNumericEpoch } = await import('../../../../../packages/api/src/numeric-epoch.ts');
 	assert.equal(typeof onStaleNumericEpoch, 'function');
 	let notices = 0;
-	const unsubscribe = onStaleNumericEpoch(() => { notices++; });
+	const unsubscribe = onStaleNumericEpoch(() => {
+		notices++;
+	});
 	t.after(unsubscribe);
 	const answer = (b: { query: string }) =>
 		isEpochRead(b) ? { data: { numericEpoch: 3 } } : staleResponse();
@@ -530,7 +581,11 @@ test('M3 composite live progress notifies without queueing the stale write', asy
 	const { onStaleNumericEpoch } = await import('../../../../../packages/api/src/numeric-epoch.ts');
 	assert.equal(typeof onStaleNumericEpoch, 'function');
 	let notices = 0;
-	t.after(onStaleNumericEpoch(() => { notices++; }));
+	t.after(
+		onStaleNumericEpoch(() => {
+			notices++;
+		}),
+	);
 	const { backend } = recordingBackend((b) =>
 		isEpochRead(b) ? { data: { numericEpoch: 3 } } : staleResponse(),
 	);
@@ -542,18 +597,24 @@ test('M3 composite live progress notifies without queueing the stale write', asy
 });
 
 test('composite live library edits notify while explicit epochs stay silent', async (t) => {
-	const { onStaleNumericEpoch, isStaleNumericEpoch } = await import('../../../../../packages/api/src/numeric-epoch.ts');
+	const { onStaleNumericEpoch, isStaleNumericEpoch } =
+		await import('../../../../../packages/api/src/numeric-epoch.ts');
 	for (const field of ['mark', 'setLibraryStatus', 'setFavorite'] as const) {
 		await t.test(field, async (t) => {
 			let notices = 0;
-			t.after(onStaleNumericEpoch(() => { notices++; }));
+			t.after(
+				onStaleNumericEpoch(() => {
+					notices++;
+				}),
+			);
 			const { backend, bodies } = recordingBackend((b) =>
 				isEpochRead(b) ? { data: { numericEpoch: 3 } } : staleResponse(),
 			);
 			const { composite, writes } = signedIn(backend);
-			const write = (id: string, epoch?: number | null) => field === 'setLibraryStatus'
-				? composite.setLibraryStatus(id, 'reading', epoch)
-				: composite[field](id, true, epoch);
+			const write = (id: string, epoch?: number | null) =>
+				field === 'setLibraryStatus'
+					? composite.setLibraryStatus(id, 'reading', epoch)
+					: composite[field](id, true, epoch);
 			await assert.rejects(write('7', 2), isStaleNumericEpoch);
 			await assert.rejects(write('7', null), isStaleNumericEpoch);
 			await assert.rejects(write('w_canonical'), isStaleNumericEpoch);
@@ -563,8 +624,10 @@ test('composite live library edits notify while explicit epochs stay silent', as
 			assert.equal(notices, 1);
 			assert.equal(writes.size(), 0);
 			assert.equal(bodies.filter(isEpochRead).length, 1);
-			assert.deepEqual(bodies.filter((b) => !isEpochRead(b)).map((b) => b.variables?.numericEpoch),
-				[2, undefined, undefined, 3, 3]);
+			assert.deepEqual(
+				bodies.filter((b) => !isEpochRead(b)).map((b) => b.variables?.numericEpoch),
+				[2, undefined, undefined, 3, 3],
+			);
 		});
 	}
 });
@@ -579,8 +642,10 @@ test('M7 numeric marks send the cached or explicit epoch and uuid marks send non
 	await backend.mark('7', true, null);
 	await backend.mark('uuid-series', true, 2);
 	assert.equal(bodies.filter(isEpochRead).length, 1);
-	assert.deepEqual(bodies.filter((b) => !isEpochRead(b)).map((b) => b.variables?.numericEpoch),
-		[3, 3, 2, undefined, undefined]);
+	assert.deepEqual(
+		bodies.filter((b) => !isEpochRead(b)).map((b) => b.variables?.numericEpoch),
+		[3, 3, 2, undefined, undefined],
+	);
 	assert.match(bodies[1].query, /\$numericEpoch: Int/);
 	assert.match(bodies[1].query, /mark\([^)]*numericEpoch: \$numericEpoch/);
 });
@@ -592,9 +657,10 @@ test('numeric shelf and favourite edits send pinned or explicit epochs through t
 			isEpochRead(b) ? { data: { numericEpoch: epoch } } : { data: { [field]: { id: '7' } } },
 		);
 		const { composite } = signedIn(backend);
-		const write = (id: string, given?: number | null) => field === 'setLibraryStatus'
-			? composite.setLibraryStatus(id, 'reading', given)
-			: composite.setFavorite(id, true, given);
+		const write = (id: string, given?: number | null) =>
+			field === 'setLibraryStatus'
+				? composite.setLibraryStatus(id, 'reading', given)
+				: composite.setFavorite(id, true, given);
 		await write('7');
 		epoch = 4;
 		await write('8');
@@ -603,7 +669,10 @@ test('numeric shelf and favourite edits send pinned or explicit epochs through t
 		await write('w_canonical', 2);
 		assert.equal(bodies.filter(isEpochRead).length, 1);
 		const edits = bodies.filter((b) => !isEpochRead(b));
-		assert.deepEqual(edits.map((b) => b.variables?.numericEpoch), [3, 3, 2, undefined, undefined]);
+		assert.deepEqual(
+			edits.map((b) => b.variables?.numericEpoch),
+			[3, 3, 2, undefined, undefined],
+		);
 		assert.ok(edits.every((b) => b.query.includes('numericEpoch: $numericEpoch')));
 		assert.ok(edits.every((b) => b.query.includes('$numericEpoch: Int')));
 	}
@@ -617,11 +686,19 @@ test('old library epoch arguments are stripped per mutation without disabling ot
 			if (b.query.includes(`${field}(`) && b.query.includes('numericEpoch')) {
 				return { errors: [{ message: `Unknown argument "numericEpoch" on field "${field}"` }] };
 			}
-			return { data: { setLibraryStatus: { id: '7' }, setFavorite: { id: '7' }, mark: { id: '7' }, setProgress: true } };
+			return {
+				data: {
+					setLibraryStatus: { id: '7' },
+					setFavorite: { id: '7' },
+					mark: { id: '7' },
+					setProgress: true,
+				},
+			};
 		});
-		const write = () => field === 'setLibraryStatus'
-			? backend.setLibraryStatus('7', 'reading')
-			: backend.setFavorite('7', true);
+		const write = () =>
+			field === 'setLibraryStatus'
+				? backend.setLibraryStatus('7', 'reading')
+				: backend.setFavorite('7', true);
 		await write();
 		await write();
 		if (other === 'setFavorite') await backend.setFavorite('7', true);
@@ -632,7 +709,9 @@ test('old library epoch arguments are stripped per mutation without disabling ot
 		assert.equal(edits.length, 3, 'one strip and retry, then the remembered form');
 		assert.ok(edits[0].query.includes('numericEpoch'));
 		assert.ok(edits.slice(1).every((b) => !b.query.includes('numericEpoch')));
-		const supported = bodies.filter((b) => b.query.includes(`${other}(`) || /mutation (Mark|SetProgress)\(/.test(b.query));
+		const supported = bodies.filter(
+			(b) => b.query.includes(`${other}(`) || /mutation (Mark|SetProgress)\(/.test(b.query),
+		);
 		assert.equal(supported.length, 3);
 		assert.ok(supported.every((b) => b.query.includes('numericEpoch: $numericEpoch')));
 		assert.ok(supported.every((b) => b.variables?.numericEpoch === 3));
@@ -642,18 +721,22 @@ test('old library epoch arguments are stripped per mutation without disabling ot
 test('legacy servers without numeric epochs still accept shelf and favourite edits', async () => {
 	const { backend, bodies } = recordingBackend((b) => {
 		if (isEpochRead(b)) return { errors: [{ message: 'Unknown field "numericEpoch"' }] };
-		if (b.query.includes('numericEpoch')) return { errors: [{ message: 'Unknown argument "numericEpoch"' }] };
+		if (b.query.includes('numericEpoch'))
+			return { errors: [{ message: 'Unknown argument "numericEpoch"' }] };
 		return { data: { setLibraryStatus: { id: '7' }, setFavorite: { id: '7' } } };
 	});
 	await backend.setLibraryStatus('7', 'reading');
 	await backend.setFavorite('7', true);
 	assert.equal(bodies.filter(isEpochRead).length, 1);
-	assert.ok(bodies.filter((b) => !isEpochRead(b)).every((b) => b.variables?.numericEpoch === undefined));
+	assert.ok(
+		bodies.filter((b) => !isEpochRead(b)).every((b) => b.variables?.numericEpoch === undefined),
+	);
 	assert.ok(!bodies.at(-1)!.query.includes('numericEpoch'));
 });
 
 test('stale live library edits notify once and never refresh the pinned epoch', async (t) => {
-	const { onStaleNumericEpoch, isStaleNumericEpoch } = await import('../../../../../packages/api/src/numeric-epoch.ts');
+	const { onStaleNumericEpoch, isStaleNumericEpoch } =
+		await import('../../../../../packages/api/src/numeric-epoch.ts');
 	let notices = 0;
 	t.after(onStaleNumericEpoch(() => notices++));
 	const { backend, bodies } = recordingBackend((b) =>
@@ -665,7 +748,10 @@ test('stale live library edits notify once and never refresh the pinned epoch', 
 	await assert.rejects(backend.setFavorite('7', true), isStaleNumericEpoch);
 	assert.equal(notices, 1);
 	assert.equal(bodies.filter(isEpochRead).length, 1);
-	assert.deepEqual(bodies.filter((b) => !isEpochRead(b)).map((b) => b.variables?.numericEpoch), [2, 3, 3]);
+	assert.deepEqual(
+		bodies.filter((b) => !isEpochRead(b)).map((b) => b.variables?.numericEpoch),
+		[2, 3, 3],
+	);
 });
 
 test('M7 an old server strips the mark epoch argument and remembers the fallback', async () => {
@@ -692,7 +778,8 @@ test('M7 a mark-only epoch fallback keeps numericEpoch on progress writes', asyn
 				return { errors: [{ message: 'Unknown argument "numericEpoch" on field "mark"' }] };
 			return { data: { mark: { id: '7' } } };
 		}
-		if (!b.query.includes('numericEpoch') || b.variables?.numericEpoch !== 3) return staleResponse();
+		if (!b.query.includes('numericEpoch') || b.variables?.numericEpoch !== 3)
+			return staleResponse();
 		return { data: { setProgress: true, setChapterRead: true } };
 	});
 	await backend.mark('7', true);
@@ -701,7 +788,10 @@ test('M7 a mark-only epoch fallback keeps numericEpoch on progress writes', asyn
 	const progress = bodies.filter((b) => /mutation Set(?:Progress|ChapterRead)/.test(b.query));
 	assert.equal(progress.length, 2);
 	assert.ok(progress.every((b) => b.query.includes('numericEpoch: $numericEpoch')));
-	assert.deepEqual(progress.map((b) => b.variables?.numericEpoch), [3, 3]);
+	assert.deepEqual(
+		progress.map((b) => b.variables?.numericEpoch),
+		[3, 3],
+	);
 });
 
 test('M7 offline numeric marks persist their epoch and stale replay drops without a retry', async (t) => {
@@ -730,7 +820,10 @@ test('M7 offline numeric marks persist their epoch and stale replay drops withou
 	replay.setCurrentUser('A');
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	assert.equal(persisted.size(), 0);
-	assert.deepEqual(bodies.filter((b) => b.variables?.seriesId === '8').map((b) => b.variables?.numericEpoch), [3, 3]);
+	assert.deepEqual(
+		bodies.filter((b) => b.variables?.seriesId === '8').map((b) => b.variables?.numericEpoch),
+		[3, 3],
+	);
 	await assert.rejects(replay.mark('9', true), /Earlier engine generation/);
 	assert.equal(persisted.size(), 0, 'a stale live mark is rethrown without enqueueing');
 	assert.equal(bodies.filter(isEpochRead).length, 1);
@@ -740,9 +833,11 @@ test('M7 legacy and unknown mark epochs replay without reading a fresh epoch', a
 	captureWarnings(t);
 	for (const numericEpoch of [undefined, null]) {
 		const storage = createMemoryStorageAdapter();
-		storage.save(JSON.stringify([
-			{ kind: 'mark', seriesId: '7', marked: true, ts: 1, tries: 0, userId: 'A', numericEpoch },
-		]));
+		storage.save(
+			JSON.stringify([
+				{ kind: 'mark', seriesId: '7', marked: true, ts: 1, tries: 0, userId: 'A', numericEpoch },
+			]),
+		);
 		const queue = new OfflineWriteQueue(storage);
 		const { backend, bodies } = recordingBackend(() => staleResponse());
 		const composite = new CompositeBackend({ hosted: backend, queue });
@@ -761,7 +856,10 @@ test('M7 composite marks stop after an account switch during the epoch read', as
 	const hosted = {
 		setToken: () => {},
 		numericEpoch: () => new Promise<number>((resolve) => (finish = resolve)),
-		mark: async () => { sent++; return { id: '7' }; },
+		mark: async () => {
+			sent++;
+			return { id: '7' };
+		},
 	} as unknown as Backend;
 	const { composite, writes } = signedIn(hosted);
 	const pending = assert.rejects(composite.mark('7', true), /identity changed/);

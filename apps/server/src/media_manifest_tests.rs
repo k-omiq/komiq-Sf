@@ -204,10 +204,23 @@ async fn fixture(
 fn router(app: Arc<AppState>) -> Router {
     Router::new()
         .route("/media/v1/c/{chapter_id}/{page}", get(serve_chapter_page))
-        .route("/api/v1/manga/{*rest}", get(|State(app): State<Arc<AppState>>, UrlPath(rest): UrlPath<String>, RawQuery(query): RawQuery| async move {
-            let covers = app.cover_pool.clone();
-            serve_suwayomi_image(State(app), State(CoverDb(covers)), UrlPath(rest), RawQuery(query)).await
-        }))
+        .route(
+            "/api/v1/manga/{*rest}",
+            get(
+                |State(app): State<Arc<AppState>>,
+                 UrlPath(rest): UrlPath<String>,
+                 RawQuery(query): RawQuery| async move {
+                    let covers = app.cover_pool.clone();
+                    serve_suwayomi_image(
+                        State(app),
+                        State(CoverDb(covers)),
+                        UrlPath(rest),
+                        RawQuery(query),
+                    )
+                    .await
+                },
+            ),
+        )
         .route(
             "/media/v1/o/{copy_id}/{sha256}",
             get(serve_media_object)
@@ -794,7 +807,6 @@ async fn ingest_publishes_nothing_when_the_engine_reorders_during_the_pass() {
     assert_eq!(manifests, 0);
 }
 
-
 async fn regional_fixture(
     strict: bool,
 ) -> (
@@ -818,12 +830,17 @@ async fn regional_fixture(
     // require, so readers fetch pages through this server where routing happens.
     let app_mut = Arc::get_mut(&mut app).unwrap();
     app_mut.suwayomi = SuwayomiClient::new(owner.url.clone(), Some("/".into()), None);
-    app_mut.suwayomi.regional =
-        Arc::new(crate::engine_route::Engines::new(&[regional.spec("sg")]));
+    app_mut.suwayomi.regional = Arc::new(crate::engine_route::Engines::new(&[regional.spec("sg")]));
     sqlx::query("INSERT INTO source_extension(source_id,pkg_name,repo_url,version_code,updated_at) VALUES('source','pkg.src','https://komiq.example.com/index.min.json',7,now())")
         .execute(&app.pool).await.unwrap();
-    crate::engine_route::store_route(&app.pool, "source", Some(("sg", strict)), None).await.unwrap();
-    app.suwayomi.regional.reload_routes(&app.pool).await.unwrap();
+    crate::engine_route::store_route(&app.pool, "source", Some(("sg", strict)), None)
+        .await
+        .unwrap();
+    app.suwayomi
+        .regional
+        .reload_routes(&app.pool)
+        .await
+        .unwrap();
     app.suwayomi.regional.probe_all().await;
     (dir, owner, app, cover_dir, regional)
 }
@@ -834,7 +851,10 @@ async fn assert_no_regional_ids(pool: &crate::database::Database) {
          FROM information_schema.columns c JOIN information_schema.tables t \
          ON t.table_schema=c.table_schema AND t.table_name=c.table_name \
          WHERE c.table_schema=current_schema() AND t.table_type='BASE TABLE'",
-    ).fetch_all(pool).await.unwrap();
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
     assert!(!columns.is_empty());
     let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
     for (schema, table, column) in columns {
@@ -842,8 +862,12 @@ async fn assert_no_regional_ids(pool: &crate::database::Database) {
             "SELECT EXISTS(SELECT 1 FROM {}.{} WHERE position($1 in {}::text)>0 OR position($2 in {}::text)>0)",
             quote(&schema), quote(&table), quote(&column), quote(&column),
         );
-        let found: bool = sqlx::query_scalar(&query).bind("987654321").bind("987650001")
-            .fetch_one(pool).await.unwrap();
+        let found: bool = sqlx::query_scalar(&query)
+            .bind("987654321")
+            .bind("987650001")
+            .fetch_one(pool)
+            .await
+            .unwrap();
         assert!(!found, "regional id persisted in {table}.{column}");
     }
 }
@@ -853,7 +877,8 @@ async fn regional_locator_legacy_graphql_ingest_objects_and_cover_keep_owner_ids
     use std::sync::atomic::Ordering::SeqCst;
     let (_dir, owner, app, _cover_dir, regional) = regional_fixture(false).await;
     let expected: Vec<Vec<u8>> = (0..3)
-        .map(|i| crate::engine_route::tests::fake_page("/chapter", i)).collect();
+        .map(|i| crate::engine_route::tests::fake_page("/chapter", i))
+        .collect();
     let response = get_media(&app, "/media/v1/c/8/1").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body(response).await, expected[1]);
@@ -871,8 +896,18 @@ async fn regional_locator_legacy_graphql_ingest_objects_and_cover_keep_owner_ids
     let path = listed[0]["mediaPath"].as_str().unwrap();
     let copy = path.split('/').nth(4).unwrap();
     let manifest = store::latest(&app.pool, copy).await.unwrap().unwrap();
-    assert_eq!(manifest.body.pages.iter().map(|p| p.sha256.clone()).collect::<Vec<_>>(),
-        expected.iter().map(|p| hex::encode(Sha256::digest(p))).collect::<Vec<_>>());
+    assert_eq!(
+        manifest
+            .body
+            .pages
+            .iter()
+            .map(|p| p.sha256.clone())
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|p| hex::encode(Sha256::digest(p)))
+            .collect::<Vec<_>>()
+    );
     let response = get_media(&app, path).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body(response).await, expected[0]);
@@ -882,7 +917,12 @@ async fn regional_locator_legacy_graphql_ingest_objects_and_cover_keep_owner_ids
     let original = crate::engine_route::tests::fake_page("/cover", 0);
     assert_eq!(cover, cover::process_cover(&original).unwrap());
     app.pool.flush_deferred().await;
-    assert!(cover::read_suwayomi_cover(&app.pool, &app.cover_pool, 7, None).await.unwrap().is_some());
+    assert!(
+        cover::read_suwayomi_cover(&app.pool, &app.cover_pool, 7, None)
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(regional.calls("cover"), 1);
     assert_eq!(owner.page_hits.load(SeqCst), 0);
     assert_eq!(owner.page_lists.load(SeqCst), 0);
@@ -890,7 +930,10 @@ async fn regional_locator_legacy_graphql_ingest_objects_and_cover_keep_owner_ids
     regional.state.lock().unwrap().page_override = Some(image_bytes(9));
     let response = get_media(&app, path).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    assert!(response.headers()[header::CACHE_CONTROL].to_str().unwrap().contains("no-store"));
+    assert!(response.headers()[header::CACHE_CONTROL]
+        .to_str()
+        .unwrap()
+        .contains("no-store"));
     assert!(store::latest(&app.pool, copy).await.unwrap().unwrap().stale);
     assert_no_regional_ids(&app.pool).await;
 }
@@ -905,19 +948,35 @@ async fn regional_down_missing_and_version_mismatch_fallback_or_refuse() {
                 "down" => regional.state.lock().unwrap().down = true,
                 "missing" => regional.state.lock().unwrap().chapters.clear(),
                 "version" => {
-                    sqlx::query("UPDATE source_extension SET version_code=8 WHERE source_id='source'")
-                        .execute(&app.pool).await.unwrap();
-                    app.suwayomi.regional.reload_routes(&app.pool).await.unwrap();
+                    sqlx::query(
+                        "UPDATE source_extension SET version_code=8 WHERE source_id='source'",
+                    )
+                    .execute(&app.pool)
+                    .await
+                    .unwrap();
+                    app.suwayomi
+                        .regional
+                        .reload_routes(&app.pool)
+                        .await
+                        .unwrap();
                 }
                 _ => unreachable!(),
             }
             let response = get_media(&app, "/media/v1/c/8/0").await;
             if strict {
-                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{failure}");
-                assert!(response.headers()[header::CACHE_CONTROL].to_str().unwrap().contains("no-store"));
+                assert_eq!(
+                    response.status(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{failure}"
+                );
+                assert!(response.headers()[header::CACHE_CONTROL]
+                    .to_str()
+                    .unwrap()
+                    .contains("no-store"));
                 assert_eq!(owner.page_hits.load(SeqCst), 0);
                 let result = graphql::build_schema(app.clone(), false)
-                    .execute("{ pages(chapterId: \"8\") { sourceUrl } }").await;
+                    .execute("{ pages(chapterId: \"8\") { sourceUrl } }")
+                    .await;
                 assert!(!result.errors.is_empty(), "{failure}");
                 assert_eq!(owner.page_lists.load(SeqCst), 0);
             } else {
@@ -925,7 +984,16 @@ async fn regional_down_missing_and_version_mismatch_fallback_or_refuse() {
                 assert_eq!(body(response).await, owner.pages.lock().unwrap()[0]);
                 assert_eq!(pages(&app).await.as_array().unwrap().len(), 2);
                 assert_eq!(owner.page_lists.load(SeqCst), 1);
-                assert!(app.suwayomi.regional.engine("sg").unwrap().counters.snapshot().fallbacks > 0);
+                assert!(
+                    app.suwayomi
+                        .regional
+                        .engine("sg")
+                        .unwrap()
+                        .counters
+                        .snapshot()
+                        .fallbacks
+                        > 0
+                );
             }
             assert_no_regional_ids(&app.pool).await;
         }
@@ -936,11 +1004,19 @@ async fn regional_down_missing_and_version_mismatch_fallback_or_refuse() {
 async fn regional_ingest_spends_page_budget_and_uncached_resolution_budget() {
     let (_dir, owner, app, _cover_dir, _regional) = regional_fixture(false).await;
     for _ in 0..595 {
-        assert!(app.source_budgets.spend_media_page("source", Duration::ZERO).await);
+        assert!(
+            app.source_budgets
+                .spend_media_page("source", Duration::ZERO)
+                .await
+        );
     }
     // One uncached resolution, three pages and the re-check use the remaining five.
     assert_eq!(ingest_chapter(&app, 8).await.unwrap(), Some(1));
-    assert!(!app.source_budgets.spend_media_page("source", Duration::ZERO).await);
+    assert!(
+        !app.source_budgets
+            .spend_media_page("source", Duration::ZERO)
+            .await
+    );
     assert_eq!(owner.page_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_no_regional_ids(&app.pool).await;
 }
@@ -948,25 +1024,41 @@ async fn regional_ingest_spends_page_budget_and_uncached_resolution_budget() {
 #[tokio::test]
 async fn regional_background_cover_fill_publishes_under_owner_manga_id() {
     let (_dir, _owner, app, _cover_dir, regional) = regional_fixture(false).await;
-    spawn_suwayomi_cover_materialize(&app, &app.cover_pool, 7).unwrap().await.unwrap();
+    spawn_suwayomi_cover_materialize(&app, &app.cover_pool, 7)
+        .unwrap()
+        .await
+        .unwrap();
     let stored = cover::read_suwayomi_cover(&app.pool, &app.cover_pool, 7, None)
-        .await.unwrap().unwrap().0;
-    assert_eq!(stored.bytes, cover::process_cover(&crate::engine_route::tests::fake_page("/cover", 0)).unwrap());
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(
+        stored.bytes,
+        cover::process_cover(&crate::engine_route::tests::fake_page("/cover", 0)).unwrap()
+    );
     assert_eq!(regional.calls("cover"), 1);
     assert_no_regional_ids(&app.pool).await;
 }
-
 
 #[tokio::test]
 async fn regional_ingest_abandons_a_partial_pass_without_owner_pages() {
     let (_dir, owner, app, _cover_dir, regional) = regional_fixture(false).await;
     regional.state.lock().unwrap().fail_page = Some(1);
     assert!(ingest_chapter(&app, 8).await.is_err());
-    assert_eq!(regional.page_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        regional.page_hits.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
     assert_eq!(owner.page_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
-    assert_eq!(owner.page_lists.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        owner.page_lists.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM media_manifest")
-        .fetch_one(&app.pool).await.unwrap();
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
     assert_eq!(count, 0);
     assert_no_regional_ids(&app.pool).await;
 }
@@ -1004,12 +1096,21 @@ async fn regional_ingest_publishes_nothing_when_chapter_changes_during_pass() {
             state.chapters_after_page = Some((2, changed));
         }
         let error = ingest_chapter(&app, 8).await.unwrap_err();
-        assert_eq!(error.to_string(), "regional chapter changed during ingest", "{change}");
-        assert_eq!(regional.page_hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            error.to_string(),
+            "regional chapter changed during ingest",
+            "{change}"
+        );
+        assert_eq!(
+            regional.page_hits.load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
         assert_eq!(regional.calls("page_list"), 2);
         assert_eq!(owner.page_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM media_manifest")
-            .fetch_one(&app.pool).await.unwrap();
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
         assert_eq!(count, 0, "{change}");
     }
 }
@@ -1017,7 +1118,10 @@ async fn regional_ingest_publishes_nothing_when_chapter_changes_during_pass() {
 #[tokio::test]
 async fn regional_ingest_drops_cached_ids_before_starting() {
     let (_dir, owner, app, _cover_dir, regional) = regional_fixture(false).await;
-    let keys = crate::engine_route::keys_for_chapter(&app.pool, 8).await.unwrap().unwrap();
+    let keys = crate::engine_route::keys_for_chapter(&app.pool, 8)
+        .await
+        .unwrap()
+        .unwrap();
     let engine = app.suwayomi.regional.engine("sg").unwrap();
     engine.chapter(&keys).await.unwrap().unwrap();
     {
@@ -1035,7 +1139,15 @@ async fn regional_ingest_drops_cached_ids_before_starting() {
     assert_eq!(ingest_chapter(&app, 8).await.unwrap(), Some(1));
     assert_eq!(regional.calls("mangas"), 2);
     assert_eq!(owner.page_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
-    let copy = store::existing_copy_for_chapter(&app.pool, 8).await.unwrap().unwrap();
+    let copy = store::existing_copy_for_chapter(&app.pool, 8)
+        .await
+        .unwrap()
+        .unwrap();
     let manifest = store::latest(&app.pool, &copy).await.unwrap().unwrap();
-    assert_eq!(manifest.body.pages[0].sha256, hex::encode(Sha256::digest(crate::engine_route::tests::fake_page("/chapter", 0))));
+    assert_eq!(
+        manifest.body.pages[0].sha256,
+        hex::encode(Sha256::digest(crate::engine_route::tests::fake_page(
+            "/chapter", 0
+        )))
+    );
 }

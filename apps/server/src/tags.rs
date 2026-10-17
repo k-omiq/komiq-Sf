@@ -444,10 +444,9 @@ async fn sync_suwayomi_tags_in(
         let (source_id, fresh) = only
             .map(|(_, source, fresh)| (source, fresh))
             .unwrap_or((None, &[]));
-        let changed = crate::db::retry_transaction(|| {
-            sync_suwayomi_tags_work(pool, &work, source_id, fresh)
-        })
-        .await?;
+        let changed =
+            crate::db::retry_transaction(|| sync_suwayomi_tags_work(pool, &work, source_id, fresh))
+                .await?;
         total.inserted += changed.inserted;
         total.deleted += changed.deleted;
         total.demographics += changed.demographics;

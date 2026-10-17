@@ -2010,12 +2010,20 @@ pub async fn retry_one_cover(
                 manga_id,
                 file_name,
             } => mangadex.cover_thumb_bytes(&manga_id, &file_name).await,
-            RepairCoverSource::Suwayomi { path, .. } => match crate::engine_route::cover_manga_id(&path) {
-                Some(id) => crate::engine_route::cover_bytes(
-                    suwayomi, main, crate::engine_route::CoverTarget::OwnerManga(id), Some(&path),
-                ).await,
-                None => suwayomi.cover_bytes(Some(&path)).await,
-            },
+            RepairCoverSource::Suwayomi { path, .. } => {
+                match crate::engine_route::cover_manga_id(&path) {
+                    Some(id) => {
+                        crate::engine_route::cover_bytes(
+                            suwayomi,
+                            main,
+                            crate::engine_route::CoverTarget::OwnerManga(id),
+                            Some(&path),
+                        )
+                        .await
+                    }
+                    None => suwayomi.cover_bytes(Some(&path)).await,
+                }
+            }
         }
     })
     .await;

@@ -11,23 +11,23 @@ Read [Exact media and signing](/developers/media-manifests) first for copies, re
 
 The server answers `GET /media/v1/p/{copyId}/{rev}`. `rev` is a revision number above zero. The route has the same eligibility as the object route: with signed manifests off, it answers `404`.
 
-| Status | When |
-| --- | --- |
-| `200` | The revision exists, is not stale, and the copy is allowed. |
-| `404` | Bad path, unknown or stale revision, unknown copy, a denied copy, a copy of a denied series, or a taken-down chapter. |
-| `500` | The manifest store cannot answer. |
-| `503` | The engine is restarting. |
+| Status | When                                                                                                                  |
+| ------ | --------------------------------------------------------------------------------------------------------------------- |
+| `200`  | The revision exists, is not stale, and the copy is allowed.                                                           |
+| `404`  | Bad path, unknown or stale revision, unknown copy, a denied copy, a copy of a denied series, or a taken-down chapter. |
+| `500`  | The manifest store cannot answer.                                                                                     |
+| `503`  | The engine is restarting.                                                                                             |
 
 Every error answer has `no-store`.
 
 A `200` answer has:
 
-| Header | Value |
-| --- | --- |
-| `Content-Type` | `application/vnd.komika.pack` |
-| `Content-Length` | The exact pack length, computed from the manifest. |
-| `Cache-Control` | The object route's value, `s-maxage` tied to the policy lease. |
-| `Access-Control-Allow-Origin` | `*`, on every answer, errors too. |
+| Header                        | Value                                                          |
+| ----------------------------- | -------------------------------------------------------------- |
+| `Content-Type`                | `application/vnd.komika.pack`                                  |
+| `Content-Length`              | The exact pack length, computed from the manifest.             |
+| `Cache-Control`               | The object route's value, `s-maxage` tied to the policy lease. |
+| `Access-Control-Allow-Origin` | `*`, on every answer, errors too.                              |
 
 The response is never compressed: the server's compression layer skips this content type. `HEAD` answers from the manifest alone and fetches no pages.
 

@@ -1,5 +1,5 @@
-pub mod types;
 mod engines;
+pub mod types;
 
 #[cfg(test)]
 mod engines_tests;
@@ -2162,6 +2162,7 @@ fn no_such_series(series_id: &str) -> &'static str {
 
 /// Whether a SITE-WIDE rule blocks the Suwayomi series `manga_id`. For the image routes,
 /// which have no GraphQL context. One small read when no rule exists, two when one does.
+#[cfg(test)]
 pub async fn site_blocks_engine_series(pool: &Database, manga_id: i64) -> anyhow::Result<bool> {
     let site = crate::block::load(pool, None).await?;
     if site.is_empty() {
@@ -11508,8 +11509,14 @@ async fn write_entry_mark_on(
          VALUES ($1, $2, $3, now()) ON CONFLICT (user_id, work_chapter_id) \
          DO UPDATE SET read = excluded.read, created_at = excluded.created_at \
          WHERE work_chapter_mark.read IS DISTINCT FROM excluded.read",
-    ).bind(crate::db_types::uuid(user_id)?).bind(entry).bind(read)
-        .execute(conn).await?.rows_affected() > 0)
+    )
+    .bind(crate::db_types::uuid(user_id)?)
+    .bind(entry)
+    .bind(read)
+    .execute(conn)
+    .await?
+    .rows_affected()
+        > 0)
 }
 
 /// Both APIs use this transaction so old clients participate in the same revisions.
@@ -11542,7 +11549,11 @@ async fn write_progress_once(
         sqlx::query_as(
             "SELECT through_entry_id, revision, last_op_id FROM work_progress \
              WHERE user_id = $1 AND work_id = $2 FOR UPDATE",
-        ).bind(user).bind(&copy.work_id).fetch_optional(&mut *tx).await?
+        )
+        .bind(user)
+        .bind(&copy.work_id)
+        .fetch_optional(&mut *tx)
+        .await?
     };
     let (mut through, revision, last_op_id) = stored.unwrap_or((None, 0, None));
     let op_id = check.as_ref().and_then(|check| check.op_id);
@@ -11829,9 +11840,8 @@ async fn write_progress_once(
     }
     // `updated_at` is the last read (it orders Continue reading): an untick is not a read
     // and keeps the stored time.
-    let new_revision =
-        if changed && !copy.work_id.is_empty() {
-            sqlx::query_scalar(
+    let new_revision = if changed && !copy.work_id.is_empty() {
+        sqlx::query_scalar(
             "INSERT INTO work_progress (user_id, work_id, through_entry_id, revision, updated_at, last_op_id) \
              VALUES ($1, $2, $3, 1, now(), $5) ON CONFLICT (user_id, work_id) DO UPDATE SET \
              through_entry_id = excluded.through_entry_id, revision = work_progress.revision + 1, \
@@ -11842,9 +11852,9 @@ async fn write_progress_once(
             .bind(matches!(write, ProgressWrite::Toggle { read: false }))
             .bind(op_id)
             .fetch_one(&mut *tx).await?
-        } else {
-            revision
-        };
+    } else {
+        revision
+    };
     if numeric {
         crate::engine_generation::commit_ready(pool)?;
     }
@@ -12949,6 +12959,7 @@ impl MutationRoot {
         .map_err(mutation_write_error)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn save_progress(
         &self,
         ctx: &Context<'_>,
@@ -12990,6 +13001,7 @@ impl MutationRoot {
         .map_err(mutation_write_error)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn save_chapter_read(
         &self,
         ctx: &Context<'_>,
@@ -14404,6 +14416,7 @@ impl MutationRoot {
     }
 
     /// Admin: edit the visibility, title, special status or position of a chapter-list entry.
+    #[allow(clippy::too_many_arguments)]
     async fn set_work_chapter(
         &self,
         ctx: &Context<'_>,
@@ -15107,7 +15120,9 @@ impl MutationRoot {
                 title: Some(m.title.clone()),
             },
             m.thumbnail_url.as_deref(),
-        ).await {
+        )
+        .await
+        {
             // dhash decodes + grayscales + resizes the cover — CPU-bound; keep it off
             // the async runtime. Best-effort: a task panic just drops the signal.
             Some(bytes) => tokio::task::spawn_blocking(move || crate::phash::dhash(&bytes))
@@ -15974,7 +15989,8 @@ pub(crate) async fn ingest_source_series(
                 title: Some(m.title.clone()),
             },
             m.thumbnail_url.as_deref(),
-        ).await
+        )
+        .await
     } else {
         None
     };
@@ -16494,7 +16510,9 @@ async fn federated_ingest(st: &AppState, raw_id: &str) -> anyhow::Result<MatchRe
             title: Some(m.title.clone()),
         },
         m.thumbnail_url.as_deref(),
-    ).await {
+    )
+    .await
+    {
         // dhash is CPU-bound (decode + grayscale + resize); keep it off the async
         // runtime. Best-effort: a task panic just drops the signal.
         Some(bytes) => tokio::task::spawn_blocking(move || crate::phash::dhash(&bytes))
@@ -18119,7 +18137,13 @@ async fn add_source_series_checked(
     // content block rule that names one of its genres lets it through. Best-effort: a
     // failure leaves the work as it was before this call existed, and the refresh
     // derives the tags then.
-    if let Err(e) = crate::tags::sync_work_suwayomi_tags(&st.pool, &result.work_id, Some(&m.source_id), &m.genre).await
+    if let Err(e) = crate::tags::sync_work_suwayomi_tags(
+        &st.pool,
+        &result.work_id,
+        Some(&m.source_id),
+        &m.genre,
+    )
+    .await
     {
         crate::db::observe_database_error(&e);
         tracing::warn!(work_id = %result.work_id, error = %e, "enrol: tag derivation failed; the next catalogue refresh retries");
@@ -18521,7 +18545,8 @@ pub(crate) async fn enrol_source_series_once(
     if linked != work_id {
         return Err(crate::locks::RestartTransaction.into());
     }
-    let cached = catalog::work_metadata::cached_suwayomi_observation_on(&mut tx, source_key).await?;
+    let cached =
+        catalog::work_metadata::cached_suwayomi_observation_on(&mut tx, source_key).await?;
     let observation = cached.as_ref().unwrap_or(observation);
     catalog::work_metadata::record_on(&mut tx, &ssid, observation, Attribution::Observed).await?;
     let groups: Vec<_> = FieldGroup::ALL

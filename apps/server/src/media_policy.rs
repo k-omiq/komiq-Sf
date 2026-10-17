@@ -72,6 +72,7 @@ pub(crate) struct Takedown {
 }
 
 /// The current epoch: 0 before the first policy change.
+#[cfg(test)]
 pub(crate) async fn epoch<'e, E>(executor: E) -> Result<i64>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
@@ -740,6 +741,9 @@ struct Held {
     checked: Instant,
 }
 
+/// A signed lease body and the (epoch, minute) it was signed for.
+type SignedLease = (i64, i64, Arc<Vec<u8>>);
+
 /// The owner's denied set, shared by every request. See the module comment.
 #[derive(Default)]
 pub(crate) struct Policy {
@@ -748,7 +752,7 @@ pub(crate) struct Policy {
     held: Mutex<Option<Held>>,
     reload: tokio::sync::Mutex<()>,
     /// The signed lease for (epoch, minute).
-    lease: Mutex<Option<(i64, i64, Arc<Vec<u8>>)>>,
+    lease: Mutex<Option<SignedLease>>,
 }
 
 impl Policy {

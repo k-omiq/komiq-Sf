@@ -26,7 +26,7 @@ networks). Production has no standby; adding one waits for a second host.
   (`<prefix>.fence.json`, never inside `<prefix>/`):
 
   ```json
-  {"at": "2026-10-16T12:00:00Z", "epoch": 2, "primary_node": "node-b", "timeline": 3}
+  { "at": "2026-10-16T12:00:00Z", "epoch": 2, "primary_node": "node-b", "timeline": 3 }
   ```
 
   Every node has a `KOMIKA_NODE_ID`. Before PostgreSQL starts as a primary
@@ -35,6 +35,7 @@ networks). Production has no standby; adding one waits for a second host.
   the local timeline is not older than the fence's. The first primary with no
   fence claims epoch 1 with a create-only write. An unreadable fence is a
   refusal, so with a node name set, a primary start needs the bucket.
+
 - **Node marker.** After a fence check passes (and after `standby-init` and
   `promote`), `hosted.py` writes the node name to
   `/var/lib/postgresql/komika-backup/node-id` on the data volume, beside the
@@ -47,6 +48,7 @@ networks). Production has no standby; adding one waits for a second host.
   ```sh
   docker compose run --rm --no-deps --entrypoint rm postgres /var/lib/postgresql/komika-backup/node-id
   ```
+
 - **Who checks the fence.** PostgreSQL's start, the backup scheduler (backups
   run only on the fenced primary; a standby pauses them and checks again each
   minute), `backup.sh` jobs, and `hosted.py fence-check`. The server checks the
@@ -173,6 +175,7 @@ does not have it yet, and drops and makes it again when the slot was lost.
    `komika.node_id`/`komika.fence_epoch`. It prints the last replayed LSN and
    commit time: anything the old primary committed after that is lost (the
    RPO). `promote.sh` then starts the rest of the stack.
+
 3. Restore what PostgreSQL does not hold (next section) before you send users.
 4. Move DNS or the tunnel to this host.
 5. The scheduler on the new primary starts its due backups within a minute.
@@ -202,14 +205,14 @@ data volume aside (do not delete it until the new pair is healthy), then run
 A promoted database alone is not a working server. Keep these on the standby
 host, or accept what the right column says:
 
-| Item | Where | On the standby |
-| --- | --- | --- |
-| Engine volume (`suwayomi-data`: extensions, engine database, numeric IDs) | Docker volume | Copy it nightly. Without a copy, re-attach a matching engine or start a new generation (`komika-server engine ...`). |
-| Cover files (`covers.sqlite3`) | `server-data` volume | They refill on demand. |
-| Media signing key (`media-signing.key`) | `server-data` volume | Copy it once. The same key keeps trust; a new key is a new signing identity for pinned regional caches. Only the promoted host may use it. |
-| `deploy/.env`, TLS fallback files (`docker-compose.fallback.yml`) | host | Copy them; keep `KOMIKA_NODE_ID` per host. |
-| Engine `server.conf` and source settings | engine volume | Part of the engine volume copy. |
-| Backup state (`status.json`, dropped-WAL record) | `postgres-data` volume | Starts empty on the new primary; the repository holds the backups. |
+| Item                                                                      | Where                  | On the standby                                                                                                                             |
+| ------------------------------------------------------------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Engine volume (`suwayomi-data`: extensions, engine database, numeric IDs) | Docker volume          | Copy it nightly. Without a copy, re-attach a matching engine or start a new generation (`komika-server engine ...`).                       |
+| Cover files (`covers.sqlite3`)                                            | `server-data` volume   | They refill on demand.                                                                                                                     |
+| Media signing key (`media-signing.key`)                                   | `server-data` volume   | Copy it once. The same key keeps trust; a new key is a new signing identity for pinned regional caches. Only the promoted host may use it. |
+| `deploy/.env`, TLS fallback files (`docker-compose.fallback.yml`)         | host                   | Copy them; keep `KOMIKA_NODE_ID` per host.                                                                                                 |
+| Engine `server.conf` and source settings                                  | engine volume          | Part of the engine volume copy.                                                                                                            |
+| Backup state (`status.json`, dropped-WAL record)                          | `postgres-data` volume | Starts empty on the new primary; the repository holds the backups.                                                                         |
 
 ## Not covered
 

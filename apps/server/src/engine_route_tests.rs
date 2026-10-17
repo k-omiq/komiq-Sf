@@ -187,8 +187,7 @@ async fn fake_graphql(
         op = "page_list";
         let id = vars["id"].as_i64().unwrap();
         let Some(chapter) = state.chapters.iter().find(|c| c.id == id).cloned() else {
-            return Json(json!({ "errors": [{ "message": "chapter not found" }] }))
-                .into_response();
+            return Json(json!({ "errors": [{ "message": "chapter not found" }] })).into_response();
         };
         let pages: Vec<String> = (0..chapter.pages)
             .map(|p| {
@@ -225,16 +224,32 @@ async fn fake_graphql(
     } else if query.contains("updateExtension(") {
         let pkg = vars["id"].as_str().unwrap().to_string();
         let patch = &vars["patch"];
-        op = if patch["install"] == json!(true) { "install" } else { "update" };
+        op = if patch["install"] == json!(true) {
+            "install"
+        } else {
+            "update"
+        };
         assert!(
             state.stores.len() == 1 || op == "update",
             "install before its repository was added"
         );
         assert!(
-            shared.calls.lock().unwrap().get("refresh_extensions").copied().unwrap_or(0) > 0,
+            shared
+                .calls
+                .lock()
+                .unwrap()
+                .get("refresh_extensions")
+                .copied()
+                .unwrap_or(0)
+                > 0,
             "extension changed before its index was refreshed"
         );
-        let offered = state.available.iter().find(|(p, _, _)| *p == pkg).cloned().unwrap();
+        let offered = state
+            .available
+            .iter()
+            .find(|(p, _, _)| *p == pkg)
+            .cloned()
+            .unwrap();
         state.extensions.retain(|(p, _, _)| *p != pkg);
         state.extensions.push(offered);
         json!({ "updateExtension": { "extension": fake_extension_entry(&state, &pkg) } })
@@ -289,15 +304,18 @@ async fn fake_page_route(
         return StatusCode::NOT_FOUND.into_response();
     };
     shared.page_hits.fetch_add(1, Ordering::SeqCst);
-    let bytes = state.page_override.clone().unwrap_or_else(|| fake_page(&chapter.url, page));
-    if state.chapters_after_page.as_ref().is_some_and(|(at, _)| *at == page) {
+    let bytes = state
+        .page_override
+        .clone()
+        .unwrap_or_else(|| fake_page(&chapter.url, page));
+    if state
+        .chapters_after_page
+        .as_ref()
+        .is_some_and(|(at, _)| *at == page)
+    {
         state.chapters = state.chapters_after_page.take().unwrap().1;
     }
-    (
-        [(header::CONTENT_TYPE, "image/png")],
-        bytes,
-    )
-        .into_response()
+    ([(header::CONTENT_TYPE, "image/png")], bytes).into_response()
 }
 
 async fn fake_cover_route(
@@ -317,7 +335,11 @@ async fn fake_cover_route(
     }
     state.cover_hits.push(manga);
     *shared.calls.lock().unwrap().entry("cover").or_default() += 1;
-    ([(header::CONTENT_TYPE, "image/png")], fake_page("/cover", 0)).into_response()
+    (
+        [(header::CONTENT_TYPE, "image/png")],
+        fake_page("/cover", 0),
+    )
+        .into_response()
 }
 
 impl FakeRegional {
@@ -430,11 +452,20 @@ fn parse(raw: &str, files: &[(&str, &str)]) -> std::result::Result<Vec<EngineSpe
 
 #[test]
 fn engines_parse_ids_urls_and_auth_files() {
-    assert_eq!(parse_engines(None, |_| None, |_| unreachable!()), Ok(vec![]));
-    assert_eq!(parse_engines(Some("  "), |_| None, |_| unreachable!()), Ok(vec![]));
+    assert_eq!(
+        parse_engines(None, |_| None, |_| unreachable!()),
+        Ok(vec![])
+    );
+    assert_eq!(
+        parse_engines(Some("  "), |_| None, |_| unreachable!()),
+        Ok(vec![])
+    );
     let engines = parse(
         "sg=http://10.8.0.2:4567/, eu-2=https://engine.internal:4567",
-        &[("sg", "komika:secret-one\n"), ("eu-2", "user:pass:with:colons")],
+        &[
+            ("sg", "komika:secret-one\n"),
+            ("eu-2", "user:pass:with:colons"),
+        ],
     )
     .unwrap();
     assert_eq!(engines.len(), 2);
@@ -463,13 +494,33 @@ fn engines_refuse_bad_entries() {
         ("sg=http://a:1,sg=http://b:1", &ok_auth[..], "listed twice"),
         ("sg=ftp://a:1", &ok_auth[..], "http or https"),
         ("sg=http://u:p@a:1", &ok_auth[..], "not in the URL"),
-        ("sg=http://user:secret@komiq.example.com:badport", &ok_auth[..], "invalid URL"),
-        ("http://user:secret@komiq.example.com:badport", &ok_auth[..], "is not `id=url`"),
+        (
+            "sg=http://user:secret@komiq.example.com:badport",
+            &ok_auth[..],
+            "invalid URL",
+        ),
+        (
+            "http://user:secret@komiq.example.com:badport",
+            &ok_auth[..],
+            "is not `id=url`",
+        ),
         ("sg=http://a:1/api", &ok_auth[..], "without a path"),
         ("sg=http://a:1", &[][..], "KOMIKA_ENGINE_SG_AUTH_FILE"),
-        ("sg=http://a:1", &[("sg", "no-colon")][..], "one `user:password` line"),
-        ("sg=http://a:1", &[("sg", ":p")][..], "one `user:password` line"),
-        ("sg=http://a:1", &[("sg", "u:p\nv:q")][..], "one `user:password` line"),
+        (
+            "sg=http://a:1",
+            &[("sg", "no-colon")][..],
+            "one `user:password` line",
+        ),
+        (
+            "sg=http://a:1",
+            &[("sg", ":p")][..],
+            "one `user:password` line",
+        ),
+        (
+            "sg=http://a:1",
+            &[("sg", "u:p\nv:q")][..],
+            "one `user:password` line",
+        ),
     ] {
         let error = parse(raw, files).unwrap_err();
         assert!(error.contains(want), "{raw}: {error}");
@@ -513,11 +564,17 @@ fn page_paths_stay_on_the_page_route() {
 async fn regional_client_sends_basic_auth() {
     let fake = FakeRegional::spawn(fixture_state()).await;
     let wrong = RegionalEngine::new(&spec_with_password("sg", &fake.url, "wrong"));
-    assert!(wrong.manga_id(&keys("/m/1", "/c/1", "Fixture One")).await.is_err());
+    assert!(wrong
+        .manga_id(&keys("/m/1", "/c/1", "Fixture One"))
+        .await
+        .is_err());
     assert!(fake.unauthorized.load(Ordering::SeqCst) >= 1);
     let engine = RegionalEngine::new(&fake.spec("sg"));
     assert_eq!(
-        engine.manga_id(&keys("/m/1", "/c/1", "Fixture One")).await.unwrap(),
+        engine
+            .manga_id(&keys("/m/1", "/c/1", "Fixture One"))
+            .await
+            .unwrap(),
         Some(501)
     );
 }
@@ -672,7 +729,10 @@ async fn a_down_engine_is_an_error_not_a_page() {
     state.down = true;
     let fake = FakeRegional::spawn(state).await;
     let engine = RegionalEngine::new(&fake.spec("sg"));
-    assert!(engine.fetch_page(&keys("/m/1", "/c/1", "Fixture One"), 0).await.is_err());
+    assert!(engine
+        .fetch_page(&keys("/m/1", "/c/1", "Fixture One"), 0)
+        .await
+        .is_err());
     let health = engine.probe().await;
     assert!(!health.reachable);
     assert!(health.error.is_some());
@@ -881,9 +941,18 @@ fn ext(pkg: &str, version: Option<i64>) -> InstalledExtension {
 #[test]
 fn version_comparison() {
     let owner = ext("pkg.src", Some(7));
-    assert_eq!(compare_versions(Some(&owner), Some(&owner)), VersionCheck::Match);
-    assert_eq!(compare_versions(None, Some(&owner)), VersionCheck::OwnerUnknown);
-    assert_eq!(compare_versions(Some(&owner), None), VersionCheck::NotInstalled);
+    assert_eq!(
+        compare_versions(Some(&owner), Some(&owner)),
+        VersionCheck::Match
+    );
+    assert_eq!(
+        compare_versions(None, Some(&owner)),
+        VersionCheck::OwnerUnknown
+    );
+    assert_eq!(
+        compare_versions(Some(&owner), None),
+        VersionCheck::NotInstalled
+    );
     for other in [ext("pkg.src", Some(8)), ext("pkg.other", Some(7))] {
         assert!(matches!(
             compare_versions(Some(&owner), Some(&other)),
@@ -958,7 +1027,10 @@ async fn decisions_follow_health_and_versions() {
 // ---- PostgreSQL -----------------------------------------------------------------------
 
 async fn database() -> Database {
-    Database::connect("sqlite::memory:").await.unwrap().foreground()
+    Database::connect("sqlite::memory:")
+        .await
+        .unwrap()
+        .foreground()
 }
 
 #[tokio::test]
@@ -971,8 +1043,12 @@ async fn routes_round_trip_with_the_owner_extension() {
     .execute(&pool)
     .await
     .unwrap();
-    store_route(&pool, "src", Some(("sg", true)), Some("admin")).await.unwrap();
-    store_route(&pool, "other", Some(("eu-2", false)), None).await.unwrap();
+    store_route(&pool, "src", Some(("sg", true)), Some("admin"))
+        .await
+        .unwrap();
+    store_route(&pool, "other", Some(("eu-2", false)), None)
+        .await
+        .unwrap();
     let routes = load_routes(&pool).await.unwrap();
     assert_eq!(
         routes["src"],
@@ -983,11 +1059,15 @@ async fn routes_round_trip_with_the_owner_extension() {
         }
     );
     assert_eq!(routes["other"].owner_extension, None);
-    store_route(&pool, "src", Some(("eu-2", false)), None).await.unwrap();
+    store_route(&pool, "src", Some(("eu-2", false)), None)
+        .await
+        .unwrap();
     assert_eq!(load_routes(&pool).await.unwrap()["src"].engine_id, "eu-2");
     store_route(&pool, "src", None, None).await.unwrap();
     assert!(!load_routes(&pool).await.unwrap().contains_key("src"));
-    assert!(store_route(&pool, "src", Some(("owner", false)), None).await.is_err());
+    assert!(store_route(&pool, "src", Some(("owner", false)), None)
+        .await
+        .is_err());
     // The table refuses a bad id even past the Rust check.
     assert!(sqlx::query(
         "INSERT INTO source_engine_route(source_id,engine_id,set_at) VALUES('x','owner',now())"
@@ -1009,7 +1089,10 @@ async fn stored_keys_answer_for_the_active_generation_only() {
     sqlx::query("INSERT INTO engine_chapter_key(generation,chapter_id,manga_id,source_order,chapter_key,updated_at) VALUES($1,8,7,3,'/c/1',now())")
         .bind(generation).execute(&pool).await.unwrap();
     let want = keys("/m/1", "/c/1", "Fixture One");
-    assert_eq!(keys_for_chapter(&pool, 8).await.unwrap(), Some(want.clone()));
+    assert_eq!(
+        keys_for_chapter(&pool, 8).await.unwrap(),
+        Some(want.clone())
+    );
     assert_eq!(keys_for_order(&pool, 7, 3).await.unwrap(), Some(want));
     assert_eq!(keys_for_order(&pool, 7, 4).await.unwrap(), None);
     assert_eq!(
@@ -1038,7 +1121,10 @@ async fn the_route_table_has_no_id_column() {
     .await
     .unwrap();
     let names: Vec<&str> = columns.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(names, ["source_id", "engine_id", "strict", "set_at", "set_by"]);
+    assert_eq!(
+        names,
+        ["source_id", "engine_id", "strict", "set_at", "set_by"]
+    );
     assert!(columns
         .iter()
         .all(|(_, ty)| !matches!(ty.as_str(), "integer" | "bigint" | "smallint")));
@@ -1070,7 +1156,9 @@ async fn provision_installs_or_updates_to_the_owner_version() {
     state.available.push(offered.clone());
     let fake = FakeRegional::spawn(state).await;
     let engine = RegionalEngine::new(&fake.spec("sg"));
-    let done = provision(&engine, &pool, &["src".into(), "nothing".into()]).await.unwrap();
+    let done = provision(&engine, &pool, &["src".into(), "nothing".into()])
+        .await
+        .unwrap();
     assert_eq!(done[0].check, VersionCheck::Match);
     assert_eq!(done[0].note, "installed");
     assert_eq!(done[1].check, VersionCheck::OwnerUnknown);
@@ -1086,7 +1174,10 @@ async fn provision_installs_or_updates_to_the_owner_version() {
     let fake = FakeRegional::spawn(state).await;
     let engine = RegionalEngine::new(&fake.spec("sg"));
     let done = provision(&engine, &pool, &["src".into()]).await.unwrap();
-    assert_eq!((done[0].check.clone(), done[0].note.as_str()), (VersionCheck::Match, "updated"));
+    assert_eq!(
+        (done[0].check.clone(), done[0].note.as_str()),
+        (VersionCheck::Match, "updated")
+    );
     let again = provision(&engine, &pool, &["src".into()]).await.unwrap();
     assert_eq!(again[0].note, "already the same version");
     assert_eq!(fake.calls("update"), 1);
@@ -1100,7 +1191,11 @@ async fn provision_installs_or_updates_to_the_owner_version() {
     // The regional engine is newer than the owner.
     owner_records(&pool, 6).await;
     let done = provision(&engine, &pool, &["src".into()]).await.unwrap();
-    assert!(done[0].note.contains("update the owner engine"), "{}", done[0].note);
+    assert!(
+        done[0].note.contains("update the owner engine"),
+        "{}",
+        done[0].note
+    );
 }
 
 #[tokio::test]
@@ -1114,21 +1209,38 @@ async fn a_route_is_refused_until_the_versions_match() {
         async move { route_refusal(engines, pool, source, engine).await.unwrap() }
     };
     assert_eq!(refusal("src", "sg").await, None);
-    assert!(refusal("src", "eu").await.unwrap().contains("not configured"));
-    assert!(refusal("other", "sg").await.unwrap().contains("records no extension"));
+    assert!(refusal("src", "eu")
+        .await
+        .unwrap()
+        .contains("not configured"));
+    assert!(refusal("other", "sg")
+        .await
+        .unwrap()
+        .contains("records no extension"));
     owner_records(&pool, 8).await;
     let differs = refusal("src", "sg").await.unwrap();
-    assert!(differs.contains("owner pkg.src 8") && differs.contains("pkg.src 7"), "{differs}");
+    assert!(
+        differs.contains("owner pkg.src 8") && differs.contains("pkg.src 7"),
+        "{differs}"
+    );
     fake.state.lock().unwrap().extensions.clear();
-    assert!(refusal("src", "sg").await.unwrap().contains("engine provision sg src"));
+    assert!(refusal("src", "sg")
+        .await
+        .unwrap()
+        .contains("engine provision sg src"));
     fake.state.lock().unwrap().down = true;
-    assert!(refusal("src", "sg").await.unwrap().contains("not reachable"));
+    assert!(refusal("src", "sg")
+        .await
+        .unwrap()
+        .contains("not reachable"));
 }
 
 #[tokio::test]
 async fn the_updater_updates_regional_engines_that_have_the_package() {
     let mut state = fixture_state();
-    state.available.push(("pkg.src".into(), 8, vec!["src".into()]));
+    state
+        .available
+        .push(("pkg.src".into(), 8, vec!["src".into()]));
     let fake = FakeRegional::spawn(state).await;
     let empty = FakeRegional::spawn(FakeState::default()).await;
     let engines = Engines::new(&[fake.spec("sg"), empty.spec("eu")]);
@@ -1142,7 +1254,6 @@ async fn the_updater_updates_regional_engines_that_have_the_package() {
     assert_eq!(health.installed["src"].version_code, Some(8));
 }
 
-
 #[tokio::test]
 async fn unrouted_page_and_cover_skip_a_closed_database_and_regional_engine() {
     let pool = database().await;
@@ -1150,13 +1261,30 @@ async fn unrouted_page_and_cover_skip_a_closed_database_and_regional_engine() {
     let fake = FakeRegional::spawn(fixture_state()).await;
     let mut owner = SuwayomiClient::new(fake.url.clone(), None, None);
     owner.regional = Arc::new(Engines::new(&[fake.spec("sg")]));
-    assert!(matches!(route_page(&owner, &pool, PageTarget::Chapter(8), 0).await, Routed::Owner));
-    assert!(matches!(route_page(&owner, &pool, PageTarget::Order { manga_id: 7, source_order: 0 }, 0).await, Routed::Owner));
-    assert!(matches!(route_cover(&owner, &pool, CoverTarget::OwnerManga(7), false).await, Routed::Owner));
+    assert!(matches!(
+        route_page(&owner, &pool, PageTarget::Chapter(8), 0).await,
+        Routed::Owner
+    ));
+    assert!(matches!(
+        route_page(
+            &owner,
+            &pool,
+            PageTarget::Order {
+                manga_id: 7,
+                source_order: 0
+            },
+            0
+        )
+        .await,
+        Routed::Owner
+    ));
+    assert!(matches!(
+        route_cover(&owner, &pool, CoverTarget::OwnerManga(7), false).await,
+        Routed::Owner
+    ));
     assert!(fake.calls.lock().unwrap().is_empty());
     assert_eq!(fake.page_hits.load(Ordering::SeqCst), 0);
 }
-
 
 #[tokio::test]
 async fn enrolment_cover_keys_need_no_stored_owner_binding() {
@@ -1167,12 +1295,30 @@ async fn enrolment_cover_keys_need_no_stored_owner_binding() {
     owner.regional = Arc::new(Engines::new(&[fake.spec("sg")]));
     routed(&owner.regional, "src", "sg", true, Some(7));
     owner.regional.probe_all().await;
-    let bytes = cover_bytes(&owner, &pool, CoverTarget::Keys {
-        source_id: "src".into(), manga_key: "/m/1".into(), title: Some("Fixture One".into()),
-    }, None).await.unwrap();
+    let bytes = cover_bytes(
+        &owner,
+        &pool,
+        CoverTarget::Keys {
+            source_id: "src".into(),
+            manga_key: "/m/1".into(),
+            title: Some("Fixture One".into()),
+        },
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(bytes, fake_page("/cover", 0));
     assert_eq!(fake.calls("cover"), 1);
-    assert_eq!(owner.regional.engine("sg").unwrap().counters.snapshot().cover_fetches, 1);
+    assert_eq!(
+        owner
+            .regional
+            .engine("sg")
+            .unwrap()
+            .counters
+            .snapshot()
+            .cover_fetches,
+        1
+    );
 }
 
 #[tokio::test]
@@ -1185,11 +1331,22 @@ async fn chapter_list_refresh_drops_sibling_page_paths() {
         let mut state = fake.state.lock().unwrap();
         let mut moved = state.chapters[0].clone();
         moved.order = 1;
-        state.listable = vec![moved, FakeChapter {
-            id: 9002, manga_id: 501, url: "/c/2".into(), order: 0, pages: 3,
-        }];
+        state.listable = vec![
+            moved,
+            FakeChapter {
+                id: 9002,
+                manga_id: 501,
+                url: "/c/2".into(),
+                order: 0,
+                pages: 3,
+            },
+        ];
     }
-    engine.chapter(&keys("/m/1", "/c/2", "Fixture One")).await.unwrap().unwrap();
+    engine
+        .chapter(&keys("/m/1", "/c/2", "Fixture One"))
+        .await
+        .unwrap()
+        .unwrap();
     let RegionalPage::Page(bytes, _) = engine.fetch_page(&a, 0).await.unwrap() else {
         panic!("expected chapter A");
     };
@@ -1205,12 +1362,21 @@ async fn a_read_that_refreshes_the_list_itself_fetches_the_page_once() {
     {
         let mut state = fake.state.lock().unwrap();
         let first = state.chapters[0].clone();
-        state.listable = vec![first, FakeChapter {
-            id: 9002, manga_id: 501, url: "/c/2".into(), order: 1, pages: 3,
-        }];
+        state.listable = vec![
+            first,
+            FakeChapter {
+                id: 9002,
+                manga_id: 501,
+                url: "/c/2".into(),
+                order: 1,
+                pages: 3,
+            },
+        ];
     }
-    let RegionalPage::Page(bytes, _) =
-        engine.fetch_page(&keys("/m/1", "/c/2", "Fixture One"), 0).await.unwrap()
+    let RegionalPage::Page(bytes, _) = engine
+        .fetch_page(&keys("/m/1", "/c/2", "Fixture One"), 0)
+        .await
+        .unwrap()
     else {
         panic!("expected the new chapter's page");
     };
@@ -1232,9 +1398,16 @@ async fn a_page_fetch_discards_bytes_when_a_concurrent_list_refresh_reorders_cha
         let mut state = fake.state.lock().unwrap();
         let mut moved = state.chapters[0].clone();
         moved.order = 1;
-        state.listable = vec![moved, FakeChapter {
-            id: 9002, manga_id: 501, url: "/c/2".into(), order: 0, pages: 3,
-        }];
+        state.listable = vec![
+            moved,
+            FakeChapter {
+                id: 9002,
+                manga_id: 501,
+                url: "/c/2".into(),
+                order: 0,
+                pages: 3,
+            },
+        ];
         state.page_pause = Some(points);
     }
     let request = tokio::spawn({
@@ -1243,7 +1416,11 @@ async fn a_page_fetch_discards_bytes_when_a_concurrent_list_refresh_reorders_cha
         async move { engine.fetch_page(&a, 0).await }
     });
     fetched.reached().await;
-    engine.chapter(&keys("/m/1", "/c/2", "Fixture One")).await.unwrap().unwrap();
+    engine
+        .chapter(&keys("/m/1", "/c/2", "Fixture One"))
+        .await
+        .unwrap()
+        .unwrap();
     fetched.release();
     let RegionalPage::Page(bytes, _) = request.await.unwrap().unwrap() else {
         panic!("expected chapter A after retrying");
@@ -1266,7 +1443,9 @@ async fn route_page_refuses_when_route_becomes_strict_during_fetch() {
         .bind(generation).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO source_extension(source_id,pkg_name,repo_url,version_code,updated_at) VALUES('src','pkg.src','https://repo.example/index.min.json',7,now())")
         .execute(&pool).await.unwrap();
-    store_route(&pool, "src", Some(("sg", false)), None).await.unwrap();
+    store_route(&pool, "src", Some(("sg", false)), None)
+        .await
+        .unwrap();
     let fake = FakeRegional::spawn(fixture_state()).await;
     let mut owner = SuwayomiClient::new(fake.url.clone(), None, None);
     owner.regional = Arc::new(Engines::new(&[fake.spec("sg")]));
@@ -1282,12 +1461,23 @@ async fn route_page_refuses_when_route_becomes_strict_during_fetch() {
         async move { route_page(&owner, &pool, PageTarget::Chapter(8), 0).await }
     });
     fetched.reached().await;
-    store_route(&pool, "src", Some(("elsewhere", true)), None).await.unwrap();
+    store_route(&pool, "src", Some(("elsewhere", true)), None)
+        .await
+        .unwrap();
     owner.regional.reload_routes(&pool).await.unwrap();
     fake.state.lock().unwrap().fail_page = Some(0);
     fetched.release();
     assert!(matches!(request.await.unwrap(), Routed::Refuse));
-    assert_eq!(owner.regional.engine("sg").unwrap().counters.snapshot().fallbacks, 0);
+    assert_eq!(
+        owner
+            .regional
+            .engine("sg")
+            .unwrap()
+            .counters
+            .snapshot()
+            .fallbacks,
+        0
+    );
 }
 
 #[tokio::test]
@@ -1310,16 +1500,38 @@ async fn covers_resolve_a_fresh_manga_id_and_keep_absences() {
         state.mangas.push(replacement);
     }
     for _ in 0..2 {
-        assert!(matches!(route_cover(&owner, &pool, CoverTarget::Keys {
-            source_id: k.source_id.clone(), manga_key: k.manga_key.clone(), title: k.title.clone(),
-        }, false).await, Routed::Served(_)));
+        assert!(matches!(
+            route_cover(
+                &owner,
+                &pool,
+                CoverTarget::Keys {
+                    source_id: k.source_id.clone(),
+                    manga_key: k.manga_key.clone(),
+                    title: k.title.clone(),
+                },
+                false
+            )
+            .await,
+            Routed::Served(_)
+        ));
     }
     assert_eq!(fake.state.lock().unwrap().cover_hits, [602, 602]);
     assert_eq!(fake.calls("mangas"), 3);
     for _ in 0..2 {
-        assert!(matches!(route_cover(&owner, &pool, CoverTarget::Keys {
-            source_id: "src".into(), manga_key: "/m/missing".into(), title: Some("Missing".into()),
-        }, false).await, Routed::Refuse));
+        assert!(matches!(
+            route_cover(
+                &owner,
+                &pool,
+                CoverTarget::Keys {
+                    source_id: "src".into(),
+                    manga_key: "/m/missing".into(),
+                    title: Some("Missing".into()),
+                },
+                false
+            )
+            .await,
+            Routed::Refuse
+        ));
     }
     assert_eq!(fake.calls("mangas"), 4);
     assert_eq!(fake.calls("search"), 1);
@@ -1334,13 +1546,36 @@ async fn page_order_keys_follow_a_moved_stored_binding() {
     sqlx::query("INSERT INTO engine_chapter_key(generation,chapter_id,manga_id,source_order,chapter_key,updated_at) VALUES($1,8,7,0,'/c/1',now()),($1,9,7,1,'/c/2',now())")
         .bind(generation).execute(&pool).await.unwrap();
     let owner = SuwayomiClient::new("http://komiq.example.com".into(), None, None);
-    let target = PageTarget::Order { manga_id: 7, source_order: 0 };
-    assert_eq!(page_keys(&owner, &pool, target).await.unwrap().unwrap().chapter_key, "/c/1");
+    let target = PageTarget::Order {
+        manga_id: 7,
+        source_order: 0,
+    };
+    assert_eq!(
+        page_keys(&owner, &pool, target)
+            .await
+            .unwrap()
+            .unwrap()
+            .chapter_key,
+        "/c/1"
+    );
     assert!(owner.regional.owner_keys.lock().unwrap().is_empty());
     sqlx::query("UPDATE engine_chapter_key SET source_order=1-source_order WHERE generation=$1")
-        .bind(generation).execute(&pool).await.unwrap();
-    assert_eq!(page_keys(&owner, &pool, target).await.unwrap().unwrap().chapter_key, "/c/2");
-    page_keys(&owner, &pool, PageTarget::Chapter(8)).await.unwrap().unwrap();
+        .bind(generation)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        page_keys(&owner, &pool, target)
+            .await
+            .unwrap()
+            .unwrap()
+            .chapter_key,
+        "/c/2"
+    );
+    page_keys(&owner, &pool, PageTarget::Chapter(8))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(owner.regional.owner_keys.lock().unwrap().len(), 1);
 }
 
@@ -1354,7 +1589,12 @@ async fn regional_pages_cached_requires_live_keys_route_and_chapter() {
     let k = keys("/m/1", "/c/1", "Fixture One");
     let memo_key = (owner.read_generation().0, PageTarget::Chapter(8));
     assert!(!regional_pages_cached(&owner, 8));
-    owner.regional.owner_keys.lock().unwrap().insert(memo_key, (Instant::now(), k.clone()));
+    owner
+        .regional
+        .owner_keys
+        .lock()
+        .unwrap()
+        .insert(memo_key, (Instant::now(), k.clone()));
     assert!(!regional_pages_cached(&owner, 8));
     let engine = owner.regional.engine("sg").unwrap();
     engine.chapter(&k).await.unwrap().unwrap();
@@ -1364,16 +1604,29 @@ async fn regional_pages_cached_requires_live_keys_route_and_chapter() {
     routed(&owner.regional, "src", "sg", true, Some(8));
     assert!(!regional_pages_cached(&owner, 8));
     routed(&owner.regional, "src", "sg", true, Some(7));
-    owner.regional.owner_keys.lock().unwrap().insert(memo_key, (Instant::now() - Duration::from_secs(61), k.clone()));
+    owner.regional.owner_keys.lock().unwrap().insert(
+        memo_key,
+        (Instant::now() - Duration::from_secs(61), k.clone()),
+    );
     assert!(!regional_pages_cached(&owner, 8));
-    owner.regional.owner_keys.lock().unwrap().insert(memo_key, (Instant::now(), k.clone()));
+    owner
+        .regional
+        .owner_keys
+        .lock()
+        .unwrap()
+        .insert(memo_key, (Instant::now(), k.clone()));
     engine.forget(&k);
     assert!(!regional_pages_cached(&owner, 8));
     assert_eq!(*fake.calls.lock().unwrap(), calls);
     let missing = keys("/m/1", "/c/missing", "Fixture One");
     assert!(engine.chapter(&missing).await.unwrap().is_none());
     assert!(engine.chapter_cached(&missing));
-    owner.regional.owner_keys.lock().unwrap().insert(memo_key, (Instant::now(), missing));
+    owner
+        .regional
+        .owner_keys
+        .lock()
+        .unwrap()
+        .insert(memo_key, (Instant::now(), missing));
     let calls = fake.calls.lock().unwrap().clone();
     assert!(!regional_pages_cached(&owner, 8));
     assert_eq!(*fake.calls.lock().unwrap(), calls);
@@ -1382,17 +1635,28 @@ async fn regional_pages_cached_requires_live_keys_route_and_chapter() {
 #[tokio::test]
 async fn reconcile_versions_retries_only_known_older_installed_packages() {
     let mut state = fixture_state();
-    state.available.push(("pkg.src".into(), 8, vec!["src".into()]));
-    state.extensions.push(("pkg.other".into(), 7, vec!["other".into()]));
-    state.available.push(("pkg.other".into(), 8, vec!["other".into()]));
+    state
+        .available
+        .push(("pkg.src".into(), 8, vec!["src".into()]));
+    state
+        .extensions
+        .push(("pkg.other".into(), 7, vec!["other".into()]));
+    state
+        .available
+        .push(("pkg.other".into(), 8, vec!["other".into()]));
     let fake = FakeRegional::spawn(state).await;
     let engines = Engines::new(&[fake.spec("sg")]);
     engines.probe_all().await;
     routed(&engines, "new-source", "sg", true, Some(8));
     let mut routes = (*engines.routes()).clone();
-    routes.insert("other".into(), Route {
-        engine_id: "sg".into(), strict: true, owner_extension: Some(ext("pkg.other", Some(8))),
-    });
+    routes.insert(
+        "other".into(),
+        Route {
+            engine_id: "sg".into(),
+            strict: true,
+            owner_extension: Some(ext("pkg.other", Some(8))),
+        },
+    );
     *engines.routes.write().unwrap() = Arc::new(routes);
     reconcile_versions(&engines).await;
     assert_eq!(fake.calls("refresh_extensions"), 1);
@@ -1409,7 +1673,16 @@ async fn reconcile_versions_retries_only_known_older_installed_packages() {
     *engines.routes.write().unwrap() = Arc::new(routes);
     reconcile_versions(&engines).await;
     let engine = engines.engine("sg").unwrap();
-    engine.health.write().unwrap().as_mut().unwrap().installed.get_mut("src").unwrap().version_code = None;
+    engine
+        .health
+        .write()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .installed
+        .get_mut("src")
+        .unwrap()
+        .version_code = None;
     routed(&engines, "src", "sg", true, Some(9));
     reconcile_versions(&engines).await;
     fake.state.lock().unwrap().extensions.clear();
@@ -1423,14 +1696,22 @@ async fn reconcile_versions_retries_only_known_older_installed_packages() {
 #[tokio::test]
 async fn route_reload_serializes_the_query_and_publish() {
     let pool = database().await;
-    store_route(&pool, "src", Some(("sg", false)), None).await.unwrap();
+    store_route(&pool, "src", Some(("sg", false)), None)
+        .await
+        .unwrap();
     let engines = Arc::new(Engines::default());
     let guard = engines.reload.lock().await;
     let reload_engines = engines.clone();
     let reload_pool = pool.clone();
     let mut reload = tokio::spawn(async move { reload_engines.reload_routes(&reload_pool).await });
-    assert!(tokio::time::timeout(Duration::from_millis(100), &mut reload).await.is_err());
-    store_route(&pool, "src", Some(("sg", true)), None).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut reload)
+            .await
+            .is_err()
+    );
+    store_route(&pool, "src", Some(("sg", true)), None)
+        .await
+        .unwrap();
     drop(guard);
     reload.await.unwrap().unwrap();
     assert!(engines.route("src").unwrap().strict);

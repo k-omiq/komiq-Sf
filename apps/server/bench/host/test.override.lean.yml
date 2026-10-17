@@ -1,7 +1,7 @@
 # Test host only. Lean profile. Not for production.
 services:
   suwayomi:
-    restart: "no"
+    restart: 'no'
     mem_limit: 1536m
     cpus: 3.0
     environment:
@@ -13,11 +13,12 @@ services:
     volumes:
       - /dev/null:/usr/bin/Xvfb
     healthcheck:
-      test: ['CMD-SHELL', 'curl -fsS http://localhost:4567/api/v1/settings/about >/dev/null || exit 1']
+      test:
+        ['CMD-SHELL', 'curl -fsS http://localhost:4567/api/v1/settings/about >/dev/null || exit 1']
   flaresolverr:
-    restart: "no"
+    restart: 'no'
   postgres:
-    restart: "no"
+    restart: 'no'
     mem_limit: 1g
     memswap_limit: 1g
     shm_size: 256m
@@ -25,7 +26,7 @@ services:
       - ./pgconf/postgresql.lean.conf:/opt/komika-postgres/postgresql.conf:ro
   server:
     image: komika-server:pg-71b96aacb501
-    restart: "no"
+    restart: 'no'
     mem_limit: 512m
     environment:
       COVER_CACHE: 'off'

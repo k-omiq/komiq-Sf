@@ -107,7 +107,11 @@ import type {
 	WorkChapterList,
 } from './backend.js';
 import * as ops from './operations.js';
-import { isNumericChapterId, isStaleNumericEpoch, notifyStaleNumericEpoch } from './numeric-epoch.js';
+import {
+	isNumericChapterId,
+	isStaleNumericEpoch,
+	notifyStaleNumericEpoch,
+} from './numeric-epoch.js';
 import { notifyProgressConflict } from './progress-conflict.js';
 import { failedOnlyAt, GraphQLRequestError, tolerablePartialErrors } from './partial-errors.js';
 import type { GraphQLErrorLike, PathSegment } from './partial-errors.js';
@@ -218,7 +222,6 @@ interface AuthCell {
 	numericEpoch?: Promise<number | null>;
 	staleNumericEpochNotified?: boolean;
 }
-
 
 const CAPABILITY_ENDPOINT_CAPACITY = 64;
 
@@ -399,11 +402,7 @@ export class GraphQLBackend implements Backend {
 	private stripUnsupported(query: string): string {
 		const unsupportedArgs = new Set(this.capabilities.unsupportedArgs);
 		if (this.capabilities.libraryEpochUnsupported.has(query)) unsupportedArgs.add('numericEpoch');
-		if (
-			this.capabilities.unsupportedFields.size === 0 &&
-			unsupportedArgs.size === 0
-		)
-			return query;
+		if (this.capabilities.unsupportedFields.size === 0 && unsupportedArgs.size === 0) return query;
 		let out = query;
 		for (const field of this.capabilities.unsupportedFields) {
 			// Nested optional fields have at most two levels of child objects.
@@ -811,8 +810,18 @@ export class GraphQLBackend implements Backend {
 	mark(seriesId: Id, marked: boolean, numericEpoch?: number | null): Promise<Series> {
 		return this.editLibrary('mark', ops.MARK, seriesId, { marked }, numericEpoch);
 	}
-	setLibraryStatus(seriesId: Id, status: LibraryStatus | null, numericEpoch?: number | null): Promise<Series> {
-		return this.editLibrary('setLibraryStatus', ops.SET_LIBRARY_STATUS, seriesId, { status }, numericEpoch);
+	setLibraryStatus(
+		seriesId: Id,
+		status: LibraryStatus | null,
+		numericEpoch?: number | null,
+	): Promise<Series> {
+		return this.editLibrary(
+			'setLibraryStatus',
+			ops.SET_LIBRARY_STATUS,
+			seriesId,
+			{ status },
+			numericEpoch,
+		);
 	}
 	setFavorite(seriesId: Id, favorite: boolean, numericEpoch?: number | null): Promise<Series> {
 		return this.editLibrary('setFavorite', ops.SET_FAVORITE, seriesId, { favorite }, numericEpoch);
@@ -1402,7 +1411,8 @@ export class GraphQLBackend implements Backend {
 		barred: boolean,
 	): Promise<SetSourceMetadataBarResult> {
 		const authRevision = this.auth.revision;
-		if (!this.metadataBarsSupported()) throw new Error('This server does not support metadata bars');
+		if (!this.metadataBarsSupported())
+			throw new Error('This server does not support metadata bars');
 		try {
 			const d = await this.gql<{ setSourceMetadataBar: SetSourceMetadataBarResult }>(
 				ops.SET_SOURCE_METADATA_BAR,

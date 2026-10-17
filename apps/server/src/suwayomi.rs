@@ -966,7 +966,11 @@ impl SuwayomiClient {
         Ok((bytes, content_type))
     }
 
-    pub(crate) async fn gql<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<T> {
+    pub(crate) async fn gql<T: DeserializeOwned>(
+        &self,
+        query: &str,
+        variables: Value,
+    ) -> Result<T> {
         self.wait_for_generation().await?;
         let generation = self.fence.as_ref().and_then(|f| f.generation());
         let revision = self.fence.as_ref().map(|f| f.revision());

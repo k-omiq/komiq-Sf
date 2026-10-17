@@ -40,7 +40,9 @@ struct Snapshot {
 }
 
 async fn snapshot(url: &str) -> Snapshot {
-    let mut c = sqlx::PgConnection::connect(url).await.expect("drill connect");
+    let mut c = sqlx::PgConnection::connect(url)
+        .await
+        .expect("drill connect");
     let wal = sqlx::query(
         "SELECT wal_bytes::bigint, wal_fpi::bigint, wal_records::bigint FROM pg_stat_wal",
     )
@@ -71,7 +73,9 @@ async fn snapshot(url: &str) -> Snapshot {
 }
 
 async fn checkpoint(url: &str) {
-    let mut c = sqlx::PgConnection::connect(url).await.expect("drill connect");
+    let mut c = sqlx::PgConnection::connect(url)
+        .await
+        .expect("drill connect");
     sqlx::query("CHECKPOINT")
         .execute(&mut c)
         .await
@@ -127,7 +131,9 @@ where
 }
 
 async fn ids(url: &str, sql: &str, n: i64) -> Vec<Vec<String>> {
-    let mut c = sqlx::PgConnection::connect(url).await.expect("drill connect");
+    let mut c = sqlx::PgConnection::connect(url)
+        .await
+        .expect("drill connect");
     let rows = sqlx::query(sql)
         .bind(n)
         .fetch_all(&mut c)
@@ -280,9 +286,11 @@ async fn run_phase(url: &str, phase: &str, n: i64) -> Value {
                         for w in &works {
                             let input = work_input(&pool, &w[0]).await;
                             if details {
-                                crate::catalog::refresh_mangadex_details(&pool, &w[0], &w[1], &input)
-                                    .await
-                                    .expect("details");
+                                crate::catalog::refresh_mangadex_details(
+                                    &pool, &w[0], &w[1], &input,
+                                )
+                                .await
+                                .expect("details");
                             } else {
                                 crate::catalog::upsert_work_from_mangadex(&pool, &w[1], &input)
                                     .await
@@ -322,7 +330,8 @@ async fn run_phase(url: &str, phase: &str, n: i64) -> Value {
                         let now = chrono::Utc::now() + chrono::Duration::minutes(i);
                         let mut calls = 0;
                         for id in &series {
-                            let (Some((m, _)), Some((list, _))) = (mangas.get(id), chapters.get(id))
+                            let (Some((m, _)), Some((list, _))) =
+                                (mangas.get(id), chapters.get(id))
                             else {
                                 continue;
                             };
@@ -469,7 +478,10 @@ async fn wal_drill() {
         out.insert(phase.to_string(), result);
     }
     if let Ok(path) = std::env::var("KOMIKA_WAL_DRILL_OUT") {
-        std::fs::write(path, serde_json::to_string_pretty(&Value::Object(out)).unwrap())
-            .expect("write drill result");
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&Value::Object(out)).unwrap(),
+        )
+        .expect("write drill result");
     }
 }

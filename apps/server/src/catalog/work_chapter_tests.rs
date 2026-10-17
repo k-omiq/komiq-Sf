@@ -946,9 +946,10 @@ async fn admin_split_moves_exclusive_entries_clones_shared_entries_and_reports_t
             make_ready(&pool, &md.work).await;
         }
 
-        let out = catalog::split_source_series(&pool, &md.work, &[moving.clone()], None)
-            .await
-            .unwrap();
+        let out =
+            catalog::split_source_series(&pool, &md.work, std::slice::from_ref(&moving), None)
+                .await
+                .unwrap();
         assert_eq!(out.moved_sources, 1);
         let stayed = entry(&pool, &md.work, "100").await;
         let cloned = entry(&pool, &out.new_work_id, "100").await;
@@ -1034,12 +1035,16 @@ async fn split_preserves_numbered_legacy_overrides_of_unlinked_moving_copies() {
         .execute(&mut *tx)
         .await
         .unwrap();
-    assert!(
-        split_entries_on(&mut tx, &from.work, &to.work, &[moving.clone()], false)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(split_entries_on(
+        &mut tx,
+        &from.work,
+        &to.work,
+        std::slice::from_ref(&moving),
+        false
+    )
+    .await
+    .unwrap()
+    .is_empty());
     tx.commit().await.unwrap();
     let rows: Vec<(String, bool, Option<String>)> = sqlx::query_as(
         "SELECT chapter_key, hidden, title_override FROM chapter_override WHERE work_id = $1 ORDER BY chapter_key",
@@ -1718,7 +1723,7 @@ async fn admin_entry_merge_claim_survives_a_copy_that_vanishes_and_returns_later
     );
 
     // One scan drops the moved copy: no copy of the work has 10.05 any more.
-    catalog::replace_source_chapters(&pool, &md.source, &[ten.clone()])
+    catalog::replace_source_chapters(&pool, &md.source, std::slice::from_ref(&ten))
         .await
         .unwrap();
     // A later scan brings it back, and another group's upload with it.
@@ -1735,7 +1740,10 @@ async fn admin_entry_merge_claim_survives_a_copy_that_vanishes_and_returns_later
     .unwrap();
     assert_eq!(linked_entry(&pool, &md.source, "md-typo").await, keep);
     assert_eq!(linked_entry(&pool, &md.source, "md-typo-b").await, keep);
-    assert_eq!(entry_ids(&pool, &md.work).await, [keep.clone()]);
+    assert_eq!(
+        entry_ids(&pool, &md.work).await,
+        std::slice::from_ref(&keep)
+    );
     // The drain takes the same path.
     make_ready(&pool, &md.work).await;
     assert_eq!(entry_ids(&pool, &md.work).await, [keep]);
@@ -1754,7 +1762,7 @@ async fn admin_entry_merge_keeps_claiming_a_merged_away_special() {
     let drop = entry(&pool, &md.work, "x:md-oneshot").await.id;
     merge_entries(&pool, &md.work, &keep, &drop).await;
 
-    catalog::replace_source_chapters(&pool, &md.source, &[ten.clone()])
+    catalog::replace_source_chapters(&pool, &md.source, std::slice::from_ref(&ten))
         .await
         .unwrap();
     catalog::replace_source_chapters(&pool, &md.source, &[ten, oneshot])
@@ -1852,9 +1860,14 @@ async fn entry_aliases_follow_work_merge_and_split() {
 
     // Split the old loser's source off again. 10 and 40 keep copies on both sides: each
     // destination clone takes the aliases too, and the staying entries keep theirs.
-    let out = catalog::split_source_series(&pool, &survivor.work, &[loser_source.clone()], None)
-        .await
-        .unwrap();
+    let out = catalog::split_source_series(
+        &pool,
+        &survivor.work,
+        std::slice::from_ref(&loser_source),
+        None,
+    )
+    .await
+    .unwrap();
     let d10 = entry(&pool, &out.new_work_id, "1000").await.id;
     let d40 = entry(&pool, &out.new_work_id, "4000").await.id;
     assert_eq!(entry(&pool, &out.new_work_id, "3000").await.id, l30);

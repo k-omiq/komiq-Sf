@@ -188,7 +188,7 @@ async fn dialog_split_moves_pointer_and_counts_pointer_and_mark_only_readers() {
     for user in users {
         before.push(reads(&pool, user, &md.work).await);
     }
-    let split = split_source_series(&pool, &md.work, &[md.source.clone()], None)
+    let split = split_source_series(&pool, &md.work, std::slice::from_ref(&md.source), None)
         .await
         .unwrap();
     assert_eq!(split.progress_readers_moved, 3);
@@ -866,9 +866,14 @@ async fn merge_and_split_keep_each_readers_last_read_time() {
         Some(("2026-04-01".into(), 8))
     );
 
-    let split = split_source_series(&pool, &survivor.work, &[loser.source.clone()], None)
-        .await
-        .unwrap();
+    let split = split_source_series(
+        &pool,
+        &survivor.work,
+        std::slice::from_ref(&loser.source),
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         progress_row(&pool, &only_loser, &survivor.work).await,
         Some(("2026-01-01".into(), 2))
@@ -940,8 +945,8 @@ async fn merge_keeps_a_ready_survivor_ready_when_every_loser_copy_is_linked() {
         let state = reads(&pool, &user, &survivor.work).await;
         let s1 = entry(&pool, &survivor.work, "100").await.id;
         let s2 = entry(&pool, &survivor.work, "200").await.id;
-        assert_eq!(state[&s1], true);
-        assert_eq!(state[&s2], true);
+        assert!(state[&s1]);
+        assert!(state[&s2]);
         // The loser's legacy untick was converted, not left behind.
         let unticks: i64 =
             sqlx::query_scalar("SELECT count(*) FROM progress_untick WHERE user_id = $1")

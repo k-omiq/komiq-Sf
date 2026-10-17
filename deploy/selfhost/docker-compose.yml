@@ -99,7 +99,11 @@ services:
       - ./postgres-init.sh:/docker-entrypoint-initdb.d/10-komiq.sh:ro
     healthcheck:
       # A TCP query as the application role proves SCRAM and database access.
-      test: ['CMD-SHELL', 'PGPASSWORD="$$KOMIQ_DB_PASSWORD" psql -h 127.0.0.1 -U komiq -d komiq -Atqc "SELECT 1" | grep -qx 1']
+      test:
+        [
+          'CMD-SHELL',
+          'PGPASSWORD="$$KOMIQ_DB_PASSWORD" psql -h 127.0.0.1 -U komiq -d komiq -Atqc "SELECT 1" | grep -qx 1',
+        ]
       interval: 5s
       timeout: 5s
       retries: 12
