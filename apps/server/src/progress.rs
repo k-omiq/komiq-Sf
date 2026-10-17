@@ -604,6 +604,7 @@ pub async fn keep_state_after(
     let mut progress_users = Vec::new();
     let mut progress_works = Vec::new();
     let mut progress_through: Vec<Option<String>> = Vec::new();
+    let mut progress_origin: Vec<Option<String>> = Vec::new();
     let mut read_users = Vec::new();
     let mut read_entries = Vec::new();
     for user in &before.users {
@@ -645,6 +646,14 @@ pub async fn keep_state_after(
                 progress_users.push(*user);
                 progress_works.push(work.clone());
                 progress_through.push(through);
+                // The row whose last-read time a new row inherits.
+                progress_origin.push(match &plan {
+                    PointerPlan::Merge { loser, .. } => Some((*loser).to_owned()),
+                    PointerPlan::Split { source, .. } if work.as_str() != *source => {
+                        Some((*source).to_owned())
+                    }
+                    _ => None,
+                });
             }
         }
     }
@@ -679,13 +688,29 @@ pub async fn keep_state_after(
         .await?;
     }
     if !progress_users.is_empty() {
+        // Only the revision moves. `updated_at` is the reader's last read, which orders
+        // Continue reading: keep the row's own; a new row takes its origin's (the loser's
+        // or the split source's), and a merge keeps the later of the two. A row with
+        // neither has no pointer, so its time is never shown.
         sqlx::query(
             "INSERT INTO work_progress (user_id, work_id, through_entry_id, revision, updated_at) \
-             SELECT u.user_id, u.work_id, u.through, 1, now() \
-               FROM UNNEST($1::uuid[], $2::text[], $3::text[]) AS u(user_id, work_id, through) \
+             SELECT u.user_id, u.work_id, u.through, 1, COALESCE(CASE WHEN $5 \
+                      THEN GREATEST(own.updated_at, origin.updated_at) \
+                      ELSE COALESCE(own.updated_at, origin.updated_at) END, now()) \
+               FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::text[]) \
+                    AS u(user_id, work_id, through, origin) \
+               LEFT JOIN work_progress own ON own.user_id = u.user_id AND own.work_id = u.work_id \
+               LEFT JOIN work_progress origin ON origin.user_id = u.user_id AND origin.work_id = u.origin \
              ON CONFLICT (user_id, work_id) DO UPDATE SET through_entry_id = EXCLUDED.through_entry_id, \
-                 revision = work_progress.revision + 1, updated_at = now()",
-        ).bind(&progress_users).bind(&progress_works).bind(&progress_through).execute(&mut *conn).await?;
+                 revision = work_progress.revision + 1, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(&progress_users)
+        .bind(&progress_works)
+        .bind(&progress_through)
+        .bind(&progress_origin)
+        .bind(matches!(plan, PointerPlan::Merge { .. }))
+        .execute(&mut *conn)
+        .await?;
     }
     if let PointerPlan::Merge { loser, .. } = plan {
         sqlx::query("DELETE FROM work_progress WHERE work_id = $1 AND user_id = ANY($2)")

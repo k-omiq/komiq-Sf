@@ -724,7 +724,48 @@ async fn not_ready_read_clears_a_kept_unread_mark() {
         r#"mutation { setProgress(chapterId:"entry-three",lastPageRead:20,read:true) }"#,
     )
     .await;
-    let marks: i64 = sqlx::query_scalar("SELECT count(*) FROM work_chapter_mark WHERE user_id = $1 AND work_chapter_id = $2")
-        .bind(crate::db_types::uuid(BOB).unwrap()).bind(&entry).fetch_one(&pool).await.unwrap();
+    let marks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM work_chapter_mark WHERE user_id = $1 AND work_chapter_id = $2",
+    )
+    .bind(crate::db_types::uuid(BOB).unwrap())
+    .bind(&entry)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(marks, 0);
+}
+
+#[tokio::test]
+async fn an_untick_keeps_the_last_read_time_and_a_finish_moves_it() {
+    let (schema, pool, work) = fixture(true).await;
+    bob(
+        &schema,
+        r#"mutation { setProgress(chapterId:"9203",lastPageRead:20,read:true) }"#,
+    )
+    .await;
+    sqlx::query("UPDATE work_progress SET updated_at = '2026-01-01T00:00:00Z' WHERE user_id = $1 AND work_id = $2")
+        .bind(crate::db_types::uuid(BOB).unwrap()).bind(&work).execute(&pool).await.unwrap();
+    let last_read = || async {
+        sqlx::query_as::<_, (bool, i64)>(
+            "SELECT updated_at = '2026-01-01T00:00:00Z'::timestamptz, revision \
+               FROM work_progress WHERE user_id = $1 AND work_id = $2",
+        )
+        .bind(crate::db_types::uuid(BOB).unwrap())
+        .bind(&work)
+        .fetch_one(pool.read())
+        .await
+        .unwrap()
+    };
+    bob(
+        &schema,
+        r#"mutation { setChapterRead(chapterId:"entry-one",read:false) }"#,
+    )
+    .await;
+    assert_eq!(last_read().await, (true, 2), "an untick is not a read");
+    bob(
+        &schema,
+        r#"mutation { setProgress(chapterId:"entry-one",lastPageRead:20,read:true) }"#,
+    )
+    .await;
+    assert_eq!(last_read().await, (false, 3), "a finish is a read");
 }

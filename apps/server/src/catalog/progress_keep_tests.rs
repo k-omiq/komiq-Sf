@@ -768,3 +768,187 @@ async fn engine_reset_keeps_progress_and_serializes_with_canonical_untick() {
         assert_eq!(numeric_rows, 0);
     }
 }
+
+async fn read_at(pool: &Database, user: &str, work: &str, at: &str) {
+    sqlx::query(
+        "UPDATE work_progress SET updated_at = $3::timestamptz WHERE user_id = $1 AND work_id = $2",
+    )
+    .bind(crate::db_types::uuid(user).unwrap())
+    .bind(work)
+    .bind(at)
+    .execute(pool.write())
+    .await
+    .unwrap();
+}
+
+async fn progress_row(pool: &Database, user: &str, work: &str) -> Option<(String, i64)> {
+    sqlx::query_as(
+        "SELECT to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD'), revision \
+           FROM work_progress WHERE user_id = $1 AND work_id = $2",
+    )
+    .bind(crate::db_types::uuid(user).unwrap())
+    .bind(work)
+    .fetch_optional(pool.read())
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn merge_and_split_keep_each_readers_last_read_time() {
+    let pool = pool().await;
+    let loser = md_work(&pool, "Last read loser").await;
+    let survivor = md_work(&pool, "Last read survivor").await;
+    replace_source_chapters(
+        &pool,
+        &loser.source,
+        &[
+            chapter("lr-loser-one", Some("1"), "One"),
+            chapter("lr-loser-two", Some("2"), "Two"),
+            chapter("lr-loser-three", Some("3"), "Three"),
+        ],
+    )
+    .await
+    .unwrap();
+    replace_source_chapters(
+        &pool,
+        &survivor.source,
+        &[
+            chapter("lr-survivor-one", Some("1"), "One"),
+            chapter("lr-survivor-two", Some("2"), "Two"),
+        ],
+    )
+    .await
+    .unwrap();
+    make_ready(&pool, &loser.work).await;
+    make_ready(&pool, &survivor.work).await;
+    let (l1, l2) = (
+        entry(&pool, &loser.work, "100").await.id,
+        entry(&pool, &loser.work, "200").await.id,
+    );
+    let (s1, s2) = (
+        entry(&pool, &survivor.work, "100").await.id,
+        entry(&pool, &survivor.work, "200").await.id,
+    );
+    let only_loser = reader(&pool).await;
+    let loser_newer = reader(&pool).await;
+    let survivor_newer = reader(&pool).await;
+    pointer(&pool, &only_loser, &loser.work, &l2).await;
+    read_at(&pool, &only_loser, &loser.work, "2026-01-01T00:00:00Z").await;
+    pointer(&pool, &loser_newer, &survivor.work, &s1).await;
+    read_at(&pool, &loser_newer, &survivor.work, "2026-02-01T00:00:00Z").await;
+    pointer(&pool, &loser_newer, &loser.work, &l1).await;
+    read_at(&pool, &loser_newer, &loser.work, "2026-03-01T00:00:00Z").await;
+    pointer(&pool, &survivor_newer, &survivor.work, &s2).await;
+    read_at(
+        &pool,
+        &survivor_newer,
+        &survivor.work,
+        "2026-04-01T00:00:00Z",
+    )
+    .await;
+    pointer(&pool, &survivor_newer, &loser.work, &l1).await;
+    read_at(&pool, &survivor_newer, &loser.work, "2026-01-15T00:00:00Z").await;
+
+    merge_works(&pool, &loser.work, &survivor.work)
+        .await
+        .unwrap();
+    // The revision moves; the last read is the reader's own, never the merge time.
+    assert_eq!(
+        progress_row(&pool, &only_loser, &survivor.work).await,
+        Some(("2026-01-01".into(), 1))
+    );
+    assert_eq!(
+        progress_row(&pool, &loser_newer, &survivor.work).await,
+        Some(("2026-03-01".into(), 8))
+    );
+    assert_eq!(
+        progress_row(&pool, &survivor_newer, &survivor.work).await,
+        Some(("2026-04-01".into(), 8))
+    );
+
+    let split = split_source_series(&pool, &survivor.work, &[loser.source.clone()], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        progress_row(&pool, &only_loser, &survivor.work).await,
+        Some(("2026-01-01".into(), 2))
+    );
+    let moved = progress_row(&pool, &only_loser, &split.new_work_id)
+        .await
+        .expect("the reader's pointer follows the moving copies");
+    assert_eq!(
+        moved.0, "2026-01-01",
+        "a new row takes the source row's time"
+    );
+}
+
+#[tokio::test]
+async fn merge_keeps_a_ready_survivor_ready_when_every_loser_copy_is_linked() {
+    for unlinked in [false, true] {
+        let pool = pool().await;
+        let loser = md_work(&pool, "Ready loser").await;
+        let survivor = md_work(&pool, "Ready survivor").await;
+        replace_source_chapters(
+            &pool,
+            &loser.source,
+            &[
+                chapter("rl-loser-two", Some("2"), "Two"),
+                chapter("rl-loser-three", Some("3"), "Three"),
+            ],
+        )
+        .await
+        .unwrap();
+        replace_source_chapters(
+            &pool,
+            &survivor.source,
+            &[
+                chapter("rl-survivor-one", Some("1"), "One"),
+                chapter("rl-survivor-two", Some("2"), "Two"),
+                chapter("rl-survivor-three", Some("3"), "Three"),
+            ],
+        )
+        .await
+        .unwrap();
+        // The loser was linked at ingest but the drain never visited it.
+        make_ready(&pool, &survivor.work).await;
+        if unlinked {
+            sqlx::query(
+                "DELETE FROM work_chapter_link WHERE chapter_id = \
+                 (SELECT id FROM chapter WHERE source_series_id = $1 AND external_id = 'rl-loser-two')",
+            )
+            .bind(&loser.source)
+            .execute(pool.write())
+            .await
+            .unwrap();
+        }
+        let user = reader(&pool).await;
+        let s3 = entry(&pool, &survivor.work, "300").await.id;
+        pointer(&pool, &user, &survivor.work, &s3).await;
+        untick(&pool, &user, "rl-loser-three").await;
+
+        merge_works(&pool, &loser.work, &survivor.work)
+            .await
+            .unwrap();
+        let (ready, _) = work_chapter::admin_entry_list(&pool, &survivor.work)
+            .await
+            .unwrap();
+        assert_eq!(ready, !unlinked);
+        if unlinked {
+            continue;
+        }
+        // Pointer-implied reads stay visible right after the merge.
+        let state = reads(&pool, &user, &survivor.work).await;
+        let s1 = entry(&pool, &survivor.work, "100").await.id;
+        let s2 = entry(&pool, &survivor.work, "200").await.id;
+        assert_eq!(state[&s1], true);
+        assert_eq!(state[&s2], true);
+        // The loser's legacy untick was converted, not left behind.
+        let unticks: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM progress_untick WHERE user_id = $1")
+                .bind(crate::db_types::uuid(&user).unwrap())
+                .fetch_one(pool.read())
+                .await
+                .unwrap();
+        assert_eq!(unticks, 0);
+    }
+}

@@ -141,7 +141,11 @@ async fn link_copies_on(
         let mut numbers = Vec::new();
         let mut labels = Vec::new();
         let mut specials = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        // A key an admin merged away has no entry of its own, but the entry that took
+        // its copies still claims it (see `merged_key_owners_on`).
+        let all_keys: Vec<String> = numbered.iter().map(|(_, key, _)| key.clone()).collect();
+        let merged = merged_key_owners_on(conn, work_id, &all_keys).await?;
+        let mut seen: std::collections::HashSet<String> = merged.keys().cloned().collect();
         for (c, key, n) in &numbered {
             if seen.insert(key.clone()) {
                 new_ids.push(super::new_id("wc_"));
@@ -179,7 +183,7 @@ async fn link_copies_on(
         .execute(&mut *conn)
         .await?
         .rows_affected();
-        let entries: HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
+        let mut entries: HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
             "SELECT match_key, id FROM work_chapter WHERE work_id = $1 AND match_key = ANY($2)",
         )
         .bind(work_id)
@@ -188,6 +192,7 @@ async fn link_copies_on(
         .await?
         .into_iter()
         .collect();
+        entries.extend(merged);
         for (c, key, _) in &numbered {
             let entry = entries
                 .get(key)
@@ -319,6 +324,37 @@ async fn link_copies_on(
         bump_list_rev_on(conn, work_id).await?;
     }
     Ok(linked)
+}
+
+/// Numbered keys with no entry of their own whose copies an admin entry merge moved onto
+/// another entry: key -> that entry. `merge_entries_within_on` deletes the dropped entry
+/// and marks the links it moves `admin`, so the survivor keeps claiming the dropped key
+/// as long as one of those copies is linked; a new copy with that key (a re-listed
+/// chapter, another group's upload) joins the survivor instead of recreating the
+/// duplicate. Matcher links are never read here: link once can leave a renumbered copy
+/// on an entry whose key is not its own.
+async fn merged_key_owners_on(
+    conn: &mut PgConnection,
+    work_id: &str,
+    keys: &[String],
+) -> Result<HashMap<String, String>> {
+    Ok(sqlx::query_as::<_, (String, String)>(
+        "SELECT DISTINCT ON (c.chapter_key) c.chapter_key, wc.id \
+           FROM work_chapter wc \
+           JOIN work_chapter_link l ON l.work_chapter_id = wc.id AND l.linked_by = 'admin' \
+           JOIN chapter c ON c.id = l.chapter_id \
+          WHERE wc.work_id = $1 AND c.chapter_key = ANY($2) \
+            AND wc.match_key IS DISTINCT FROM c.chapter_key \
+            AND NOT EXISTS (SELECT 1 FROM work_chapter k \
+                             WHERE k.work_id = $1 AND k.match_key = c.chapter_key) \
+          ORDER BY c.chapter_key, l.linked_at DESC, wc.id",
+    )
+    .bind(work_id)
+    .bind(keys)
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .collect())
 }
 
 /// Where a new special goes, as one SQL expression over `$2` (work) and `$4` (release):
@@ -674,7 +710,7 @@ pub async fn run_cli(pool: &Database, args: &[String]) -> Result<()> {
 /// before the source work is deleted. An entry whose `match_key` the target already has
 /// maps onto that entry (its links move; the target's overrides win, a loser override
 /// fills a target entry that has none); every other entry moves as it is. Returns the
-/// entry map. The target stays ready only if both works were.
+/// entry map. The target stays ready if it was and every copy it now has is linked.
 pub(crate) async fn merge_entries_on(
     conn: &mut PgConnection,
     source_work: &str,
@@ -724,16 +760,34 @@ pub(crate) async fn merge_entries_on(
             .await?;
     // The merge already folded legacy overrides with survivor precedence.
     sync_numbered_entries_from_overrides_on(conn, target_work).await?;
-    sqlx::query(
-        "INSERT INTO work_chapter_state (work_id, ready, list_rev, updated_at) \
-         VALUES ($2, false, 1, now()) \
-         ON CONFLICT (work_id) DO UPDATE SET \
-           ready = work_chapter_state.ready \
-                   AND COALESCE((SELECT ready FROM work_chapter_state WHERE work_id = $1), false), \
-           list_rev = work_chapter_state.list_rev + 1, updated_at = now()",
+    // A ready target stays ready when every copy it now has is linked; the loser's own
+    // flag only says whether the drain has visited it yet. The caller moved the loser's
+    // mappings first and locked their untick users, so the loser's legacy unticks become
+    // marks here, as the drain would do (a ready loser has none left).
+    let (target_ready, source_ready, all_linked): (bool, bool, bool) = sqlx::query_as(
+        "SELECT COALESCE((SELECT ready FROM work_chapter_state WHERE work_id = $2), false), \
+                COALESCE((SELECT ready FROM work_chapter_state WHERE work_id = $1), false), \
+                NOT EXISTS (SELECT 1 FROM chapter c \
+                  JOIN source_series ss ON ss.id = c.source_series_id \
+                 WHERE ss.work_id = $2 AND NOT EXISTS \
+                       (SELECT 1 FROM work_chapter_link l WHERE l.chapter_id = c.id))",
     )
     .bind(source_work)
     .bind(target_work)
+    .fetch_one(&mut *conn)
+    .await?;
+    let ready = target_ready && all_linked;
+    if ready && !source_ready {
+        crate::progress::convert_unticks_on(conn, target_work).await?;
+    }
+    sqlx::query(
+        "INSERT INTO work_chapter_state (work_id, ready, list_rev, updated_at) \
+         VALUES ($1, false, 1, now()) \
+         ON CONFLICT (work_id) DO UPDATE SET ready = $2, \
+           list_rev = work_chapter_state.list_rev + 1, updated_at = now()",
+    )
+    .bind(target_work)
+    .bind(ready)
     .execute(&mut *conn)
     .await?;
     let mut map: Vec<EntryMove> = pairs
@@ -990,11 +1044,16 @@ pub(crate) async fn merge_entries_within_on(
     let Some((key, hidden, title)) = row else {
         anyhow::bail!("entries are not in work: {work_id}");
     };
-    sqlx::query("UPDATE work_chapter_link SET work_chapter_id = $1 WHERE work_chapter_id = $2")
-        .bind(keep)
-        .bind(drop)
-        .execute(&mut *conn)
-        .await?;
+    // `admin` links are what lets the kept entry go on claiming the dropped key
+    // (`merged_key_owners_on`).
+    sqlx::query(
+        "UPDATE work_chapter_link SET work_chapter_id = $1, linked_by = 'admin', linked_at = now() \
+         WHERE work_chapter_id = $2",
+    )
+    .bind(keep)
+    .bind(drop)
+    .execute(&mut *conn)
+    .await?;
     sqlx::query("DELETE FROM work_chapter WHERE id = $1")
         .bind(drop)
         .execute(&mut *conn)

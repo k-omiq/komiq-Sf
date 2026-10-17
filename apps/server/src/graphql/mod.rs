@@ -3039,17 +3039,34 @@ fn group_aggregated_chapter_states(
     let mut volume_from_mirror: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for r in rows {
-        let (key, entry_id, entry_order, special) = if ready {
+        // A ready group prints its entry's own number and label: link once keeps a
+        // renumbered copy on its old entry, so the first copy's number can name another
+        // chapter. A copy's values fill in only when the entry has none (a special).
+        // `key` stays the copy's spine key, which the legacy override paths read.
+        let (key, entry_id, entry_order, special, number, label) = if ready {
             let e = r.entry.as_ref().expect("ready rows have entries");
             entry_overrides.insert(
                 e.id.clone(),
                 (e.hidden, e.title_override.clone(), e.match_key.clone()),
             );
+            let number = e
+                .number
+                .as_deref()
+                .and_then(|n| n.trim().parse::<f64>().ok())
+                .filter(|n| n.is_finite())
+                .or(r.number);
+            let label = e
+                .label
+                .clone()
+                .filter(|l| !l.trim().is_empty())
+                .unwrap_or_else(|| r.label.clone());
             (
                 (e.rank, OrderedNumber(None), e.id.clone()),
                 Some(ID(e.id.clone())),
                 i32::try_from(e.rank).ok(),
                 Some(e.special),
+                number,
+                label,
             )
         } else {
             (
@@ -3057,6 +3074,8 @@ fn group_aggregated_chapter_states(
                 None,
                 None,
                 None,
+                r.number,
+                r.label.clone(),
             )
         };
         let group_id = key.2.clone();
@@ -3067,8 +3086,8 @@ fn group_aggregated_chapter_states(
             // 0.0 for an unnumbered chapter is a DISPLAY fallback for older clients only —
             // `label` is authoritative and says "Oneshot". Deliberately not a negative
             // sentinel: a client that renders it still shows something harmless.
-            number: r.number.unwrap_or(0.0),
-            label: r.label.clone(),
+            number: number.unwrap_or(0.0),
+            label,
             key: r.key.clone(),
             title: r.title.clone(),
             first_released_at: None,
@@ -11785,14 +11804,19 @@ async fn write_progress_once(
             through = Some(next);
         }
     }
+    // `updated_at` is the last read (it orders Continue reading): an untick is not a read
+    // and keeps the stored time.
     let new_revision =
         if changed && !copy.work_id.is_empty() {
             sqlx::query_scalar(
             "INSERT INTO work_progress (user_id, work_id, through_entry_id, revision, updated_at) \
              VALUES ($1, $2, $3, 1, now()) ON CONFLICT (user_id, work_id) DO UPDATE SET \
              through_entry_id = excluded.through_entry_id, revision = work_progress.revision + 1, \
-             updated_at = excluded.updated_at RETURNING revision",
-        ).bind(user).bind(&copy.work_id).bind(&through).fetch_one(&mut *tx).await?
+             updated_at = CASE WHEN $4 THEN work_progress.updated_at ELSE excluded.updated_at END \
+             RETURNING revision",
+        ).bind(user).bind(&copy.work_id).bind(&through)
+            .bind(matches!(write, ProgressWrite::Toggle { read: false }))
+            .fetch_one(&mut *tx).await?
         } else {
             revision
         };
@@ -26716,6 +26740,59 @@ mod tests {
         );
         assert_eq!(data["seriesPage"]["aggregated"], data["aggregatedChapters"]);
         assert!(chapters.iter().all(|c| c["entryId"] != hidden));
+    }
+
+    #[tokio::test]
+    async fn ready_aggregated_chapter_prints_its_entry_number_after_a_copy_renumbers() {
+        let (schema, pool) = setup_full(100).await;
+        let work = seed_work_chapter_graphql_fixture(&pool).await;
+        drain_work_chapter_fixture(&pool).await;
+        let one = fixture_entry_id(&pool, &work, "100").await;
+        // The source renumbers its chapter 1 to 5. Link once keeps the copy on entry 1,
+        // and the Suwayomi copy is the first row of that entry.
+        let chapters: Vec<SuwayomiChapter> = (0..4)
+            .map(|number| SuwayomiChapter {
+                engine_generation: None,
+                manga: None,
+                url: None,
+                real_url: None,
+                source_order: None,
+                id: 9200 + number,
+                manga_id: 779,
+                name: format!("Ch {}", if number == 1 { 5 } else { number }),
+                chapter_number: if number == 1 { 5.0 } else { number as f64 },
+                scanlator: Some("Source Group".into()),
+                upload_date: None,
+                is_read: false,
+                is_bookmarked: false,
+                is_downloaded: false,
+                last_page_read: 0,
+                page_count: 20,
+            })
+            .collect();
+        crate::series_cache::put_chapters(&pool, 779, &chapters)
+            .await
+            .unwrap();
+        let rows = catalog::work_source_chapters(&pool, &work).await.unwrap();
+        assert!(
+            rows.iter()
+                .any(|r| r.chapter_id == "9201" && r.number == Some(5.0)),
+            "fixture: the copy is renumbered"
+        );
+        let data = work_chapter_gql(&schema, &format!(r#"{{
+            aggregatedChapters(workId: "{work}") {{ entryId number label key sources {{ chapterId }} }}
+            seriesPage(workId: "{work}") {{ aggregated {{ entryId number label key sources {{ chapterId }} }} }}
+        }}"#)).await;
+        let chapters = data["aggregatedChapters"].as_array().unwrap();
+        let first = chapters.iter().find(|c| c["entryId"] == one).unwrap();
+        assert_eq!(first["number"], 1.0);
+        assert_eq!(first["label"], "1");
+        assert_eq!(first["sources"].as_array().unwrap().len(), 2);
+        assert!(
+            chapters.iter().all(|c| c["label"] != "5"),
+            "no row is labelled with the renumbered copy's number"
+        );
+        assert_eq!(data["seriesPage"]["aggregated"], data["aggregatedChapters"]);
     }
 
     #[tokio::test]

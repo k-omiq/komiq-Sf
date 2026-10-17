@@ -6492,6 +6492,11 @@ pub struct RowEntry {
     pub special: bool,
     pub hidden: bool,
     pub title_override: Option<String>,
+    /// The entry's own number and label, set when the matcher (or an admin) made it. A
+    /// ready list prints these, not a copy's: link once keeps a renumbered copy on its old
+    /// entry, so a copy's current number can name a different chapter.
+    pub number: Option<String>,
+    pub label: Option<String>,
 }
 
 /// One reconciled Suwayomi mapping for a work (F1): the authoritative
@@ -6735,6 +6740,7 @@ pub async fn work_source_chapters(pool: &Database, work_id: &str) -> Result<Vec<
                 c.external_url, NULLIF(TRIM(c.volume), '') AS volume, \
                 wc.id AS entry_id, wc.match_key, r.rank, \
                 wc.special, wc.hidden, wc.title_override, \
+                wc.number AS entry_number, wc.label AS entry_label, \
                 COALESCE((SELECT ready FROM work_chapter_state WHERE work_id = $1), false) AS work_ready \
            FROM authoritative a \
            JOIN chapter c ON c.source_series_id = a.ssid \
@@ -6748,6 +6754,7 @@ pub async fn work_source_chapters(pool: &Database, work_id: &str) -> Result<Vec<
                 COALESCE(c.readable_at, c.published_at), c.external_url, \
                 NULLIF(TRIM(c.volume), ''), \
                 wc.id, wc.match_key, r.rank, wc.special, wc.hidden, wc.title_override, \
+                wc.number, wc.label, \
                 COALESCE((SELECT ready FROM work_chapter_state WHERE work_id = $1), false) \
            FROM source_series ss \
            JOIN chapter c ON c.source_series_id = ss.id \
@@ -6787,6 +6794,8 @@ pub async fn work_source_chapters(pool: &Database, work_id: &str) -> Result<Vec<
                     special: r.special.unwrap_or(false),
                     hidden: r.hidden.unwrap_or(false),
                     title_override: r.title_override,
+                    number: r.entry_number,
+                    label: r.entry_label,
                 }),
                 work_ready: r.work_ready,
                 number: derived.number(),
@@ -6840,6 +6849,8 @@ struct SpineChapterRow {
     special: Option<bool>,
     hidden: Option<bool>,
     title_override: Option<String>,
+    entry_number: Option<String>,
+    entry_label: Option<String>,
     work_ready: bool,
 }
 

@@ -821,7 +821,8 @@ async fn merge_maps_collisions_moves_unique_entries_and_combines_overrides_and_r
         assert_eq!(three.id, l3.id);
         assert_same_attributes(&l3, &three);
         let (ready, entries) = admin_entry_list(&pool, &survivor.work).await.unwrap();
-        assert_eq!(ready, loser_ready && survivor_ready);
+        // Every loser copy was linked at ingest, so only the survivor's flag matters.
+        assert_eq!(ready, survivor_ready);
         assert_eq!(entries.len(), 3);
         assert_eq!(entries.iter().map(|e| e.copies.len()).sum::<usize>(), 5);
         let owner: String = sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = $1")
@@ -1593,4 +1594,73 @@ async fn work_chapter_reads_are_counted_through_the_database_executor() {
         1,
         "the drain work-list read is counted"
     );
+}
+
+#[tokio::test]
+async fn admin_entry_merge_keeps_claiming_the_dropped_key_for_new_copies() {
+    let pool = pool().await;
+    let md = md_work(&pool, "Merged key").await;
+    let ten = chapter("md-ten", Some("10"), "Ten");
+    let typo = chapter("md-typo", Some("10.05"), "Ten");
+    catalog::replace_source_chapters(&pool, &md.source, &[ten.clone(), typo.clone()])
+        .await
+        .unwrap();
+    let keep = entry(&pool, &md.work, "1000").await.id;
+    let drop = entry(&pool, &md.work, "1005").await.id;
+    let mut tx = pool.begin().await.unwrap();
+    crate::locks::lock_works(&mut tx, &[&md.work])
+        .await
+        .unwrap();
+    merge_entries_within_on(&mut tx, &md.work, &keep, &drop)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // Another group uploads the same mis-numbered chapter.
+    catalog::upsert_chapter(
+        &pool,
+        &md.source,
+        &chapter("md-typo-2", Some("10.05"), "Ten"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(linked_entry(&pool, &md.source, "md-typo-2").await, keep);
+    // The source re-lists it under a new id: the new copy is linked in the same write
+    // that drops the old ones.
+    catalog::replace_source_chapters(
+        &pool,
+        &md.source,
+        &[ten, chapter("md-typo-3", Some("10.05"), "Ten")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(linked_entry(&pool, &md.source, "md-typo-3").await, keep);
+    let (_, entries) = admin_entry_list(&pool, &md.work).await.unwrap();
+    assert_eq!(
+        entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+        [keep.as_str()],
+        "the merge is not undone"
+    );
+
+    // A copy the matcher left on another entry after a renumber claims nothing.
+    catalog::replace_source_chapters(
+        &pool,
+        &md.source,
+        &[
+            chapter("md-ten", Some("12"), "Ten"),
+            chapter("md-typo-3", Some("10.05"), "Ten"),
+        ],
+    )
+    .await
+    .unwrap();
+    catalog::upsert_chapter(
+        &pool,
+        &md.source,
+        &chapter("md-twelve", Some("12"), "Twelve"),
+    )
+    .await
+    .unwrap();
+    let twelve = entry(&pool, &md.work, "1200").await.id;
+    assert_ne!(twelve, keep);
+    assert_eq!(linked_entry(&pool, &md.source, "md-twelve").await, twelve);
 }
