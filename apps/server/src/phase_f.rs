@@ -862,20 +862,27 @@ pub async fn split_mismatched(pool: &Database, apply: Apply) -> Result<StepRepor
         }
         crate::db::retry_transaction(|| async {
         let mut tx = pool.begin_with("BEGIN").await?;
+        let works = [r.work_id.clone(), target.clone()];
+        let users = crate::progress::affected_users(&mut tx, &works).await?;
+        crate::locks::lock_users(&mut tx, &users).await?;
         lock_proof_inputs(&mut tx, &r.source_series_id, false).await?;
+        if crate::progress::affected_users(&mut tx, &works).await? != users {
+            return Err(crate::locks::RestartTransaction.into());
+        }
         let current = classify_on(&mut tx, Some(&r.source_series_id)).await?;
         let current = current.first().ok_or_else(|| anyhow::anyhow!("source disappeared under split proof"))?;
         if current.verdict() != Verdict::Mismatch || current.work_id != r.work_id || current.uuid_owner_work.as_deref() != Some(target.as_str()) {
             anyhow::bail!("source changed under split proof — reload classification");
         }
         crate::catalog::guards::held().await;
+        let before = crate::progress::keep_state_before(&mut tx, &users, &works).await?;
         sqlx::query("UPDATE source_series SET work_id = $1 WHERE id = $2")
             .bind(&target)
             .bind(&r.source_series_id)
             .execute(&mut *tx)
             .await?;
         // The row's chapter-list entries follow it, as in an admin split (W3a).
-        crate::catalog::work_chapter::split_entries_on(
+        let entry_map = crate::catalog::work_chapter::split_entries_on(
             &mut tx,
             &r.work_id,
             &target,
@@ -883,6 +890,15 @@ pub async fn split_mismatched(pool: &Database, apply: Apply) -> Result<StepRepor
             false,
         )
         .await?;
+        crate::catalog::move_split_progress(
+            &mut tx, &r.work_id, &target, std::slice::from_ref(&r.source_series_id),
+        ).await?;
+        crate::progress::keep_state_after(
+            &mut tx, before, &entry_map, &[],
+            crate::progress::PointerPlan::Split {
+                source: &r.work_id, dest: &target, dest_is_new: false,
+            },
+        ).await?;
         // Move the release events this row was the ONLY source of. `INSERT OR IGNORE`
         // then delete: if the target already knows the chapter key, its own (possibly
         // earlier) first_seen_at wins, which is the ledger's rule everywhere else.
@@ -1140,6 +1156,12 @@ pub async fn delete_redundant(
                 );
             }
             crate::catalog::guards::held().await;
+            let chapters: Vec<String> =
+                sqlx::query_scalar("SELECT id FROM chapter WHERE source_series_id = $1")
+                    .bind(&r.source_series_id)
+                    .fetch_all(&mut *tx)
+                    .await?;
+            crate::progress::keep_explicit_reads(&mut tx, &chapters).await?;
             sqlx::query("DELETE FROM source_series WHERE id = $1")
                 .bind(&r.source_series_id)
                 .execute(&mut *tx)

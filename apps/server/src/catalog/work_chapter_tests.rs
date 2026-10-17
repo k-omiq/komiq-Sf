@@ -5,13 +5,13 @@ use crate::catalog::phase4_tests::pool;
 use crate::catalog::{self, ChapterInput, WorkInput};
 use crate::phase_f::{self, Apply};
 
-struct MdWork {
-    work: String,
-    source: String,
-    uuid: String,
+pub(crate) struct MdWork {
+    pub(crate) work: String,
+    pub(crate) source: String,
+    pub(crate) uuid: String,
 }
 
-async fn md_work(pool: &Database, title: &str) -> MdWork {
+pub(crate) async fn md_work(pool: &Database, title: &str) -> MdWork {
     let uuid = uuid::Uuid::new_v4().to_string();
     let work = catalog::upsert_work_from_mangadex(
         pool,
@@ -31,13 +31,13 @@ async fn md_work(pool: &Database, title: &str) -> MdWork {
     MdWork { work, source, uuid }
 }
 
-async fn source(pool: &Database, work: &str, key: &str) -> String {
+pub(crate) async fn source(pool: &Database, work: &str, key: &str) -> String {
     catalog::upsert_source_series(pool, work, "suwayomi", "source", key, None, false)
         .await
         .unwrap()
 }
 
-fn chapter(id: &str, number: Option<&str>, title: &str) -> ChapterInput {
+pub(crate) fn chapter(id: &str, number: Option<&str>, title: &str) -> ChapterInput {
     ChapterInput {
         external_id: id.into(),
         number: number.map(str::to_owned),
@@ -47,7 +47,7 @@ fn chapter(id: &str, number: Option<&str>, title: &str) -> ChapterInput {
     }
 }
 
-async fn entry(pool: &Database, work: &str, key: &str) -> AdminEntry {
+pub(crate) async fn entry(pool: &Database, work: &str, key: &str) -> AdminEntry {
     admin_entry_list(pool, work)
         .await
         .unwrap()
@@ -57,7 +57,7 @@ async fn entry(pool: &Database, work: &str, key: &str) -> AdminEntry {
         .unwrap_or_else(|| panic!("missing entry {key} on {work}"))
 }
 
-async fn linked_entry(pool: &Database, source: &str, external: &str) -> String {
+pub(crate) async fn linked_entry(pool: &Database, source: &str, external: &str) -> String {
     sqlx::query_scalar(
         "SELECT l.work_chapter_id FROM chapter c \
          JOIN work_chapter_link l ON l.chapter_id = c.id \
@@ -93,7 +93,7 @@ async fn snapshot(pool: &Database, work: &str) -> Snapshot {
     .unwrap()
 }
 
-async fn make_ready(pool: &Database, work: &str) {
+pub(crate) async fn make_ready(pool: &Database, work: &str) {
     for _ in 0..10 {
         if drain_work_attempt(pool, work).await.unwrap().1 {
             assert!(work_entries(pool, work).await.unwrap().ready);
@@ -130,7 +130,12 @@ fn assert_same_attributes(before: &AdminEntry, after: &AdminEntry) {
     assert_eq!(after.title_override, before.title_override);
 }
 
-async fn all_mangadex_source(pool: &Database, work: &str, key: &str, uuid: &str) -> String {
+pub(crate) async fn all_mangadex_source(
+    pool: &Database,
+    work: &str,
+    key: &str,
+    uuid: &str,
+) -> String {
     catalog::upsert_source_extension(
         pool,
         phase_f::PRIMARY_SOURCE_ID,

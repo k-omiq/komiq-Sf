@@ -571,6 +571,30 @@ impl Fence {
             replaceable(current_on(&mut tx).await?, replace)? == old,
             "Engine generation changed during recovery"
         );
+        let users: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT user_id FROM suwayomi_progress \
+             UNION SELECT user_id FROM progress_untick WHERE chapter_id ~ '^[0-9]+$' \
+             ORDER BY user_id",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let users: Vec<String> = users.into_iter().map(|id| id.to_string()).collect();
+        crate::locks::lock_users(&mut tx, &users).await?;
+        #[cfg(test)]
+        crate::catalog::guards::pause("engine-reset-users").await;
+        // The keepers write marks (child rows) on every work with a numeric source:
+        // take those work locks first, in order. detach_numeric_rows below locks a
+        // subset of them again.
+        let store_works = "SELECT DISTINCT work_id FROM source_series WHERE source_type = 'suwayomi' ORDER BY work_id";
+        let works: Vec<String> = sqlx::query_scalar(store_works).fetch_all(&mut *tx).await?;
+        crate::locks::lock_works(&mut tx, &works).await?;
+        let current: Vec<String> = sqlx::query_scalar(store_works).fetch_all(&mut *tx).await?;
+        ensure!(
+            current == works,
+            "A catalogue merge ran at the same time; start the new generation again"
+        );
+        crate::progress::keep_explicit_reads_of_store(&mut tx, "suwayomi").await?;
+        crate::progress::keep_unticks_of_store(&mut tx, "suwayomi").await?;
         sqlx::query("INSERT INTO suwayomi_progress_detached SELECT $1,user_id,chapter_id,series_id,last_page_read,read,updated_at FROM suwayomi_progress").bind(old).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM suwayomi_progress")
             .execute(&mut *tx)

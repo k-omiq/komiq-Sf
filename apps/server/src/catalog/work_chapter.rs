@@ -492,8 +492,12 @@ pub async fn drain_once(
 
 /// Link one batch of a work's copies; mark it ready once none is left. `ready` is also
 /// true for a work that no longer exists (merged away or deleted): nothing to do.
-async fn drain_work_attempt(pool: &Database, work_id: &str) -> Result<(u64, bool)> {
+pub(super) async fn drain_work_attempt(pool: &Database, work_id: &str) -> Result<(u64, bool)> {
     let mut tx = pool.begin().await?;
+    let users = crate::progress::untick_users(&mut tx, work_id).await?;
+    #[cfg(test)]
+    crate::catalog::guards::pause("work-chapter-drain-users").await;
+    crate::locks::lock_users(&mut tx, &users).await?;
     // The work lock excludes every chapter writer of its sources (they lock the work
     // first), merges and splits.
     let present: Option<String> =
@@ -530,6 +534,10 @@ async fn drain_work_attempt(pool: &Database, work_id: &str) -> Result<(u64, bool
     .fetch_one(&mut *tx)
     .await?;
     if ready {
+        if crate::progress::untick_users(&mut tx, work_id).await? != users {
+            return Err(crate::locks::RestartTransaction.into());
+        }
+        crate::progress::convert_unticks_on(&mut tx, work_id).await?;
         mark_ready_on(&mut tx, work_id).await?;
     }
     tx.commit().await?;
@@ -870,6 +878,135 @@ pub(crate) async fn split_entries_on(
     .await?;
     bump_list_rev_on(conn, from_work).await?;
     Ok(map)
+}
+
+/// Relink a copy within its work, or give it an independent admin entry. The old
+/// entry stays because other copies and readers may still name it. Caller holds the
+/// work lock; bumps list_rev.
+pub(crate) async fn relink_copy_on(
+    conn: &mut PgConnection,
+    work_id: &str,
+    chapter_id: &str,
+    target: Option<&str>,
+) -> Result<(String, String)> {
+    crate::catalog::guards::assert_in_transaction(conn, "work_chapter::relink_copy_on");
+    let copy: Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<DateTime<Utc>>,
+    )> = sqlx::query_as(
+        "SELECT l.work_chapter_id, c.number, c.title, c.label, \
+                    COALESCE(c.readable_at, c.published_at) \
+               FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
+               JOIN work_chapter_link l ON l.chapter_id = c.id \
+               JOIN work_chapter wc ON wc.id = l.work_chapter_id \
+              WHERE c.id = $1 AND ss.work_id = $2 AND wc.work_id = $2",
+    )
+    .bind(chapter_id)
+    .bind(work_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((old, number, title, label, released)) = copy else {
+        anyhow::bail!("no linked copy in work: {chapter_id}");
+    };
+    let next = match target {
+        Some(target) => {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM work_chapter WHERE id = $1 AND work_id = $2)",
+            )
+            .bind(target)
+            .bind(work_id)
+            .fetch_one(&mut *conn)
+            .await?;
+            if !exists {
+                anyhow::bail!("entry is not in work: {target}");
+            }
+            target.to_owned()
+        }
+        None => {
+            let id = super::new_id("wc_");
+            let display =
+                crate::chapter_label::chapter_display(None, number.as_deref(), title.as_deref());
+            let sort = display.number().map(crate::chapter_label::format_number);
+            sqlx::query(&format!(
+                "INSERT INTO work_chapter \
+                     (id, work_id, match_key, sort_key, number, label, special, hidden, created_at) \
+                 VALUES ($1, $2, NULL, COALESCE($3::numeric, ({PLACE_SQL})), $5, $6, false, false, now())"
+            ))
+            .bind(&id)
+            .bind(work_id)
+            .bind(sort)
+            .bind(released)
+            .bind(&number)
+            .bind(label.unwrap_or_else(|| display.text()))
+            .execute(&mut *conn)
+            .await?;
+            id
+        }
+    };
+    sqlx::query(
+        "UPDATE work_chapter_link SET work_chapter_id = $2, linked_by = 'admin', linked_at = now() \
+         WHERE chapter_id = $1",
+    )
+    .bind(chapter_id)
+    .bind(&next)
+    .execute(&mut *conn)
+    .await?;
+    bump_list_rev_on(conn, work_id).await?;
+    Ok((old, next))
+}
+
+/// Fold two entries without rematching any copies. Independent overrides on the
+/// survivor win; a missing override can inherit the dropped entry's value. Caller
+/// holds the work lock; bumps list_rev.
+pub(crate) async fn merge_entries_within_on(
+    conn: &mut PgConnection,
+    work_id: &str,
+    keep: &str,
+    drop: &str,
+) -> Result<Vec<EntryMove>> {
+    crate::catalog::guards::assert_in_transaction(conn, "work_chapter::merge_entries_within_on");
+    if keep == drop {
+        anyhow::bail!("cannot merge an entry into itself");
+    }
+    let row: Option<(Option<String>, bool, Option<String>)> = sqlx::query_as(
+        // Same rule as a work merge: the kept entry's overrides win; a kept entry with
+        // none takes the dropped one's.
+        "UPDATE work_chapter k SET \
+           hidden = CASE WHEN NOT k.hidden AND k.title_override IS NULL THEN d.hidden ELSE k.hidden END, \
+           title_override = CASE WHEN NOT k.hidden AND k.title_override IS NULL \
+                                 THEN d.title_override ELSE k.title_override END \
+           FROM work_chapter d \
+          WHERE k.id = $1 AND d.id = $2 AND k.work_id = $3 AND d.work_id = $3 \
+          RETURNING k.match_key, k.hidden, k.title_override",
+    )
+    .bind(keep)
+    .bind(drop)
+    .bind(work_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((key, hidden, title)) = row else {
+        anyhow::bail!("entries are not in work: {work_id}");
+    };
+    sqlx::query("UPDATE work_chapter_link SET work_chapter_id = $1 WHERE work_chapter_id = $2")
+        .bind(keep)
+        .bind(drop)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM work_chapter WHERE id = $1")
+        .bind(drop)
+        .execute(&mut *conn)
+        .await?;
+    if let Some(key) = key.filter(|key| !key.starts_with("x:")) {
+        write_override_row_on(conn, work_id, &key, hidden, title.as_deref()).await?;
+    }
+    bump_list_rev_on(conn, work_id).await?;
+    Ok(vec![EntryMove {
+        from: drop.to_owned(),
+        to: keep.to_owned(),
+    }])
 }
 
 // ── Overrides ─────────────────────────────────────────────────────────────────────
@@ -1296,4 +1433,4 @@ mod unit_tests {
 
 #[cfg(test)]
 #[path = "work_chapter_tests.rs"]
-mod tests;
+pub(crate) mod tests;

@@ -3448,6 +3448,7 @@ async fn group_backfill_hot_works(pool: &crate::db::Database) -> Result<Vec<Stri
     const HOT_WORKS_SQL: &str = "WITH keys(k) AS ( \
              SELECT series_id FROM user_library \
              UNION SELECT work_id FROM canonical_progress \
+             UNION SELECT work_id FROM work_progress \
              UNION SELECT k FROM (SELECT series_key AS k FROM series_views \
                                    ORDER BY total DESC LIMIT $1) \
          ), \
@@ -7409,6 +7410,7 @@ mod tests {
         let in_library = work("lib-uuid", true).await;
         let in_work_library = work("canon-lib-uuid", true).await;
         let in_progress = work("progress-uuid", true).await;
+        let in_work_progress = work("work-progress-uuid", true).await;
         let most_viewed = work("viewed-uuid", true).await;
         let drained = work("drained-uuid", false).await;
         let _cold = work("cold-uuid", true).await;
@@ -7443,6 +7445,11 @@ mod tests {
             most_viewed.clone(),
         )
         .await;
+        exec(
+            r#"INSERT INTO work_progress (user_id, work_id, updated_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468', $1, now())"#,
+            in_work_progress.clone(),
+        )
+        .await;
         // Hot but fully drained: must not cost a probe per batch.
         exec(
             r#"INSERT INTO user_library (user_id, series_id, created_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468', $1, '2020-01-01T00:00:00Z')"#,
@@ -7458,7 +7465,13 @@ mod tests {
 
         let mut got = group_backfill_hot_works(&pool).await.unwrap();
         got.sort_unstable();
-        let mut want = vec![in_library, in_work_library, in_progress, most_viewed];
+        let mut want = vec![
+            in_library,
+            in_work_library,
+            in_progress,
+            in_work_progress,
+            most_viewed,
+        ];
         want.sort_unstable();
         assert_eq!(got, want);
     }

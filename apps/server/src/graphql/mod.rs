@@ -7,6 +7,9 @@ mod cache_refresh_tests;
 #[cfg(test)]
 mod postgres_golden_tests;
 #[cfg(test)]
+#[path = "progress_w3b_tests.rs"]
+mod progress_w3b_tests;
+#[cfg(test)]
 mod scanlator_rating_tests;
 #[cfg(test)]
 mod sources_tests;
@@ -25,6 +28,7 @@ use chrono::Utc;
 use crate::auth::{self, User};
 use crate::browse::BROWSE_PAGE_SIZE;
 use crate::catalog;
+use crate::progress;
 use crate::request_budget::{check_upstream_rate as upstream_budget, UpstreamRateLimit};
 use crate::scanner::scan_series;
 use crate::suwayomi::{FetchType, SuwayomiChapter, SuwayomiClient, SuwayomiManga};
@@ -1382,10 +1386,10 @@ async fn catch_up_canonical(
     number: f64,
     now: &str,
     excluded: &[String],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
     // work_id is '' for a chapter that isn't in the mirror; there is nothing to catch up.
     if work_id.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let candidates: Vec<(String, Option<String>)> = crate::db_types::query_tuple(
         "SELECT c.external_id, c.number FROM chapter c JOIN source_series ss ON ss.id=c.source_series_id \
@@ -1404,7 +1408,7 @@ async fn catch_up_canonical(
         .collect();
     earlier.sort_unstable();
     earlier.dedup();
-    sqlx::query(
+    let updated = sqlx::query(
         "UPDATE canonical_progress SET read = TRUE, updated_at = $3 \
           WHERE user_id = $1 AND chapter_id = ANY($2::text[]) AND read = FALSE \
             AND NOT (chapter_id = ANY($4::text[]))",
@@ -1414,8 +1418,9 @@ async fn catch_up_canonical(
     .bind(crate::db_types::date(now)?)
     .bind(excluded)
     .execute(&mut *conn)
-    .await?;
-    sqlx::query(
+    .await?
+    .rows_affected();
+    let inserted = sqlx::query(
         "INSERT INTO canonical_progress \
            (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
          SELECT $1, id, $2, 0, TRUE, $3 FROM unnest($4::text[]) AS t(id) \
@@ -1428,8 +1433,9 @@ async fn catch_up_canonical(
     .bind(&earlier)
     .bind(excluded)
     .execute(conn)
-    .await?;
-    Ok(())
+    .await?
+    .rows_affected();
+    Ok(updated + inserted)
 }
 
 /// SQLite ROUND(float*100) uses its zero-decimal, half-away primitive, then
@@ -1459,9 +1465,9 @@ async fn catch_up_suwayomi(
     number: f64,
     now: &str,
     excluded: &[String],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
     if series_id.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let mut earlier: Vec<String> = sqlx::query_scalar(
         "SELECT CAST(sc.id AS TEXT) FROM suwayomi_chapter sc \
@@ -1473,7 +1479,7 @@ async fn catch_up_suwayomi(
     .await?;
     earlier.sort_unstable();
     earlier.dedup();
-    sqlx::query(
+    let updated = sqlx::query(
         "UPDATE suwayomi_progress SET read = TRUE, updated_at = $3 \
           WHERE user_id = $1 AND chapter_id = ANY($2::text[]) AND read = FALSE \
             AND NOT (chapter_id = ANY($4::text[]))",
@@ -1483,8 +1489,9 @@ async fn catch_up_suwayomi(
     .bind(crate::db_types::date(now)?)
     .bind(excluded)
     .execute(&mut *conn)
-    .await?;
-    sqlx::query(
+    .await?
+    .rows_affected();
+    let inserted = sqlx::query(
         "INSERT INTO suwayomi_progress \
            (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
          SELECT $1, id, $2, 0, TRUE, $3 FROM unnest($4::text[]) AS t(id) \
@@ -1497,8 +1504,9 @@ async fn catch_up_suwayomi(
     .bind(&earlier)
     .bind(excluded)
     .execute(conn)
-    .await?;
-    Ok(())
+    .await?
+    .rows_affected();
+    Ok(updated + inserted)
 }
 
 // `rating_summary` (single-series, keyed on the LITERAL `reviews.series_id`) is gone: every
@@ -4379,75 +4387,6 @@ fn canonical_chapter_key(c: &catalog::CanonicalChapter) -> String {
     .0
 }
 
-/// Every spine key the VIEWER has read on this work, from ANY of its sources.
-///
-/// THIS IS THE CROSS-SOURCE READ STATE. Progress is stored against a source's own chapter
-/// row — `canonical_progress.chapter_id` is a MangaDex uuid, `suwayomi_progress.chapter_id`
-/// a numeric Suwayomi id — so the same chapter read from two sources has two unrelated
-/// keys, and switching translator blanked every marker the reader had earned (a real user
-/// here has 98 chapters of one work read under one source that a sibling source carries
-/// under different ids). Folding both stores onto `chapter.chapter_key` is the same
-/// mapping `library_progress` already does to count `read <= total` honestly, and the same
-/// identity the aggregated chapter list groups by.
-///
-/// DERIVED, never stored: it needs no migration and no backfill, and it heals progress
-/// recorded before this existed. `last_page_read` deliberately does NOT come from here —
-/// a resume position belongs to the row the viewer actually stopped in, and inheriting one
-/// across sources would drop them mid-chapter in a copy they have never opened.
-///
-/// MATCHING IS PURE KEY EQUALITY, scoped to one work. Keys are only comparable inside a
-/// work (`"1900"` exists in every series), hence both branches join through
-/// `source_series`. The residual risk is a source that numbers per volume instead of
-/// absolutely: its "chapter 3" is not the other source's, and it is marked read. Measured
-/// at 3 works of 1,335 multi-source ones; the 53 works whose sources' numbering does not
-/// overlap at all match nothing, which is the correct outcome. An overlap-ratio guard was
-/// considered and rejected — it silently suppresses legitimate matches.
-///
-/// Rows that cannot resolve to a work stay invisible here BY DESIGN: `set_progress` stores
-/// `work_id`/`series_id` as `''` for a chapter that isn't mirrored, and the callers keep
-/// their per-source progress map as the fallback that still reads those.
-async fn work_read_keys(
-    pool: &Database,
-    user_id: Option<&str>,
-    work_id: &str,
-) -> std::collections::HashSet<String> {
-    let Some(uid) = user_id else {
-        return std::collections::HashSet::new();
-    };
-    let Ok(uid) = crate::db_types::uuid(uid) else {
-        return std::collections::HashSet::new();
-    };
-    if work_id.is_empty() {
-        return std::collections::HashSet::new();
-    }
-    let rows = crate::db_types::query_scalar::<String>(
-        // `lang = 'en'` on the MangaDex arm, as everywhere else: `chapter` holds every
-        // language and komika serves English only.
-        "SELECT c.chapter_key \
-           FROM canonical_progress cp \
-           JOIN source_series ss ON ss.work_id = cp.work_id AND ss.source_type = 'mangadex' \
-           JOIN chapter c ON c.source_series_id = ss.id AND c.external_id = cp.chapter_id \
-          WHERE cp.user_id = $1 AND cp.work_id = $2 AND cp.read = TRUE \
-            AND c.lang = 'en' AND c.chapter_key IS NOT NULL \
-          UNION \
-         SELECT c.chapter_key \
-           FROM suwayomi_progress sp \
-           JOIN source_series ss ON ss.source_type = 'suwayomi' \
-                AND ss.source_key = sp.series_id AND ss.work_id = $2 \
-           JOIN chapter c ON c.source_series_id = ss.id AND c.external_id = sp.chapter_id \
-          WHERE sp.user_id = $1 AND sp.read = TRUE AND c.chapter_key IS NOT NULL",
-    )
-    .bind(uid)
-    .bind(work_id)
-    .fetch_all(pool)
-    .await
-    // Log (don't swallow); an empty set degrades to per-source read state, never to a
-    // wrongly-read chapter.
-    .inspect_err(|e| tracing::warn!(error = %e, work_id, "work_read_keys query failed"))
-    .unwrap_or_default();
-    rows.into_iter().collect()
-}
-
 /// The work a numeric Suwayomi series belongs to, if it is catalogued. `None` means the
 /// series has no `source_series` mapping yet, and the caller falls back to per-source read
 /// state — there is no work to gather sibling sources from.
@@ -5527,6 +5466,9 @@ pub struct SeriesPageBundle {
     /// so the translator picker needs no follow-up requests.
     #[graphql(complexity = "8 * child_complexity")]
     pub sources: Vec<SeriesPageSourceEntry>,
+    pub viewer_progress: Option<ViewerProgress>,
+    #[graphql(skip)]
+    read_state: progress::WorkReadState,
 }
 
 /// One source mapping of a [`SeriesPageBundle`], carrying what the old per-source
@@ -5567,7 +5509,14 @@ impl SeriesPageBundle {
         let chapters = aggregated_chapters_with_overrides(&st.pool, &self.work_id.0, rows, false)
             .await
             .into_iter()
-            .map(|state| state.chapter)
+            .map(|state| {
+                let mut chapter = state.chapter;
+                chapter.read_anywhere = self.read_state.row_read(
+                    chapter.entry_id.as_ref().map(|id| id.0.as_str()),
+                    &chapter.key,
+                );
+                chapter
+            })
             .collect();
         Ok(Some(chapters))
     }
@@ -6195,15 +6144,11 @@ impl QueryRoot {
             .map_err(gql_read_err)?;
         let user = current_user(ctx).await?;
         let uid = user.as_ref().map(|u| u.id.as_str());
-        // Two lookups, two different jobs. `progress` is this SOURCE's own rows and is what
-        // carries `last_page_read` (a resume position belongs to the copy it was earned in).
-        // `read_keys` is the viewer's read state across EVERY source of the work, folded
-        // onto the spine key — without it, switching translator blanks every marker.
+        // Resume positions belong to a copy; the work state supplies effective reads.
+        // Keeping the two separate preserves the page when switching translators.
         let progress = canonical_progress_map(&st.pool, uid, &work_id.0).await;
-        let read_keys = work_read_keys(&st.pool, uid, &work_id.0).await;
-        // When we first had each chapter, on the SAME spine key `read_keys` already folds
-        // on — so the found date follows a chapter across a translator switch exactly the
-        // way its read marker does.
+        let read_state = progress::work_read_state(&st.pool, uid, &work_id.0).await;
+        // Found dates follow a chapter's spine key across translator switches.
         let found = announce_map_for_work(&st.pool, &work_id.0).await;
         let entries = work_entries_or_default(&st.pool, &work_id.0).await;
         Ok(chapters
@@ -6212,7 +6157,7 @@ impl QueryRoot {
                 let p = progress.get(&c.external_id).copied();
                 let key = canonical_chapter_key(&c);
                 let mut ch = map_canonical_chapter(&work_id.0, c, p);
-                ch.read = ch.read || read_keys.contains(&key);
+                ch.read = read_state.copy_read("mangadex", &ch.id.0, &key, ch.read);
                 ch.found_at = found.get(&key).cloned();
                 overlay_chapter(ch, &entries, "mangadex", &key)
             })
@@ -6254,14 +6199,30 @@ impl QueryRoot {
         // series page renders once a work has several sources, and every row a translator
         // does not carry used to render unread by construction.
         let user = current_user(ctx).await?;
-        let read_keys =
-            work_read_keys(&st.pool, user.as_ref().map(|u| u.id.as_str()), &work_id.0).await;
-        if !read_keys.is_empty() {
-            for c in &mut chapters {
-                c.read_anywhere = read_keys.contains(&c.key);
-            }
+        let read_state =
+            progress::work_read_state(&st.pool, user.as_ref().map(|u| u.id.as_str()), &work_id.0)
+                .await;
+        for c in &mut chapters {
+            c.read_anywhere =
+                read_state.row_read(c.entry_id.as_ref().map(|id| id.0.as_str()), &c.key);
         }
         Ok(chapters)
+    }
+
+    async fn viewer_progress(
+        &self,
+        ctx: &Context<'_>,
+        work_id: ID,
+    ) -> Result<Option<ViewerProgress>> {
+        let Some(user) = current_user(ctx).await? else {
+            return Ok(None);
+        };
+        let st = state(ctx);
+        let Some(work) = load_work_following_redirect(&st.pool, &work_id.0).await? else {
+            return Ok(None);
+        };
+        let read_state = progress::work_read_state(&st.pool, Some(&user.id), &work.work_id).await;
+        Ok(ViewerProgress::from_state(&read_state))
     }
 
     /// P2.1: the series/reader page in ONE round trip — see [`SeriesPageBundle`].
@@ -6296,7 +6257,7 @@ impl QueryRoot {
         // state use spine keys, while entry overlays also identify each source copy.
         // Loading them per source would turn the bundle back into an N+1.
         let found = announce_map_for_work(&st.pool, &effective_id).await;
-        let read_keys = work_read_keys(&st.pool, user_id, &effective_id).await;
+        let read_state = progress::work_read_state(&st.pool, user_id, &effective_id).await;
         let entries = work_entries_or_default(&st.pool, &effective_id).await;
 
         // Canonical spine — only when MangaDex-anchored. `load_canonical_chapters` is
@@ -6316,7 +6277,7 @@ impl QueryRoot {
                     let p = progress.get(&c.external_id).copied();
                     let key = canonical_chapter_key(&c);
                     let mut ch = map_canonical_chapter(&effective_id, c, p);
-                    ch.read = ch.read || read_keys.contains(&key);
+                    ch.read = read_state.copy_read("mangadex", &ch.id.0, &key, ch.read);
                     ch.found_at = found.get(&key).cloned();
                     overlay_chapter(ch, &entries, "mangadex", &key)
                 })
@@ -6410,7 +6371,8 @@ impl QueryRoot {
                                     )
                                     .0;
                                     let mut ch = map_chapter(c, p);
-                                    ch.read = ch.read || read_keys.contains(&key);
+                                    ch.read =
+                                        read_state.copy_read("suwayomi", &ch.id.0, &key, ch.read);
                                     ch.found_at = found.get(&key).cloned();
                                     overlay_chapter(ch, &entries, "suwayomi", &key)
                                 })
@@ -6443,6 +6405,8 @@ impl QueryRoot {
             series,
             spine_chapters,
             sources,
+            viewer_progress: ViewerProgress::from_state(&read_state),
+            read_state,
         })
     }
 
@@ -7568,10 +7532,8 @@ impl QueryRoot {
         // The work id is resolved once and reused for the found-date lookup below: a series
         // with no work mapping has no ledger either, so both degrade to empty together.
         let work = suwayomi_series_work_id(&st.pool, n).await;
-        let read_keys = match &work {
-            Some(w) => work_read_keys(&st.pool, uid, w).await,
-            None => std::collections::HashSet::new(),
-        };
+        let read_state =
+            progress::work_read_state(&st.pool, uid, work.as_deref().unwrap_or("")).await;
         let found = match &work {
             Some(w) => announce_map_for_work(&st.pool, w).await,
             None => HashMap::new(),
@@ -7588,7 +7550,7 @@ impl QueryRoot {
                 // writer binds — no second labelling rule, no SQL `round(number * 100)`.
                 let key = catalog::spine_key_and_label(&catalog::suwayomi_chapter_input(&c)).0;
                 let mut ch = map_chapter(c, p);
-                ch.read = ch.read || read_keys.contains(&key);
+                ch.read = read_state.copy_read("suwayomi", &ch.id.0, &key, ch.read);
                 ch.found_at = found.get(&key).cloned();
                 overlay_chapter(ch, &entries, "suwayomi", &key)
             })
@@ -8144,6 +8106,17 @@ impl QueryRoot {
             if e.total == 0 && !ready {
                 e.read = read as i32;
                 e.total = total as i32;
+            }
+        }
+        for (work, (read, total, last_read_at)) in
+            progress::ready_library_progress(&st.pool, &user.id)
+                .await
+                .map_err(gql_read_err)?
+        {
+            if let Some(e) = by_id.get_mut(&work) {
+                e.read = read as i32;
+                e.total = total as i32;
+                e.last_read_at = last_read_at;
             }
         }
         for progress in by_id.values_mut() {
@@ -10584,20 +10557,26 @@ async fn lock_progress_owner(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user_id: &str,
     chapter_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     crate::locks::lock_user(tx, user_id).await?;
     let sources = progress_sources_on(tx, chapter_id).await?;
     #[cfg(test)]
     guard_pause("progress-discovered").await;
-    // The user parent serializes all of this user's progress/catch-up/clear sets,
-    // including chapters not yet in the spine. Sources protect owner changes.
+    // The user parent serializes this user's complete catch-up/clear sets. The
+    // source helper also locks the work parents (the tier entry edits and the
+    // readiness drain take), so the rule and copy link stay fixed for this write.
     crate::locks::lock_source_series(tx, &sources).await?;
     if progress_sources_on(tx, chapter_id).await? != sources {
         return Err(crate::locks::RestartTransaction.into());
     }
     #[cfg(test)]
     guard_pause("progress-locked").await;
-    Ok(())
+    Ok(sqlx::query_scalar(
+        "SELECT DISTINCT work_id FROM source_series WHERE id = ANY($1) ORDER BY work_id",
+    )
+    .bind(&sources)
+    .fetch_all(&mut **tx)
+    .await?)
 }
 
 /// Store library membership once per work, folding historical source-scoped rows.
@@ -11205,6 +11184,429 @@ async fn mark_notifications_read_once(
     Ok(count)
 }
 
+#[derive(Clone, Copy)]
+struct ProgressCheck<'a> {
+    work_id: Option<&'a str>,
+    revision: i64,
+}
+
+#[derive(Clone, Copy)]
+enum ProgressWrite {
+    Save { page: i32, read: bool },
+    Toggle { read: bool },
+}
+
+impl ProgressWrite {
+    fn read(self) -> bool {
+        match self {
+            Self::Save { read, .. } | Self::Toggle { read } => read,
+        }
+    }
+}
+
+#[derive(Default, sqlx::FromRow)]
+struct ProgressCopy {
+    work_id: String,
+    series_id: String,
+    number: Option<String>,
+    entry_id: Option<String>,
+    special: bool,
+    ready: bool,
+}
+
+/// Resolve after the owner locks: a source can have moved while we waited.
+async fn progress_copy_on(
+    conn: &mut sqlx::PgConnection,
+    id: &str,
+    numeric: bool,
+) -> anyhow::Result<ProgressCopy> {
+    let engine: Option<(i64, Option<f64>)> = if numeric {
+        sqlx::query_as("SELECT manga_id, chapter_number FROM suwayomi_chapter WHERE id = $1")
+            .bind(id.parse::<i64>()?)
+            .fetch_optional(&mut *conn)
+            .await?
+    } else {
+        None
+    };
+    let series = engine.as_ref().map(|(series, _)| series.to_string());
+    let spine: Option<ProgressCopy> = sqlx::query_as(
+        "SELECT ss.work_id, ss.source_key AS series_id, c.number, wc.id AS entry_id, \
+                COALESCE(wc.special, false) AS special, COALESCE(s.ready, false) AS ready \
+           FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
+           LEFT JOIN work_chapter_link l ON l.chapter_id = c.id \
+           LEFT JOIN work_chapter wc ON wc.id = l.work_chapter_id \
+           LEFT JOIN work_chapter_state s ON s.work_id = ss.work_id \
+          WHERE c.external_id = $1 AND ss.source_type = $2 \
+            AND ($3::text IS NULL OR ss.source_key = $3) \
+          ORDER BY ss.id, c.id LIMIT 1",
+    )
+    .bind(id)
+    .bind(if numeric { "suwayomi" } else { "mangadex" })
+    .bind(series.as_deref())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let mut copy = spine.unwrap_or_default();
+    if let Some((sid, number)) = engine {
+        copy.series_id = sid.to_string();
+        copy.number = number.map(|n| n.to_string());
+        if copy.work_id.is_empty() {
+            let owner: Option<(String, bool)> = sqlx::query_as(
+                "SELECT ss.work_id, COALESCE(s.ready, false) FROM source_series ss \
+                 LEFT JOIN work_chapter_state s ON s.work_id = ss.work_id \
+                 WHERE ss.source_type = 'suwayomi' AND ss.source_key = $1 ORDER BY ss.id LIMIT 1",
+            )
+            .bind(&copy.series_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+            if let Some((work, ready)) = owner {
+                copy.work_id = work;
+                copy.ready = ready;
+            }
+        }
+    }
+    Ok(copy)
+}
+
+async fn write_entry_mark_on(
+    conn: &mut sqlx::PgConnection,
+    user_id: &str,
+    entry: &str,
+    read: bool,
+) -> anyhow::Result<bool> {
+    Ok(sqlx::query(
+        "INSERT INTO work_chapter_mark (user_id, work_chapter_id, read, created_at) \
+         VALUES ($1, $2, $3, now()) ON CONFLICT (user_id, work_chapter_id) \
+         DO UPDATE SET read = excluded.read, created_at = excluded.created_at \
+         WHERE work_chapter_mark.read IS DISTINCT FROM excluded.read",
+    ).bind(crate::db_types::uuid(user_id)?).bind(entry).bind(read)
+        .execute(conn).await?.rows_affected() > 0)
+}
+
+/// Both APIs use this transaction so old clients participate in the same revisions.
+async fn write_progress_once(
+    pool: &Database,
+    user_id: &str,
+    id: &str,
+    write: ProgressWrite,
+    numeric_epoch: Option<i64>,
+    check: Option<ProgressCheck<'_>>,
+) -> anyhow::Result<ProgressResult> {
+    let numeric = !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit());
+    if numeric {
+        crate::engine_generation::wait(pool).await?;
+    }
+    let mut tx = pool.begin().await?;
+    if numeric {
+        crate::engine_generation::progress_guard(&mut tx, numeric_epoch).await?;
+    }
+    let locked_works = lock_progress_owner(&mut tx, user_id, id).await?;
+    let copy = progress_copy_on(&mut tx, id, numeric).await?;
+    // A chapter imported after discovery can name a work this write did not lock.
+    if !copy.work_id.is_empty() && !locked_works.contains(&copy.work_id) {
+        return Err(crate::locks::RestartTransaction.into());
+    }
+    let user = crate::db_types::uuid(user_id)?;
+    let stored: Option<(Option<String>, i64)> = if copy.work_id.is_empty() {
+        None
+    } else {
+        sqlx::query_as(
+            "SELECT through_entry_id, revision FROM work_progress WHERE user_id = $1 AND work_id = $2 FOR UPDATE",
+        ).bind(user).bind(&copy.work_id).fetch_optional(&mut *tx).await?
+    };
+    let (mut through, revision) = stored.unwrap_or((None, 0));
+    let outcome = |status, revision| ProgressResult {
+        status,
+        revision,
+        work_id: (!copy.work_id.is_empty()).then(|| ID(copy.work_id.clone())),
+    };
+    if let Some(check) = check.filter(|_| !copy.work_id.is_empty()) {
+        let client_work = match check.work_id {
+            Some(work) => Some(resolve_library_identity_on(&mut tx, work).await?),
+            None => None,
+        };
+        if client_work.as_deref() != Some(copy.work_id.as_str()) {
+            tx.commit().await?;
+            return Ok(outcome(ProgressStatus::Moved, revision));
+        }
+        if check.revision != revision {
+            if let ProgressWrite::Save { page, read: false } = write {
+                let sql = if numeric {
+                    "SELECT last_page_read FROM suwayomi_progress WHERE user_id = $1 AND chapter_id = $2"
+                } else {
+                    "SELECT last_page_read FROM canonical_progress WHERE user_id = $1 AND chapter_id = $2"
+                };
+                let stored_page: i64 = sqlx::query_scalar(sql)
+                    .bind(user)
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .unwrap_or(0);
+                if i64::from(page) <= stored_page {
+                    tx.commit().await?;
+                    return Ok(outcome(ProgressStatus::Refused, revision));
+                }
+                // A stale page may advance this copy, but cannot replay a read or owner repair.
+                let sql = if numeric {
+                    "INSERT INTO suwayomi_progress (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
+                     SELECT $1, $2, $3, $4, false, now() WHERE $4 > 0 \
+                     ON CONFLICT (user_id, chapter_id) DO UPDATE SET last_page_read = excluded.last_page_read, \
+                     updated_at = excluded.updated_at WHERE suwayomi_progress.last_page_read < excluded.last_page_read"
+                } else {
+                    "INSERT INTO canonical_progress (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
+                     SELECT $1, $2, $3, $4, false, now() WHERE $4 > 0 \
+                     ON CONFLICT (user_id, chapter_id) DO UPDATE SET last_page_read = excluded.last_page_read, \
+                     updated_at = excluded.updated_at WHERE canonical_progress.last_page_read < excluded.last_page_read"
+                };
+                let changed = sqlx::query(sql)
+                    .bind(user)
+                    .bind(id)
+                    .bind(if numeric {
+                        &copy.series_id
+                    } else {
+                        &copy.work_id
+                    })
+                    .bind(page as i64)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected()
+                    > 0;
+                if numeric {
+                    crate::engine_generation::commit_ready(pool)?;
+                }
+                tx.commit().await?;
+                return Ok(outcome(
+                    if changed {
+                        ProgressStatus::PageOnly
+                    } else {
+                        ProgressStatus::Refused
+                    },
+                    revision,
+                ));
+            }
+            tx.commit().await?;
+            return Ok(outcome(ProgressStatus::Refused, revision));
+        }
+    }
+    if matches!(write, ProgressWrite::Toggle { read: true })
+        && if numeric {
+            copy.series_id.is_empty()
+        } else {
+            copy.work_id.is_empty()
+        }
+    {
+        return Err(MutationValidation("No such chapter").into());
+    }
+    let now = crate::db_types::format_date(Utc::now());
+    let owner = if numeric {
+        &copy.series_id
+    } else {
+        &copy.work_id
+    };
+    let mut changed = match write {
+        ProgressWrite::Save { page, read } => {
+            let sql = if numeric {
+                "INSERT INTO suwayomi_progress (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (user_id, chapter_id) DO UPDATE SET \
+                 last_page_read = excluded.last_page_read, read = (suwayomi_progress.read OR excluded.read), \
+                 series_id = excluded.series_id, updated_at = excluded.updated_at \
+                 WHERE (suwayomi_progress.last_page_read, suwayomi_progress.read, suwayomi_progress.series_id) \
+                   IS DISTINCT FROM (excluded.last_page_read, suwayomi_progress.read OR excluded.read, excluded.series_id)"
+            } else {
+                "INSERT INTO canonical_progress (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (user_id, chapter_id) DO UPDATE SET \
+                 last_page_read = excluded.last_page_read, read = (canonical_progress.read OR excluded.read), \
+                 work_id = excluded.work_id, updated_at = excluded.updated_at \
+                 WHERE (canonical_progress.last_page_read, canonical_progress.read, canonical_progress.work_id) \
+                   IS DISTINCT FROM (excluded.last_page_read, canonical_progress.read OR excluded.read, excluded.work_id)"
+            };
+            sqlx::query(sql)
+                .bind(user)
+                .bind(id)
+                .bind(owner)
+                .bind(page as i64)
+                .bind(read)
+                .bind(crate::db_types::date(&now)?)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                > 0
+        }
+        ProgressWrite::Toggle { read: true } => {
+            let sql = if numeric {
+                "INSERT INTO suwayomi_progress (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
+                 VALUES ($1, $2, $3, 0, true, $4) ON CONFLICT (user_id, chapter_id) DO UPDATE SET \
+                 read = true, series_id = excluded.series_id, updated_at = excluded.updated_at \
+                 WHERE (suwayomi_progress.read, suwayomi_progress.series_id) IS DISTINCT FROM (true, excluded.series_id)"
+            } else {
+                "INSERT INTO canonical_progress (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
+                 VALUES ($1, $2, $3, 0, true, $4) ON CONFLICT (user_id, chapter_id) DO UPDATE SET \
+                 read = true, work_id = excluded.work_id, updated_at = excluded.updated_at \
+                 WHERE (canonical_progress.read, canonical_progress.work_id) IS DISTINCT FROM (true, excluded.work_id)"
+            };
+            sqlx::query(sql)
+                .bind(user)
+                .bind(id)
+                .bind(owner)
+                .bind(crate::db_types::date(&now)?)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                > 0
+        }
+        ProgressWrite::Toggle { read: false } => {
+            let sql = if numeric {
+                "UPDATE suwayomi_progress SET read = false, updated_at = $1 WHERE user_id = $2 AND chapter_id = $3 AND read"
+            } else {
+                "UPDATE canonical_progress SET read = false, updated_at = $1 WHERE user_id = $2 AND chapter_id = $3 AND read"
+            };
+            sqlx::query(sql)
+                .bind(crate::db_types::date(&now)?)
+                .bind(user)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                > 0
+        }
+    };
+    if copy.ready {
+        if let Some(entry) = &copy.entry_id {
+            match write {
+                ProgressWrite::Save { read: true, .. } => {
+                    changed |= sqlx::query("DELETE FROM work_chapter_mark WHERE user_id = $1 AND work_chapter_id = $2 AND NOT read")
+                        .bind(user).bind(entry).execute(&mut *tx).await?.rows_affected() > 0;
+                    if copy.special {
+                        changed |= write_entry_mark_on(&mut tx, user_id, entry, true).await?;
+                    }
+                }
+                ProgressWrite::Toggle { read: true } => {
+                    let implied: bool = sqlx::query_scalar(
+                        "SELECT NOT e.special AND e.sort_key <= p.sort_key FROM work_chapter e \
+                         JOIN work_chapter p ON p.id = $2 WHERE e.id = $1",
+                    )
+                    .bind(entry)
+                    .bind(&through)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .unwrap_or(false);
+                    if implied {
+                        changed |= sqlx::query("DELETE FROM work_chapter_mark WHERE user_id = $1 AND work_chapter_id = $2")
+                            .bind(user).bind(entry).execute(&mut *tx).await?.rows_affected() > 0;
+                    } else {
+                        changed |= write_entry_mark_on(&mut tx, user_id, entry, true).await?;
+                    }
+                }
+                ProgressWrite::Toggle { read: false } => {
+                    // Clear every linked copy, even when the admin grouped different spine keys.
+                    for sql in [
+                        "UPDATE canonical_progress cp SET read = false, updated_at = $3 WHERE cp.user_id = $1 AND cp.read \
+                         AND EXISTS (SELECT 1 FROM work_chapter_link l JOIN chapter c ON c.id = l.chapter_id \
+                           JOIN source_series ss ON ss.id = c.source_series_id WHERE l.work_chapter_id = $2 \
+                           AND ss.source_type = 'mangadex' AND ss.work_id = cp.work_id AND c.external_id = cp.chapter_id)",
+                        "UPDATE suwayomi_progress sp SET read = false, updated_at = $3 WHERE sp.user_id = $1 AND sp.read \
+                         AND EXISTS (SELECT 1 FROM work_chapter_link l JOIN chapter c ON c.id = l.chapter_id \
+                           JOIN source_series ss ON ss.id = c.source_series_id WHERE l.work_chapter_id = $2 \
+                           AND ss.source_type = 'suwayomi' AND ss.source_key = sp.series_id AND c.external_id = sp.chapter_id)",
+                    ] {
+                        changed |= sqlx::query(sql).bind(user).bind(entry).bind(crate::db_types::date(&now)?)
+                            .execute(&mut *tx).await?.rows_affected() > 0;
+                    }
+                    changed |= write_entry_mark_on(&mut tx, user_id, entry, false).await?;
+                }
+                ProgressWrite::Save { read: false, .. } => {}
+            }
+        }
+    } else if write.read() {
+        // A not-ready work can hold an unread mark kept from a removed copy's untick
+        // (engine reset). Reading the chapter clears it, as reading clears an untick.
+        if let Some(entry) = &copy.entry_id {
+            changed |= sqlx::query("DELETE FROM work_chapter_mark WHERE user_id = $1 AND work_chapter_id = $2 AND NOT read")
+                .bind(user).bind(entry).execute(&mut *tx).await?.rows_affected() > 0;
+        }
+    } else if matches!(write, ProgressWrite::Toggle { read: false }) {
+        let ident: Option<String> = sqlx::query_scalar(
+            "SELECT c.chapter_key FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
+             WHERE c.external_id = $1 AND ss.source_type = $2 AND ss.work_id = $3 AND c.chapter_key IS NOT NULL LIMIT 1",
+        ).bind(id).bind(if numeric { "suwayomi" } else { "mangadex" }).bind(&copy.work_id)
+            .fetch_optional(&mut *tx).await?;
+        if let Some(key) = ident {
+            for sql in [
+                "UPDATE canonical_progress SET read = false, updated_at = $1 WHERE user_id = $2 AND read \
+                 AND chapter_id IN (SELECT c.external_id FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
+                   WHERE ss.work_id = $3 AND ss.source_type = 'mangadex' AND c.chapter_key = $4)",
+                "UPDATE suwayomi_progress SET read = false, updated_at = $1 WHERE user_id = $2 AND read \
+                 AND chapter_id IN (SELECT c.external_id FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
+                   WHERE ss.work_id = $3 AND ss.source_type = 'suwayomi' AND c.chapter_key = $4)",
+            ] {
+                changed |= sqlx::query(sql).bind(crate::db_types::date(&now)?).bind(user).bind(&copy.work_id).bind(&key)
+                    .execute(&mut *tx).await?.rows_affected() > 0;
+            }
+        }
+        changed |= sqlx::query(
+            "INSERT INTO progress_untick (user_id, chapter_id, created_at) VALUES ($1, $2, $3) \
+             ON CONFLICT (user_id, chapter_id) DO NOTHING",
+        )
+        .bind(user)
+        .bind(id)
+        .bind(crate::db_types::date(&now)?)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+    }
+    if write.read() {
+        let ids = untick_ids(&mut tx, user_id).await?;
+        let remaining = clear_untick(&mut tx, user_id, id, numeric, &ids).await?;
+        changed |= remaining.len() != ids.len();
+        if !copy.ready && matches!(write, ProgressWrite::Save { .. }) {
+            if let Some(number) = copy.number.as_deref().and_then(parse_chapter_number) {
+                let excluded = untick_excluded(
+                    &mut tx,
+                    user_id,
+                    (!copy.work_id.is_empty()).then_some(copy.work_id.as_str()),
+                    &remaining,
+                )
+                .await?;
+                changed |= if numeric {
+                    catch_up_suwayomi(&mut tx, user_id, &copy.series_id, number, &now, &excluded)
+                        .await?
+                        > 0
+                } else {
+                    catch_up_canonical(&mut tx, user_id, &copy.work_id, number, &now, &excluded)
+                        .await?
+                        > 0
+                };
+            }
+        }
+    }
+    if matches!(write, ProgressWrite::Save { read: true, .. }) {
+        if let Some(entry) = &copy.entry_id {
+            let next: String = sqlx::query_scalar(
+                "SELECT CASE WHEN p.id IS NULL OR (e.sort_key, e.id) > (p.sort_key, p.id) THEN e.id ELSE p.id END \
+                 FROM work_chapter e LEFT JOIN work_chapter p ON p.id = $2 WHERE e.id = $1",
+            ).bind(entry).bind(&through).fetch_one(&mut *tx).await?;
+            changed |= through.as_ref() != Some(&next);
+            through = Some(next);
+        }
+    }
+    let new_revision =
+        if changed && !copy.work_id.is_empty() {
+            sqlx::query_scalar(
+            "INSERT INTO work_progress (user_id, work_id, through_entry_id, revision, updated_at) \
+             VALUES ($1, $2, $3, 1, now()) ON CONFLICT (user_id, work_id) DO UPDATE SET \
+             through_entry_id = excluded.through_entry_id, revision = work_progress.revision + 1, \
+             updated_at = excluded.updated_at RETURNING revision",
+        ).bind(user).bind(&copy.work_id).bind(&through).fetch_one(&mut *tx).await?
+        } else {
+            revision
+        };
+    if numeric {
+        crate::engine_generation::commit_ready(pool)?;
+    }
+    tx.commit().await?;
+    Ok(outcome(ProgressStatus::Applied, new_revision))
+}
+
 async fn set_progress_once(
     pool: &Database,
     user_id: &str,
@@ -11213,126 +11615,18 @@ async fn set_progress_once(
     read: bool,
     numeric_epoch: Option<i64>,
 ) -> anyhow::Result<bool> {
-    let numeric = !chapter_id.is_empty() && chapter_id.bytes().all(|b| b.is_ascii_digit());
-    if numeric {
-        crate::engine_generation::wait(pool).await?;
-    }
-    let mut tx = pool.begin().await?;
-    if numeric {
-        crate::engine_generation::progress_guard(&mut tx, numeric_epoch).await?;
-    }
-    lock_progress_owner(&mut tx, user_id, chapter_id).await?;
-    // Canonical chapter ids are MangaDex uuids (not all-digits); persist their
-    // progress in `canonical_progress`. Numeric Suwayomi ids fall through (CR6).
-    let is_numeric = !chapter_id.is_empty() && chapter_id.bytes().all(|b| b.is_ascii_digit());
-    if !is_numeric {
-        // The owning work, for per-series aggregation. If the chapter isn't in the
-        // mirror, store with work_id = '' rather than erroring — it's per-user private.
-        // The chapter's own number comes back with it, for the catch-up cascade below.
-        let owner: Option<(String, Option<String>)> = crate::db_types::query_tuple(
-                "SELECT ss.work_id, c.number FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
-                 WHERE c.external_id = $1 AND ss.source_type = 'mangadex' LIMIT 1",
-            )
-            .bind(chapter_id)
-            .fetch_optional(&mut *tx)
-            .await
-            ?;
-        let (work_id, number) = owner.unwrap_or_default();
-        let now = crate::db_types::format_date(Utc::now());
-        sqlx::query(
-                "INSERT INTO canonical_progress \
-                   (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
-                 ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
-                   last_page_read = excluded.last_page_read, read = (canonical_progress.read OR excluded.read), \
-                   work_id = excluded.work_id, updated_at = excluded.updated_at",
-            )
-            .bind(crate::db_types::uuid(user_id )?)
-            .bind(chapter_id)
-            .bind(&work_id)
-            .bind(last_page_read as i64)
-            .bind(read)
-            .bind(crate::db_types::date(&now )?)
-            .execute(&mut *tx)
-            .await
-            ?;
-        if read {
-            // Untick wins: only reading this chapter clears its record and sibling records.
-            let ids = untick_ids(&mut tx, user_id).await?;
-            let ids = clear_untick(&mut tx, user_id, chapter_id, false, &ids).await?;
-            if let Some(n) = number.as_deref().and_then(parse_chapter_number) {
-                // Untick wins: catch-up must skip every protected copy in this work.
-                let excluded = untick_excluded(
-                    &mut tx,
-                    user_id,
-                    (!work_id.is_empty()).then_some(work_id.as_str()),
-                    &ids,
-                )
-                .await?;
-                catch_up_canonical(&mut tx, user_id, &work_id, n, &now, &excluded).await?;
-            }
-        }
-        tx.commit().await?;
-        return Ok(true);
-    }
-    // Numeric Suwayomi chapter: per-user progress in `suwayomi_progress` (CR6).
-    // Suwayomi is a content source only now — we no longer push read state to it.
-    let n = chapter_id.parse::<i64>()?;
-    // The owning series id, for per-series aggregation in `libraryProgress`. If the
-    // chapter isn't cached yet, store with series_id = '' rather than erroring —
-    // the row is per-user private and the read state still round-trips.
-    // Its number rides along for the catch-up cascade below.
-    let owner: Option<(i64, Option<f64>)> = crate::db_types::query_tuple(
-        "SELECT manga_id, chapter_number FROM suwayomi_chapter WHERE id = $1 LIMIT 1",
+    write_progress_once(
+        pool,
+        user_id,
+        chapter_id,
+        ProgressWrite::Save {
+            page: last_page_read,
+            read,
+        },
+        numeric_epoch,
+        None,
     )
-    .bind(n)
-    .fetch_optional(&mut *tx)
     .await?;
-    let (series_id, number) = match owner {
-        Some((sid, num)) => (sid.to_string(), num),
-        None => (String::new(), None),
-    };
-    let now = crate::db_types::format_date(Utc::now());
-    sqlx::query(
-            "INSERT INTO suwayomi_progress \
-               (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
-               last_page_read = excluded.last_page_read, read = (suwayomi_progress.read OR excluded.read), \
-               series_id = excluded.series_id, updated_at = excluded.updated_at",
-        )
-        .bind(crate::db_types::uuid(user_id )?)
-        .bind(chapter_id)
-        .bind(&series_id)
-        .bind(last_page_read as i64)
-        .bind(read)
-        .bind(crate::db_types::date(&now )?)
-        .execute(&mut *tx)
-        .await
-        ?;
-    if read {
-        // Untick wins: only reading this chapter clears its record and sibling records.
-        let ids = untick_ids(&mut tx, user_id).await?;
-        let ids = clear_untick(&mut tx, user_id, chapter_id, true, &ids).await?;
-        if let Some(num) = number {
-            // Untick wins: expand protected copies only when there are records to protect.
-            let work_id: Option<String> = if ids.is_empty() {
-                None
-            } else {
-                sqlx::query_scalar(
-                    "SELECT work_id FROM source_series \
-                      WHERE source_type = 'suwayomi' AND source_key = $1 LIMIT 1",
-                )
-                .bind(&series_id)
-                .fetch_optional(&mut *tx)
-                .await?
-            };
-            let excluded = untick_excluded(&mut tx, user_id, work_id.as_deref(), &ids).await?;
-            catch_up_suwayomi(&mut tx, user_id, &series_id, num, &now, &excluded).await?;
-        }
-    }
-    crate::engine_generation::commit_ready(pool)?;
-    tx.commit().await?;
     Ok(true)
 }
 
@@ -11343,148 +11637,15 @@ async fn set_chapter_read_once(
     read: bool,
     numeric_epoch: Option<i64>,
 ) -> anyhow::Result<bool> {
-    // Same id-shape routing as `set_progress` (CR6): numeric = Suwayomi, else MangaDex.
-    let numeric = id.bytes().all(|b| b.is_ascii_digit());
-    if numeric {
-        crate::engine_generation::wait(pool).await?;
-    }
-    let now = crate::db_types::format_date(Utc::now());
-    let mut tx = pool.begin().await?;
-    if numeric {
-        crate::engine_generation::progress_guard(&mut tx, numeric_epoch).await?;
-    }
-    lock_progress_owner(&mut tx, user_id, id).await?;
-    if read {
-        if numeric {
-            // The owning Suwayomi series: from the engine's chapter cache, or — when that
-            // cache never held the chapter (the engine is down, or the row came in through
-            // the spine drain) — from the spine mapping, whose `source_key` IS the series
-            // id `suwayomi_progress.series_id` stores.
-            let series_id: String = crate::db_types::query_scalar::<String>(
-                "SELECT CAST(manga_id AS TEXT) FROM suwayomi_chapter WHERE id = $1 \
-                 UNION ALL \
-                 SELECT ss.source_key FROM chapter c \
-                   JOIN source_series ss ON ss.id = c.source_series_id \
-                  WHERE c.external_id = $2 AND ss.source_type = 'suwayomi' \
-                 LIMIT 1",
-            )
-            .bind(id.parse::<i64>()?)
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(MutationValidation("No such chapter"))?;
-            sqlx::query(
-                "INSERT INTO suwayomi_progress \
-                   (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
-                 VALUES ($1, $2, $3, 0, TRUE, $4) \
-                 ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
-                   read = TRUE, updated_at = excluded.updated_at",
-            )
-            .bind(crate::db_types::uuid(user_id)?)
-            .bind(id)
-            .bind(&series_id)
-            .bind(crate::db_types::date(&now)?)
-            .execute(&mut *tx)
-            .await?;
-        } else {
-            let work_id: String = crate::db_types::query_scalar::<String>(
-                "SELECT ss.work_id FROM chapter c \
-                   JOIN source_series ss ON ss.id = c.source_series_id \
-                  WHERE c.external_id = $1 AND ss.source_type = 'mangadex' LIMIT 1",
-            )
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(MutationValidation("No such chapter"))?;
-            sqlx::query(
-                "INSERT INTO canonical_progress \
-                   (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
-                 VALUES ($1, $2, $3, 0, TRUE, $4) \
-                 ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
-                   read = TRUE, updated_at = excluded.updated_at",
-            )
-            .bind(crate::db_types::uuid(user_id)?)
-            .bind(id)
-            .bind(&work_id)
-            .bind(crate::db_types::date(&now)?)
-            .execute(&mut *tx)
-            .await?;
-        }
-        // Untick wins: an explicit tick clears this chapter's record on every copy.
-        let ids = untick_ids(&mut tx, user_id).await?;
-        clear_untick(&mut tx, user_id, id, numeric, &ids).await?;
-        if numeric {
-            crate::engine_generation::commit_ready(pool)?;
-        }
-        tx.commit().await?;
-        return Ok(true);
-    }
-    // Unread. The clicked copy first, by id — this alone is the whole answer for a
-    // chapter the spine does not know (no key to fold on).
-    let own = if numeric {
-        "UPDATE suwayomi_progress SET read = FALSE, updated_at = $1 \
-          WHERE user_id = $2 AND chapter_id = $3 AND read = TRUE"
-    } else {
-        "UPDATE canonical_progress SET read = FALSE, updated_at = $1 \
-          WHERE user_id = $2 AND chapter_id = $3 AND read = TRUE"
-    };
-    sqlx::query(own)
-        .bind(crate::db_types::date(&now)?)
-        .bind(crate::db_types::uuid(user_id)?)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    // Then every sibling copy of the same chapter in the same work, on both stores.
-    let ident: Option<(String, String)> = crate::db_types::query_tuple(
-        "SELECT ss.work_id, c.chapter_key FROM chapter c \
-           JOIN source_series ss ON ss.id = c.source_series_id \
-          WHERE c.external_id = $1 AND ss.source_type = $2 AND c.chapter_key IS NOT NULL \
-          LIMIT 1",
+    write_progress_once(
+        pool,
+        user_id,
+        id,
+        ProgressWrite::Toggle { read },
+        numeric_epoch,
+        None,
     )
-    .bind(id)
-    .bind(if numeric { "suwayomi" } else { "mangadex" })
-    .fetch_optional(&mut *tx)
     .await?;
-    if let Some((work_id, key)) = ident {
-        // Two static statements rather than one formatted over the table name: identical
-        // but for the store, and kept literal so no SQL text is ever assembled at runtime.
-        const CLEAR_CANONICAL: &str =
-            "UPDATE canonical_progress SET read = FALSE, updated_at = $1 \
-              WHERE user_id = $2 AND read = TRUE AND chapter_id IN ( \
-                SELECT c.external_id FROM chapter c \
-                  JOIN source_series ss ON ss.id = c.source_series_id \
-                 WHERE ss.work_id = $3 AND ss.source_type = 'mangadex' \
-                   AND c.chapter_key = $4)";
-        const CLEAR_SUWAYOMI: &str = "UPDATE suwayomi_progress SET read = FALSE, updated_at = $1 \
-              WHERE user_id = $2 AND read = TRUE AND chapter_id IN ( \
-                SELECT c.external_id FROM chapter c \
-                  JOIN source_series ss ON ss.id = c.source_series_id \
-                 WHERE ss.work_id = $3 AND ss.source_type = 'suwayomi' \
-                   AND c.chapter_key = $4)";
-        for sql in [CLEAR_CANONICAL, CLEAR_SUWAYOMI] {
-            sqlx::query(sql)
-                .bind(crate::db_types::date(&now)?)
-                .bind(crate::db_types::uuid(user_id)?)
-                .bind(&work_id)
-                .bind(&key)
-                .execute(&mut *tx)
-                .await?;
-        }
-    }
-    // Untick wins: retain the clicked id even when it has no progress row or spine key.
-    sqlx::query(
-        "INSERT INTO progress_untick (user_id, chapter_id, created_at) VALUES ($1, $2, $3) \
-         ON CONFLICT (user_id, chapter_id) DO NOTHING",
-    )
-    .bind(crate::db_types::uuid(user_id)?)
-    .bind(id)
-    .bind(crate::db_types::date(&now)?)
-    .execute(&mut *tx)
-    .await?;
-    if numeric {
-        crate::engine_generation::commit_ready(pool)?;
-    }
-    tx.commit().await?;
     Ok(true)
 }
 
@@ -11978,6 +12139,128 @@ async fn set_work_chapter_once(
     Ok(work)
 }
 
+#[derive(Clone, Copy)]
+enum ChapterIdentityEdit<'a> {
+    Relink {
+        chapter: &'a str,
+        target: Option<&'a str>,
+    },
+    Merge {
+        keep: &'a str,
+        drop: &'a str,
+    },
+}
+
+/// The work that owns the copy or entry an identity edit names.
+async fn chapter_identity_owner(
+    conn: &mut sqlx::PgConnection,
+    edit: ChapterIdentityEdit<'_>,
+) -> anyhow::Result<Option<String>> {
+    Ok(match edit {
+        ChapterIdentityEdit::Relink {
+            chapter,
+            target: None,
+        } => sqlx::query_scalar(
+            "SELECT ss.work_id FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
+                     WHERE c.external_id = $1 AND ss.source_type = $2 ORDER BY ss.id LIMIT 1",
+        )
+        .bind(chapter)
+        .bind(if chapter.bytes().all(|b| b.is_ascii_digit()) {
+            "suwayomi"
+        } else {
+            "mangadex"
+        })
+        .fetch_optional(&mut *conn)
+        .await?,
+        ChapterIdentityEdit::Relink {
+            target: Some(entry),
+            ..
+        }
+        | ChapterIdentityEdit::Merge { keep: entry, .. } => {
+            sqlx::query_scalar("SELECT work_id FROM work_chapter WHERE id = $1")
+                .bind(entry)
+                .fetch_optional(&mut *conn)
+                .await?
+        }
+    })
+}
+
+async fn edit_chapter_identity_once(
+    pool: &Database,
+    edit: ChapterIdentityEdit<'_>,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let work = chapter_identity_owner(&mut tx, edit).await?;
+    let work = work.ok_or(MutationValidation("No such chapter entry"))?;
+    let works = vec![work.clone()];
+    let users = progress::affected_users(&mut tx, &works).await?;
+    crate::locks::lock_users(&mut tx, &users).await?;
+    let locked = crate::locks::lock_works(&mut tx, &[&work]).await?;
+    // A split or merge between discovery and the lock can move the copy or entry.
+    if !locked.missing.is_empty()
+        || progress::affected_users(&mut tx, &works).await? != users
+        || chapter_identity_owner(&mut tx, edit).await?.as_deref() != Some(work.as_str())
+    {
+        return Err(crate::locks::RestartTransaction.into());
+    }
+    let mut copy_moves = Vec::new();
+    let before = progress::keep_state_before(&mut tx, &users, &works).await?;
+    let moves = match edit {
+        ChapterIdentityEdit::Relink { chapter, target } => {
+            if let Some(entry) = target {
+                let current: Option<String> =
+                    sqlx::query_scalar("SELECT work_id FROM work_chapter WHERE id = $1")
+                        .bind(entry)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                if current.as_deref() != Some(work.as_str()) {
+                    return Err(crate::locks::RestartTransaction.into());
+                }
+            }
+            let internal: Option<String> = sqlx::query_scalar(
+                "SELECT c.id FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
+                 WHERE ss.work_id = $1 AND c.external_id = $2 AND ss.source_type = $3 ORDER BY ss.id LIMIT 1",
+            ).bind(&work).bind(chapter)
+                .bind(if chapter.bytes().all(|b| b.is_ascii_digit()) { "suwayomi" } else { "mangadex" })
+                .fetch_optional(&mut *tx).await?;
+            let internal = internal.ok_or(MutationValidation("No such chapter in this work"))?;
+            let (from, to) =
+                catalog::work_chapter::relink_copy_on(&mut tx, &work, &internal, target).await?;
+            copy_moves.push((internal, to.clone()));
+            // A copy moved onto an existing entry brings only its own read row; a copy
+            // given a new entry of its own keeps the state it had as part of the old one.
+            if target.is_some() {
+                Vec::new()
+            } else {
+                vec![catalog::work_chapter::EntryMove { from, to }]
+            }
+        }
+        ChapterIdentityEdit::Merge { keep, drop } => {
+            let owners: Vec<String> =
+                sqlx::query_scalar("SELECT work_id FROM work_chapter WHERE id = ANY($1)")
+                    .bind(vec![keep, drop])
+                    .fetch_all(&mut *tx)
+                    .await?;
+            if owners.len() != 2 || owners.iter().any(|owner| owner != &work) {
+                return Err(
+                    MutationValidation("Chapter entries must belong to the same work").into(),
+                );
+            }
+            catalog::work_chapter::merge_entries_within_on(&mut tx, &work, keep, drop).await?
+        }
+    };
+    progress::keep_state_after(
+        &mut tx,
+        before,
+        &moves,
+        &copy_moves,
+        progress::PointerPlan::Edit { work: &work },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 // ---- Mutation --------------------------------------------------------------
 
 pub struct MutationRoot;
@@ -12421,27 +12704,78 @@ impl MutationRoot {
         .map_err(mutation_write_error)
     }
 
-    /// Mark ONE chapter read or unread, exactly — the series list's per-chapter toggle.
-    ///
-    /// NOT `setProgress`, on purpose, for two reasons that are both features THERE:
-    ///  - `setProgress` merges `read = MAX(old, new)`, so a reader reopening a finished
-    ///    chapter at page 1 does not un-finish it. That makes it unable to express "unread"
-    ///    at all: the call succeeded and the chapter came back read on the next load.
-    ///  - `read: true` there cascades (`catch_up_*`) every earlier chapter to read, which is
-    ///    right when the viewer FINISHES chapter 178 and wrong when they tick one box in a
-    ///    list.
-    ///
-    /// Unread clears the chapter's read flag on EVERY copy this viewer has a row for — the
-    /// same `chapter_key` within the same work, across the MangaDex mirror and Suwayomi
-    /// sources — because the list's read state is the cross-source fold (`readAnywhere`,
-    /// `work_read_keys`); clearing only the clicked copy would leave the row read. Resume
-    /// positions (`last_page_read`) are left alone either way.
-    ///
-    /// A READ of a chapter the server does not know is refused ("No such chapter") rather
-    /// than stored with an empty owner the way `set_progress` does: this upsert never
-    /// rewrites the owner on conflict, so a row written with `''` would stay invisible to
-    /// the per-series progress maps even after the chapter is catalogued. The list only
-    /// offers chapters it loaded, so a refusal here means the id is stale or forged.
+    async fn save_progress(
+        &self,
+        ctx: &Context<'_>,
+        chapter_id: ID,
+        work_id: Option<ID>,
+        last_page_read: i32,
+        read: bool,
+        numeric_epoch: Option<i64>,
+        revision: i64,
+    ) -> Result<ProgressResult> {
+        if last_page_read < 0 {
+            return Err(Error::new("lastPageRead must be non-negative"));
+        }
+        let user = require_user(ctx).await?;
+        let id = chapter_id.0.trim();
+        if id.is_empty() || id.len() > 128 {
+            return Err(Error::new("Invalid chapter id"));
+        }
+        crate::db::retry_transaction(|| {
+            write_progress_once(
+                &state(ctx).pool,
+                &user.id,
+                id,
+                ProgressWrite::Save {
+                    page: last_page_read,
+                    read,
+                },
+                numeric_epoch,
+                Some(ProgressCheck {
+                    work_id: work_id.as_ref().map(|id| id.0.as_str()),
+                    revision,
+                }),
+            )
+        })
+        .await
+        .map_err(mutation_write_error)
+    }
+
+    async fn save_chapter_read(
+        &self,
+        ctx: &Context<'_>,
+        chapter_id: ID,
+        work_id: Option<ID>,
+        read: bool,
+        numeric_epoch: Option<i64>,
+        revision: i64,
+    ) -> Result<ProgressResult> {
+        let user = require_user(ctx).await?;
+        let id = chapter_id.0.trim();
+        if id.is_empty() || id.len() > 128 {
+            return Err(Error::new("Invalid chapter id"));
+        }
+        crate::db::retry_transaction(|| {
+            write_progress_once(
+                &state(ctx).pool,
+                &user.id,
+                id,
+                ProgressWrite::Toggle { read },
+                numeric_epoch,
+                Some(ProgressCheck {
+                    work_id: work_id.as_ref().map(|id| id.0.as_str()),
+                    revision,
+                }),
+            )
+        })
+        .await
+        .map_err(mutation_write_error)
+    }
+
+    /// Toggle one chapter entry without advancing the through pointer. Unreading clears
+    /// its linked copies; a false mark keeps later finishes from undoing the choice.
+    /// Before the list is ready, the legacy key fold and untick records still apply.
     async fn set_chapter_read(
         &self,
         ctx: &Context<'_>,
@@ -13858,6 +14192,41 @@ impl MutationRoot {
             .find(|entry| entry.id == entry_id.0)
             .map(WorkChapterEntry::from)
             .ok_or_else(|| Error::new("No such chapter entry"))
+    }
+
+    async fn link_chapter_copy(
+        &self,
+        ctx: &Context<'_>,
+        chapter_id: ID,
+        entry_id: Option<ID>,
+    ) -> Result<bool> {
+        require_admin(ctx).await?;
+        let edit = ChapterIdentityEdit::Relink {
+            chapter: &chapter_id.0,
+            target: entry_id.as_ref().map(|id| id.0.as_str()),
+        };
+        crate::db::retry_transaction(|| edit_chapter_identity_once(&state(ctx).pool, edit))
+            .await
+            .map_err(mutation_write_error)
+    }
+
+    async fn merge_work_chapters(
+        &self,
+        ctx: &Context<'_>,
+        keep_id: ID,
+        drop_id: ID,
+    ) -> Result<bool> {
+        require_admin(ctx).await?;
+        if keep_id == drop_id {
+            return Err(Error::new("Choose two different chapter entries"));
+        }
+        let edit = ChapterIdentityEdit::Merge {
+            keep: &keep_id.0,
+            drop: &drop_id.0,
+        };
+        crate::db::retry_transaction(|| edit_chapter_identity_once(&state(ctx).pool, edit))
+            .await
+            .map_err(mutation_write_error)
     }
 
     /// Admin moderation: suspend or restore a user account. A banned user can't
@@ -17982,7 +18351,6 @@ mod tests {
 
     use super::*;
     use crate::database::TestPoolOptions;
-    use std::collections::HashSet;
 
     // ---- MangaDex UUID extraction (exact-identity consolidation) ----
 
@@ -19553,7 +19921,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn setup_full(max: u32) -> (ApiSchema, Database) {
+    pub(super) async fn setup_full(max: u32) -> (ApiSchema, Database) {
         let (schema, pool, _) = setup_with_state(max).await;
         (schema, pool)
     }
@@ -20904,7 +21272,7 @@ mod tests {
         assert_eq!(flags(&pool, &before.work_id).await, (0, None));
     }
 
-    async fn exec(
+    pub(super) async fn exec(
         schema: &ApiSchema,
         query: &str,
         token: Option<&str>,
@@ -25837,7 +26205,7 @@ mod tests {
     /// from `canonicalSeries` + `canonicalChapters` + `workSources` + a per-source
     /// `chapters`/`series` N+1: the canonical series, the spine chapters, every
     /// source mapping WITH its chapters and metadata, and (opt-in) the aggregation.
-    async fn seed_work_chapter_graphql_fixture(pool: &Database) -> String {
+    pub(super) async fn seed_work_chapter_graphql_fixture(pool: &Database) -> String {
         let mid = "97c5fbec-51a4-4f97-a2c6-1654af21e182";
         let work = catalog::upsert_work_from_mangadex(
             pool,
@@ -25910,7 +26278,7 @@ mod tests {
         work
     }
 
-    async fn drain_work_chapter_fixture(pool: &Database) {
+    pub(super) async fn drain_work_chapter_fixture(pool: &Database) {
         for _ in 0..20 {
             let (outcome, _) = catalog::work_chapter::drain_once(pool, None).await.unwrap();
             if outcome.works_visited == 0 {
@@ -25920,7 +26288,7 @@ mod tests {
         panic!("work chapter drain did not finish");
     }
 
-    async fn fixture_entry_id(pool: &Database, work: &str, key: &str) -> String {
+    pub(super) async fn fixture_entry_id(pool: &Database, work: &str, key: &str) -> String {
         sqlx::query_scalar("SELECT id FROM work_chapter WHERE work_id = $1 AND match_key = $2")
             .bind(work)
             .bind(key)
@@ -27311,13 +27679,13 @@ mod tests {
             Some((0, 0)),
             "the sibling copy must clear too, or the fold still reads it as read"
         );
-        assert!(work_read_keys(
+        assert!(!progress::work_read_state(
             &pool,
             Some("ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c"),
             &work_id
         )
         .await
-        .is_empty());
+        .copy_read("mangadex", "tg-1", "100", false));
 
         // Read marks exactly one chapter: ch. 3 read, 1 and 2 untouched (no catch-up).
         let r = exec(
@@ -31672,7 +32040,7 @@ mod tests {
     }
 
     // Native PG values also let the tests detect a conflict row lock without an update.
-    async fn bob_progress_row(
+    pub(super) async fn bob_progress_row(
         pool: &Database,
         id: &str,
     ) -> Option<(i64, bool, chrono::DateTime<Utc>, String, String)> {
@@ -33271,11 +33639,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.progress_readers_moved, expected);
-        assert_eq!(
-            work_read_keys(&pool, Some(BOB), &out.new_work_id).await,
-            HashSet::from(["100".into()]),
+        assert!(
+            progress::work_read_state(&pool, Some(BOB), &out.new_work_id)
+                .await
+                .copy_read("mangadex", "split-progress-read", "100", false)
         );
-        assert!(work_read_keys(&pool, Some(BOB), &work).await.is_empty());
+        assert!(!progress::work_read_state(&pool, Some(BOB), &work)
+            .await
+            .copy_read("mangadex", "split-progress-read", "100", false));
     }
 
     #[tokio::test]

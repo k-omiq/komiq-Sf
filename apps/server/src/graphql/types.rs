@@ -829,6 +829,36 @@ pub struct SeriesProgress {
     pub last_read_at: Option<String>,
 }
 
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ProgressStatus {
+    Applied,
+    PageOnly,
+    Refused,
+    Moved,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct ProgressResult {
+    pub status: ProgressStatus,
+    pub revision: i64,
+    pub work_id: Option<ID>,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct ViewerProgress {
+    pub revision: i64,
+    pub through_entry_id: Option<ID>,
+}
+
+impl ViewerProgress {
+    pub(super) fn from_state(state: &crate::progress::WorkReadState) -> Option<Self> {
+        state.viewer().map(|(revision, through)| Self {
+            revision,
+            through_entry_id: through.map(ID),
+        })
+    }
+}
+
 #[derive(SimpleObject, Clone)]
 pub struct Chapter {
     /// The chapter-list entry this copy is linked to; null while the work's list is not built.

@@ -55,6 +55,7 @@ mod phash;
 #[path = "../bench/postgres_contention.rs"]
 mod postgres_contention;
 mod postgres_metrics;
+mod progress;
 mod rate_limit;
 mod request_budget;
 mod scanlators;

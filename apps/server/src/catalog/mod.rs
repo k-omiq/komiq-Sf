@@ -4959,16 +4959,22 @@ async fn merge_discovery(
     works: &[&str],
     planned_pairs: &[(&str, &str)],
 ) -> Result<MergeDiscovery> {
+    // Purge also supplies numeric cache ids, including ones with no source mapping.
     let users: Vec<uuid::Uuid> = sqlx::query_scalar(
         "SELECT user_id FROM user_library WHERE series_id = ANY($1) \
          UNION SELECT user_id FROM reviews WHERE series_id = ANY($1) \
-         UNION SELECT user_id FROM canonical_progress WHERE work_id = ANY($1) \
-         UNION SELECT user_id FROM suwayomi_progress WHERE series_id = ANY($1) \
+         UNION SELECT user_id FROM suwayomi_progress \
+          WHERE series_id = ANY($1) AND series_id ~ '^[0-9]+$' \
          UNION SELECT user_id FROM comments WHERE target_type = 'series' AND target_id = ANY($1) \
          UNION SELECT user_id FROM user_activity WHERE target_type = 'series' AND target_id = ANY($1) \
          UNION SELECT user_id FROM notifications WHERE target_type = 'series' AND target_id = ANY($1) \
          ORDER BY user_id",
     ).bind(works).fetch_all(&mut *conn).await?;
+    let mut users: Vec<String> = users.into_iter().map(|id| id.to_string()).collect();
+    let progress_works: Vec<String> = works.iter().map(|id| (*id).to_owned()).collect();
+    users.extend(crate::progress::affected_users(conn, &progress_works).await?);
+    users.sort_unstable();
+    users.dedup();
     let external: Vec<(String, String)> = sqlx::query_as(
         "SELECT provider, external_id FROM work_external_id WHERE work_id = ANY($1) ORDER BY provider, external_id",
     ).bind(works).fetch_all(&mut *conn).await?;
@@ -5003,7 +5009,7 @@ async fn merge_discovery(
     keys.sort_unstable();
     keys.dedup();
     Ok(MergeDiscovery {
-        users: users.into_iter().map(|id| id.to_string()).collect(),
+        users,
         keys,
         sources: rows.into_iter().map(|r| r.0).collect(),
     })
@@ -5229,6 +5235,12 @@ pub(crate) async fn merge_works_on(
             anyhow::bail!("merge precondition failed: review is no longer pending for this pair");
         }
     }
+
+    // Discovery was rechecked under the complete user/work guard set.
+    let progress_works = [target_work.to_owned(), source_work.to_owned()];
+    let progress_users = crate::progress::affected_users(tx, &progress_works).await?;
+    let progress_before =
+        crate::progress::keep_state_before(tx, &progress_users, &progress_works).await?;
 
     // Fold aliases (fresh ids; UNIQUE(work_id,normalized_title,lang) de-dupes).
     let src_aliases = crate::db_types::query_tuple::<(String, String, Option<String>)>(
@@ -5587,6 +5599,17 @@ pub(crate) async fn merge_works_on(
     ledger::merge_release_events(tx, source_work, target_work).await?;
     // BEFORE the delete too: `work_chapter.work_id` cascades.
     let entry_map = work_chapter::merge_entries_on(tx, source_work, target_work).await?;
+    crate::progress::keep_state_after(
+        tx,
+        progress_before,
+        &entry_map,
+        &[],
+        crate::progress::PointerPlan::Merge {
+            survivor: target_work,
+            loser: source_work,
+        },
+    )
+    .await?;
 
     sqlx::query("DELETE FROM work WHERE id = $1")
         .bind(source_work)
@@ -5933,6 +5956,9 @@ async fn split_source_series_attempt(
     .execute(&mut *tx)
     .await?;
 
+    let progress_before =
+        crate::progress::keep_state_before(&mut tx, &users, &[work_id.to_owned()]).await?;
+
     // The move itself — one UPDATE, no chapter writes, nothing deleted.
     let mut moved = 0_u64;
     for r in &detached {
@@ -5949,6 +5975,18 @@ async fn split_source_series_attempt(
     let entry_map =
         work_chapter::split_entries_on(&mut tx, work_id, &new_work_id, source_series_ids, true)
             .await?;
+    crate::progress::keep_state_after(
+        &mut tx,
+        progress_before,
+        &entry_map,
+        &[],
+        crate::progress::PointerPlan::Split {
+            source: work_id,
+            dest: &new_work_id,
+            dest_is_new: true,
+        },
+    )
+    .await?;
     if moved as usize != detached.len() {
         // A concurrent merge/split moved a row out from under the read above. Roll back
         // rather than mint a half-populated work.
@@ -6086,6 +6124,15 @@ pub(crate) async fn split_progress_readers(
              UNION \
              SELECT sp.user_id FROM suwayomi_progress sp \
               JOIN picked p ON p.source_type = 'suwayomi' AND p.source_key = sp.series_id \
+             UNION \
+             SELECT m.user_id FROM work_chapter_mark m \
+              JOIN work_chapter_link l ON l.work_chapter_id = m.work_chapter_id \
+              JOIN chapter c ON c.id = l.chapter_id JOIN picked p ON p.id = c.source_series_id \
+             UNION \
+             SELECT wp.user_id FROM work_progress wp \
+              JOIN work_chapter_link l ON l.work_chapter_id = wp.through_entry_id \
+              JOIN chapter c ON c.id = l.chapter_id JOIN picked p ON p.id = c.source_series_id \
+              WHERE wp.work_id = $1 \
          ) readers",
     )
     .bind(work_id)
@@ -7005,6 +7052,9 @@ pub(crate) async fn replace_source_chapters_on(
     }
     // Link new copies once (W3a). A vanished copy's link cascades below; its entry stays.
     work_chapter::link_source_copies_on(conn, source_series_id, None).await?;
+    if !vanished.is_empty() {
+        crate::progress::keep_explicit_reads(conn, &vanished).await?;
+    }
     for id in &vanished {
         sqlx::query("DELETE FROM chapter WHERE id = $1")
             .bind(id)
@@ -8157,6 +8207,14 @@ async fn purge_foreign_language_batch(pool: &Database) -> Result<Vec<i64>> {
     // reading progress, admin overrides, and view counters. Left uncleaned these
     // dangle forever (e.g. a purged series stuck in a user's library, re-rendered live
     // on every view) since none carry an enforced FK to the refreshable cache.
+    let chapters: Vec<String> = sqlx::query_scalar(
+        "SELECT c.id FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
+         WHERE ss.source_type = 'suwayomi' AND ss.source_key = ANY($1)",
+    )
+    .bind(&numeric)
+    .fetch_all(&mut *tx)
+    .await?;
+    crate::progress::keep_explicit_reads(&mut tx, &chapters).await?;
     for stmt in [
             format!("DELETE FROM user_library      WHERE series_id  IN {non_en_text}"),
             format!("DELETE FROM suwayomi_progress  WHERE series_id  IN {non_en_text}"),
@@ -13535,3 +13593,6 @@ mod production_safety_tests;
 
 #[cfg(test)]
 pub(crate) mod phase4_tests;
+
+#[cfg(test)]
+mod progress_keep_tests;
