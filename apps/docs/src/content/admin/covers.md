@@ -1,84 +1,81 @@
 ---
-title: Cover issues
-description: Diagnose failed cover downloads on your server and repair or replace broken cover images.
+title: Covers
+description: Choose which source supplies each series cover, pick covers and titles by hand, free cover storage, and repair broken covers.
 ---
 
-Your server caches series covers to deliver fast image loading and reduce reliance on third-party sources. Recorded crawler failures appear on the Cover issues page in the admin app.
+Your server stores one cover for each series and serves it from its own address. The Covers page in the admin app (`/bugs`) sets where those covers come from, can free the space of covers no series shows, and lists covers that failed.
 
-This guide explains how cover processing works, what causes covers to land in the issues queue, and how to repair or replace broken images.
+This guide explains the cover ranking, the cover and title picker in the reader app, the optional cleanup of unpicked covers, and how to repair or replace broken images.
 
 ## How komiq processes covers
 
-To keep the reader responsive, your server caches optimized covers as files under `KOMIKA_COVERS_DIR`. PostgreSQL holds the file index in `cover_object`. Covers are served locally at `/covers/{work_id}.webp`.
-
-When enabled, the background cover crawler fetches and optimizes covers for eligible uncached works. The pipeline applies these processing steps:
-
-- **Source size limit**: Raw images passed to the processor cannot exceed 24 MiB. The decoder also limits dimensions and memory allocation.
-- **Completeness checks**: Your server checks image byte streams before decoding to reject truncated or corrupted downloads.
-- **Aspect-preserving downscaling**: The image is resized to fit longest-edge boundaries (512, 448, 384, 320, or 256 pixels). Images smaller than the target size are never upscaled.
-- **WebP compression**: The image is re-encoded as lossy WebP using a quality ladder from 82 down to 50. Your server accepts the first size and quality combination at or below the 150 KiB target. If none fits, it returns the smallest encoding produced.
+Your server keeps covers as files under `KOMIKA_COVERS_DIR`, indexed in PostgreSQL (`cover_object`), and serves them at `/covers/{work_id}.webp`. Every cover goes through the same steps:
 
 ```flow
-Your server fetches source cover -> validates source size at or below 24 MiB
-Ensures bytes are complete -> decodes and downscales longest edge
-Encodes lossy WebP with a 150 KiB target -> saves file and indexes it in PostgreSQL
+Source image -> size check: at most 24 MiB, complete bytes
+Decode -> downscale the longest edge to 512 px or less, never up
+Encode -> lossy WebP with a 150 KiB target
+Save -> file plus its PostgreSQL index row
 ```
 
-The crawler records fetch, processing, and storage failures in `work_cover_issue` and surfaces the title on the Cover issues page. Other paths, such as lazy cover loading, do not record every failure in this queue.
+The crawler records fetch, processing, and storage failures in `work_cover_issue` and lists the title under Cover issues. Other paths, such as lazy cover loading, do not record every failure there.
 
-## The Cover issues page
+## Which cover a series shows
 
-The Cover issues page (`/bugs`) lists works with recorded cover issues.
+Three rules decide the cover, strongest first:
 
-### Table columns
+1. **A cover an admin chose.** An uploaded file, or a cover picked in the reader app. It stays until an admin changes it.
+2. **The cover ranking.** The cover comes from the highest-ranked source that supplies one.
+3. **The first source that answers.** A series with no cover yet gets one from the first source that sends a usable image, so it is never left empty.
 
-Each entry in the list displays diagnostic information and repair actions:
+Source bars still apply first: a source barred for covers under [Sources](/admin/sources), Metadata, never supplies one.
 
-- **Cover**: Displays a thumbnail preview or a broken image indicator.
-- **Work**: The primary series title and canonical work identifier.
-- **Reason**: A badge indicating the error category, alongside the failure message from your server.
-- **Tries**: The number of failed attempts recorded for this title.
-- **Last attempt**: The date and time when your server last attempted processing.
-- **Fix**: Action buttons for retrying the operation or uploading a local replacement file.
+### Cover ranking
 
-### Failure reasons
+The **Cover ranking** section lists MangaDex and every installed source. Drag a row by its handle, or use the up and down arrows, then click **Save ranking**. The save ranks every row down to the last one you moved. The rows below it show **default order**: they stay unranked and keep the default order after the ranked ones, MangaDex first, then the source linked to the series first.
 
-The console gives these processing and storage errors readable labels:
+After a save, your server moves covers to their top-ranked source in the background. It checks again once a day, so new series and new sources follow the ranking. It uses a source cover it already stores when it can, and downloads only when it must. **Reset to default** clears the ranking. Covers stay as they are until something else changes them.
 
-- **Image too large** (`too_large`): The image exceeds a source size limit.
-- **Unsupported or damaged file** (`unsupported`): The error message indicates an unsupported or corrupt image, or zero dimensions.
-- **Image is empty** (`empty`): The image processor received empty input.
-- **Could not convert** (`encode`): Other processing errors, including WebP encoding failures.
-- **Could not save** (`store`): Your server could not save the cover file or its database record.
+### Choose a cover and title in the reader app
 
-Other reasons appear as raw codes, including `truncated` and `fetch`.
+On a series page in the reader app, an admin sees a **Cover & title** button. It opens a picker:
+
+- **Cover**: every cover the series' allowed sources supply. MangaDex can offer one cover per volume. Pick one to make it the series cover. Your server downloads it and keeps a copy in PostgreSQL, as it does for an upload. **Automatic** drops your choice, or an uploaded cover, and lets the cover ranking choose again. If no source sends a cover just then, the current cover stays and the picker says so.
+- **Title**: what each source calls the series, and its alternative titles. Pick one to show it to readers. **Source title** goes back to the title the sources give.
+
+Cards in lists, search and the Updates feed show the change at once. The title choice is the same title override as in the [series editor](/admin/catalog).
+
+### Delete unpicked covers
+
+Your server also stores the cover of each linked source, for that source's own pages. **Delete unpicked covers** removes the stored source covers that no series shows. It is off by default.
+
+Before you turn it on, the section shows how many covers it would remove and how much space that frees, per source. It never removes:
+
+- MangaDex covers;
+- a cover any series shows;
+- the cover of the source a series' cover came from;
+- a cover an admin picked;
+- the only cover of a series that has no stored cover of its own.
+
+The removal runs in the background and resumes after a restart. Turn the switch off to stop it at the next cover. While it is on, your server also stops downloading these covers ahead of time. A removed cover downloads again if a reader opens it from that source. The files themselves go with the hourly cleanup, once nothing names them.
+
+## Cover issues
+
+The Cover issues section lists works with recorded cover issues.
+
+Each row shows the cover, the series, the reason, the number of tries, the last attempt, and the **Retry** and **Upload** buttons. Reasons have readable labels: **Image too large** (`too_large`), **Unsupported or damaged file** (`unsupported`), **Image is empty** (`empty`), **Could not convert** (`encode`) and **Could not save** (`store`). Other reasons, such as `truncated` and `fetch`, appear as raw codes.
 
 ## How to repair a cover
 
-You have two methods to resolve an item on the Cover issues page.
-
 ### Retry the download
 
-If a failure was caused by a temporary network glitch, server timeout, or rate limit, use the retry button:
-
-1. Click **Retry** on the affected row.
-2. Your server tries MangaDex first when enabled and available, then linked Suwayomi sources until one supplies a processable image.
-3. Your server runs the image through the validation, resizing, and WebP compression pipeline.
-4. If processing succeeds, the cover file is saved, its index and cover version update in one database transaction, and the item is automatically removed from the queue.
-5. A deterministic processing failure updates the attempt count and error details. If no image can be fetched, the existing issue remains unchanged. Truncated downloads are not recorded by manual retry.
+Use **Retry** after a temporary network failure, timeout or rate limit. Your server tries the linked sources in cover ranking order, MangaDex only when it is enabled, until one supplies a processable image. On success it saves the cover and its new version in one database transaction, and the row leaves the list. A deterministic processing failure updates the attempt count and the error. If no image can be fetched, the issue stays as it was.
 
 ### Upload a replacement image
 
-When an upstream source is permanently unreachable, returns a 404 error, is blocked by anti-bot verification, or provides low-resolution artwork, you can upload an image file from your device:
+Use **Upload** when a source is gone, blocked, or sends poor artwork. Pick a JPEG, PNG or WebP file. Your server processes it like any cover, stores the file, and keeps the processed image in PostgreSQL's `cover_upload` table for backups. The row leaves the list at once. The upload is an admin cover: the cover ranking and background downloads never replace it.
 
-1. Click **Upload** on the affected row.
-2. Select an image file from your local file picker. Supported formats include standard web image types such as JPEG, PNG, and WebP.
-3. Your server receives the file, verifies that it is within size limits and processes it as lossy WebP with the 150 KiB target and smallest-encoding fallback. It caches the result as a file and keeps the processed master in PostgreSQL's `cover_upload` table for backups.
-4. The issue is marked resolved and disappears from the Cover issues list immediately.
-
-A background cover download already in progress cannot replace your uploaded cover.
-
-Cover files are not backed up. Missing files refill from their sources, and uploads since this update return from PostgreSQL. Covers uploaded before this update copy from the old cache, but are not in database backups. Read [Update and back up](/self-host/update-and-backup).
+Cover files are not backed up. Missing files refill from their sources, and admin covers return from PostgreSQL. Covers uploaded before cover files existed copy from the old cache, but are not in database backups. Read [Update and back up](/self-host/update-and-backup).
 
 ## Bulk cover storage
 

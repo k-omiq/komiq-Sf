@@ -15,6 +15,7 @@
 	import StatusMenu from '$lib/components/StatusMenu.svelte';
 	import MergeDialog from '$lib/components/MergeDialog.svelte';
 	import UnmergeDialog from '$lib/components/UnmergeDialog.svelte';
+	import SeriesDefaultsDialog from '$lib/components/SeriesDefaultsDialog.svelte';
 	import { deriveShelf, FLAG, type Shelf } from '$lib/data/types';
 	import {
 		setLibraryMark,
@@ -578,6 +579,32 @@
 		} finally {
 			if (generation === coverGeneration) coverBusy = false;
 		}
+	}
+
+	// --- admin: pick the work's default cover and title ---
+	//
+	// Gated like the actions above, but HIDDEN rather than disabled without a `workId`:
+	// an uncatalogued series has no work row for either default to live on.
+	const canDefaults = $derived(
+		auth.ready &&
+			!!auth.user?.isAdmin &&
+			!!workId &&
+			!!backend.seriesDefaults &&
+			!!backend.setSeriesDefaultCover,
+	);
+	let defaultsOpen = $state(false);
+
+	// Same refetch as `afterMerge`: the series payload carries the new title and the
+	// re-versioned cover URL. Dropping `fetchedCover` lets that cover replace one a
+	// "Fetch cover" put on screen earlier. Pinned to the work so an answer for a series
+	// the admin already left is dropped.
+	async function afterDefaults(): Promise<void> {
+		const id = workId;
+		if (!id) return;
+		const r = await getSeries(id).catch(() => null);
+		if (workId !== id || !r?.view) return;
+		fetchedCover = '';
+		override = r;
 	}
 
 	// Go to what was just created. Confirming the detached run landed where the admin
@@ -1170,6 +1197,14 @@
 						onclick={fetchAdminCover}>{coverBusy ? 'Fetching…' : 'Fetch cover'}</button
 					>
 				{/if}
+				{#if canDefaults}
+					<button
+						class="merge"
+						aria-haspopup="dialog"
+						title="Choose the default cover and title"
+						onclick={() => (defaultsOpen = true)}>Cover &amp; title</button
+					>
+				{/if}
 				{#if canRate && nsfwOverride !== undefined}
 					<div class="rating" role="group" aria-label="Admin: content rating">
 						<span class="rating-tag">RATING</span>
@@ -1730,6 +1765,16 @@
 <!-- admin source splitter. Same mount conditions as the merge picker. -->
 {#if canSplit && workId}
 	<UnmergeDialog bind:open={splitOpen} {workId} workTitle={title} onsplit={afterSplit} />
+{/if}
+
+<!-- admin default cover + title picker. Same mount rule: admins with a resolved work. -->
+{#if canDefaults && workId}
+	<SeriesDefaultsDialog
+		bind:open={defaultsOpen}
+		{workId}
+		workTitle={title}
+		onchanged={afterDefaults}
+	/>
 {/if}
 
 <!-- cover lightbox (F2) -->

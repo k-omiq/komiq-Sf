@@ -258,6 +258,14 @@ pub const DIRECT_HTTPS_SEEN: Setting = Setting {
     default: "",
 };
 
+/// `on`: remove stored source covers that no work picked, except MangaDex covers
+/// (`cover_choice::prune_pass`), and stop warming them. Off by default.
+pub const COVER_PRUNE: Setting = Setting {
+    key: "cover_prune",
+    env: "",
+    default: "",
+};
+
 /// JSON record of what Cloudflare setup created (ids for "Remove"); see
 /// `cloudflare::Stored`. Never holds a token.
 pub const CLOUDFLARE_STATE: Setting = Setting {

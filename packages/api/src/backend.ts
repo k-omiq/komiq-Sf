@@ -679,6 +679,22 @@ export interface Backend {
 	/** Replace one work's cover from an uploaded image (multipart POST /admin/cover).
 	 * Returns the new cover URL. Optional: only the unified Komika API implements it. */
 	uploadCover?(workId: Id, file: Blob): Promise<string>;
+	/** Admin: a work's default cover and title, and the covers and titles that can
+	 * replace them. Optional: only the unified Komika API implements it. */
+	seriesDefaults?(workId: Id): Promise<SeriesDefaults>;
+	/** Admin: make the gallery cover `key` (a {@link CoverChoice} key) the work's default
+	 * cover; `null` drops the admin cover (a pick or an upload) and lets the cover ranking
+	 * choose again. The title is set with {@link updateSeriesMetadata}. */
+	setSeriesDefaultCover?(workId: Id, key: string | null): Promise<SeriesDefaults>;
+	/** Admin: the cover ranking, best source first ("mangadex" or a source id). Empty
+	 * means the default order: MangaDex first, then the oldest mapping. */
+	coverSourceRank?(): Promise<string[]>;
+	/** Admin: replace the cover ranking; an empty list restores the default order. */
+	setCoverSourceRank?(sourceIds: string[]): Promise<string[]>;
+	/** Admin: the unpicked-cover prune setting and what it would remove now. */
+	coverPrune?(): Promise<CoverPruneStatus>;
+	/** Admin: turn the unpicked-cover prune on or off. */
+	setCoverPrune?(enabled: boolean): Promise<CoverPruneStatus>;
 
 	// --- admin sources & extensions (requires an admin session; EXT-1/EXT-2) ---
 	/** Every Mihon extension known to the Suwayomi engine, installed or not. No
@@ -1150,6 +1166,62 @@ export interface SetSourceMetadataBarResult {
 	fieldGroup: MetadataFieldGroup;
 	barred: boolean;
 	works: number;
+}
+
+/** One cover an admin can make a work's default. */
+export interface CoverChoice {
+	/** `md:<file name>` (a MangaDex cover) or `src:<source_series id>`. */
+	key: string;
+	/** "mangadex" or the Suwayomi source id. */
+	sourceId: string;
+	sourceName: string;
+	/** Display URL; resolve through the ImageProvider like `coverUrl`. */
+	thumbnailUrl: string;
+	volume: string | null;
+	lang: string | null;
+	isPrimary: boolean;
+	/** The cover the work shows now, as far as the server can tell. */
+	current: boolean;
+}
+
+/** One title an admin can make a work's default. */
+export interface TitleChoice {
+	title: string;
+	sourceId: string | null;
+	sourceName: string | null;
+}
+
+/** A work's default cover and title, and what can replace them (admin only). */
+export interface SeriesDefaults {
+	workId: Id;
+	covers: CoverChoice[];
+	/** The picked cover's key; null when the cover is automatic or uploaded. */
+	pickedCover: string | null;
+	uploadedCover: boolean;
+	/** The source the shown cover came from; null for an upload or unknown origin. */
+	coverSource: string | null;
+	titles: TitleChoice[];
+	/** The title the sources give. */
+	sourceTitle: string;
+	titleOverride: string | null;
+	/** What the change just made did not do, for the admin; null otherwise. */
+	notice?: string | null;
+}
+
+export interface CoverPruneSource {
+	sourceId: string;
+	sourceName: string;
+	covers: number;
+	/** Bytes freed: files no kept cover shares. */
+	bytes: number;
+}
+
+/** The unpicked-cover prune: the setting, and what it would remove now. */
+export interface CoverPruneStatus {
+	enabled: boolean;
+	covers: number;
+	bytes: number;
+	sources: CoverPruneSource[];
 }
 
 export interface WorkMetadataSource {

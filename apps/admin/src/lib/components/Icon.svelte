@@ -21,6 +21,8 @@
 		| 'chevron-right'
 		| 'chevron-left'
 		| 'chevron-down'
+		| 'chevron-up'
+		| 'grip'
 		| 'arrow-left'
 		| 'arrow-right'
 		| 'external'
@@ -122,6 +124,10 @@
 		<path d="M15 18l-6-6 6-6" />
 	{:else if name === 'chevron-down'}
 		<path d="M6 9l6 6 6-6" />
+	{:else if name === 'chevron-up'}
+		<path d="M18 15l-6-6-6 6" />
+	{:else if name === 'grip'}
+		<path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01" />
 	{:else if name === 'arrow-left'}
 		<path d="M19 12H5M11 18l-6-6 6-6" />
 	{:else if name === 'arrow-right'}

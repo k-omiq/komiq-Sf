@@ -10,6 +10,7 @@ mod config;
 mod cover;
 #[cfg(test)]
 mod cover_bar_tests;
+mod cover_choice;
 mod cover_copy;
 #[cfg(test)]
 mod cover_files_tests;

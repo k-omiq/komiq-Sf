@@ -43,7 +43,7 @@ The Library group manages catalog series, releases, and content health:
 - **Catalog** (`/`): Search series, view chapter counts, adjust scan frequencies, add series to the canonical catalog, and initiate merges. See [Catalog and series editor](/admin/catalog).
 - **Latest updates** (`/updates`): A chronological feed of newly released chapters from MangaDex.
 - **Duplicates** (`/review`): A review queue for candidate pairs that the deduplication matcher could not decide with certainty. See [Duplicates, merge, and split](/admin/duplicates).
-- **Cover issues** (`/bugs`): A list of series covers that failed download or conversion in the image processing pipeline. See [Cover issues](/admin/covers).
+- **Covers** (`/bugs`): The cover ranking, the cleanup of unpicked covers, and a list of series covers that failed download or conversion. See [Covers](/admin/covers).
 
 ### Sources
 

@@ -130,8 +130,8 @@
 				{ href: '/updates', label: 'Latest updates', icon: 'clock' },
 				// The matcher's own uncertainty: pairs it could not decide on.
 				{ href: '/review', label: 'Duplicates', icon: 'layers' },
-				// Our cover pipeline's own failures.
-				{ href: '/bugs', label: 'Cover issues', icon: 'image' },
+				// Cover ranking, unpicked-cover cleanup and the cover pipeline's own failures.
+				{ href: '/bugs', label: 'Covers', icon: 'image' },
 			],
 		},
 		{

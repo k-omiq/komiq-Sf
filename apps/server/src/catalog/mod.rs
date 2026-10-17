@@ -946,7 +946,8 @@ fn feed_updates_select(scope: &str) -> String {
 }
 
 /// Cover eligibility must not change the mapping used for a card's other fields.
-/// Each projection keeps its existing thumbnail order when skipping barred sources.
+/// Each projection keeps its existing thumbnail order when skipping barred sources,
+/// after the cover ranking.
 fn suwayomi_cover_thumbnails_select(joined_scope: &str, feed: bool) -> String {
     let barred = work_metadata::barred_sql(&work_metadata::mapping_source_sql("ss"), "'cover'");
     let (eligible, order) = if feed {
@@ -962,7 +963,8 @@ fn suwayomi_cover_thumbnails_select(joined_scope: &str, feed: bool) -> String {
            FROM source_series ss \
            LEFT JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
           WHERE ss.source_type = 'suwayomi' {joined_scope} AND NOT {barred} {eligible} \
-          ORDER BY ss.work_id, {order}"
+          ORDER BY ss.work_id, {rank}, {order}",
+        rank = work_metadata::cover_rank_sql("ss"),
     )
 }
 

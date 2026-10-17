@@ -30,6 +30,10 @@ pub(crate) enum JobFamily<'a> {
     CoverCrawl,
     /// The one-time copy of the SQLite cover cache into files.
     CoverCopy,
+    /// The cover ranking pass (`cover_choice::rank_pass`).
+    CoverRank,
+    /// The unpicked source cover prune (`cover_choice::prune_pass`).
+    CoverPrune,
     /// Provisional reconciliation and duplicate consolidation, from the admin and
     /// after the gap backfill.
     Reconcile,
@@ -50,6 +54,8 @@ impl JobFamily<'_> {
             Self::MangadexCatalogue => &["job-lease", "mangadex-catalogue"],
             Self::CoverCrawl => &["job-lease", "cover-crawl"],
             Self::CoverCopy => &["job-lease", "cover-copy"],
+            Self::CoverRank => &["job-lease", "cover-rank"],
+            Self::CoverPrune => &["job-lease", "cover-prune"],
             Self::Reconcile => &["job-lease", "reconcile"],
             Self::ExtensionUpdate => &["job-lease", "extension-update"],
             Self::SourceSync => &["job-lease", "source-sync"],

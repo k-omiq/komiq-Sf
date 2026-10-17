@@ -17,7 +17,11 @@
 //! the projector: overrides are separate columns, and a pinned field's projected value
 //! goes to `work_field_pin.source_value`, so unpinning restores it.
 //!
-//! The cover group is recorded here but enforced by the cover code (phase C).
+//! The cover group is recorded here but enforced by the cover code (phase C). It is the
+//! one group with an admin ranking (`cover_source_rank`, the admin Covers page): ranked
+//! sources come first by position, then this default rank. Every cover choice orders
+//! its mappings with [`cover_rank_sql`] ahead of the order it used before, so with no
+//! ranking nothing changes.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -318,6 +322,16 @@ pub(crate) fn barred_sql(source: &str, group: &str) -> String {
 /// `mangadex` for MangaDex mappings, the Suwayomi source id otherwise.
 pub(crate) fn mapping_source_sql(alias: &str) -> String {
     format!("COALESCE({alias}.source_id, {alias}.source_type)")
+}
+
+/// SQL integer expression: the cover ranking position of the source of the
+/// `source_series` row aliased `alias`, or `i32::MAX` for an unranked source. Callers
+/// order by it first and keep their own order after it.
+pub(crate) fn cover_rank_sql(alias: &str) -> String {
+    format!(
+        "COALESCE((SELECT r.position FROM cover_source_rank r WHERE r.source_id = {}), 2147483647)",
+        mapping_source_sql(alias)
+    )
 }
 
 /// SQL text expression, over a `work` row aliased `w`, for the author or artist the

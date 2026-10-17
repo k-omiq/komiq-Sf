@@ -94,7 +94,7 @@ The **Metadata** section lets you replace source values with your own.
 
 An override replaces what the source sends. Leaving a field blank, or choosing `Auto`, tells your server to use the source value.
 
-- **Title override**: Replaces the title shown to readers.
+- **Title override**: Replaces the title shown to readers. Admins can also pick it from the series' known titles in the reader app, with **Cover & title** on the series page. See [Covers](/admin/covers).
 - **Description override**: Replaces the synopsis in every language.
 - **Type**: Selects a comic format or remains on `Auto`.
 - **NSFW**: Forces `SFW`, forces `NSFW`, or follows `Auto`.

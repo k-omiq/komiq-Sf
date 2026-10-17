@@ -12,6 +12,9 @@ mod cache_refresh_tests;
 #[path = "chapter_work_tests.rs"]
 mod chapter_work_tests;
 #[cfg(test)]
+#[path = "cover_choice_tests.rs"]
+mod cover_choice_tests;
+#[cfg(test)]
 mod metadata_trust_tests;
 #[cfg(test)]
 mod postgres_golden_tests;
@@ -985,6 +988,179 @@ pub(crate) async fn load_cover_gallery(
             is_primary: c.is_primary,
         })
         .collect())
+}
+
+/// The current id of an existing work (`w_` id, following merges), or "No such work".
+async fn existing_work_id(pool: &Database, id: &str) -> Result<String> {
+    let id = catalog::redirect_work_id(pool, id)
+        .await
+        .map_err(gql_read_err)?
+        .unwrap_or_else(|| id.to_string());
+    sqlx::query_scalar("SELECT id FROM work WHERE id = $1")
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(gql_read_err)?
+        .ok_or_else(|| Error::new("No such work"))
+}
+
+/// Display names of the engine's sources, best effort within a short bound: a down or
+/// hung engine leaves them out.
+async fn engine_source_names(st: &AppState) -> HashMap<String, String> {
+    match tokio::time::timeout(
+        WORK_METADATA_SOURCE_NAMES_TIMEOUT,
+        st.suwayomi.list_sources(),
+    )
+    .await
+    {
+        Ok(Ok(sources)) => sources.into_iter().map(|s| (s.id, s.name)).collect(),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "source names unavailable");
+            HashMap::new()
+        }
+        Err(_) => {
+            tracing::warn!("source names timed out");
+            HashMap::new()
+        }
+    }
+}
+
+fn source_label(names: &HashMap<String, String>, id: &str) -> String {
+    if id == "mangadex" {
+        return "MangaDex".into();
+    }
+    names.get(id).cloned().unwrap_or_else(|| id.to_string())
+}
+
+async fn load_series_defaults(st: &AppState, work_id: &str) -> Result<SeriesDefaults> {
+    let pool = &st.pool;
+    let choices = crate::cover_choice::choices(pool, work_id)
+        .await
+        .map_err(gql_read_err)?;
+    let (picked, uploaded, cover_source) = crate::cover_choice::admin_cover(pool, work_id)
+        .await
+        .map_err(gql_read_err)?;
+    let (source_title, title_override, cover_file): (String, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT primary_title, title_override, cover_file_name FROM work WHERE id = $1",
+        )
+        .bind(work_id)
+        .fetch_one(pool)
+        .await
+        .map_err(gql_read_err)?;
+    // What each source calls the work, then the aliases, each title once.
+    let titled: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT title, source_id FROM ( \
+           SELECT DISTINCT ON (title) title, source_id, ord, at FROM ( \
+             SELECT c.value AS title, COALESCE(ss.source_id, ss.source_type) AS source_id, \
+                    CASE WHEN c.slot = 'primary' THEN 0 ELSE 1 END AS ord, ss.created_at AS at \
+               FROM work_metadata_contribution c JOIN source_series ss ON ss.id = c.source_series_id \
+              WHERE ss.work_id = $1 AND c.field_group = 'title' AND c.slot IN ('primary', 'alias') \
+             UNION ALL \
+             SELECT a.raw_title, NULL, 2, NULL FROM work_alias a WHERE a.work_id = $1 \
+           ) t WHERE btrim(title) <> '' ORDER BY title, ord, at NULLS LAST \
+         ) d ORDER BY ord, at NULLS LAST, title LIMIT 100",
+    )
+    .bind(work_id)
+    .fetch_all(pool)
+    .await
+    .map_err(gql_read_err)?;
+    let names = if choices.iter().any(|c| c.source_id != "mangadex")
+        || titled
+            .iter()
+            .any(|(_, s)| s.as_deref().is_some_and(|s| s != "mangadex"))
+    {
+        engine_source_names(st).await
+    } else {
+        HashMap::new()
+    };
+    let mut titles: Vec<TitleChoice> = Vec::with_capacity(titled.len() + 1);
+    if !titled.iter().any(|(t, _)| *t == source_title) {
+        titles.push(TitleChoice {
+            title: source_title.clone(),
+            source_id: None,
+            source_name: None,
+        });
+    }
+    titles.extend(titled.into_iter().map(|(title, source_id)| TitleChoice {
+        source_name: source_id.as_deref().map(|id| source_label(&names, id)),
+        title,
+        source_id,
+    }));
+    // The shown cover, as far as provenance tells: the pick, else the first cover of the
+    // source it came from (MangaDex: the file the work names).
+    let current = match (&picked, uploaded, cover_source.as_deref()) {
+        (Some(key), _, _) => Some(key.clone()),
+        (None, true, _) | (None, false, None) => None,
+        (None, false, Some("mangadex")) => choices
+            .iter()
+            .find(|c| {
+                c.source_id == "mangadex"
+                    && cover_file
+                        .as_deref()
+                        .is_some_and(|f| c.key == format!("md:{f}"))
+            })
+            .or_else(|| choices.iter().find(|c| c.source_id == "mangadex"))
+            .map(|c| c.key.clone()),
+        (None, false, Some(source)) => choices
+            .iter()
+            .find(|c| c.source_id == source)
+            .map(|c| c.key.clone()),
+    };
+    Ok(SeriesDefaults {
+        work_id: ID(work_id.to_string()),
+        covers: choices
+            .into_iter()
+            .map(|c| CoverChoice {
+                current: current.as_deref() == Some(c.key.as_str()),
+                source_name: source_label(&names, &c.source_id),
+                key: c.key,
+                source_id: c.source_id,
+                thumbnail_url: c.thumbnail_url,
+                volume: c.volume,
+                lang: c.lang,
+                is_primary: c.primary,
+            })
+            .collect(),
+        picked_cover: picked,
+        uploaded_cover: uploaded,
+        cover_source,
+        titles,
+        source_title,
+        title_override,
+        notice: None,
+    })
+}
+
+async fn load_cover_prune(st: &AppState) -> Result<CoverPruneStatus> {
+    let enabled = crate::cover_choice::prune_enabled(&st.pool).await;
+    let rows = crate::cover_choice::prune_preview(&st.pool)
+        .await
+        .map_err(gql_read_err)?;
+    let names = if rows.is_empty() {
+        HashMap::new()
+    } else {
+        engine_source_names(st).await
+    };
+    let sources: Vec<CoverPruneSource> = rows
+        .into_iter()
+        .map(|(source_id, covers, bytes)| CoverPruneSource {
+            source_name: source_label(&names, &source_id),
+            source_id,
+            covers: covers.min(i32::MAX as i64) as i32,
+            bytes: bytes as f64,
+        })
+        .collect();
+    Ok(CoverPruneStatus {
+        enabled,
+        covers: sources
+            .iter()
+            .map(|s| s.covers as i64)
+            .sum::<i64>()
+            .min(i32::MAX as i64) as i32,
+        bytes: sources.iter().map(|s| s.bytes).sum(),
+        sources,
+    })
 }
 
 /// The current session token, if the request carried one.
@@ -7335,6 +7511,30 @@ impl QueryRoot {
                 created_at: created_at.to_rfc3339(),
             })
             .collect())
+    }
+
+    /// Admin: a work's default cover and title, and the covers and titles that can
+    /// replace them (the reader's series page). Follows merged work ids.
+    async fn series_defaults(&self, ctx: &Context<'_>, work_id: ID) -> Result<SeriesDefaults> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let work_id = existing_work_id(&st.pool, &work_id.0).await?;
+        load_series_defaults(st, &work_id).await
+    }
+
+    /// Admin: the cover ranking, best source first. Empty: the default order (MangaDex
+    /// first, then the oldest mapping).
+    async fn cover_source_rank(&self, ctx: &Context<'_>) -> Result<Vec<String>> {
+        require_admin(ctx).await?;
+        crate::cover_choice::load_rank(&state(ctx).pool)
+            .await
+            .map_err(gql_read_err)
+    }
+
+    /// Admin: the unpicked-cover prune setting and what it would remove now.
+    async fn cover_prune(&self, ctx: &Context<'_>) -> Result<CoverPruneStatus> {
+        require_admin(ctx).await?;
+        load_cover_prune(state(ctx)).await
     }
 
     /// Admin: the metadata source for each field group, following merged work ids.
@@ -14744,6 +14944,157 @@ impl MutationRoot {
             barred,
             works: works.min(i32::MAX as u64) as i32,
         })
+    }
+
+    /// Admin: make the gallery cover `key` (from `seriesDefaults`) the work's default
+    /// cover, or with `key: null` drop the admin cover (a pick or an upload) and let the
+    /// cover ranking choose again. A pick is fetched now and kept like an upload; cards
+    /// show it at once. Returns the work's defaults after the change.
+    async fn set_series_default_cover(
+        &self,
+        ctx: &Context<'_>,
+        work_id: ID,
+        key: Option<String>,
+    ) -> Result<SeriesDefaults> {
+        let admin = require_admin(ctx).await?;
+        let st = state(ctx);
+        let work_id = existing_work_id(&st.pool, &work_id.0).await?;
+        let shutdown = tokio::sync::watch::channel(false).1;
+        let clients = crate::cover_choice::Clients {
+            main: &st.pool,
+            covers: &st.cover_pool,
+            mangadex: &st.mangadex,
+            suwayomi: &st.suwayomi,
+            budgets: &st.source_budgets,
+            shutdown: &shutdown,
+            waiting: true,
+        };
+        let mut notice = None;
+        match key.as_deref().map(str::trim) {
+            Some(key) => {
+                use crate::cover_choice::PickError;
+                match crate::cover_choice::pick(&clients, &work_id, key)
+                    .await
+                    .map_err(gql_err)?
+                {
+                    Ok(()) => {}
+                    Err(PickError::Unknown) => {
+                        return Err(Error::new("That cover is not offered for this series."))
+                    }
+                    Err(PickError::Unavailable) => {
+                        return Err(Error::new(
+                            "The source did not send a usable image just now. Try again later or pick another cover.",
+                        ))
+                    }
+                    Err(PickError::Refused) => {
+                        return Err(Error::new("The series changed while saving. Try again."))
+                    }
+                }
+            }
+            None => {
+                let moved = crate::cover_choice::clear_pick(&clients, &work_id)
+                    .await
+                    .map_err(gql_err)?;
+                if !moved {
+                    notice = Some(
+                        "Automatic is on. No source sent a cover just now, so the current cover stays for now."
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        clear_feed_caches();
+        tracing::info!(work_id, key = ?key, by = %admin.username, "series default cover set by an admin");
+        let defaults = load_series_defaults(st, &work_id).await?;
+        Ok(SeriesDefaults { notice, ..defaults })
+    }
+
+    /// Admin: replace the cover ranking with `sourceIds` (best first; an empty list
+    /// restores the default order). Covers move to their ranked source in the
+    /// background; an admin cover never moves. Returns the stored ranking.
+    async fn set_cover_source_rank(
+        &self,
+        ctx: &Context<'_>,
+        source_ids: Vec<String>,
+    ) -> Result<Vec<String>> {
+        let admin = require_admin(ctx).await?;
+        let ids: Vec<String> = source_ids.iter().map(|id| id.trim().to_string()).collect();
+        if ids.len() > 500 {
+            return Err(Error::new("Rank at most 500 sources."));
+        }
+        if let Some(bad) = ids
+            .iter()
+            .find(|id| !catalog::work_metadata::valid_source_id(id))
+        {
+            return Err(Error::new(format!(
+                "Invalid source id {bad:?}: use 1-32 ASCII letters, digits, or hyphens."
+            )));
+        }
+        if ids.iter().collect::<std::collections::HashSet<_>>().len() != ids.len() {
+            return Err(Error::new("A source is ranked twice."));
+        }
+        let st = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
+        crate::cover_choice::save_rank(&st.pool, &ids)
+            .await
+            .map_err(gql_err)?;
+        tracing::info!(sources = ids.len(), by = %admin.username, "cover ranking set by an admin");
+        if !ids.is_empty() {
+            // Detached: a large catalogue takes a while, and a dropped request must not
+            // cut it off. The cover drainer resumes it from its cursor after a restart.
+            tokio::spawn(async move {
+                let pool = st.pool.background();
+                let shutdown = tokio::sync::watch::channel(false).1;
+                let clients = crate::cover_choice::Clients {
+                    main: &pool,
+                    covers: &st.cover_pool,
+                    mangadex: &st.mangadex,
+                    suwayomi: &st.suwayomi,
+                    budgets: &st.source_budgets,
+                    shutdown: &shutdown,
+                    waiting: false,
+                };
+                match crate::cover_choice::rank_pass(&clients, None).await {
+                    Ok(changed) => {
+                        clear_feed_caches();
+                        tracing::info!(changed, "cover ranking pass finished");
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), "cover ranking pass failed; it resumes later")
+                    }
+                }
+            });
+        }
+        crate::cover_choice::load_rank(&state(ctx).pool)
+            .await
+            .map_err(gql_read_err)
+    }
+
+    /// Admin: turn the unpicked-cover prune on or off (off by default). On removes the
+    /// stored source covers no work shows, never a MangaDex cover, a cover a work uses,
+    /// or an admin cover, and stops warming them; it runs in the background and resumes
+    /// after a restart. Off stops it at the next cover. Returns the setting and what is
+    /// left to remove.
+    async fn set_cover_prune(&self, ctx: &Context<'_>, enabled: bool) -> Result<CoverPruneStatus> {
+        let admin = require_admin(ctx).await?;
+        let st = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
+        crate::cover_choice::set_prune(&st.pool, enabled)
+            .await
+            .map_err(gql_err)?;
+        tracing::info!(enabled, by = %admin.username, "cover prune set by an admin");
+        if enabled {
+            let task = st.clone();
+            tokio::spawn(async move {
+                let pool = task.pool.background();
+                let shutdown = tokio::sync::watch::channel(false).1;
+                match crate::cover_choice::prune_pass(&pool, &shutdown, None).await {
+                    Ok(removed) => tracing::info!(removed, "cover prune pass finished"),
+                    Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), "cover prune pass failed; it resumes later")
+                    }
+                }
+            });
+        }
+        load_cover_prune(&st).await
     }
 
     /// Admin: replace the site-wide content block rules with `rules` (at most 50; an

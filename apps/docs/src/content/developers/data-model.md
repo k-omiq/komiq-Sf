@@ -119,7 +119,8 @@ Precomputed tables support browse and search:
 PostgreSQL stores two cover tables:
 
 - `cover_object`: one index row per `(asset_key, kind)`. The asset identifies a work, Suwayomi manga or extension icon. Kind is `master`, `w192` or `w320`. Rows hold `sha256`, `byte_length`, `version` and, for a resized derivative, `master_sha256`, the master it came from. The index and the work's cover version change in one transaction.
-- `cover_upload`: the processed master bytes of an admin-uploaded cover, keyed by `work_id`, with its hash and creation time. These bytes are included in database backups and dumps so uploads survive loss of the cover files.
+- `cover_upload`: the processed master bytes of a work's admin cover, keyed by `work_id`, with its hash and creation time. `choice` names the gallery cover an admin picked (`md:<file name>` or `src:<source_series id>`), or is null for an uploaded file. These bytes are included in database backups and dumps so admin covers survive loss of the cover files.
+- `cover_source_rank`: the cover ranking, one row per `source_id` with a unique `position`. Ranked sources supply covers first, then the default order. No rows means the default order alone.
 
 ## Legacy cover copy source
 

@@ -408,6 +408,71 @@ impl From<crate::catalog::work_metadata::Attribution> for MetadataAttribution {
     }
 }
 
+/// One cover an admin can make a work's default.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct CoverChoice {
+    /// `md:<file name>` (a MangaDex cover) or `src:<source_series id>`.
+    pub key: String,
+    /// `mangadex` or the Suwayomi source id.
+    pub source_id: String,
+    pub source_name: String,
+    /// Display URL (client resolves via ImageProvider).
+    pub thumbnail_url: String,
+    pub volume: Option<String>,
+    pub lang: Option<String>,
+    /// The MangaDex cover the source names as its main one.
+    pub is_primary: bool,
+    /// The cover the work shows now, as far as the server can tell.
+    pub current: bool,
+}
+
+/// One title an admin can make a work's default.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct TitleChoice {
+    pub title: String,
+    /// The source that gives it, when one does (`mangadex` or a Suwayomi source id).
+    pub source_id: Option<String>,
+    pub source_name: Option<String>,
+}
+
+/// Admin: the default cover and title of a work, with what can replace them.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct SeriesDefaults {
+    pub work_id: ID,
+    pub covers: Vec<CoverChoice>,
+    /// The picked cover's key; null when the cover is automatic or uploaded.
+    pub picked_cover: Option<String>,
+    /// The cover is an uploaded file.
+    pub uploaded_cover: bool,
+    /// The source the shown cover came from; null for an upload or an unknown origin.
+    pub cover_source: Option<String>,
+    pub titles: Vec<TitleChoice>,
+    /// The title the sources give (shown when there is no override).
+    pub source_title: String,
+    pub title_override: Option<String>,
+    /// What the change just made did not do, for the admin; null otherwise.
+    pub notice: Option<String>,
+}
+
+/// What the unpicked-cover prune removes from one source.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct CoverPruneSource {
+    pub source_id: String,
+    pub source_name: String,
+    pub covers: i32,
+    /// Bytes freed: files no kept cover shares.
+    pub bytes: f64,
+}
+
+/// Admin: the unpicked-cover prune setting and what it would remove now.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct CoverPruneStatus {
+    pub enabled: bool,
+    pub covers: i32,
+    pub bytes: f64,
+    pub sources: Vec<CoverPruneSource>,
+}
+
 /// One field group a source is barred from supplying.
 #[derive(SimpleObject, Clone, Debug)]
 pub struct SourceMetadataBar {

@@ -82,6 +82,8 @@ import type {
 	SourceMetadataBar,
 	SetSourceMetadataBarResult,
 	WorkMetadataSource,
+	SeriesDefaults,
+	CoverPruneStatus,
 	SourceRateLimit,
 	MyComment,
 	PostCommentInput,
@@ -1426,6 +1428,43 @@ export class GraphQLBackend implements Backend {
 			this.capabilities.setSourceMetadataBarUnsupported = true;
 			throw new Error('This server does not support metadata bars');
 		}
+	}
+
+	async seriesDefaults(workId: Id): Promise<SeriesDefaults> {
+		const d = await this.gql<{ seriesDefaults: SeriesDefaults }>(ops.SERIES_DEFAULTS, { workId });
+		return d.seriesDefaults;
+	}
+
+	async setSeriesDefaultCover(workId: Id, key: string | null): Promise<SeriesDefaults> {
+		const d = await this.gql<{ setSeriesDefaultCover: SeriesDefaults }>(
+			ops.SET_SERIES_DEFAULT_COVER,
+			{ workId, key },
+		);
+		return d.setSeriesDefaultCover;
+	}
+
+	async coverSourceRank(): Promise<string[]> {
+		const d = await this.gql<{ coverSourceRank: string[] }>(ops.COVER_SOURCE_RANK);
+		return d.coverSourceRank;
+	}
+
+	async setCoverSourceRank(sourceIds: string[]): Promise<string[]> {
+		const d = await this.gql<{ setCoverSourceRank: string[] }>(ops.SET_COVER_SOURCE_RANK, {
+			sourceIds,
+		});
+		return d.setCoverSourceRank;
+	}
+
+	async coverPrune(): Promise<CoverPruneStatus> {
+		const d = await this.gql<{ coverPrune: CoverPruneStatus }>(ops.COVER_PRUNE);
+		return d.coverPrune;
+	}
+
+	async setCoverPrune(enabled: boolean): Promise<CoverPruneStatus> {
+		const d = await this.gql<{ setCoverPrune: CoverPruneStatus }>(ops.SET_COVER_PRUNE, {
+			enabled,
+		});
+		return d.setCoverPrune;
 	}
 
 	async siteBlockRules(): Promise<BlockRule[]> {

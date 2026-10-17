@@ -71,6 +71,8 @@ import type {
 	SourceMetadataBar,
 	SetSourceMetadataBarResult,
 	WorkMetadataSource,
+	SeriesDefaults,
+	CoverPruneStatus,
 	SourceRateLimit,
 	MyComment,
 	PostCommentInput,
@@ -1091,6 +1093,24 @@ export class CompositeBackend implements Backend {
 	}
 	retryCover(workId: Id): Promise<boolean> {
 		return this.opts.hosted.retryCover!(workId);
+	}
+	seriesDefaults(workId: Id): Promise<SeriesDefaults> {
+		return this.opts.hosted.seriesDefaults!(workId);
+	}
+	setSeriesDefaultCover(workId: Id, key: string | null): Promise<SeriesDefaults> {
+		return this.opts.hosted.setSeriesDefaultCover!(workId, key);
+	}
+	coverSourceRank(): Promise<string[]> {
+		return this.opts.hosted.coverSourceRank!();
+	}
+	setCoverSourceRank(sourceIds: string[]): Promise<string[]> {
+		return this.opts.hosted.setCoverSourceRank!(sourceIds);
+	}
+	coverPrune(): Promise<CoverPruneStatus> {
+		return this.opts.hosted.coverPrune!();
+	}
+	setCoverPrune(enabled: boolean): Promise<CoverPruneStatus> {
+		return this.opts.hosted.setCoverPrune!(enabled);
 	}
 	workSourceRows(workId: Id): Promise<WorkSourceRow[]> {
 		return this.opts.hosted.workSourceRows!(workId);

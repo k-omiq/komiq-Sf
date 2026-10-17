@@ -39,6 +39,7 @@ import type {
 	BlockRule,
 	BrowseSource,
 	CertificateStatus,
+	CoverPruneStatus,
 	AdminChapter,
 	ChapterOverrideInput,
 	CloudflareConnection,
@@ -827,6 +828,47 @@ export async function setSourceMetadataBar(
 ): Promise<SetSourceMetadataBarResult> {
 	if (!backend.setSourceMetadataBar) throw new Error('This server does not support metadata bars');
 	return backend.setSourceMetadataBar(sourceId, fieldGroup, barred);
+}
+
+/** An older server answers a new field with a GraphQL "Unknown field" error. */
+function isUnknownField(err: unknown, field: string): boolean {
+	const msg = err instanceof Error ? err.message : String(err);
+	return msg.includes(`Unknown field "${field}"`);
+}
+
+/** The cover ranking, best first; empty means the default order. `null` when the
+ * server has no cover ranking. */
+export async function loadCoverSourceRank(): Promise<string[] | null> {
+	if (!backend.coverSourceRank) return null;
+	try {
+		return await backend.coverSourceRank();
+	} catch (err) {
+		if (isUnknownField(err, 'coverSourceRank')) return null;
+		throw err;
+	}
+}
+
+/** Replace the cover ranking; an empty list restores the default order. */
+export async function setCoverSourceRank(sourceIds: string[]): Promise<string[]> {
+	if (!backend.setCoverSourceRank) throw new Error('This server does not support cover ranking');
+	return backend.setCoverSourceRank(sourceIds);
+}
+
+/** The unpicked-cover delete setting and what it would remove. `null` when the server
+ * has no such setting. */
+export async function loadCoverPrune(): Promise<CoverPruneStatus | null> {
+	if (!backend.coverPrune) return null;
+	try {
+		return await backend.coverPrune();
+	} catch (err) {
+		if (isUnknownField(err, 'coverPrune')) return null;
+		throw err;
+	}
+}
+
+export async function setCoverPrune(enabled: boolean): Promise<CoverPruneStatus> {
+	if (!backend.setCoverPrune) throw new Error('This server does not support cover ranking');
+	return backend.setCoverPrune(enabled);
 }
 
 /** Old servers leave the field-source hints out of the editor. */

@@ -1811,6 +1811,87 @@ export const SET_SOURCE_METADATA_BAR = /* GraphQL */ `
 	}
 `;
 
+const SERIES_DEFAULTS_FIELDS = /* GraphQL */ `
+	workId
+	covers {
+		key
+		sourceId
+		sourceName
+		thumbnailUrl
+		volume
+		lang
+		isPrimary
+		current
+	}
+	pickedCover
+	uploadedCover
+	coverSource
+	titles {
+		title
+		sourceId
+		sourceName
+	}
+	sourceTitle
+	titleOverride
+	notice
+`;
+
+export const SERIES_DEFAULTS = /* GraphQL */ `
+	query SeriesDefaults($workId: ID!) {
+		seriesDefaults(workId: $workId) {
+			${SERIES_DEFAULTS_FIELDS}
+		}
+	}
+`;
+
+export const SET_SERIES_DEFAULT_COVER = /* GraphQL */ `
+	mutation SetSeriesDefaultCover($workId: ID!, $key: String) {
+		setSeriesDefaultCover(workId: $workId, key: $key) {
+			${SERIES_DEFAULTS_FIELDS}
+		}
+	}
+`;
+
+export const COVER_SOURCE_RANK = /* GraphQL */ `
+	query CoverSourceRank {
+		coverSourceRank
+	}
+`;
+
+export const SET_COVER_SOURCE_RANK = /* GraphQL */ `
+	mutation SetCoverSourceRank($sourceIds: [String!]!) {
+		setCoverSourceRank(sourceIds: $sourceIds)
+	}
+`;
+
+const COVER_PRUNE_FIELDS = /* GraphQL */ `
+	enabled
+	covers
+	bytes
+	sources {
+		sourceId
+		sourceName
+		covers
+		bytes
+	}
+`;
+
+export const COVER_PRUNE = /* GraphQL */ `
+	query CoverPrune {
+		coverPrune {
+			${COVER_PRUNE_FIELDS}
+		}
+	}
+`;
+
+export const SET_COVER_PRUNE = /* GraphQL */ `
+	mutation SetCoverPrune($enabled: Boolean!) {
+		setCoverPrune(enabled: $enabled) {
+			${COVER_PRUNE_FIELDS}
+		}
+	}
+`;
+
 export const SITE_BLOCK_RULES = /* GraphQL */ `
 	query SiteBlockRules {
 		siteBlockRules {

@@ -39,6 +39,8 @@ A missing group means the source has not been observed for it. An empty slot and
 
 `source_metadata_bar` bars one source from one group. No row means allowed. The source identity is `COALESCE(source_id, source_type)`. Only `mangadex` and `suwayomi` mappings count. Mappings with type `mangadex` rank first. Within each tier, earlier `source_series.created_at` wins, then the lowest `id`.
 
+The cover group alone has an admin ranking, `cover_source_rank`. Every cover choice orders mappings by that position first and keeps this default order after it, so an empty ranking changes nothing. An admin cover (`cover_upload`) wins over both. `apps/server/src/cover_choice.rs` holds the ranking pass, the admin pick and the unpicked-cover prune.
+
 For title, description, credits and status, the projector, `work_metadata::project_on`, chooses the first allowed mapping. It uses that mapping's rows regardless of attribution. If it has no rows, the current values stay. Values also stay when every mapping is barred. The [series editor](/admin/catalog) reports these cases.
 
 The projector changes only values that differ. It never blanks the primary title. Allowed title aliases form a union. An alias, localized description or credit supplied only by barred mappings is removed. An alias with no contribution stays. The first allowed MangaDex mapping with a tag observation sets the work's MangaDex tags. An empty observation clears them. Barring MangaDex for tags removes that tier. Extension tags are rebuilt separately in `tags.rs`. The projector does not handle covers; the cover code applies the cover bar itself.

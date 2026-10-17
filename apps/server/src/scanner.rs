@@ -1894,17 +1894,17 @@ const FEED_HAS_MIRROR_HALF_SQL: &str = "EXISTS (SELECT 1 FROM feed_updates fu \
 
 /// The feed upsert of one Suwayomi series (`$1` is its id as text).
 ///
-/// The thumbnail fallback skips mappings whose source is barred for cover with the
-/// rebuild's rule and order (`catalog::suwayomi_cover_thumbnails_select(_, true)`): the
-/// newest-releasing allowed in-library Suwayomi mapping of the work. That function is
-/// private to `catalog`, so this is its one-work form. With no bar this is the chosen
-/// row's own thumbnail.
+/// The thumbnail fallback follows the rebuild's rule and order
+/// (`catalog::suwayomi_cover_thumbnails_select(_, true)`): the cover ranking, then the
+/// newest-releasing allowed in-library Suwayomi mapping of the work, skipping sources
+/// barred for cover. That function is private to `catalog`, so this is its one-work
+/// form. With no ranking and no bar this is the chosen row's own thumbnail.
 fn feed_series_upsert_sql() -> String {
-    use crate::catalog::work_metadata::{barred_sql, mapping_source_sql};
+    use crate::catalog::work_metadata::{barred_sql, cover_rank_sql, mapping_source_sql};
     let status_sql = crate::catalog::FSU_STATUS_SQL;
     let mirror = FEED_HAS_MIRROR_HALF_SQL;
-    let barred = barred_sql(&mapping_source_sql("ss"), "'cover'");
     let allowed_barred = barred_sql(&mapping_source_sql("a"), "'cover'");
+    let rank = cover_rank_sql("a");
     format!(
         "INSERT INTO feed_series_updates \
          (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, \
@@ -1919,14 +1919,12 @@ fn feed_series_upsert_sql() -> String {
             CASE WHEN w.cover_cached_version IS NOT NULL \
                  THEN '/covers/' || w.id || '.webp?v=' || w.cover_cached_version \
                  END, \
-            CASE WHEN {barred} THEN \
-                 (SELECT ay.thumbnail_url FROM source_series a \
-                    JOIN suwayomi_series ay ON ay.id = sqlite_integer_pin(a.source_key) \
-                   WHERE a.work_id = ss.work_id AND a.source_type = 'suwayomi' \
-                     AND NOT {allowed_barred} \
-                     AND ay.in_library = TRUE AND ay.latest_chapter_at IS NOT NULL \
-                   ORDER BY ay.latest_chapter_at DESC, ay.id ASC LIMIT 1) \
-                 ELSE sy.thumbnail_url END, NULL, \
+            (SELECT ay.thumbnail_url FROM source_series a \
+               JOIN suwayomi_series ay ON ay.id = sqlite_integer_pin(a.source_key) \
+              WHERE a.work_id = ss.work_id AND a.source_type = 'suwayomi' \
+                AND NOT {allowed_barred} \
+                AND ay.in_library = TRUE AND ay.latest_chapter_at IS NOT NULL \
+              ORDER BY {rank}, ay.latest_chapter_at DESC, ay.id ASC LIMIT 1), NULL, \
             sqlite_general_number(lc.chapter_number), lc.name, sy.chapter_count, \
             TIMESTAMPTZ '1970-01-01 00:00:00+00' + sy.latest_chapter_at * INTERVAL '1 millisecond', \
             sss.last_new_chapter_at, \

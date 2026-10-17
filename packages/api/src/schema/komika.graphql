@@ -27,6 +27,9 @@ type Query {
 	sourceAiTags: [SourceAiTag!]! # [komika] every source an admin tagged as using AI — public. A source that translates its own series credits no group, so the source is the scanlator. A chapter copy takes the stronger of this tag (matched on ChapterSource.sourceId, or the series' sourceId) and the tag on its scanlator credit
 	sourceMetadataBars: [SourceMetadataBar!]! # [komika] admin — every source metadata bar, ordered by source id then field group
 	workMetadataSources(workId: ID!): [WorkMetadataSource!]! # [komika] admin — all six metadata field groups for a canonical work or redirected old id; unknown work is an error
+	seriesDefaults(workId: ID!): SeriesDefaults! # [komika] admin — a work's default cover and title and what can replace them (the cover gallery of its allowed sources, its known titles and aliases); follows merged ids; unknown work is an error
+	coverSourceRank: [String!]! # [komika] admin — the cover ranking, best source first ("mangadex" or a Suwayomi source id); empty = the default order (MangaDex first, then the oldest mapping)
+	coverPrune: CoverPruneStatus! # [komika] admin — the unpicked-cover prune setting and what it would remove now, per source
 	genreFacets: [GenreFacet!]! # [komika] S4: the genre chips for Browse's filter, most common first then alphabetical, gated by the viewer's NSFW posture. Each `count` is now EXACTLY the number of results the same genre filter returns — it previously came from JSON-parsing 13.8k Suwayomi `genre` blobs per request (301 entries, ungated, top entry literally "Japanese") while the filter ran against the canonical catalogue, so the chip's number and its results disagreed. Empty until MangaDex tags are ingested into `work_tag`
 	searchAllSources(query: String!, page: Int = 1): FederatedSearchPage! # [komika] federated multi-extension search — fans out to every installed source, dedupes to one canonical work per series with its per-source translators; NSFW-gated by the viewer's posture. REQUIRES LOGIN (persists mappings); per-user rate-limited (~20/min); errors "Not authenticated" for anonymous callers
 	series(id: ID!): Series! # [suwayomi] MangaType by id
@@ -170,6 +173,9 @@ type Mutation {
 	setScanlatorAi(name: String!, ai: ScanlatorAi): Boolean! # [komika] admin — tag a scanlator as using AI (AI) or partly using it (PARTIAL); `ai: null` removes the tag. Kept by name, case-folded; applies to every chapter credited to the name on every source, now and later. false when nothing changed (requires isAdmin)
 	setSourceAi(sourceId: String!, ai: ScanlatorAi): Boolean! # [komika] admin — tag a whole source as using AI (AI) or partly using it (PARTIAL); `ai: null` removes the tag. Applies to every chapter copy read from the source, now and later. Not for "mangadex". false when nothing changed (requires isAdmin)
 	setSourceMetadataBar(sourceId: String!, fieldGroup: MetadataFieldGroup!, barred: Boolean!): SetSourceMetadataBarResult! # [komika] admin — bar or allow a source for a field group and re-project its works; sourceId is trimmed and validated
+	setSeriesDefaultCover(workId: ID!, key: String): SeriesDefaults! # [komika] admin — make the gallery cover `key` (CoverChoice.key) the work's admin cover, fetched now and kept like an upload; `key: null` drops the admin cover (a pick or an upload) and lets the cover ranking choose again. Cards show the change at once. The default title is set with updateSeriesMetadata(title)
+	setCoverSourceRank(sourceIds: [String!]!): [String!]! # [komika] admin — replace the cover ranking (best first, at most 500, distinct valid ids; empty restores the default order). Published covers move to their ranked source in the background and again daily; an admin cover never moves. Returns the stored ranking
+	setCoverPrune(enabled: Boolean!): CoverPruneStatus! # [komika] admin — turn the unpicked-cover prune on or off (off by default). On removes stored source covers no work shows, never a MangaDex cover, a cover any work uses, or an admin cover, and stops warming them; runs in the background, resumable. Off stops it at the next cover
 	rateScanlator(id: ID!, score: Int): RatedScanlator! # [komika] set or change the viewer's rating of a scanlator (1..10); `score: null` removes it. Resolves to the scanlator with its new numbers (requires auth)
 	setSiteBlockRules(rules: [BlockRuleInput!]!): [BlockRule!]! # [komika] admin — replace the site-wide content block rules (at most 50; an empty list clears them). They apply to every viewer, signed in or not: a matching series is left out of every list and cannot be opened or read. Returns the stored list (requires isAdmin)
 	takeDownMedia(kind: TakedownKind!, subjectId: ID!, reason: String!): Boolean! # [komika] admin — stop serving a work (every copy, its covers, its merged-away ids; carried by merges and splits) or one copy to everyone. Lists, pages, manifests and the policy lease drop it; shared caches within one lease; browser and downloaded copies cannot be recalled. reason required, at most 500 characters. false when already taken down (requires isAdmin)
@@ -363,6 +369,44 @@ type SetSourceMetadataBarResult {
 	fieldGroup: MetadataFieldGroup!
 	barred: Boolean!
 	works: Int! # works re-projected, including when the bar was already in this state
+}
+type CoverChoice {
+	key: String! # md:<file name> (a MangaDex cover) or src:<source_series id>
+	sourceId: String! # "mangadex" or the Suwayomi source id
+	sourceName: String!
+	thumbnailUrl: String! # client resolves via ImageProvider
+	volume: String
+	lang: String
+	isPrimary: Boolean! # the MangaDex cover the source names as its main one
+	current: Boolean! # the cover the work shows now, as far as provenance tells
+}
+type TitleChoice {
+	title: String!
+	sourceId: String # the source that gives it, when one does
+	sourceName: String
+}
+type SeriesDefaults {
+	workId: ID!
+	covers: [CoverChoice!]! # in cover rank order; barred sources offer none
+	pickedCover: String # the picked CoverChoice.key; null when automatic or uploaded
+	uploadedCover: Boolean!
+	coverSource: String # where the shown cover came from; null for an upload or unknown origin
+	titles: [TitleChoice!]! # what each source calls the work, then aliases; at most 100
+	sourceTitle: String! # the title the sources give
+	titleOverride: String
+	notice: String # what the change just made did not do; null otherwise
+}
+type CoverPruneSource {
+	sourceId: String!
+	sourceName: String!
+	covers: Int!
+	bytes: Float! # bytes freed: files no kept cover shares
+}
+type CoverPruneStatus {
+	enabled: Boolean!
+	covers: Int!
+	bytes: Float!
+	sources: [CoverPruneSource!]!
 }
 type WorkMetadataSource {
 	fieldGroup: MetadataFieldGroup!
