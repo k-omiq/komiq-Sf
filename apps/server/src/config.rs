@@ -115,7 +115,9 @@ impl FallbackConfig {
             return Err("KOMIKA_FALLBACK_HOSTS must contain authorities (name or name:port, IPv6 in brackets), without schemes, paths, userinfo or spaces".into());
         }
         let port = match get("KOMIKA_FALLBACK_PORT") {
-            Some(v) => v.trim().parse()
+            Some(v) => v
+                .trim()
+                .parse()
                 .map_err(|_| "KOMIKA_FALLBACK_PORT must be a port number")?,
             None => 8443,
         };
@@ -123,7 +125,8 @@ impl FallbackConfig {
             get("KOMIKA_FALLBACK_BIND_ADDR"),
             &addr_or(get("BIND_ADDR"), "0.0.0.0"),
         );
-        let bind_addr = bind.parse()
+        let bind_addr = bind
+            .parse()
             .map_err(|_| "KOMIKA_FALLBACK_BIND_ADDR (or BIND_ADDR) must be an IP address")?;
         let reader_dir = get("KOMIKA_FALLBACK_READER_DIR")
             .filter(|v| !v.trim().is_empty())
@@ -135,7 +138,9 @@ impl FallbackConfig {
             })
             .ok_or("KOMIKA_FALLBACK_READER_DIR is required when KOMIKA_WEB_DIR is unset")?;
         let media_bytes_per_day = match get("KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY") {
-            Some(v) => v.trim().parse()
+            Some(v) => v
+                .trim()
+                .parse()
                 .map_err(|_| "KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY must be an integer byte count")?,
             None => 50_000_000_000,
         };
@@ -155,7 +160,9 @@ impl FallbackConfig {
 /// Canonicalize DNS case/trailing dots and bracketed IPv6; never accept userinfo.
 pub(crate) fn parse_fallback_authority(raw: &str) -> Option<(String, Option<u16>)> {
     if raw.is_empty()
-        || raw.bytes().any(|b| b.is_ascii_whitespace() || b"/@?#\\".contains(&b))
+        || raw
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b"/@?#\\".contains(&b))
     {
         return None;
     }
@@ -175,8 +182,11 @@ pub(crate) fn parse_fallback_authority(raw: &str) -> Option<(String, Option<u16>
         format!("[{}]", ip.parse::<std::net::Ipv6Addr>().ok()?)
     } else {
         let host = host.strip_suffix('.').unwrap_or(host);
-        if host.is_empty() || host.split('.').any(str::is_empty)
-            || !host.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        if host.is_empty()
+            || host.split('.').any(str::is_empty)
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
         {
             return None;
         }
@@ -266,11 +276,12 @@ pub struct Config {
     pub database_url: String,
     /// Expected PostgreSQL primary identity (`KOMIKA_NODE_ID`); unset disables the check.
     pub node_id: Option<String>,
-    /// SQLite URL for the SEPARATE cover-cache DB. Kept out of `database_url` on
-    /// purpose: cover blobs are large and re-derivable from MangaDex, so this DB is
-    /// not stored in PostgreSQL. Defaults to `sqlite://covers.sqlite3`; override
-    /// with `COVERS_DATABASE_URL`.
+    /// SQLite URL placing the data-directory lock, the default covers directory,
+    /// and the legacy cache read by the one-time copy into files. Defaults to
+    /// `sqlite://covers.sqlite3`; override with `COVERS_DATABASE_URL`.
     pub covers_database_url: String,
+    /// Cover files directory (`KOMIKA_COVERS_DIR`), defaulting beside the SQLite cache.
+    pub covers_dir: std::path::PathBuf,
     /// Directory holding the vendored extension icons served at
     /// `/ext-icons/{pkgName}.png`. Populated from `assets/ext-icons/` in the repo
     /// (see `scripts/fetch-ext-icons.mjs`) and copied into the image by
@@ -412,6 +423,10 @@ impl Config {
         // the PostgreSQL database endpoint.
         let covers_database_url =
             env::var("COVERS_DATABASE_URL").unwrap_or_else(|_| derive_covers_url(&database_url));
+        let covers_dir = covers_dir_or_default(
+            env::var("KOMIKA_COVERS_DIR").ok().as_deref(),
+            &covers_database_url,
+        );
         let ext_icons_dir =
             env::var("EXT_ICONS_DIR").unwrap_or_else(|_| "/srv/ext-icons".to_string());
         let web_dir = env::var("KOMIKA_WEB_DIR")
@@ -683,6 +698,7 @@ impl Config {
             cover_recompress_interval_secs,
             cover_recompress_batch,
             covers_database_url,
+            covers_dir,
             ext_icons_dir,
             web_dir,
             img_proxy_enabled,
@@ -717,6 +733,13 @@ fn addr_or(raw: Option<String>, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+fn covers_dir_or_default(raw: Option<&str>, covers_database_url: &str) -> std::path::PathBuf {
+    raw.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| crate::cover_store::default_dir(covers_database_url))
+}
+
 fn derive_covers_url(database_url: &str) -> String {
     if database_url.starts_with("postgres:") || database_url.starts_with("postgresql:") {
         return "sqlite://covers.sqlite3".to_string();
@@ -743,6 +766,7 @@ impl std::fmt::Debug for Config {
             .field("metrics_port", &self.metrics_port)
             .field("database_url", &"<redacted>")
             .field("covers_database_url", &self.covers_database_url)
+            .field("covers_dir", &self.covers_dir)
             .finish_non_exhaustive()
     }
 }
@@ -916,6 +940,28 @@ mod node_id_tests {
 }
 
 #[cfg(test)]
+mod covers_dir_tests {
+    use super::covers_dir_or_default;
+    use std::path::Path;
+
+    #[test]
+    fn covers_dir_defaults_beside_cache_and_trims_override() {
+        let url = "sqlite:///data/covers.sqlite3";
+        for raw in [None, Some(""), Some(" \t ")] {
+            assert_eq!(covers_dir_or_default(raw, url), Path::new("/data/covers"));
+        }
+        assert_eq!(
+            covers_dir_or_default(Some(" /custom/covers "), url),
+            Path::new("/custom/covers")
+        );
+        assert_eq!(
+            covers_dir_or_default(None, "sqlite::memory:"),
+            Path::new("covers")
+        );
+    }
+}
+
+#[cfg(test)]
 mod fallback_config_tests {
     use super::FallbackConfig;
 
@@ -933,7 +979,10 @@ mod fallback_config_tests {
 
     fn parse(values: &[(&str, &str)]) -> Result<Option<FallbackConfig>, String> {
         FallbackConfig::parse(|name| {
-            values.iter().find(|(key, _)| *key == name).map(|(_, v)| v.to_string())
+            values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, v)| v.to_string())
         })
     }
 
@@ -943,7 +992,9 @@ mod fallback_config_tests {
             assert!(FallbackConfig::parse(|name| {
                 assert_eq!(name, "KOMIKA_FALLBACK_CERT_FILE");
                 value.map(str::to_string)
-            }).unwrap().is_none());
+            })
+            .unwrap()
+            .is_none());
         }
     }
 
@@ -971,7 +1022,10 @@ mod fallback_config_tests {
         assert_eq!(cfg.port, 9443);
         assert_eq!(cfg.media_bytes_per_day, 0);
         values.push(("KOMIKA_FALLBACK_BIND_ADDR", "::1"));
-        assert_eq!(parse(&values).unwrap().unwrap().bind_addr.to_string(), "::1");
+        assert_eq!(
+            parse(&values).unwrap().unwrap().bind_addr.to_string(),
+            "::1"
+        );
     }
 
     #[test]
@@ -995,16 +1049,30 @@ mod fallback_config_tests {
     #[test]
     fn fallback_rejects_bad_authorities() {
         for host in [
-            ", ,", "https://reader.example", "reader.example/path", "user@reader.example",
-            "reader .example", "reader\texample", "reader.example?x", "reader.example#x",
-            "reader.example:", "reader.example:no", "reader.example:65536", "::1", "[nope]",
-            "[::1]:no", ".", "x..example",
+            ", ,",
+            "https://reader.example",
+            "reader.example/path",
+            "user@reader.example",
+            "reader .example",
+            "reader\texample",
+            "reader.example?x",
+            "reader.example#x",
+            "reader.example:",
+            "reader.example:no",
+            "reader.example:65536",
+            "::1",
+            "[nope]",
+            "[::1]:no",
+            ".",
+            "x..example",
         ] {
             let mut values = values();
             values.retain(|(key, _)| *key != "KOMIKA_FALLBACK_HOSTS");
             values.push(("KOMIKA_FALLBACK_HOSTS", host));
             assert!(
-                parse(&values).unwrap_err().contains("KOMIKA_FALLBACK_HOSTS"),
+                parse(&values)
+                    .unwrap_err()
+                    .contains("KOMIKA_FALLBACK_HOSTS"),
                 "{host}"
             );
         }
@@ -1027,7 +1095,10 @@ mod fallback_config_tests {
             ("KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY", "five"),
             ("KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY", "-1"),
             ("KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY", "1.5"),
-            ("KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY", "18446744073709551616"),
+            (
+                "KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY",
+                "18446744073709551616",
+            ),
             ("KOMIKA_FALLBACK_PORT", "bad"),
             ("KOMIKA_FALLBACK_BIND_ADDR", "localhost"),
         ] {

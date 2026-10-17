@@ -27,7 +27,7 @@ Data fetching takes two paths:
 
 Image fetching depends on the image origin:
 
-- Covers cached in the database load directly from `/covers/{work_id}.webp` on the API origin. For card-sized covers, the reader provides responsive variants through a `srcset` attribute at 192 pixels (1x) and 320 pixels (2x) using the `?w=` query parameter, along with the master cover at 3x.
+- Covers cached as files on the server load directly from `/covers/{work_id}.webp` on the API origin. For card-sized covers, the reader provides responsive variants through a `srcset` attribute at 192 pixels (1x) and 320 pixels (2x) using the `?w=` query parameter, along with the master cover at 3x.
 - User avatars load from `/avatars/{user_id}.webp` on the API origin.
 - For engine chapter pages, `pages` hands out `/media/v1/c/...` when the server has stored the chapter's source key. Otherwise it returns the older `/api/v1/manga/...` index path, which still works. Both load directly from the API origin with `Cache-Control: public, max-age=300, must-revalidate`. Thumbnails keep their `/api/v1/manga/...` path.
 - In proxy or server image mode, MangaDex chapter pages and uncached covers route through the Cloudflare Worker at `img.komiq.cc/img?src=...` on the global server, or through `/img?src=...` on your own server. The embedded reader uses the server path without a Worker. This step adds permissive CORS headers and sets an upstream referrer.
@@ -86,7 +86,7 @@ The embedded JVM engine does not start on mobile devices unless it is chosen or 
 
 A self-hosted komiq server fetches data and images directly from upstream services:
 
-- When enabled, it synchronizes metadata from the MangaDex API and downloads covers to store in SQLite.
+- When enabled, it synchronizes metadata from the MangaDex API and caches covers as files under `KOMIKA_COVERS_DIR`, indexed in PostgreSQL.
 - It communicates with Suwayomi at the configured `SUWAYOMI_URL`, defaulting to loopback port 4567, to inspect installed extensions, query sources, and proxy chapter pages.
 - With `KOMIKA_IMG_PROXY=on`, the server mounts an `/img` route that mirrors Cloudflare Worker validation rules. Serving the web reader enables this by default unless disabled. Self-hosted readers can proxy images without a Worker.
 

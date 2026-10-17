@@ -17,9 +17,9 @@
 //! The lazy fetch below covers everything the snapshot can't: extensions
 //! published AFTER a given snapshot was taken, and — on a self-hosted server,
 //! where the operator adds whatever repos they like — every extension from any
-//! other repo. Each is fetched once, cached in `extension_icon_blob`, and served
-//! from there afterwards, so a newly-listed source gets its icon without a
-//! redeploy.
+//! other repo. Each is fetched once, cached as an `icon:<pkg>` master in the cover
+//! store, and served from there afterwards, so a newly-listed source gets its icon
+//! without a redeploy.
 //!
 //! WHERE THE ICON COMES FROM. The extension's OWN repo ([`icon_candidates`]): a
 //! Mihon-format repo keeps `icon/{pkgName}.png` next to its index, so the URL is
@@ -32,14 +32,15 @@
 //! the hosted instance, because it is local disk and answers its ~1,300 Keiyoushi
 //! icons without a single outbound request; a self-hosted install ships none.
 
-use crate::sqlite_database::SqliteDatabase as Database;
+use crate::cover_store::{self, CoverStore};
+use crate::db::Database;
 use std::time::Duration;
 
 /// Bound the outbound fetch hard. This runs on a request path, and a stalled
 /// upstream must surface as a placeholder rather than a hung image slot.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long a recorded miss (empty-BLOB tombstone) suppresses re-fetching. ~41
+/// How long a recorded miss (empty-file tombstone) suppresses re-fetching. ~41
 /// extensions publish no icon anywhere; without this, each one would hit
 /// Keiyoushi on EVERY request for it. A week is short enough that an icon added
 /// upstream still appears on its own, and long enough that the misses cost
@@ -136,16 +137,48 @@ fn is_png(bytes: &[u8]) -> bool {
 }
 
 /// A cached row: `Some(bytes)` = icon, `None` = a live tombstone (recorded miss
-/// still inside its TTL). An absent/expired row yields `Err(())` meaning
-/// "nothing usable cached — go fetch".
+/// still inside its TTL, or a store read error). An absent/expired row or a missing
+/// file yields `Err(())` meaning "nothing usable cached — go fetch".
 #[allow(clippy::result_unit_err)]
-pub async fn cached(pool: &Database, pkg: &str) -> Result<Option<Vec<u8>>, ()> {
+pub async fn cached(
+    main: &Database,
+    covers: &CoverStore,
+    pkg: &str,
+) -> Result<Option<Vec<u8>>, ()> {
+    let asset = cover_store::icon_asset(pkg);
+    // A store error answers "no icon" for now. Fetching upstream instead would load the
+    // repo for every request and could replace a good icon with a tombstone.
+    let row = match cover_store::row(main, &asset, cover_store::Kind::Master).await {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::warn!(error = %e, pkg, "icon index read failed");
+            return Ok(None);
+        }
+    };
+    if let Some(row) = row {
+        let bytes = match covers.read_object(&row.sha).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Err(()),
+            Err(e) => {
+                tracing::warn!(error = %e, pkg, "icon file read failed");
+                return Ok(None);
+            }
+        };
+        return if !bytes.is_empty() {
+            Ok(Some(bytes))
+        } else if (chrono::Utc::now() - row.updated_at).num_seconds() < MISS_TTL_SECS {
+            Ok(None)
+        } else {
+            Err(())
+        };
+    }
+    let legacy = covers.legacy_for_read(&asset).ok_or(())?;
     let row: Option<(Vec<u8>, i64)> = sqlx::query_as(
         "SELECT png, CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', updated_at) AS INTEGER) \
          FROM extension_icon_blob WHERE pkg_name = $1",
     )
     .bind(pkg)
-    .fetch_optional(pool)
+    .fetch_optional(legacy)
     .await
     .unwrap_or(None);
     match row {
@@ -282,12 +315,17 @@ pub enum RepoLookup<'a> {
 }
 
 /// Fetch a package's icon from its own repo ([`icon_candidates`]) and record the
-/// outcome — the bytes on success, an empty-BLOB tombstone on a definite miss.
+/// outcome — the bytes on success, an empty-file tombstone on a definite miss.
 /// Returns the bytes to serve.
 ///
 /// Cache writes are best-effort: a failed write costs a repeat fetch next time,
 /// which is not worth failing an image request over.
-pub async fn fetch_and_cache(pool: &Database, pkg: &str, repo: RepoLookup<'_>) -> Option<Vec<u8>> {
+pub async fn fetch_and_cache(
+    main: &Database,
+    covers: &CoverStore,
+    pkg: &str,
+    repo: RepoLookup<'_>,
+) -> Option<Vec<u8>> {
     let candidates = icon_candidates(
         match repo {
             RepoLookup::Repo(r) => Some(r),
@@ -314,18 +352,17 @@ pub async fn fetch_and_cache(pool: &Database, pkg: &str, repo: RepoLookup<'_>) -
         return None;
     }
     let store = bytes.clone().unwrap_or_default();
-    let writer = pool.clone();
-    let cache_key = pkg.to_owned();
-    pool.defer(async move {
-        sqlx::query(
-            "INSERT INTO extension_icon_blob (pkg_name, png, updated_at) \
-             VALUES ($1, $2, datetime('now')) \
-             ON CONFLICT(pkg_name) DO UPDATE SET png = excluded.png, updated_at = excluded.updated_at",
-        )
-        .bind(cache_key)
-        .bind(store)
-        .execute(&writer)
-        .await?;
+    let writer = main.background();
+    let covers = covers.clone();
+    let asset = cover_store::icon_asset(pkg);
+    main.defer(async move {
+        let mut staged = covers.stage(&store).await?;
+        let mut tx = writer.begin().await?;
+        let _guards =
+            crate::cover::lock_assets_and_files(&mut tx, &[&asset], &[staged.sha]).await?;
+        covers.place(&mut staged).await?;
+        cover_store::put_master(&mut tx, &asset, &staged, None).await?;
+        tx.commit().await?;
         Ok(())
     });
     if bytes.is_none() {
@@ -341,10 +378,15 @@ pub async fn fetch_and_cache(pool: &Database, pkg: &str, repo: RepoLookup<'_>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cover_store::test_support::{self, TestDir};
 
-    async fn cached_after_flush(pool: &Database, pkg: &str) -> Result<Option<Vec<u8>>, ()> {
-        pool.flush_deferred().await;
-        cached(pool, pkg).await
+    async fn cached_after_flush(
+        main: &Database,
+        covers: &CoverStore,
+        pkg: &str,
+    ) -> Result<Option<Vec<u8>>, ()> {
+        main.flush_deferred().await;
+        cached(main, covers, pkg).await
     }
 
     #[test]
@@ -386,75 +428,144 @@ mod tests {
         );
     }
 
-    /// An in-memory clone of the `extension_icon_blob` schema from `db::init_covers`.
+    /// Main database with the file index and durable settings.
     async fn cache_pool() -> Database {
-        let pool = crate::sqlite_database::SqliteTestPoolOptions::new()
-            .max_connections(1)
+        let pool = crate::database::TestPoolOptions::new()
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::query(
-            "CREATE TABLE extension_icon_blob (\
-                 pkg_name   TEXT PRIMARY KEY,\
-                 png        BLOB NOT NULL,\
-                 updated_at TEXT NOT NULL\
-             )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::migrate!("./migrations_pg")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 
-    async fn put(pool: &Database, pkg: &str, png: &[u8], age_secs: i64) {
+    async fn put(main: &Database, covers: &CoverStore, pkg: &str, png: &[u8], age_secs: i64) {
+        let asset = cover_store::icon_asset(pkg);
+        let mut staged = covers.stage(png).await.unwrap();
+        let mut tx = main.begin().await.unwrap();
+        let _guards = crate::cover::lock_assets_and_files(&mut tx, &[&asset], &[staged.sha])
+            .await
+            .unwrap();
+        covers.place(&mut staged).await.unwrap();
+        cover_store::put_master(&mut tx, &asset, &staged, None)
+            .await
+            .unwrap();
         sqlx::query(
-            "INSERT INTO extension_icon_blob (pkg_name, png, updated_at) \
-             VALUES ($1, $2, datetime('now', $3))",
+            "UPDATE cover_object SET updated_at = $2 WHERE asset_key = $1 AND kind = 'master'",
         )
-        .bind(pkg)
-        .bind(png)
-        .bind(format!("-{age_secs} seconds"))
-        .execute(pool)
+        .bind(&asset)
+        .bind(chrono::Utc::now() - chrono::Duration::seconds(age_secs))
+        .execute(&mut *tx)
         .await
         .unwrap();
+        tx.commit().await.unwrap();
     }
 
     #[tokio::test]
     async fn cache_distinguishes_hit_live_tombstone_and_refetch() {
         let pool = cache_pool().await;
+        let dir = TestDir::new();
+        let covers = test_support::store(&dir);
 
         // Nothing cached → "go fetch".
-        assert!(cached_after_flush(&pool, "pkg.absent").await.is_err());
+        assert!(cached_after_flush(&pool, &covers, "pkg.absent")
+            .await
+            .is_err());
 
         // A stored icon is served back verbatim.
-        put(&pool, "pkg.hit", b"\x89PNG\r\n\x1a\nbytes", 0).await;
+        put(&pool, &covers, "pkg.hit", b"\x89PNG\r\n\x1a\nbytes", 0).await;
         assert_eq!(
-            cached_after_flush(&pool, "pkg.hit").await.unwrap().unwrap(),
+            cached_after_flush(&pool, &covers, "pkg.hit")
+                .await
+                .unwrap()
+                .unwrap(),
             b"\x89PNG\r\n\x1a\nbytes".to_vec()
         );
 
         // A fresh tombstone suppresses the refetch (serves 404) rather than
         // hammering Keiyoushi on every request for an icon that doesn't exist.
-        put(&pool, "pkg.miss", b"", MISS_TTL_SECS / 2).await;
-        assert_eq!(cached_after_flush(&pool, "pkg.miss").await.unwrap(), None);
+        put(&pool, &covers, "pkg.miss", b"", MISS_TTL_SECS / 2).await;
+        assert_eq!(
+            cached_after_flush(&pool, &covers, "pkg.miss")
+                .await
+                .unwrap(),
+            None
+        );
 
         // Once it ages past the TTL it stops counting, so an icon added upstream
         // is picked up without anyone clearing the cache by hand.
-        put(&pool, "pkg.stale", b"", MISS_TTL_SECS + 60).await;
-        assert!(cached_after_flush(&pool, "pkg.stale").await.is_err());
+        put(&pool, &covers, "pkg.stale", b"", MISS_TTL_SECS + 60).await;
+        assert!(cached_after_flush(&pool, &covers, "pkg.stale")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn serves_a_legacy_icon_until_the_copy_passes_it() {
+        let pool = cache_pool().await;
+        let dir = TestDir::new();
+        let legacy = test_support::legacy_pool().await;
+        let pkg = "pkg.legacy";
+        let png = b"\x89PNG\r\n\x1a\nlegacy";
+        sqlx::query(
+            "INSERT INTO extension_icon_blob (pkg_name, png, updated_at) \
+             VALUES ($1, $2, datetime('now'))",
+        )
+        .bind(pkg)
+        .bind(png.as_slice())
+        .execute(&legacy)
+        .await
+        .unwrap();
+        let covers =
+            test_support::store_with_legacy(&dir, legacy, cover_store::CopyCursor::default());
+
+        assert_eq!(
+            cached(&pool, &covers, pkg).await.unwrap(),
+            Some(png.to_vec())
+        );
+        covers.set_copy_cursor(cover_store::CopyCursor {
+            phase: cover_store::CopyPhase::Icon,
+            after: pkg.to_owned(),
+        });
+        assert!(cached(&pool, &covers, pkg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_expired_tombstone_is_refetched() {
+        use std::sync::atomic::Ordering;
+        let pool = cache_pool().await;
+        let dir = TestDir::new();
+        let covers = test_support::store(&dir);
+        let (repo, hits) = icon_repo().await;
+        put(&pool, &covers, "pkg.has.icon", b"", MISS_TTL_SECS + 60).await;
+
+        assert!(cached(&pool, &covers, "pkg.has.icon").await.is_err());
+        let got = fetch_and_cache(&pool, &covers, "pkg.has.icon", RepoLookup::Repo(&repo)).await;
+        assert_eq!(got.as_deref(), Some(&b"\x89PNG\r\n\x1a\nicon"[..]));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cached_after_flush(&pool, &covers, "pkg.has.icon")
+                .await
+                .unwrap(),
+            got
+        );
     }
 
     #[tokio::test]
     async fn non_keiyoushi_package_records_a_tombstone_without_fetching() {
         let pool = cache_pool().await;
+        let dir = TestDir::new();
+        let covers = test_support::store(&dir);
         // No derivable URL → no outbound request, but the miss is still recorded
         // so the next request short-circuits instead of retrying the derivation.
         assert_eq!(
-            fetch_and_cache(&pool, "com.example.custom", RepoLookup::Unknown).await,
+            fetch_and_cache(&pool, &covers, "com.example.custom", RepoLookup::Unknown).await,
             None
         );
         assert_eq!(
-            cached_after_flush(&pool, "com.example.custom")
+            cached_after_flush(&pool, &covers, "com.example.custom")
                 .await
                 .unwrap(),
             None
@@ -469,24 +580,31 @@ mod tests {
     #[tokio::test]
     async fn a_failed_fetch_still_records_a_tombstone() {
         let pool = cache_pool().await;
+        let dir = TestDir::new();
+        let covers = test_support::store(&dir);
         // A derivable-but-unroutable URL exercises the same fall-through the
         // upstream-404 path takes, without depending on the network.
         let pkg = "eu.kanade.tachiyomi.extension.zz.definitely-not-a-real-extension";
         // Port 1 on loopback: a refused connection, never the network.
         let repo = "http://127.0.0.1:1/repo/index.min.json";
         assert_eq!(
-            fetch_and_cache(&pool, pkg, RepoLookup::Repo(repo)).await,
+            fetch_and_cache(&pool, &covers, pkg, RepoLookup::Repo(repo)).await,
             None
         );
         pool.flush_deferred().await;
-        let tombstoned: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM extension_icon_blob WHERE pkg_name = $1")
-                .bind(pkg)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(tombstoned, 1, "a failed fetch must record a miss");
-        assert_eq!(cached_after_flush(&pool, pkg).await.unwrap(), None);
+        let tombstone = cover_store::row(
+            &pool,
+            &cover_store::icon_asset(pkg),
+            cover_store::Kind::Master,
+        )
+        .await
+        .unwrap()
+        .expect("a failed fetch must record a miss");
+        assert_eq!(
+            covers.read_object(&tombstone.sha).await.unwrap(),
+            Some(Vec::new())
+        );
+        assert_eq!(cached_after_flush(&pool, &covers, pkg).await.unwrap(), None);
     }
 
     #[test]
@@ -604,14 +722,17 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let pool = cache_pool().await;
+        let dir = TestDir::new();
+        let covers = test_support::store(&dir);
         let repo = format!("http://127.0.0.1:{port}/repo/index.min.json");
 
         for pkg in ["by.address", "by.name"] {
             assert_eq!(
-                fetch_and_cache(&pool, pkg, RepoLookup::Repo(&repo)).await,
+                fetch_and_cache(&pool, &covers, pkg, RepoLookup::Repo(&repo)).await,
                 None
             );
         }
+        pool.flush_deferred().await;
         assert_eq!(inside.load(Ordering::SeqCst), 0);
     }
 
@@ -638,14 +759,16 @@ mod tests {
     async fn fetches_from_the_repo_then_serves_from_cache() {
         use std::sync::atomic::Ordering;
         let pool = cache_pool().await;
+        let dir = TestDir::new();
+        let covers = test_support::store(&dir);
         let (repo, hits) = icon_repo().await;
 
-        let got = fetch_and_cache(&pool, "pkg.has.icon", RepoLookup::Repo(&repo)).await;
+        let got = fetch_and_cache(&pool, &covers, "pkg.has.icon", RepoLookup::Repo(&repo)).await;
         assert_eq!(got.as_deref(), Some(&b"\x89PNG\r\n\x1a\nicon"[..]));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         // Cached now: the route's tier 2 answers without the repo.
         assert_eq!(
-            cached_after_flush(&pool, "pkg.has.icon")
+            cached_after_flush(&pool, &covers, "pkg.has.icon")
                 .await
                 .unwrap()
                 .as_deref(),
@@ -654,21 +777,25 @@ mod tests {
 
         // The repo has no icon for this one: a definite miss, recorded.
         assert_eq!(
-            fetch_and_cache(&pool, "pkg.no.icon", RepoLookup::Repo(&repo)).await,
+            fetch_and_cache(&pool, &covers, "pkg.no.icon", RepoLookup::Repo(&repo)).await,
             None
         );
         assert_eq!(
-            cached_after_flush(&pool, "pkg.no.icon").await.unwrap(),
+            cached_after_flush(&pool, &covers, "pkg.no.icon")
+                .await
+                .unwrap(),
             None
         );
 
         // The engine could not be asked: nothing to try for a non-Keiyoushi package,
         // and NO tombstone — the icon may exist in a repo we could not name this time.
         assert_eq!(
-            fetch_and_cache(&pool, "pkg.engine.down", RepoLookup::Unavailable).await,
+            fetch_and_cache(&pool, &covers, "pkg.engine.down", RepoLookup::Unavailable).await,
             None
         );
-        assert!(cached_after_flush(&pool, "pkg.engine.down").await.is_err());
+        assert!(cached_after_flush(&pool, &covers, "pkg.engine.down")
+            .await
+            .is_err());
     }
 
     #[test]

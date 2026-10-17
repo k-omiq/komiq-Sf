@@ -1313,11 +1313,10 @@ async fn graphql_is_admin_only_and_drives_a_setup() {
         .await
         .unwrap();
     }
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
     let state = Arc::new(AppState {
         pool: pool.clone(),
-        cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
-            .await
-            .unwrap(),
+        cover_pool: crate::cover_store::test_support::store(&cover_dir),
         suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
         mangadex: Arc::new(crate::mangadex::MangaDexClient::new("test-ua", 5.0, 40.0)),
         admin_users: vec![],

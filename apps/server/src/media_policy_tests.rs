@@ -107,13 +107,18 @@ fn collected(bytes: &[u8]) -> CollectedPage {
     }
 }
 
-async fn app(pool: db::Database, engine: &Engine, key: &std::path::Path) -> Arc<AppState> {
+async fn app(
+    pool: db::Database,
+    engine: &Engine,
+    key: &std::path::Path,
+    cover_dir: &crate::cover_store::test_support::TestDir,
+) -> Arc<AppState> {
     let mut config = Config::from_env();
     config.media_manifests = true;
     config.media_signing_key_file = key.to_path_buf();
     Arc::new(AppState {
         pool,
-        cover_pool: db::init_covers("sqlite::memory:").await.unwrap(),
+        cover_pool: crate::cover_store::test_support::store(cover_dir),
         suwayomi: SuwayomiClient::new(engine.url.clone(), None, None),
         mangadex: Arc::new(
             mangadex::MangaDexClient::new("media-policy-test", 100.0, 100.0)
@@ -273,7 +278,14 @@ async fn policy_epoch_moves_in_the_same_transaction_as_each_change() {
     let pool = pool().await;
     let dir = TempDir::new();
     let engine = Engine::spawn().await;
-    let app = app(pool.clone(), &engine, &dir.0.join("signing.key")).await;
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
+    let app = app(
+        pool.clone(),
+        &engine,
+        &dir.0.join("signing.key"),
+        &cover_dir,
+    )
+    .await;
     let (copy, _) = two_copies(&pool).await;
     assert_eq!(epoch(&pool).await, 0);
 
@@ -289,21 +301,29 @@ async fn policy_epoch_moves_in_the_same_transaction_as_each_change() {
     assert!(after_rule > 0);
 
     // A takedown moves it, and records its own epoch; a repeat changes nothing.
-    assert_eq!(take_down(&app, Kind::Copy, &copy).await, (copy.clone(), true));
+    assert_eq!(
+        take_down(&app, Kind::Copy, &copy).await,
+        (copy.clone(), true)
+    );
     let after_takedown = epoch(&pool).await;
     assert!(after_takedown > after_rule);
     let rows = media_policy::list(&pool).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].epoch, after_takedown);
     assert_eq!(rows[0].created_by.as_deref(), Some("test"));
-    assert_eq!(take_down(&app, Kind::Copy, &copy).await, (copy.clone(), false));
+    assert_eq!(
+        take_down(&app, Kind::Copy, &copy).await,
+        (copy.clone(), false)
+    );
     assert_eq!(epoch(&pool).await, after_takedown);
 
     // A refused takedown moves nothing.
     for (kind, subject) in [(Kind::Copy, "mc_unknown"), (Kind::Work, "w_missing")] {
-        assert!(media_policy::take_down(&pool, &app.cover_pool, kind, subject, "x", None)
-            .await
-            .is_err());
+        assert!(
+            media_policy::take_down(&pool, &app.cover_pool, kind, subject, "x", None)
+                .await
+                .is_err()
+        );
     }
     assert!(
         media_policy::take_down(&pool, &app.cover_pool, Kind::Copy, &copy, "  ", None)
@@ -341,7 +361,14 @@ async fn shared_bytes_denying_copy_a_never_refuses_copy_b() {
     let pool = pool().await;
     let dir = TempDir::new();
     let engine = Engine::spawn().await;
-    let app = app(pool.clone(), &engine, &dir.0.join("signing.key")).await;
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
+    let app = app(
+        pool.clone(),
+        &engine,
+        &dir.0.join("signing.key"),
+        &cover_dir,
+    )
+    .await;
     let (a, b) = two_copies(&pool).await;
     let shared = hex::encode(Sha256::digest(page_bytes(0, 0)));
     let own_a = hex::encode(Sha256::digest(page_bytes(0, 1)));
@@ -362,30 +389,35 @@ async fn shared_bytes_denying_copy_a_never_refuses_copy_b() {
     let response = get_path(&app, &format!("/media/v1/o/{b}/{shared}")).await;
     assert_eq!(response.status(), StatusCode::OK);
     let cache = cache_control(&response);
-    let s_maxage: i64 = cache
-        .rsplit("s-maxage=")
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let s_maxage: i64 = cache.rsplit("s-maxage=").next().unwrap().parse().unwrap();
     assert!(cache.starts_with("public, max-age=31536000, immutable, s-maxage="));
-    assert!((1..=media_policy::LEASE_SECS).contains(&s_maxage), "{cache}");
+    assert!(
+        (1..=media_policy::LEASE_SECS).contains(&s_maxage),
+        "{cache}"
+    );
     assert_eq!(body(response).await, page_bytes(1, 0));
 
     // Manifests, the chapter-id page route and the lease agree.
     assert_eq!(
-        get_path(&app, &format!("/media/v1/manifest/{a}")).await.status(),
+        get_path(&app, &format!("/media/v1/manifest/{a}"))
+            .await
+            .status(),
         StatusCode::NOT_FOUND
     );
     assert_eq!(
-        get_path(&app, &format!("/media/v1/manifest/{b}")).await.status(),
+        get_path(&app, &format!("/media/v1/manifest/{b}"))
+            .await
+            .status(),
         StatusCode::OK
     );
     assert_eq!(
         get_path(&app, "/media/v1/c/8/0").await.status(),
         StatusCode::NOT_FOUND
     );
-    assert_eq!(get_path(&app, "/media/v1/c/9/0").await.status(), StatusCode::OK);
+    assert_eq!(
+        get_path(&app, "/media/v1/c/9/0").await.status(),
+        StatusCode::OK
+    );
     let (_, body) = lease(&app).await;
     assert_eq!(body.denied_copies, vec![a.clone()]);
     assert!(body.denied_works.is_empty());
@@ -405,7 +437,9 @@ async fn shared_bytes_denying_copy_a_never_refuses_copy_b() {
     assert!(media_policy::lift(&pool, Kind::Copy, &a).await.unwrap());
     app.policy.invalidate();
     assert_eq!(
-        get_path(&app, &format!("/media/v1/o/{a}/{shared}")).await.status(),
+        get_path(&app, &format!("/media/v1/o/{a}/{shared}"))
+            .await
+            .status(),
         StatusCode::OK
     );
 }
@@ -415,7 +449,14 @@ async fn lease_is_signed_memoized_per_epoch_and_verifiable_by_a_cache() {
     let pool = pool().await;
     let dir = TempDir::new();
     let engine = Engine::spawn().await;
-    let app = app(pool.clone(), &engine, &dir.0.join("signing.key")).await;
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
+    let app = app(
+        pool.clone(),
+        &engine,
+        &dir.0.join("signing.key"),
+        &cover_dir,
+    )
+    .await;
     let (a, _) = two_copies(&pool).await;
 
     let (first, lease_1) = lease(&app).await;
@@ -423,7 +464,10 @@ async fn lease_is_signed_memoized_per_epoch_and_verifiable_by_a_cache() {
     assert_eq!(first, again, "one lease per epoch and minute");
     assert_eq!(lease_1.v, 1);
     assert_eq!(lease_1.epoch, 0);
-    assert_eq!(lease_1.expires_at - lease_1.issued_at, media_policy::LEASE_SECS);
+    assert_eq!(
+        lease_1.expires_at - lease_1.issued_at,
+        media_policy::LEASE_SECS
+    );
     assert_eq!(lease_1.issued_at % 60, 0);
     assert_eq!(
         lease_1.kid,
@@ -462,7 +506,10 @@ async fn lease_is_signed_memoized_per_epoch_and_verifiable_by_a_cache() {
     let entry = signer.public_entry();
     assert_ne!(entry.kid, key_id(&[0; 32]));
     assert_eq!(
-        verify_lease(&second, &PinnedKeys::new([(entry.kid, entry.public_key)]).unwrap()),
+        verify_lease(
+            &second,
+            &PinnedKeys::new([(entry.kid, entry.public_key)]).unwrap()
+        ),
         Err(crate::media_verify::VerifyError::UnknownKey)
     );
 }
@@ -471,8 +518,9 @@ async fn lease_is_signed_memoized_per_epoch_and_verifiable_by_a_cache() {
 async fn lease_route_is_absent_with_exact_media_off() {
     let pool = pool().await;
     let engine = Engine::spawn().await;
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
     let dir = TempDir::new();
-    let mut app = Arc::try_unwrap(app(pool, &engine, &dir.0.join("signing.key")).await)
+    let mut app = Arc::try_unwrap(app(pool, &engine, &dir.0.join("signing.key"), &cover_dir).await)
         .unwrap_or_else(|_| unreachable!());
     app.media_manifests = None;
     let app = Arc::new(app);
@@ -560,7 +608,14 @@ async fn a_copy_published_after_a_work_takedown_is_denied_for_good() {
     let pool = pool().await;
     let dir = TempDir::new();
     let engine = Engine::spawn().await;
-    let app = app(pool.clone(), &engine, &dir.0.join("signing.key")).await;
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
+    let app = app(
+        pool.clone(),
+        &engine,
+        &dir.0.join("signing.key"),
+        &cover_dir,
+    )
+    .await;
     let (work, _) = two_works(&pool).await;
     copies_of(&pool, &[500]).await;
     let generation = engine_keys::adopt(&pool).await.unwrap();
@@ -594,7 +649,9 @@ async fn a_copy_published_after_a_work_takedown_is_denied_for_good() {
 
     // An unchanged pass preserves the row without moving the epoch again.
     assert_eq!(
-        store::publish(&pool, Some(generation), &identity, &pages).await.unwrap(),
+        store::publish(&pool, Some(generation), &identity, &pages)
+            .await
+            .unwrap(),
         (copy.clone(), None)
     );
     assert_eq!(epoch(&pool).await, row.epoch);
@@ -612,29 +669,53 @@ async fn the_cover_warmer_skips_a_taken_down_work() {
     let pool = pool().await;
     let dir = TempDir::new();
     let engine = Engine::spawn().await;
-    let app = app(pool.clone(), &engine, &dir.0.join("signing.key")).await;
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
+    let app = app(
+        pool.clone(),
+        &engine,
+        &dir.0.join("signing.key"),
+        &cover_dir,
+    )
+    .await;
     let (work, _) = two_works(&pool).await;
-    sqlx::query("UPDATE suwayomi_series SET thumbnail_url = '/api/v1/manga/500/thumbnail' WHERE id = 500")
-        .execute(&pool).await.unwrap();
+    sqlx::query(
+        "UPDATE suwayomi_series SET thumbnail_url = '/api/v1/manga/500/thumbnail' WHERE id = 500",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     assert_eq!(
-        cover::pending_suwayomi_cover_count(&pool, &app.cover_pool).await.unwrap(),
+        cover::pending_suwayomi_cover_count(&pool, &app.cover_pool)
+            .await
+            .unwrap(),
         1
     );
     let webp = cover::process_cover(&image(50)).unwrap();
-    assert!(cover::publish_suwayomi_cover_if_missing(&pool, &app.cover_pool, 500, &webp)
-        .await
-        .unwrap());
+    assert!(
+        cover::publish_suwayomi_cover_if_missing(&pool, &app.cover_pool, 500, &webp)
+            .await
+            .unwrap()
+    );
 
     take_down(&app, Kind::Work, &work).await;
-    assert!(!cover::publish_suwayomi_cover_if_missing(&pool, &app.cover_pool, 500, &webp)
+    assert!(
+        !cover::publish_suwayomi_cover_if_missing(&pool, &app.cover_pool, 500, &webp)
+            .await
+            .unwrap()
+    );
+    cover::publish_suwayomi_cover(&pool, &app.cover_pool, 500, &webp)
         .await
-        .unwrap());
-    cover::publish_suwayomi_cover(&pool, &app.cover_pool, 500, &webp).await.unwrap();
-    let blobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM suwayomi_cover_blob WHERE manga_id = 500")
-        .fetch_one(&app.cover_pool).await.unwrap();
+        .unwrap();
+    let blobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM cover_object WHERE asset_key = 's:500'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(blobs, 0);
     assert_eq!(
-        cover::pending_suwayomi_cover_count(&pool, &app.cover_pool).await.unwrap(),
+        cover::pending_suwayomi_cover_count(&pool, &app.cover_pool)
+            .await
+            .unwrap(),
         0
     );
 }
@@ -644,12 +725,22 @@ async fn takedowns_survive_merge_and_split_and_cover_redirected_ids() {
     let pool = pool().await;
     let dir = TempDir::new();
     let engine = Engine::spawn().await;
-    let app = app(pool.clone(), &engine, &dir.0.join("signing.key")).await;
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
+    let app = app(
+        pool.clone(),
+        &engine,
+        &dir.0.join("signing.key"),
+        &cover_dir,
+    )
+    .await;
     let (a, b) = two_works(&pool).await;
     copies_of(&pool, &[500, 501, 502]).await;
 
     take_down(&app, Kind::Work, &a).await;
-    assert_eq!(copy_rows(&pool).await, vec![(copy_of(500), Some(a.clone()))]);
+    assert_eq!(
+        copy_rows(&pool).await,
+        vec![(copy_of(500), Some(a.clone()))]
+    );
     let before_merge = epoch(&pool).await;
     let snapshot = app.policy.current(&pool).await.unwrap();
     assert!(snapshot.denies_work(&a) && !snapshot.denies_work(&b));
@@ -664,7 +755,9 @@ async fn takedowns_survive_merge_and_split_and_cover_redirected_ids() {
     // Every copy the survivor now has is recorded under its takedown.
     assert_eq!(
         copy_rows(&pool).await,
-        [500, 501, 502].map(|m| (copy_of(m), Some(b.clone()))).to_vec()
+        [500, 501, 502]
+            .map(|m| (copy_of(m), Some(b.clone())))
+            .to_vec()
     );
     app.policy.invalidate();
     let snapshot = app.policy.current(&pool).await.unwrap();
@@ -682,7 +775,10 @@ async fn takedowns_survive_merge_and_split_and_cover_redirected_ids() {
             "{{ canonicalSeries(workId: \"{a}\", includeFederated: true) {{ id }} }}"
         ))
         .await;
-    assert_eq!(refused.errors[0].message, "No such work", "an old id opens nothing");
+    assert_eq!(
+        refused.errors[0].message, "No such work",
+        "an old id opens nothing"
+    );
     let refused = schema.execute("{ series(id: \"501\") { id } }").await;
     assert_eq!(refused.errors[0].message, "No such series");
     // Every list gate carries the takedown clause while a work is taken down.
@@ -696,7 +792,10 @@ async fn takedowns_survive_merge_and_split_and_cover_redirected_ids() {
     )
     .await
     .unwrap();
-    assert_eq!(blocked, [b.clone(), "501".to_string()].into_iter().collect());
+    assert_eq!(
+        blocked,
+        [b.clone(), "501".to_string()].into_iter().collect()
+    );
 
     // Split one source off B: the new work inherits the takedown.
     let source_502: String = sqlx::query_scalar(
@@ -742,24 +841,64 @@ async fn a_cover_warmed_before_a_merge_is_denied_once_the_survivor_is_taken_down
     let pool = pool().await;
     let dir = TempDir::new();
     let engine = Engine::spawn().await;
-    let app = app(pool.clone(), &engine, &dir.0.join("signing.key")).await;
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
+    let mut app = app(
+        pool.clone(),
+        &engine,
+        &dir.0.join("signing.key"),
+        &cover_dir,
+    )
+    .await;
+    Arc::get_mut(&mut app).unwrap().cover_pool =
+        crate::cover_store::test_support::store_with_legacy(
+            &cover_dir,
+            crate::cover_store::test_support::legacy_pool().await,
+            crate::cover_store::CopyCursor::default(),
+        );
     let (a, b) = two_works(&pool).await;
     let covers = app.cover_pool.clone();
-    // A's cover is in the cover file, as it was served before the merge.
+    // A's uploaded cover was served before the merge.
     let webp = cover::process_cover(&image(50)).unwrap();
-    cover::put_work_cover(&pool, &covers, &a, &webp).await.unwrap();
-    sqlx::query("INSERT INTO suwayomi_cover_blob (manga_id, webp, updated_at) VALUES (501, $1, '2026-01-01')")
-        .bind(&webp)
-        .execute(&covers)
+    assert!(cover::put_uploaded_work_cover(&pool, &covers, &a, &webp)
+        .await
+        .unwrap());
+    cover::put_suwayomi_cover(&pool, &covers, 501, &webp)
         .await
         .unwrap();
     crate::catalog::merge_works(&pool, &a, &b).await.unwrap();
-    cover::put_work_cover(&pool, &covers, &b, &webp).await.unwrap();
-    // The merge may leave A's blob behind (it is reclaimed best effort).
-    sqlx::query("INSERT OR IGNORE INTO work_cover_blob (work_id, webp, version, updated_at) VALUES ($1, $2, 1, '2026-01-01')")
-        .bind(&a)
+    // A merge without the legacy store can leave SQLite bytes under the redirected id.
+    let legacy = covers.legacy().unwrap();
+    sqlx::query(
+        "INSERT INTO work_cover_blob(work_id,webp,version,updated_at) VALUES($1,$2,1,'now')",
+    )
+    .bind(&a)
+    .bind(&webp)
+    .execute(legacy)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cover_variant(asset_key,width,webp,updated_at) VALUES($1,192,$2,'now')",
+    )
+    .bind(&a)
+    .bind(b"card".as_slice())
+    .execute(legacy)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO suwayomi_cover_blob(manga_id,webp,updated_at) VALUES(501,$1,'now')")
         .bind(&webp)
-        .execute(&covers)
+        .execute(legacy)
+        .await
+        .unwrap();
+    assert!(cover::put_uploaded_work_cover(&pool, &covers, &b, &webp)
+        .await
+        .unwrap());
+    let master = covers
+        .read_master(&pool, &b, None)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    cover::put_current_variant(&pool, &covers, &b, 192, &master, b"card")
         .await
         .unwrap();
 
@@ -787,14 +926,19 @@ async fn a_cover_warmed_before_a_merge_is_denied_once_the_survivor_is_taken_down
     let thumbnail = serve_suwayomi_cover(&app, &covers, 501, None).await;
     assert_eq!(thumbnail.status(), StatusCode::NOT_FOUND);
 
-    // The owner keeps no bytes: the blobs are gone, and the pointer is cleared.
-    let blobs: i64 = sqlx::query_scalar(
-        "SELECT (SELECT COUNT(*) FROM work_cover_blob) + (SELECT COUNT(*) FROM suwayomi_cover_blob)",
+    // The owner keeps no indexed covers or uploads under either work id.
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM cover_object), (SELECT COUNT(*) FROM cover_upload)",
     )
-    .fetch_one(&covers)
+    .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(blobs, 0);
+    assert_eq!(counts, (0, 0));
+    let legacy_rows: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM work_cover_blob) + (SELECT COUNT(*) FROM suwayomi_cover_blob) \
+         + (SELECT COUNT(*) FROM cover_variant)",
+    ).fetch_one(legacy).await.unwrap();
+    assert_eq!(legacy_rows, 0);
     let pointer: Option<i64> =
         sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id = $1")
             .bind(&b)
@@ -812,4 +956,80 @@ async fn a_cover_warmed_before_a_merge_is_denied_once_the_survivor_is_taken_down
         gate.work(&a, now),
         Err(crate::media_verify::VerifyError::Denied)
     );
+}
+
+#[tokio::test]
+async fn merge_reclaims_losing_cover_index_and_upload() {
+    for copying in [false, true] {
+        let pool = pool().await;
+        let dir = crate::cover_store::test_support::TestDir::new();
+        let covers = if copying {
+            crate::cover_store::test_support::store_with_legacy(
+                &dir,
+                crate::cover_store::test_support::legacy_pool().await,
+                crate::cover_store::CopyCursor::default(),
+            )
+        } else {
+            crate::cover_store::test_support::store(&dir)
+        };
+        let (a, b) = two_works(&pool).await;
+        for work in [&a, &b] {
+            assert!(
+                cover::put_uploaded_work_cover(&pool, &covers, work, work.as_bytes())
+                    .await
+                    .unwrap()
+            );
+            let master = covers
+                .read_master(&pool, work, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .0;
+            cover::put_current_variant(&pool, &covers, work, 192, &master, b"card")
+                .await
+                .unwrap();
+            if let Some(legacy) = covers.legacy() {
+                sqlx::query("INSERT INTO work_cover_blob(work_id,webp,version,updated_at) VALUES($1,$2,1,'now')")
+                    .bind(work).bind(work.as_bytes()).execute(legacy).await.unwrap();
+                sqlx::query("INSERT INTO cover_variant(asset_key,width,webp,updated_at) VALUES($1,192,$2,'now')")
+                    .bind(work).bind(b"card".as_slice()).execute(legacy).await.unwrap();
+            }
+        }
+        crate::catalog::merge_works_ex(&pool, Some(&covers), &a, &b)
+            .await
+            .unwrap();
+        for (work, expected) in [(&a, (0_i64, 0_i64)), (&b, (2, 1))] {
+            let counts: (i64, i64) = sqlx::query_as(
+                "SELECT (SELECT COUNT(*) FROM cover_object WHERE work_id = $1), \
+                 (SELECT COUNT(*) FROM cover_upload WHERE work_id = $1)",
+            )
+            .bind(work)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(counts, expected, "{work}");
+            if let Some(legacy) = covers.legacy() {
+                let counts: (i64, i64) = sqlx::query_as(
+                    "SELECT (SELECT COUNT(*) FROM work_cover_blob WHERE work_id = $1), \
+                     (SELECT COUNT(*) FROM cover_variant WHERE asset_key = $1)",
+                )
+                .bind(work)
+                .fetch_one(legacy)
+                .await
+                .unwrap();
+                let remaining = i64::from(work == &b);
+                assert_eq!(counts, (remaining, remaining), "{work}");
+            }
+        }
+        assert_eq!(
+            covers
+                .read_master(&pool, &b, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .bytes,
+            b.as_bytes()
+        );
+    }
 }

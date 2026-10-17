@@ -2626,7 +2626,7 @@ enum PassResult {
 /// One bounded backfill pass, under the catalogue single-flight lock.
 async fn run_backfill_pass(
     pool: &crate::db::Database,
-    covers: &crate::database::SqliteDatabase,
+    covers: &crate::cover_store::CoverStore,
     client: &MangaDexClient,
     cover_phash: bool,
 ) -> PassResult {
@@ -2760,7 +2760,7 @@ async fn run_backfill_pass(
 /// checkpointed per page, so the next boot resumes within one page).
 pub fn spawn_backfill_if_needed(
     pool: crate::db::Database,
-    covers: crate::database::SqliteDatabase,
+    covers: crate::cover_store::CoverStore,
     client: Arc<MangaDexClient>,
     cover_phash: bool,
     mut shutdown: tokio::sync::watch::Receiver<bool>,

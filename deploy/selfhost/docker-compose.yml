@@ -36,6 +36,7 @@ services:
     environment:
       DATABASE_URL: postgres://komiq:${KOMIQ_DB_PASSWORD:?Run install.sh to generate KOMIQ_DB_PASSWORD in .env}@postgres:5432/komiq
       COVERS_DATABASE_URL: sqlite:///data/covers.sqlite3
+      KOMIKA_COVERS_DIR: /data/covers
       TZ: ${TZ:-UTC}
       # The port published below: the server names it in the addresses it suggests.
       # Inside the container it always listens on 8080.

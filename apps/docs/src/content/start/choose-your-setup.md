@@ -21,7 +21,7 @@ When you launch the admin app, it starts these components automatically. It retr
 
 Application data stays in your operating system's user application folder:
 
-- PostgreSQL holds server data and user accounts. Cover images live in the separate `server/covers.sqlite3` cache.
+- PostgreSQL holds server data and user accounts. Cover images are cached as files in `server/covers/`, with their index and new uploads kept in PostgreSQL.
 - Source engine files and installed extensions live in `suwayomi/`.
 
 ### For this computer

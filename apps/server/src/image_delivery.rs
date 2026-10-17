@@ -13,7 +13,29 @@ use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit};
 use crate::telemetry::{BodyCheck, BodySource, MEDIA};
 
 pub(crate) const MUTABLE_CACHE: &str = "public, max-age=300, must-revalidate";
+/// Current cover and avatar versions. Browsers keep them for a year; a shared cache
+/// keeps them no longer than a media policy lease, so a takedown reaches the edge
+/// within one lease. The `s-maxage` below must equal `media_policy::LEASE_SECS`.
 pub(crate) const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable, s-maxage=600";
+
+/// The trailing `s-maxage=<n>` of a cache header, at compile time.
+const fn trailing_s_maxage(header: &str) -> i64 {
+    let bytes = header.as_bytes();
+    let mut end = bytes.len();
+    let mut value = 0;
+    let mut scale = 1;
+    while end > 0 && bytes[end - 1].is_ascii_digit() {
+        value += (bytes[end - 1] - b'0') as i64 * scale;
+        scale *= 10;
+        end -= 1;
+    }
+    value
+}
+
+const _: () = assert!(
+    trailing_s_maxage(IMMUTABLE_CACHE) == crate::media_policy::LEASE_SECS,
+    "IMMUTABLE_CACHE s-maxage must follow media_policy::LEASE_SECS"
+);
 
 struct ImageOwner {
     bytes: Vec<u8>,

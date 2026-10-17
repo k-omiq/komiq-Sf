@@ -4,7 +4,12 @@ use std::sync::{
     Arc,
 };
 
-async fn fixture() -> (AppState, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+async fn fixture() -> (
+    AppState,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+    crate::cover_store::test_support::TestDir,
+) {
     let pool = crate::database::TestPoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -39,11 +44,10 @@ async fn fixture() -> (AppState, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) 
     let server = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
     let state = AppState {
         pool: pool.clone(),
-        cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
-            .await
-            .unwrap(),
+        cover_pool: crate::cover_store::test_support::store(&cover_dir),
         suwayomi: SuwayomiClient::new(format!("http://{addr}"), None, None),
         mangadex: Arc::new(crate::mangadex::MangaDexClient::new("test", 5.0, 40.0)),
         admin_users: vec![],
@@ -63,12 +67,12 @@ async fn fixture() -> (AppState, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) 
         policy: Default::default(),
         setup_code: crate::instance::SetupCode::default(),
     };
-    (state, requests, server)
+    (state, requests, server, cover_dir)
 }
 
 #[tokio::test]
 async fn stale_metadata_and_chapters_return_before_refresh_and_do_not_stampede() {
-    let (state, requests, server) = fixture().await;
+    let (state, requests, server, _cover_dir) = fixture().await;
     let state = Arc::new(state);
     let id = 88001;
     sqlx::query("INSERT INTO suwayomi_series (id, title, status, source_id, updated_at, series_fetched_at) VALUES ($1, 'Cached', 'ONGOING', 'src', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')")
@@ -160,7 +164,7 @@ async fn stale_metadata_and_chapters_return_before_refresh_and_do_not_stampede()
 
 #[tokio::test]
 async fn failed_refresh_retains_stale_data_and_true_misses_still_error() {
-    let (mut state, _, server) = fixture().await;
+    let (mut state, _, server, _cover_dir) = fixture().await;
     server.abort();
     state.suwayomi = SuwayomiClient::new("http://127.0.0.1:1".into(), None, None);
     sqlx::query("INSERT INTO suwayomi_series (id, title, status, source_id, updated_at) VALUES (88003, 'Cached', 'ONGOING', 'src', '2020-01-01T00:00:00Z')")
@@ -187,7 +191,7 @@ async fn failed_refresh_retains_stale_data_and_true_misses_still_error() {
 
 #[tokio::test]
 async fn cold_cache_misses_still_fetch_and_persist_data() {
-    let (state, requests, server) = fixture().await;
+    let (state, requests, server, _cover_dir) = fixture().await;
     assert_eq!(
         resolve_series_cached(&state, 88002).await.unwrap().title,
         "Refreshed"
@@ -206,7 +210,7 @@ async fn cold_cache_misses_still_fetch_and_persist_data() {
 
 #[tokio::test]
 async fn cold_cache_reads_return_while_the_writer_is_held() {
-    let (state, _, server) = fixture().await;
+    let (state, _, server, _cover_dir) = fixture().await;
     let writer = state.pool.begin().await.unwrap();
     let manga = tokio::time::timeout(Duration::from_secs(2), resolve_series_cached(&state, 88005))
         .await

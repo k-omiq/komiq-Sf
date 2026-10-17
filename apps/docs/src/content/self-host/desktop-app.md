@@ -17,11 +17,13 @@ The desktop admin app uses Tauri, a framework for native apps, to package these 
 
 The app starts and stops its database, server and engine with your session. Keep it open while other devices use your server.
 
-Your data stays in the application data folder under `app.komika.desktop`. PostgreSQL holds accounts, settings and library history in `server/postgres/18/data`. Its passwords are in `server/postgres/18/credentials`: without that file PostgreSQL cannot open its data, and the app never makes new passwords for an existing database. Covers stay in a separate SQLite cache, `server/covers.sqlite3`. `suwayomi/` holds installed extensions and engine data.
+Your data stays in the application data folder under `app.komika.desktop`. PostgreSQL holds accounts, settings and library history in `server/postgres/18/data`. Its passwords are in `server/postgres/18/credentials`: without that file PostgreSQL cannot open its data, and the app never makes new passwords for an existing database. Cover images and extension icons are cached as files in `server/covers/`. PostgreSQL holds their index and covers uploaded since this update. `suwayomi/` holds installed extensions and engine data.
 
 For an old installation with `server/komika.sqlite3`, follow [Old SQLite install](/self-host/update-and-backup#old-sqlite-install) to start fresh. This version cannot read or convert that file.
 
-The app saves a PostgreSQL dump, a consistent database export without the cover cache, when none exists or the newest is at least 20 hours old. Dumps are `server/backups/komika-<UTC time>-<random>.dump`; the seven newest stay. The app has no restore button, and this guide has no restore steps for it yet. Keep dump copies elsewhere too.
+The app saves a PostgreSQL dump, a consistent database export including the cover index and uploads since this update, when none exists or the newest is at least 20 hours old. Cover files are not backed up: missing files refill from sources, and uploads return from PostgreSQL. Dumps are `server/backups/komika-<UTC time>-<random>.dump`; the seven newest stay. The app has no restore button, and this guide has no restore steps for it yet. Keep dump copies elsewhere too.
+
+The old `server/covers.sqlite3` cache copies into files in the background. Earlier uploads are copied, but are not in database dumps. Read [Update and back up](/self-host/update-and-backup) for disk space and when you can delete the old cache.
 
 To build from source, read [Desktop](/developers/desktop).
 

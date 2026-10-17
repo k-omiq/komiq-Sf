@@ -34,21 +34,27 @@ If PostgreSQL already holds data, the server logs a warning that the old file is
 
 An earlier release could convert that file into PostgreSQL. If such a conversion stopped before it finished, the server refuses to start, because the database holds only part of the data. Restore a PostgreSQL backup, or empty the database to start fresh.
 
+### Copying the old cover cache
+
+The server copies `covers.sqlite3` into cover files once, in the background. The copy resumes after a restart. Covers not yet copied still load from the old cache. Plan free disk space for about twice the cache size while both exist.
+
+The log line `cover copy finished` means the server no longer opens `covers.sqlite3`. The file stays on disk. You can delete it then to free space. Covers uploaded before this update are copied too, but are not in database backups: the old cache did not record which covers were uploads.
+
 ## Where data lives
 
 Docker named volumes are storage directories outside container images:
 
-| Volume                | Contents                                                                 |
-| --------------------- | ------------------------------------------------------------------------ |
-| `komiq_postgres-data` | Accounts, libraries, reading progress, comments, catalogue and settings. |
-| `komiq_server-data`   | SQLite cover cache and connector files.                                  |
-| `komiq_engine-data`   | Installed extensions and the source engine's own data.                   |
+| Volume                | Contents                                                                                               |
+| --------------------- | ------------------------------------------------------------------------------------------------------ |
+| `komiq_postgres-data` | Accounts, libraries, reading progress, comments, catalogue, settings, cover index and uploaded covers. |
+| `komiq_server-data`   | Cover files in `/data/covers`, the old SQLite cover cache and connector files.                         |
+| `komiq_engine-data`   | Installed extensions and the source engine's own data.                                                 |
 
 Names use your Compose project prefix if you changed it. Keep `.env` securely too: it holds the database password. Changing that password in `.env` does not change the password inside an existing PostgreSQL cluster.
 
 ## Dump the database
 
-A dump is a consistent database export. The included `backup.sh` makes one with `pg_dump` while komiq runs: a custom-format file named `komiq-<UTC time>.dump` in the private `$HOME/komiq-backups` directory, or in the directory you pass as its first argument. It publishes a dump only after success, keeps the newest seven, and leaves earlier dumps in place when a dump fails or is empty. A dump excludes the refetchable `covers.sqlite3` cache and the source engine's data.
+A dump is a consistent database export. The included `backup.sh` makes one with `pg_dump` while komiq runs: a custom-format file named `komiq-<UTC time>.dump` in the private `$HOME/komiq-backups` directory, or in the directory you pass as its first argument. It publishes a dump only after success, keeps the newest seven, and leaves earlier dumps in place when a dump fails or is empty. It includes the cover index and covers uploaded since this update. Cover files are a cache and are not backed up. The dump also excludes the source engine's data.
 
 Run `bash deploy/selfhost/backup.sh` from the repository root once, then add this line to the host user's crontab with `crontab -e`. Replace the example repository path with yours:
 
@@ -73,7 +79,7 @@ docker compose exec -T postgres sh -c \
   < "$DUMP"
 ```
 
-Restore before starting the server so its migrations do not create conflicting tables. Check the restore exit status. Restore the engine volume archive using the next section, then start the rest with `docker compose up -d` and inspect your library.
+Restore before starting the server so its migrations do not create conflicting tables. Check the restore exit status. Restore the engine volume archive using the next section, then start the rest with `docker compose up -d` and inspect your library. Missing cover files refill from their sources on request, or through the background cover crawl and warmer after garbage collection notices them. Uploaded covers return from PostgreSQL, except uploads from before this update.
 
 ### Server and engine files
 
@@ -83,14 +89,14 @@ Stop the stack before archiving its non-database volumes:
 umask 077
 mkdir -p "$HOME/komiq-backups"
 docker compose stop
-for v in server engine; do
-  docker run --rm -v "komiq_$v-data":/data -v "$HOME/komiq-backups":/backup busybox \
-    tar czf "/backup/komiq-$v-data.tgz" -C /data .
-done
+docker run --rm -v komiq_server-data:/data -v "$HOME/komiq-backups":/backup busybox \
+  tar czf /backup/komiq-server-data.tgz --exclude='./covers' --exclude='./covers.sqlite3*' -C /data .
+docker run --rm -v komiq_engine-data:/data -v "$HOME/komiq-backups":/backup busybox \
+  tar czf /backup/komiq-engine-data.tgz -C /data .
 docker compose start
 ```
 
-On a fresh restore, create these volumes with `docker compose create` and extract each archive with a temporary container. Set server file ownership to user ID `10001` and engine file ownership to `1000` before starting. The cover cache can be omitted and fetched again. Never treat a copied live PostgreSQL data directory as a database dump.
+On a fresh restore, create these volumes with `docker compose create` and extract each archive with a temporary container. Set server file ownership to user ID `10001` and engine file ownership to `1000` before starting. The server archive excludes cover files and the old cover cache. Never treat a copied live PostgreSQL data directory as a database dump.
 
 ### If the engine was replaced
 

@@ -16,7 +16,7 @@ pub mod similarity;
 pub mod spine;
 pub mod work_chapter;
 
-use crate::database::SqliteDatabase;
+use crate::cover_store::CoverStore;
 use crate::db::Database;
 use anyhow::Result;
 use chrono::Utc;
@@ -3825,13 +3825,11 @@ async fn replace_mangadex_details(
             }
         }
     }
-    sqlx::query(
-        "DELETE FROM work_tracker_link WHERE work_id = $1 AND NOT (provider = ANY($2))",
-    )
-    .bind(work_id)
-    .bind(&providers)
-    .execute(&mut **tx)
-    .await?;
+    sqlx::query("DELETE FROM work_tracker_link WHERE work_id = $1 AND NOT (provider = ANY($2))")
+        .bind(work_id)
+        .bind(&providers)
+        .execute(&mut **tx)
+        .await?;
     if !providers.is_empty() {
         sqlx::query(
             "INSERT INTO work_tracker_link (work_id, provider, external_id) \
@@ -3847,10 +3845,10 @@ async fn replace_mangadex_details(
         .await?;
     }
     sqlx::query("UPDATE work SET mangadex_details_synced_at = $1 WHERE id = $2")
-    .bind(Utc::now())
-    .bind(work_id)
-    .execute(&mut **tx)
-    .await?;
+        .bind(Utc::now())
+        .bind(work_id)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -4810,13 +4808,8 @@ pub struct MergeOutcome {
 /// mapping the target already has is dropped rather than duplicated. Returns how many
 /// `source_series` rows moved. Errors if either work is missing or they're equal.
 ///
-/// LEAKS COVER BLOBS — prefer [`merge_works_ex`]. The cover blobs of the losing work
-/// live in a SEPARATE database (see `db::init_covers`) that cannot join this
-/// transaction, and this entry point passes no covers pool, so they are orphaned (a
-/// live audit found 8,868 orphans / 1.53 GB accumulated exactly this way). Every
-/// production call site now goes through `merge_works_ex` with `Some(&st.cover_pool)`;
-/// this shim survives only for the tests that don't have a covers pool, and for
-/// out-of-tree callers that haven't been converted yet.
+/// Pass a cover store to [`merge_works_ex`] to also reclaim any SQLite cache rows
+/// while the copy is running. Indexed covers and uploads cascade with the losing work.
 #[allow(dead_code)] // no non-test caller left; kept as the covers-pool-free entry point
 pub async fn merge_works(
     pool: &Database,
@@ -4826,19 +4819,11 @@ pub async fn merge_works(
     merge_works_ex(pool, None, source_work, target_work).await
 }
 
-/// As [`merge_works`], but also reclaims the losing work's cached cover blob from the
-/// un-replicated covers pool when one is supplied.
-///
-/// The blob table (`work_cover_blob`, keyed by `work_id`) is in a different database
-/// with no FK to `work`, so nothing ever deleted the loser's row: a live audit found
-/// 8,868 orphaned blobs totalling 1.53 GB accumulated from past merges and purges. The
-/// delete runs AFTER the main transaction commits — a cross-DB transaction is
-/// impossible, and this is the safe order (mirrors `cover::put_work_cover`): a crash in
-/// between leaks one blob, exactly the harmless, re-derivable state we already tolerate,
-/// whereas deleting first could strip a live cover if the merge then rolled back.
+/// As [`merge_works`], but also reclaims the losing work's legacy SQLite cover rows
+/// after the merge commits. Index rows and uploads are deleted by the work FK cascade.
 pub async fn merge_works_ex(
     pool: &Database,
-    covers: Option<&SqliteDatabase>,
+    covers: Option<&CoverStore>,
     source_work: &str,
     target_work: &str,
 ) -> Result<MergeOutcome> {
@@ -4896,7 +4881,7 @@ pub struct WorkIdentity {
 /// to the captured work, inside the transaction that claims and merges it.
 pub async fn merge_works_checked(
     pool: &Database,
-    covers: Option<&SqliteDatabase>,
+    covers: Option<&CoverStore>,
     source_work: &str,
     target_work: &str,
     expected: Option<(&WorkIdentity, &WorkIdentity)>,
@@ -4909,7 +4894,7 @@ pub async fn merge_works_checked(
 #[cfg(test)]
 pub async fn merge_pending_candidate(
     pool: &Database,
-    covers: Option<&SqliteDatabase>,
+    covers: Option<&CoverStore>,
     source_work: &str,
     target_work: &str,
     candidate_id: &str,
@@ -4930,7 +4915,7 @@ pub async fn merge_pending_candidate(
 #[cfg(test)]
 pub async fn merge_pending_candidate_checked(
     pool: &Database,
-    covers: Option<&SqliteDatabase>,
+    covers: Option<&CoverStore>,
     source_work: &str,
     target_work: &str,
     expected: (&WorkIdentity, &WorkIdentity),
@@ -5080,7 +5065,7 @@ pub(crate) async fn lock_merge_inputs(
 
 async fn merge_works_guarded(
     pool: &Database,
-    covers: Option<&SqliteDatabase>,
+    covers: Option<&CoverStore>,
     source_work: &str,
     target_work: &str,
     expected: Option<(&WorkIdentity, &WorkIdentity)>,
@@ -5649,18 +5634,22 @@ pub async fn redirect_work_id(pool: &Database, old_id: &str) -> Result<Option<St
     Ok(new_id)
 }
 
-/// Drop a dead work's cached cover blob from the un-replicated covers pool.
-///
-/// `work_cover_blob` lives in a different database from `work` (see `db::init_covers`)
-/// and carries no FK, so a deleted work's blob is invisible to every cascade in the
-/// main DB and simply accumulates — a live audit measured 8,868 orphans / 1.53 GB of a
-/// 20.4 GB store. Blobs are re-derivable from MangaDex, so a failure here is logged by
-/// the caller rather than being allowed to fail a merge that already committed.
-pub async fn reclaim_cover_blob(covers: &SqliteDatabase, work_id: &str) -> Result<()> {
-    sqlx::query("DELETE FROM work_cover_blob WHERE work_id = $1")
-        .bind(work_id)
-        .execute(covers)
-        .await?;
+/// Reclaim a dead work's legacy SQLite master and derivatives while the copy runs.
+/// The index rows and upload already went with the work's FK cascade. Callers log
+/// failures because the merge has committed and reads reject the retired work.
+pub async fn reclaim_cover_blob(covers: &CoverStore, work_id: &str) -> Result<()> {
+    if let Some(legacy) = covers.legacy() {
+        let mut tx = legacy.begin().await?;
+        sqlx::query("DELETE FROM work_cover_blob WHERE work_id = $1")
+            .bind(work_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM cover_variant WHERE asset_key = $1")
+            .bind(work_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+    }
     Ok(())
 }
 
@@ -10251,16 +10240,40 @@ mod tests {
             author: Some("Fuse".into()),
             status: Some("ongoing".into()),
             descriptions: vec![
-                ("en".into(), "Mikami Satoru is reincarnated as a slime.".into()),
+                (
+                    "en".into(),
+                    "Mikami Satoru is reincarnated as a slime.".into(),
+                ),
                 ("fr".into(), "Satoru Mikami se réincarne en slime.".into()),
             ],
-            tags: vec!["Isekai".into(), "Fantasy".into(), " Isekai ".into(), "".into()],
-            tag_details: vec![
-                SourceTag { id: Some("t-isekai-old".into()), name: "Isekai".into(), group: "theme".into() },
-                SourceTag { id: Some("t-fantasy".into()), name: "Fantasy".into(), group: "genre".into() },
-                SourceTag { id: Some("t-isekai".into()), name: "Isekai".into(), group: "theme".into() },
+            tags: vec![
+                "Isekai".into(),
+                "Fantasy".into(),
+                " Isekai ".into(),
+                "".into(),
             ],
-            external_ids: vec![("al".into(), "101517".into()), ("mal".into(), "1".into()), ("al".into(), "86399".into())],
+            tag_details: vec![
+                SourceTag {
+                    id: Some("t-isekai-old".into()),
+                    name: "Isekai".into(),
+                    group: "theme".into(),
+                },
+                SourceTag {
+                    id: Some("t-fantasy".into()),
+                    name: "Fantasy".into(),
+                    group: "genre".into(),
+                },
+                SourceTag {
+                    id: Some("t-isekai".into()),
+                    name: "Isekai".into(),
+                    group: "theme".into(),
+                },
+            ],
+            external_ids: vec![
+                ("al".into(), "101517".into()),
+                ("mal".into(), "1".into()),
+                ("al".into(), "86399".into()),
+            ],
             ..slime_input()
         }
     }
@@ -10272,7 +10285,9 @@ mod tests {
     async fn an_unchanged_mangadex_resync_writes_no_row_versions() {
         let pool = pool().await;
         let input = rich_slime_input();
-        let id = upsert_work_from_mangadex(&pool, "md-slime", &input).await.unwrap();
+        let id = upsert_work_from_mangadex(&pool, "md-slime", &input)
+            .await
+            .unwrap();
         let mut conn = pool.write().acquire().await.unwrap();
         pin_work_field(&mut conn, &id, PinnedField::Author, Some("Pinned Author"))
             .await
@@ -10295,8 +10310,20 @@ mod tests {
         assert_eq!(
             tags,
             [
-                ("Isekai".into(), 0, Some(crate::tags::slug("Isekai")), Some("t-isekai".into()), Some("theme".into())),
-                ("Fantasy".into(), 1, Some(crate::tags::slug("Fantasy")), Some("t-fantasy".into()), Some("genre".into())),
+                (
+                    "Isekai".into(),
+                    0,
+                    Some(crate::tags::slug("Isekai")),
+                    Some("t-isekai".into()),
+                    Some("theme".into())
+                ),
+                (
+                    "Fantasy".into(),
+                    1,
+                    Some(crate::tags::slug("Fantasy")),
+                    Some("t-fantasy".into()),
+                    Some("genre".into())
+                ),
             ]
         );
         let trackers = crate::db_types::query_tuple::<(String, String)>(
@@ -10306,7 +10333,10 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(trackers, [("al".into(), "86399".into()), ("mal".into(), "1".into())]);
+        assert_eq!(
+            trackers,
+            [("al".into(), "86399".into()), ("mal".into(), "1".into())]
+        );
 
         let before = metadata_row_versions(&pool, &id).await;
         let stamps = || async {
@@ -10321,9 +10351,15 @@ mod tests {
         };
         let stamped = stamps().await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        upsert_work_from_mangadex(&pool, "md-slime", &input).await.unwrap();
+        upsert_work_from_mangadex(&pool, "md-slime", &input)
+            .await
+            .unwrap();
         refresh_mangadex_details(&pool, &id, &input).await.unwrap();
-        assert_eq!(metadata_row_versions(&pool, &id).await, before, "nothing new, nothing written");
+        assert_eq!(
+            metadata_row_versions(&pool, &id).await,
+            before,
+            "nothing new, nothing written"
+        );
         let restamped = stamps().await;
         assert!(
             restamped.0 > stamped.0 && restamped.1 > stamped.1 && restamped.2 > stamped.2,
@@ -10341,7 +10377,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        upsert_work_from_mangadex(&pool, "md-slime", &input).await.unwrap();
+        upsert_work_from_mangadex(&pool, "md-slime", &input)
+            .await
+            .unwrap();
         let (author, source): (Option<String>, Option<String>) = crate::db_types::query_tuple(
             "SELECT w.author, p.source_value FROM work w \
              JOIN work_field_pin p ON p.work_id = w.id AND p.field = 'author' WHERE w.id = $1",
@@ -10354,11 +10392,13 @@ mod tests {
             (author.as_deref(), source.as_deref()),
             (Some("Pinned Author 2"), Some("Fuse"))
         );
-        sqlx::query("DELETE FROM work_field_pin WHERE work_id = $1 AND field IN ('year', 'status')")
-            .bind(&id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "DELETE FROM work_field_pin WHERE work_id = $1 AND field IN ('year', 'status')",
+        )
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
         let mut conn = pool.write().acquire().await.unwrap();
         pin_work_field(&mut conn, &id, PinnedField::Author, Some("Pinned Author"))
             .await
@@ -10366,8 +10406,13 @@ mod tests {
         drop(conn);
 
         // A changed status rewrites the work; the pin holds and keeps the source value.
-        let changed = WorkInput { status: Some("completed".into()), ..input.clone() };
-        upsert_work_from_mangadex(&pool, "md-slime", &changed).await.unwrap();
+        let changed = WorkInput {
+            status: Some("completed".into()),
+            ..input.clone()
+        };
+        upsert_work_from_mangadex(&pool, "md-slime", &changed)
+            .await
+            .unwrap();
         let (status, author, source): (Option<String>, Option<String>, Option<String>) =
             crate::db_types::query_tuple(
                 "SELECT w.status, w.author, p.source_value FROM work w \
@@ -10382,8 +10427,13 @@ mod tests {
             (Some("completed"), Some("Pinned Author"), Some("Fuse"))
         );
         // A new source value for the pinned field alone is recorded under the pin.
-        let renamed = WorkInput { author: Some("Fuse (new)".into()), ..changed.clone() };
-        upsert_work_from_mangadex(&pool, "md-slime", &renamed).await.unwrap();
+        let renamed = WorkInput {
+            author: Some("Fuse (new)".into()),
+            ..changed.clone()
+        };
+        upsert_work_from_mangadex(&pool, "md-slime", &renamed)
+            .await
+            .unwrap();
         let source: Option<String> = crate::db_types::query_scalar(
             "SELECT source_value FROM work_field_pin WHERE work_id = $1 AND field = 'author'",
         )
@@ -10397,15 +10447,29 @@ mod tests {
         let before = metadata_row_versions(&pool, &id).await;
         let retagged = WorkInput {
             tags: vec!["Fantasy".into(), "Comedy".into()],
-            tag_details: vec![SourceTag { id: Some("t-fantasy".into()), name: "Fantasy".into(), group: "genre".into() }],
+            tag_details: vec![SourceTag {
+                id: Some("t-fantasy".into()),
+                name: "Fantasy".into(),
+                group: "genre".into(),
+            }],
             external_ids: vec![("al".into(), "86399".into())],
             ..renamed.clone()
         };
-        refresh_mangadex_details(&pool, &id, &retagged).await.unwrap();
+        refresh_mangadex_details(&pool, &id, &retagged)
+            .await
+            .unwrap();
         let after = metadata_row_versions(&pool, &id).await;
         let kept = |v: &[String], prefix: &str| v.iter().find(|r| r.starts_with(prefix)).cloned();
-        assert_eq!(kept(&after, "tracker:al="), kept(&before, "tracker:al="), "unchanged link kept");
-        assert_ne!(kept(&after, "tag:Fantasy="), kept(&before, "tag:Fantasy="), "moved to position 0");
+        assert_eq!(
+            kept(&after, "tracker:al="),
+            kept(&before, "tracker:al="),
+            "unchanged link kept"
+        );
+        assert_ne!(
+            kept(&after, "tag:Fantasy="),
+            kept(&before, "tag:Fantasy="),
+            "moved to position 0"
+        );
         assert!(kept(&after, "tag:Isekai=").is_none() && kept(&after, "tracker:mal=").is_none());
         assert!(kept(&after, "tag:Comedy=").is_some());
 
@@ -10415,7 +10479,9 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        upsert_work_from_mangadex(&pool, "md-slime", &renamed).await.unwrap();
+        upsert_work_from_mangadex(&pool, "md-slime", &renamed)
+            .await
+            .unwrap();
         let stamped: bool = crate::db_types::query_scalar(
             "SELECT metadata_synced_at IS NOT NULL FROM work WHERE id = $1",
         )
@@ -10431,7 +10497,9 @@ mod tests {
     #[tokio::test]
     async fn a_curated_tag_survives_the_diffed_upstream_tags() {
         let pool = pool().await;
-        let id = upsert_work_from_mangadex(&pool, "md-slime", &slime_input()).await.unwrap();
+        let id = upsert_work_from_mangadex(&pool, "md-slime", &slime_input())
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO work_tag (work_id, tag, ord, source, tag_key) VALUES ($1, 'Isekai', 7, 'admin', 'isekai')",
         )
@@ -10439,7 +10507,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        refresh_mangadex_details(&pool, &id, &rich_slime_input()).await.unwrap();
+        refresh_mangadex_details(&pool, &id, &rich_slime_input())
+            .await
+            .unwrap();
         let rows = crate::db_types::query_tuple::<(String, String, i64, Option<String>)>(
             "SELECT tag, source, ord, tag_id FROM work_tag WHERE work_id = $1 ORDER BY tag",
         )
@@ -10450,20 +10520,36 @@ mod tests {
         assert_eq!(
             rows,
             [
-                ("Fantasy".into(), "mangadex".into(), 1, Some("t-fantasy".into())),
+                (
+                    "Fantasy".into(),
+                    "mangadex".into(),
+                    1,
+                    Some("t-fantasy".into())
+                ),
                 ("Isekai".into(), "admin".into(), 7, None),
             ]
         );
-        refresh_mangadex_details(&pool, &id, &WorkInput { tags: Vec::new(), ..rich_slime_input() })
-            .await
-            .unwrap();
+        refresh_mangadex_details(
+            &pool,
+            &id,
+            &WorkInput {
+                tags: Vec::new(),
+                ..rich_slime_input()
+            },
+        )
+        .await
+        .unwrap();
         let left: Vec<String> =
             crate::db_types::query_scalar("SELECT source FROM work_tag WHERE work_id = $1")
                 .bind(&id)
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(left, ["admin"], "an empty upstream list removes only upstream rows");
+        assert_eq!(
+            left,
+            ["admin"],
+            "an empty upstream list removes only upstream rows"
+        );
     }
 
     #[tokio::test]
@@ -11791,7 +11877,11 @@ mod tests {
         replace_source_chapters(&pool, &ssid, &[input(1, 1.0), input(3, 3.0)])
             .await
             .unwrap();
-        assert_eq!(versions().await, settled, "an unchanged list rewrites nothing");
+        assert_eq!(
+            versions().await,
+            settled,
+            "an unchanged list rewrites nothing"
+        );
         let mut renamed = input(3, 3.0);
         renamed.title = Some("Chapter 3: Renamed".into());
         replace_source_chapters(&pool, &ssid, &[input(1, 1.0), renamed])

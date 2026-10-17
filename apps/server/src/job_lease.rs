@@ -28,6 +28,8 @@ pub(crate) enum JobFamily<'a> {
     MangadexCatalogue,
     /// The cover drainer's crawl and the admin's full crawl.
     CoverCrawl,
+    /// The one-time copy of the SQLite cover cache into files.
+    CoverCopy,
     /// Provisional reconciliation and duplicate consolidation, from the admin and
     /// after the gap backfill.
     Reconcile,
@@ -47,6 +49,7 @@ impl JobFamily<'_> {
         let components: &[&str] = match self {
             Self::MangadexCatalogue => &["job-lease", "mangadex-catalogue"],
             Self::CoverCrawl => &["job-lease", "cover-crawl"],
+            Self::CoverCopy => &["job-lease", "cover-copy"],
             Self::Reconcile => &["job-lease", "reconcile"],
             Self::ExtensionUpdate => &["job-lease", "extension-update"],
             Self::SourceSync => &["job-lease", "source-sync"],

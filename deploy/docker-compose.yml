@@ -222,6 +222,7 @@ services:
       PORT: '8080'
       DATABASE_URL: postgres://komika:${KOMIKA_POSTGRES_PASSWORD:?set a URI-safe PostgreSQL password in deploy/.env}@postgres:5432/komika
       COVERS_DATABASE_URL: sqlite:///data/covers.sqlite3
+      KOMIKA_COVERS_DIR: /data/covers
       # The /metrics scrape endpoint, on a SEPARATE listener (never the public
       # router). Docker forwards a published port to the container's network
       # address, never to its loopback, so a 127.0.0.1 bind here could not be

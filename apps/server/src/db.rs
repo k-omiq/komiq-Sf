@@ -42,6 +42,11 @@ fn database_file(database_url: &str) -> Result<Option<PathBuf>> {
     Ok(Some(opts.get_filename().to_owned()))
 }
 
+/// The file behind the covers SQLite URL; `None` for an in-memory database.
+pub fn covers_database_file(database_url: &str) -> Result<Option<PathBuf>> {
+    database_file(database_url)
+}
+
 /// Keep this guard alive until the server exits. SQLite's sqlx migrator has no
 /// inter-process lock, and a second server must not run on the same data directory.
 pub struct DataDirectoryLock {
@@ -914,146 +919,79 @@ async fn open_covers(database_url: &str) -> Result<SqliteDatabase> {
     Ok(pool)
 }
 
-/// Repair cover pointers that disagree with the cover cache.
+/// Reconcile pointers with the file index: at boot once the SQLite copy is done, and when
+/// the copy finishes. The index, pointers and card URLs commit together; an older master
+/// never lowers an already published pointer, and a pointer with no master is cleared so
+/// the cover crawl refills it.
 ///
-/// Two disagreements exist, and both come from the blob and its pointer living in
-/// different databases:
-///
-/// * the pointer names a blob that is missing (a partly lost or recreated cache). The
-///   pointer is cleared and the cover is fetched again;
-/// * the pointer names an OLDER version than the stored blob. A publication commits the
-///   blob first and the pointer second (`cover::publish_work_cover`), so a PostgreSQL
-///   failure between the two leaves blob version 2 behind pointer version 1. Nothing
-///   else repairs that: the drainer only looks at NULL pointers. The pointer and the
-///   card URLs are moved to the blob's version here.
-///
-/// An older local blob may belong to another server copy and never replaces a newer
-/// published pointer.
-///
-/// One unguarded probe per batch of [`COVER_POINTER_BATCH`] pointers finds the suspects.
-/// Only a batch that has one opens a transaction, and it is ONE transaction for the
-/// whole batch: one sorted advisory call for the suspects' Cover keys, one sorted
-/// `lock_works`, a second read of the blobs under those guards, and conditional writes
-/// that name the pointer value the probe saw. A publication that overlaps therefore
-/// either finishes first (and the second read sees its blob) or waits for the batch.
-pub async fn reconcile_cover_pointers(pool: &Database, covers: &SqliteDatabase) -> Result<u64> {
-    let mut cursor = String::new();
-    let mut repaired = 0;
+/// Works go in batches under their `Cover` locks, and each batch re-reads the index after
+/// the locks, so a publisher or takedown that commits meanwhile is never undone.
+pub async fn reconcile_cover_pointers(pool: &Database) -> Result<u64> {
+    const BATCH: i64 = 500;
+    let mut after = String::new();
+    let mut changed = 0;
     loop {
-        let pointers: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT id, cover_cached_version FROM work \
-             WHERE id > $1 AND cover_cached_version IS NOT NULL ORDER BY id LIMIT $2",
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT w.id FROM work w \
+              LEFT JOIN cover_object c ON c.work_id = w.id AND c.kind = 'master' \
+              WHERE w.id > $1 AND ( \
+                    (c.version IS NOT NULL AND (w.cover_cached_version IS NULL \
+                       OR w.cover_cached_version < c.version)) \
+                 OR (c.asset_key IS NULL AND w.cover_cached_version IS NOT NULL)) \
+              ORDER BY w.id LIMIT $2",
         )
-        .bind(&cursor)
-        .bind(COVER_POINTER_BATCH)
+        .bind(&after)
+        .bind(BATCH)
         .fetch_all(pool)
         .await?;
-        let Some((last, _)) = pointers.last() else {
-            break;
+        let Some(last) = ids.last() else {
+            return Ok(changed);
         };
-        cursor.clone_from(last);
-        let ids: Vec<&str> = pointers.iter().map(|(id, _)| id.as_str()).collect();
-        let blobs = cover_blob_versions(covers, &ids).await?;
-        // Sorted by id already (the keyset page), which is the order the guards need.
-        let suspects: Vec<(String, i64)> = pointers
-            .into_iter()
-            .filter(|(id, version)| blobs.get(id).is_none_or(|blob| blob > version))
-            .collect();
-        if suspects.is_empty() {
-            continue;
+        after = last.clone();
+        let mut transaction = pool.begin().await?;
+        let assets: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let _guards = crate::cover::lock_assets_and_files(&mut transaction, &assets, &[]).await?;
+        // Work rows in sorted order before any UPDATE, as every multi-work writer does.
+        crate::locks::lock_works(&mut transaction, &assets).await?;
+        let moved: Vec<(String, i64)> = sqlx::query_as(
+            "UPDATE work w SET cover_cached_version = c.version \
+               FROM cover_object c WHERE c.work_id = w.id AND c.kind = 'master' \
+                AND w.id = ANY($1) \
+                AND (w.cover_cached_version IS NULL OR w.cover_cached_version < c.version) \
+                AND c.version IS NOT NULL RETURNING w.id, c.version",
+        )
+        .bind(&assets)
+        .fetch_all(&mut *transaction)
+        .await?;
+        if !moved.is_empty() {
+            let (ids, urls): (Vec<&str>, Vec<String>) = moved
+                .iter()
+                .map(|(id, version)| (id.as_str(), crate::cover::cover_path(id, *version)))
+                .unzip();
+            for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
+                sqlx::query(&format!(
+                    "UPDATE {table} t SET cover_url = r.url \
+                       FROM UNNEST($1::text[], $2::text[]) AS r(id, url) \
+                      WHERE t.work_id = r.id AND t.cover_url IS DISTINCT FROM r.url"
+                ))
+                .bind(&ids)
+                .bind(&urls)
+                .execute(&mut *transaction)
+                .await?;
+            }
         }
-        repaired +=
-            retry_transaction(|| repair_cover_pointer_batch(pool, covers, &suspects)).await?;
+        let cleared = sqlx::query(
+            "UPDATE work w SET cover_cached_version = NULL \
+              WHERE w.id = ANY($1) AND w.cover_cached_version IS NOT NULL AND NOT EXISTS \
+                (SELECT 1 FROM cover_object c WHERE c.work_id = w.id AND c.kind = 'master')",
+        )
+        .bind(&assets)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        transaction.commit().await?;
+        changed += moved.len() as u64 + cleared;
     }
-    Ok(repaired)
-}
-
-/// Pointers read, and at most repaired, per transaction of [`reconcile_cover_pointers`].
-const COVER_POINTER_BATCH: i64 = 256;
-
-/// The stored blob version of each of `ids` that has a blob.
-async fn cover_blob_versions(
-    covers: &SqliteDatabase,
-    ids: &[&str],
-) -> Result<std::collections::HashMap<String, i64>> {
-    let marks = crate::sql_params::placeholders(1, ids.len());
-    let sql = format!("SELECT work_id, version FROM work_cover_blob WHERE work_id IN ({marks})");
-    let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
-    for id in ids {
-        query = query.bind(*id);
-    }
-    Ok(query.fetch_all(covers).await?.into_iter().collect())
-}
-
-/// One transaction of [`reconcile_cover_pointers`]: `suspects` is sorted by work id.
-async fn repair_cover_pointer_batch(
-    pool: &Database,
-    covers: &SqliteDatabase,
-    suspects: &[(String, i64)],
-) -> Result<u64> {
-    let ids: Vec<&str> = suspects.iter().map(|(id, _)| id.as_str()).collect();
-    let mut transaction = pool.begin().await?;
-    let _assets = crate::cover::lock_assets(&mut transaction, &ids).await?;
-    crate::locks::lock_works(&mut transaction, &ids).await?;
-    // The probe is stale by now: a publication may have committed a blob in between.
-    // Decide again under the guards a publication holds.
-    let blobs = cover_blob_versions(covers, &ids).await?;
-    let mut work_ids = Vec::new();
-    let mut seen = Vec::new();
-    let mut current: Vec<Option<i64>> = Vec::new();
-    let mut urls: Vec<Option<String>> = Vec::new();
-    for (id, version) in suspects {
-        let blob = blobs.get(id).copied();
-        if blob.is_some_and(|blob| blob <= *version) {
-            continue;
-        }
-        work_ids.push(id.as_str());
-        seen.push(*version);
-        current.push(blob);
-        urls.push(blob.map(|version| crate::cover::cover_path(id, version)));
-    }
-    if work_ids.is_empty() {
-        transaction.rollback().await?;
-        return Ok(0);
-    }
-    // Conditional on the pointer value the probe saw: a pointer that moved since is
-    // somebody else's publication and is left alone.
-    let changed: Vec<String> = sqlx::query_scalar(
-        "UPDATE work w SET cover_cached_version = r.version \
-           FROM UNNEST($1::text[], $2::bigint[], $3::bigint[]) AS r(id, seen, version) \
-          WHERE w.id = r.id AND w.cover_cached_version = r.seen \
-         RETURNING w.id",
-    )
-    .bind(&work_ids)
-    .bind(&seen)
-    .bind(&current)
-    .fetch_all(&mut *transaction)
-    .await?;
-    // A pointer that moved to a newer blob takes its card URLs with it, as a
-    // publication does. A cleared pointer keeps the cards as they are: the cover
-    // route fetches the art again on the next request.
-    let changed: std::collections::HashSet<&str> = changed.iter().map(String::as_str).collect();
-    let (moved_ids, moved_urls): (Vec<&str>, Vec<&str>) = work_ids
-        .iter()
-        .zip(&urls)
-        .filter(|(id, _)| changed.contains(**id))
-        .filter_map(|(id, url)| Some((*id, url.as_deref()?)))
-        .unzip();
-    if !moved_ids.is_empty() {
-        for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
-            sqlx::query(&format!(
-                "UPDATE {table} t SET cover_url = r.url \
-                   FROM UNNEST($1::text[], $2::text[]) AS r(id, url) \
-                  WHERE t.work_id = r.id AND t.cover_url IS DISTINCT FROM r.url"
-            ))
-            .bind(&moved_ids)
-            .bind(&moved_urls)
-            .execute(&mut *transaction)
-            .await?;
-        }
-    }
-    transaction.commit().await?;
-    Ok(changed.len() as u64)
 }
 
 /// Tables whose PostgreSQL statistics the planner depends on, and whose row
@@ -1531,34 +1469,30 @@ mod boot_tests {
 
     #[tokio::test]
     async fn partly_missing_covers_clear_only_dangling_pointers_across_chunks() {
-        let scratch = Scratch::new();
         let main = crate::database::TestPoolOptions::new()
-            .max_connections(2)
-            .connect_with(
-                SqliteConnectOptions::from_str(&scratch.url("main.sqlite3"))
-                    .unwrap()
-                    .create_if_missing(true)
-                    .journal_mode(SqliteJournalMode::Wal),
-            )
+            .connect("sqlite::memory:")
             .await
             .unwrap();
-        let covers = init_covers(&scratch.url("covers.sqlite3")).await.unwrap();
-        for n in 0..600 {
-            sqlx::query("INSERT INTO work (id,cover_cached_version,created_at,updated_at) VALUES ($1, $2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
-                .bind(format!("w_{n:04}"))
-                .bind(if n == 599 { None } else { Some(7_i64) })
-                .execute(&main)
-                .await
-                .unwrap();
-        }
+        sqlx::migrate!("./migrations_pg")
+            .run(main.write())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO work (id, cover_cached_version, created_at, updated_at) \
+             SELECT 'w_' || lpad(n::text, 4, '0'), CASE WHEN n = 599 THEN NULL ELSE 7 END, \
+                    now(), now() FROM generate_series(0, 599) n",
+        )
+        .execute(&main)
+        .await
+        .unwrap();
         for id in ["w_0000", "w_0300", "w_0598"] {
-            sqlx::query("INSERT INTO work_cover_blob VALUES ($1, X'01', 7, 'now')")
-                .bind(id)
-                .execute(&covers)
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO cover_object (asset_key, kind, sha256, byte_length, version, updated_at) \
+                 VALUES ($1, 'master', $2, 1, 7, now())",
+            ).bind(format!("w:{id}")).bind(vec![1u8; 32])
+                .execute(&main).await.unwrap();
         }
-        assert_eq!(reconcile_cover_pointers(&main, &covers).await.unwrap(), 596);
+        assert_eq!(reconcile_cover_pointers(&main).await.unwrap(), 596);
         let remaining: Vec<String> = sqlx::query_scalar(
             "SELECT id FROM work WHERE cover_cached_version IS NOT NULL ORDER BY id",
         )
@@ -1566,111 +1500,7 @@ mod boot_tests {
         .await
         .unwrap();
         assert_eq!(remaining, ["w_0000", "w_0300", "w_0598"]);
-        assert_eq!(reconcile_cover_pointers(&main, &covers).await.unwrap(), 0);
-        main.close().await;
-        covers.close().await;
-    }
-
-    #[tokio::test]
-    async fn startup_reconciliation_never_publishes_an_older_cover_file() {
-        let scratch = Scratch::new();
-        let main = Database::connect("sqlite::memory:")
-            .await
-            .unwrap()
-            .foreground();
-        let older = init_covers(&scratch.url("older.sqlite3")).await.unwrap();
-        let newer = init_covers(&scratch.url("newer.sqlite3")).await.unwrap();
-        sqlx::query("INSERT INTO work(id,cover_cached_version,created_at,updated_at) VALUES ('w_copies',9,now(),now())")
-            .execute(&main).await.unwrap();
-        for (covers, version, bytes) in [
-            (&older, 7_i64, b"older".as_slice()),
-            (&newer, 9, b"newer".as_slice()),
-        ] {
-            sqlx::query("INSERT INTO work_cover_blob VALUES ('w_copies',$1,$2,'now')")
-                .bind(bytes)
-                .bind(version)
-                .execute(covers)
-                .await
-                .unwrap();
-        }
-        let url = crate::cover::cover_path("w_copies", 9);
-        sqlx::query("INSERT INTO feed_updates(work_id,title,latest_at,cover_url) VALUES ('w_copies','Cover',now(),$1)")
-            .bind(&url).execute(&main).await.unwrap();
-        sqlx::query("INSERT INTO feed_series_updates(work_id,reader_id,title,released_at,cover_url) VALUES ('w_copies','7','Cover',now(),$1)")
-            .bind(&url).execute(&main).await.unwrap();
-        sqlx::query("INSERT INTO browse_catalogue(work_id,reader_id,title,created_at,cover_url) VALUES ('w_copies','7','Cover',now(),$1)")
-            .bind(&url).execute(&main).await.unwrap();
-
-        let mut held = main.begin().await.unwrap();
-        let guard = crate::cover::lock_asset(&mut held, "w_copies")
-            .await
-            .unwrap();
-        for covers in [&older, &newer] {
-            assert_eq!(
-                tokio::time::timeout(
-                    Duration::from_secs(2),
-                    reconcile_cover_pointers(&main, covers),
-                )
-                .await
-                .expect("current or older cover took the publication lock")
-                .unwrap(),
-                0
-            );
-        }
-        held.rollback().await.unwrap();
-        drop(guard);
-
-        // The initial probe sees a missing blob. Before the guarded read, a local
-        // fill restores an older version: that must not roll back the shared pointer.
-        sqlx::query("DELETE FROM work_cover_blob")
-            .execute(&older)
-            .await
-            .unwrap();
-        let mut held = main.begin().await.unwrap();
-        let guard = crate::cover::lock_asset(&mut held, "w_copies")
-            .await
-            .unwrap();
-        let writer = main.clone();
-        let cache = older.clone();
-        let repair = tokio::spawn(async move { reconcile_cover_pointers(&writer, &cache).await });
-        crate::cover::wait_for_writer_lock(&main).await;
-        sqlx::query("INSERT INTO work_cover_blob VALUES ('w_copies',$1,7,'now')")
-            .bind(b"older".as_slice())
-            .execute(&older)
-            .await
-            .unwrap();
-        held.commit().await.unwrap();
-        drop(guard);
-        assert_eq!(repair.await.unwrap().unwrap(), 0);
-        let published: i64 =
-            sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id='w_copies'")
-                .fetch_one(&main)
-                .await
-                .unwrap();
-        assert_eq!(published, 9);
-        for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
-            let published_url: String = sqlx::query_scalar(&format!(
-                "SELECT cover_url FROM {table} WHERE work_id='w_copies'"
-            ))
-            .fetch_one(&main)
-            .await
-            .unwrap();
-            assert_eq!(published_url, url, "{table}");
-        }
-        for (covers, bytes, version) in [
-            (&older, b"older".as_slice(), 7_i64),
-            (&newer, b"newer".as_slice(), 9),
-        ] {
-            let stored: (Vec<u8>, i64) =
-                sqlx::query_as("SELECT webp,version FROM work_cover_blob WHERE work_id='w_copies'")
-                    .fetch_one(covers)
-                    .await
-                    .unwrap();
-            assert_eq!(stored, (bytes.to_vec(), version));
-        }
-        main.close().await;
-        older.close().await;
-        newer.close().await;
+        assert_eq!(reconcile_cover_pointers(&main).await.unwrap(), 0);
     }
 }
 
@@ -2733,227 +2563,115 @@ mod observation_scan_tests {
 mod rest_phase4_tests {
     use super::*;
 
-    /// Boot must not queue behind (or open a transaction for) a work whose blob is
-    /// present: only a pointer whose blob is missing takes the asset guard.
     #[tokio::test]
-    async fn cover_pointer_repair_takes_the_asset_guard_only_for_missing_blobs() {
-        let main = Database::connect("sqlite::memory:")
-            .await
-            .unwrap()
-            .foreground();
-        let covers = crate::sqlite_database::SqliteTestPoolOptions::new()
-            .max_connections(1)
+    async fn reconciliation_preserves_newer_pointers_and_repairs_cards_from_the_index() {
+        let main = crate::database::TestPoolOptions::new()
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE work_cover_blob(work_id TEXT PRIMARY KEY, webp BLOB NOT NULL,version INTEGER NOT NULL,updated_at TEXT NOT NULL)").execute(&covers).await.unwrap();
-        sqlx::query("INSERT INTO work(id,cover_cached_version,created_at,updated_at) VALUES ('w_present',7,now(),now()),('w_missing',9,now(),now())").execute(&main).await.unwrap();
-        sqlx::query(
-            "INSERT INTO work_cover_blob VALUES ('w_present',x'00',7,'2026-01-01T00:00:00Z')",
-        )
-        .execute(&covers)
-        .await
-        .unwrap();
-        // Another session is in the middle of a publication for the present asset.
-        let mut busy = main.begin().await.unwrap();
-        crate::locks::advisory(
-            &mut busy,
-            &[crate::locks::AdvisoryKey::new(
-                crate::locks::KeyClass::Cover,
-                &["w_present"],
-            )],
-        )
-        .await
-        .unwrap();
-        let cleared = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            reconcile_cover_pointers(&main, &covers),
-        )
-        .await
-        .expect("the repair waited on the guard of an asset whose blob is present")
-        .unwrap();
-        assert_eq!(cleared, 1);
-        busy.rollback().await.unwrap();
-        let pointers: Vec<(String, Option<i64>)> =
-            sqlx::query_as("SELECT id, cover_cached_version FROM work ORDER BY id")
-                .fetch_all(&main)
-                .await
-                .unwrap();
-        assert_eq!(
-            pointers,
-            [
-                ("w_missing".to_owned(), None),
-                ("w_present".to_owned(), Some(7))
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn cover_pointer_repair_waits_for_the_asset_publication_guard() {
-        for reject_pointer in [false, true] {
-            let main = Database::connect("sqlite::memory:")
-                .await
-                .unwrap()
-                .foreground();
-            let covers = crate::sqlite_database::SqliteTestPoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await
-                .unwrap();
-            for ddl in ["CREATE TABLE work_cover_blob(work_id TEXT PRIMARY KEY, webp BLOB NOT NULL,version INTEGER NOT NULL,updated_at TEXT NOT NULL)","CREATE TABLE cover_variant(asset_key TEXT NOT NULL,width INTEGER NOT NULL,webp BLOB NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(asset_key,width))"] { sqlx::query(ddl).execute(&covers).await.unwrap(); }
-            sqlx::query("INSERT INTO work(id,cover_cached_version,created_at,updated_at) VALUES ('w_repair_overlap',7,now(),now())").execute(&main).await.unwrap();
-            if reject_pointer {
-                sqlx::raw_sql("CREATE SEQUENCE rest_reject_once; CREATE FUNCTION rest_reject_cover_pointer() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.cover_cached_version IS DISTINCT FROM OLD.cover_cached_version AND NEW.cover_cached_version IS NOT NULL AND nextval('rest_reject_once') = 1 THEN RAISE EXCEPTION 'pointer publication deliberately rejected'; END IF; RETURN NEW; END $$; CREATE TRIGGER rest_reject_cover_pointer BEFORE UPDATE ON work FOR EACH ROW EXECUTE FUNCTION rest_reject_cover_pointer()")
-                .execute(&main).await.unwrap();
+        sqlx::migrate!("./migrations_pg")
+            .run(main.write())
+            .await
+            .unwrap();
+        for (id, pointer, version) in [
+            ("w_current", Some(7_i64), Some(7_i64)),
+            ("w_newer", Some(9), Some(7)),
+            ("w_gone", Some(7), None),
+            ("w_stale", Some(7), Some(9)),
+            ("w_null", None, Some(8)),
+            ("w_derivative_only", Some(7), None),
+        ] {
+            sqlx::query("INSERT INTO work(id,cover_cached_version,created_at,updated_at) VALUES ($1,$2,now(),now())")
+                .bind(id).bind(pointer).execute(&main).await.unwrap();
+            if let Some(version) = version {
+                sqlx::query(
+                    "INSERT INTO cover_object (asset_key,kind,sha256,byte_length,version,updated_at) \
+                     VALUES ($1,'master',$2,1,$3,now())",
+                ).bind(format!("w:{id}")).bind(vec![1u8; 32]).bind(version)
+                    .execute(&main).await.unwrap();
             }
-            let points = crate::locks::pause_points::PausePoints::default();
-            let armed = points.arm("cover-locked");
-            let writer = main.clone();
-            let cache = covers.clone();
-            let first = tokio::spawn(crate::cover::COVER_PUBLICATION_PAUSE.scope(
-                points,
-                async move {
-                    crate::cover::put_work_cover(&writer, &cache, "w_repair_overlap", b"fresh")
+            let url = crate::cover::cover_path(id, pointer.unwrap_or(1));
+            sqlx::query("INSERT INTO feed_updates(work_id,title,latest_at,cover_url) VALUES ($1,'Cover',now(),$2)")
+                .bind(id).bind(&url).execute(&main).await.unwrap();
+            sqlx::query("INSERT INTO feed_series_updates(work_id,reader_id,title,released_at,cover_url) VALUES ($1,$1,'Cover',now(),$2)")
+                .bind(id).bind(&url).execute(&main).await.unwrap();
+            sqlx::query("INSERT INTO browse_catalogue(work_id,reader_id,title,created_at,cover_url) VALUES ($1,$1,'Cover',now(),$2)")
+                .bind(id).bind(&url).execute(&main).await.unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO cover_object (asset_key,kind,sha256,byte_length,master_sha256,updated_at) \
+             VALUES ('w:w_derivative_only','w192',$1,1,$1,now())",
+        ).bind(vec![1u8; 32]).execute(&main).await.unwrap();
+
+        assert_eq!(reconcile_cover_pointers(&main).await.unwrap(), 4);
+        for (id, pointer, url_version) in [
+            ("w_current", Some(7_i64), 7_i64),
+            ("w_newer", Some(9), 9),
+            ("w_gone", None, 7),
+            ("w_stale", Some(9), 9),
+            ("w_null", Some(8), 8),
+            ("w_derivative_only", None, 7),
+        ] {
+            let actual: Option<i64> =
+                sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id=$1")
+                    .bind(id)
+                    .fetch_one(&main)
+                    .await
+                    .unwrap();
+            assert_eq!(actual, pointer, "{id}");
+            for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
+                let url: String =
+                    sqlx::query_scalar(&format!("SELECT cover_url FROM {table} WHERE work_id=$1"))
+                        .bind(id)
+                        .fetch_one(&main)
                         .await
-                },
-            ));
-            tokio::time::timeout(std::time::Duration::from_secs(30), armed.reached())
-                .await
-                .unwrap();
-            let writer = main.clone();
-            let cache = covers.clone();
-            let second =
-                tokio::spawn(async move { reconcile_cover_pointers(&writer, &cache).await });
-            crate::cover::wait_for_writer_lock(&main).await;
-            armed.release();
-            let saved = first.await.unwrap();
-            if reject_pointer {
-                let error = saved.unwrap_err();
+                        .unwrap();
                 assert_eq!(
-                    error
-                        .downcast_ref::<sqlx::Error>()
-                        .and_then(sqlx::Error::as_database_error)
-                        .and_then(|e| e.code())
-                        .as_deref(),
-                    Some("P0001")
+                    url,
+                    crate::cover::cover_path(id, url_version),
+                    "{id}: {table}"
                 );
-            } else {
-                saved.unwrap();
             }
-
-            // A sequence is not rolled back, so the trigger rejects the publication's
-            // pointer write only: the blob is stored, the pointer still names the old
-            // version. The repair that waited must move the pointer to the stored blob.
-            assert_eq!(second.await.unwrap().unwrap(), u64::from(reject_pointer));
-            let version: i64 = sqlx::query_scalar(
-                "SELECT version FROM work_cover_blob WHERE work_id='w_repair_overlap'",
-            )
-            .fetch_one(&covers)
-            .await
-            .unwrap();
-            let pointer: i64 = sqlx::query_scalar(
-                "SELECT cover_cached_version FROM work WHERE id='w_repair_overlap'",
-            )
-            .fetch_one(&main)
-            .await
-            .unwrap();
-            // Blob-first recovery must never clear an existing pointer after a failed
-            // pointer write (a repair that read "missing" before waiting would), and
-            // it must not leave the pointer on the replaced version either.
-            assert_ne!(version, 7);
-            assert_eq!(pointer, version);
         }
+        assert_eq!(reconcile_cover_pointers(&main).await.unwrap(), 0);
     }
 
-    /// The state a failed pointer write leaves behind for a LATER run: the stored blob
-    /// is newer than a non-NULL pointer. The drainer never looks at it (it selects
-    /// NULL pointers), so the boot repair has to move the pointer and the card URLs.
-    #[tokio::test]
-    async fn a_stale_cover_pointer_is_moved_to_the_stored_blob_version() {
-        let main = Database::connect("sqlite::memory:")
-            .await
-            .unwrap()
-            .foreground();
-        let covers = crate::sqlite_database::SqliteTestPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::query("CREATE TABLE work_cover_blob(work_id TEXT PRIMARY KEY, webp BLOB NOT NULL,version INTEGER NOT NULL,updated_at TEXT NOT NULL)").execute(&covers).await.unwrap();
-        sqlx::query("INSERT INTO work(id,cover_cached_version,created_at,updated_at) VALUES ('w_current',7,now(),now()),('w_gone',7,now(),now()),('w_stale',7,now(),now())").execute(&main).await.unwrap();
-        sqlx::query(
-            "INSERT INTO work_cover_blob VALUES ('w_current',x'00',7,'t'),('w_stale',x'01',9,'t')",
-        )
-        .execute(&covers)
-        .await
-        .unwrap();
-        for work in ["w_current", "w_gone", "w_stale"] {
-            let url = crate::cover::cover_path(work, 7);
-            sqlx::query("INSERT INTO feed_series_updates (work_id, reader_id, title, released_at, cover_url) VALUES ($1, $1, 'Cover', now(), $2)")
-                .bind(work).bind(&url).execute(&main).await.unwrap();
-            sqlx::query("INSERT INTO browse_catalogue (work_id, reader_id, title, created_at, cover_url) VALUES ($1, $1, 'Cover', now(), $2)")
-                .bind(work).bind(&url).execute(&main).await.unwrap();
-        }
-
-        assert_eq!(reconcile_cover_pointers(&main, &covers).await.unwrap(), 2);
-        let state = || async {
-            sqlx::query_as::<_, (String, Option<i64>, Option<String>, Option<String>)>(
-                "SELECT w.id, w.cover_cached_version, f.cover_url, b.cover_url FROM work w \
-                 JOIN feed_series_updates f ON f.work_id = w.id \
-                 JOIN browse_catalogue b ON b.work_id = w.id ORDER BY w.id",
-            )
-            .fetch_all(&main)
-            .await
-            .unwrap()
-        };
-        let old = |work: &str| Some(crate::cover::cover_path(work, 7));
-        let moved = Some(crate::cover::cover_path("w_stale", 9));
-        let want = vec![
-            (
-                "w_current".to_owned(),
-                Some(7),
-                old("w_current"),
-                old("w_current"),
-            ),
-            ("w_gone".to_owned(), None, old("w_gone"), old("w_gone")),
-            ("w_stale".to_owned(), Some(9), moved.clone(), moved),
-        ];
-        assert_eq!(state().await, want);
-        assert_eq!(reconcile_cover_pointers(&main, &covers).await.unwrap(), 0);
-        assert_eq!(state().await, want);
-    }
-
-    /// A batch of suspects is one transaction: one advisory call, one `lock_works`.
-    /// With a transaction per pointer, the first pointers would already be cleared
-    /// while a later one of the same batch still waits for its work.
     #[tokio::test]
     async fn cover_pointer_repair_commits_a_batch_of_pointers_together() {
-        let main = Database::connect("sqlite::memory:")
+        let main = crate::database::TestPoolOptions::new()
+            .connect("sqlite::memory:")
             .await
             .unwrap()
             .foreground();
-        let covers = crate::sqlite_database::SqliteTestPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
+        sqlx::migrate!("./migrations_pg")
+            .run(main.write())
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE work_cover_blob(work_id TEXT PRIMARY KEY, webp BLOB NOT NULL,version INTEGER NOT NULL,updated_at TEXT NOT NULL)").execute(&covers).await.unwrap();
-        sqlx::query("INSERT INTO work(id,cover_cached_version,created_at,updated_at) VALUES ('w_a',7,now(),now()),('w_b',7,now(),now()),('w_c',7,now(),now())").execute(&main).await.unwrap();
+        sqlx::query("INSERT INTO work(id,cover_cached_version,created_at,updated_at) VALUES ('w_a',7,now(),now()),('w_b',7,now(),now()),('w_c',7,now(),now())")
+            .execute(&main).await.unwrap();
+        sqlx::query(
+            "INSERT INTO cover_object (asset_key,kind,sha256,byte_length,version,updated_at) \
+             SELECT 'w:' || id,'master',$1,1,9,now() FROM work",
+        )
+        .bind(vec![1u8; 32])
+        .execute(&main)
+        .await
+        .unwrap();
         let mut holder = main.begin().await.unwrap();
         crate::locks::lock_works(&mut holder, &["w_c"])
             .await
             .unwrap();
-        let (writer, cache) = (main.clone(), covers.clone());
-        let repair = tokio::spawn(async move { reconcile_cover_pointers(&writer, &cache).await });
+        let writer = main.clone();
+        let repair = tokio::spawn(async move { reconcile_cover_pointers(&writer).await });
         crate::cover::wait_for_writer_lock(&main).await;
         let pending: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM work WHERE cover_cached_version IS NOT NULL")
+            sqlx::query_scalar("SELECT count(*) FROM work WHERE cover_cached_version = 7")
                 .fetch_one(&main)
                 .await
                 .unwrap();
         assert_eq!(
             pending, 3,
-            "no pointer of the batch is published before the batch commits"
+            "no pointer is published before the transaction commits"
         );
         holder.rollback().await.unwrap();
         assert_eq!(repair.await.unwrap().unwrap(), 3);

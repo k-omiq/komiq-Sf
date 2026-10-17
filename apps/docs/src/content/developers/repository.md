@@ -49,7 +49,8 @@ Key parts of `apps/server`:
 
 - `apps/server/src/main.rs`: Axum web server configuration, route mounting, CORS middleware, and GraphiQL handler.
 - `apps/server/src/graphql/`: Async-graphql schema definitions and resolver functions.
-- `apps/server/src/db.rs`: PostgreSQL initialization, SQLite cover recovery and migration runners using sqlx.
+- `apps/server/src/db.rs`: PostgreSQL initialization, legacy SQLite cover recovery and migration runners using sqlx.
+- `apps/server/src/cover_store.rs` and `apps/server/src/cover_copy.rs`: cover files, PostgreSQL index and the one-time copy from the old cache.
 - `apps/server/src/auth.rs`: User password hashing with argon2id and session token verification.
 - `apps/server/src/suwayomi.rs`: HTTP client federating requests to the Suwayomi source engine.
 - `apps/server/migrations_pg/`: PostgreSQL schema and migrations for the main database.

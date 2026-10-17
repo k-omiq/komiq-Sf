@@ -233,7 +233,8 @@ async fn cached_reader_requests_survive_all_upstream_slots_hanging_and_client_li
     let engine = Engine::start().await;
     let pool = db::Database::connect("sqlite::memory:").await.unwrap();
     crate::db::MIGRATOR_PG.run(pool.write()).await.unwrap();
-    let covers = db::init_covers("sqlite::memory:").await.unwrap();
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
+    let covers = crate::cover_store::test_support::store(&cover_dir);
     let reserved = ReadyDb::connect(&pool).await.unwrap();
     let reader_id = crate::db_types::test_uuid("admission-reader");
     sqlx::query("INSERT INTO users (id, username, email, password_hash, created_at) VALUES ($1, 'admission-reader', 'admission@example.test', 'unused', '2020-01-01T00:00:00Z')")
@@ -650,7 +651,6 @@ async fn cached_reader_requests_survive_all_upstream_slots_hanging_and_client_li
     assert_eq!(execute(&app, &pages_query, 1, false).await, warmed_pages);
     assert_eq!(engine.calls.total.load(Ordering::SeqCst), 18);
     reserved.0.close().await;
-    covers.close().await;
     pool.close().await;
 }
 

@@ -76,9 +76,13 @@ If adding a repository fails, check `docker compose ps`. The server cannot insta
 
 ## Covers or chapter pages do not load
 
-If the log says the cover cache was recreated, komiq preserved an unavailable or corrupt cache beside `covers.sqlite3` with a `.quarantined-<id>` suffix. Check disk space while both cache files exist.
+During the one-time copy of the old `covers.sqlite3` cache, an open or corruption failure preserves it with a `.quarantined-<id>` suffix and recreates it. This recovery applies only to the old SQLite cache while the copy runs.
 
-This happens if the source engine is stopped, an extension is down, or the source website uses Cloudflare bot protection. Check `docker compose ps`, then open **Sources › Health** in the admin console.
+The copy runs in the background and resumes after a restart. Covers not yet copied still load from SQLite. Plan free disk space for about twice the cache size. The log line `cover copy finished` means the server no longer opens `covers.sqlite3`; you can delete that file then to free space.
+
+Missing cover files refill from their sources on the next request, or through the background cover crawl and warmer after garbage collection notices them. Covers uploaded since this update return from PostgreSQL. Older uploads are copied from the old cache, but are not in database backups. Read [Update and back up](/self-host/update-and-backup).
+
+Covers or chapter pages can also fail if the source engine is stopped, an extension is down, or the source website uses Cloudflare bot protection. Check `docker compose ps`, then open **Sources › Health** in the admin console.
 
 If the upstream source website requires solving a Cloudflare "checking your browser" challenge, enable FlareSolverr, a headless browser that solves challenge pages for the engine. In `.env`, set:
 

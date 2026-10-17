@@ -9,7 +9,7 @@ Run it through the desktop admin app, Docker or a standalone binary. See [Reach 
 
 ## Framework and architecture
 
-The server uses axum for HTTP routing, Tokio for asynchronous tasks, async-graphql for the schema and sqlx for PostgreSQL and the SQLite cover cache. Reqwest handles upstream HTTP; Tower middleware handles tracing, CORS and compression.
+The server uses axum for HTTP routing, Tokio for asynchronous tasks, async-graphql for the schema and sqlx for PostgreSQL. SQLite is used for the legacy cover copy source. Reqwest handles upstream HTTP; Tower middleware handles tracing, CORS and compression.
 
 ### Middleware stack
 
@@ -50,6 +50,8 @@ Modules in `apps/server/src/`:
 | `setup_cli.rs` | `komika-server setup`: first-run setup in a terminal                |
 | `lan.rs`       | Home network addresses of the server, for the console to show       |
 | `cover.rs`     | Cover fetching, WebP encoding, variant resizing and caching         |
+| `cover_store.rs` | Cover files, PostgreSQL index and upload recovery                  |
+| `cover_copy.rs` | Resumable background copy from the old SQLite cover cache          |
 | `gc.rs`        | Cleanup of orphaned covers, staged media and old read notifications |
 | `instance.rs`  | Instance settings, setup code generation and access modes           |
 
@@ -66,7 +68,7 @@ Access modes are `local`, `internet` and `direct`. The last serves the server's 
 1. **Environment and logging**: loads variables and initializes text or JSON logs.
 2. **Configuration**: parses runtime settings and handles utility commands before creating server state.
 3. **Database initialization**: takes a lifetime lock on `.komiq-server.lock` and checks for an old `komika.sqlite3` main database before anything listens. It refuses that file when PostgreSQL is empty; otherwise it warns that the file is ignored. See [Old SQLite install](/self-host/update-and-backup#old-sqlite-install). It connects to PostgreSQL and applies migrations. A second server using the directory cannot boot.
-4. **Cover recovery**: preserves an unavailable or corrupt cache and recreates it. Checks saved cover pointers in batches, including when only part of the cache is missing.
+4. **Cover store**: opens the file cache under `KOMIKA_COVERS_DIR`. It opens the old SQLite cache only while the one-time copy needs it; open or corruption failures preserve that old cache and recreate it.
 5. **Accounts and clients**: provisions configured administrators, creates source clients and issues a setup code if no administrator exists.
 6. **Startup sweep**: marks interrupted source ingestion jobs as failed. A job that another server on the same database still runs holds its job lease and is left alone.
 7. **Background tasks**: starts supervised recurring jobs.
@@ -80,7 +82,7 @@ On `SIGTERM` or `Ctrl+C`, the server stops accepting connections and notifies ba
 
 ## Background jobs
 
-The main database uses PostgreSQL pools. Reader sessions are query-only. Foreground (request) writes and background writes use separate pools, and background cache writes have their own bounded lane. Transactions use PostgreSQL locking and constraints. The shared transaction helper retries serialization failures and deadlocks with a fresh transaction, at most five attempts, with a bounded delay. SQLite locks belong only to the cover cache.
+The main database uses PostgreSQL pools. Reader sessions are query-only. Foreground (request) writes and background writes use separate pools, and background cache writes have their own bounded lane. Transactions use PostgreSQL locking and constraints. The shared transaction helper retries serialization failures and deadlocks with a fresh transaction, at most five attempts, with a bounded delay. SQLite locks belong only to the legacy cover copy source.
 
 ### Writer lanes and job owners
 
@@ -93,7 +95,7 @@ Background writes take one of two lanes (`apps/server/src/database.rs`):
 
 A job joins the Parallel list only with pairwise overlap tests: the job and each other writer of its tables wait on a real PostgreSQL lock, in both orders, and the rows are checked afterwards. A new backfill drain adds its own `ParallelJob` variant with those tests and runs each pass inside `Database::job_scope`. A task spawned from a pass writes on the Serial lane.
 
-A lane orders write turns; it does not choose which server runs a job. A job that must run once holds a job lease for its whole pass (`apps/server/src/job_lease.rs`): a session advisory lock on its own connection. The MangaDex catalogue cycle, chapter cycle, admin reseed and gap backfill share one lease because they share cursors. The cover crawl, reconcile, extension updates, source sync and discovery have one each, and source ingest has one per source. A loop that finds its lease held skips the pass, and an admin action is refused as already running. The lock ends with its connection, so a crash never leaves a job stuck. That connection is outside the pools: count one extra PostgreSQL connection per running leased job.
+A lane orders write turns; it does not choose which server runs a job. A job that must run once holds a job lease for its whole pass (`apps/server/src/job_lease.rs`): a session advisory lock on its own connection. The MangaDex catalogue cycle, chapter cycle, admin reseed and gap backfill share one lease because they share cursors. The cover crawl, the one-time cover copy, reconcile, extension updates, source sync and discovery have one each, and source ingest has one per source. A loop that finds its lease held skips the pass, and an admin action is refused as already running. The lock ends with its connection, so a crash never leaves a job stuck. That connection is outside the pools: count one extra PostgreSQL connection per running leased job.
 
 Run one server per database. Leases stop two servers from running one job, but each server counts source rate limits on its own.
 
@@ -130,7 +132,11 @@ Catalogue writes update browse and search together. A local reconciliation loop 
 
 The cover drainer in `apps/server/src/cover.rs` downloads and resizes uncached covers every 5 minutes (`cover_cache_interval_secs = 300`), in batches of 500.
 
-The garbage collector in `apps/server/src/gc.rs` runs hourly. It deletes orphaned cover blobs, abandoned staged comment media, and read notifications created more than 90 days ago. Notifications use batches of 128, up to 1,024 per tick. Unread notifications and release events are kept.
+Cover images and extension icons are files under `KOMIKA_COVERS_DIR`. PostgreSQL's `cover_object` index and a work's cover version change in one transaction. `cover_upload` keeps admin uploads in database backups. The owner server alone writes covers under its data-directory lock. Missing files refill on request, or through the background crawl and warmer after garbage collection notices them. Uploaded covers return from PostgreSQL.
+
+The old `covers.sqlite3` cache copies in the background and resumes after a restart. Covers not yet reached still load from SQLite. `COVERS_DATABASE_URL` still places the lock, default covers directory and old cache. Read [Data model](/developers/data-model) for disk space, copy completion and the backup limit for earlier uploads.
+
+The garbage collector runs hourly. It removes cover files older than 24 hours with no entry in the index, abandoned staged comment media, and read notifications created more than 90 days ago. Notifications use batches of 128, up to 1,024 per tick. Unread notifications and release events are kept.
 
 ### Database statistics refresh
 
@@ -206,5 +212,6 @@ PostgreSQL recovery health is in the same output: archived and failed WAL counts
 - `apps/server/src/web_dir.rs`: static file serving and SPA fallback mechanics.
 - `apps/server/src/scanner.rs`: adaptive scan scheduler and cadence calculations.
 - `apps/server/src/maintenance.rs`: extension auto-update tasks and duplicate queue rechecks.
-- `apps/server/src/gc.rs`: hourly garbage collection for orphaned cover blobs and staged media.
+- `apps/server/src/gc.rs`: hourly garbage collection for cover files and staged media.
+- `apps/server/src/cover_store.rs` and `apps/server/src/cover_copy.rs`: file storage, index and legacy copy.
 - `apps/server/src/browse.rs`: catalog browse queries, genre facets and tag search.

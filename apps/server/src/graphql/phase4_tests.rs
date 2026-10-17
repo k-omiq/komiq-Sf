@@ -101,7 +101,7 @@ fn successful(response: async_graphql::Response) {
 
 #[tokio::test]
 async fn two_sessions_first_owner_has_one_winner() {
-    let (schema, pool, state) = setup_without_admin().await;
+    let (schema, pool, state, _cover_dir) = setup_without_admin().await;
     let code = state.setup_code.issue();
     let b_query = create_owner_q(&code, "second_owner");
     let b_schema = schema.clone();
@@ -1093,7 +1093,7 @@ async fn two_sessions_noop_review_acceptance_and_rejection_have_one_winner() {
 
 #[tokio::test]
 async fn two_sessions_mangadex_setting_and_memory_publish_in_the_same_order() {
-    let (schema, pool, state) = setup_with_state(100).await;
+    let (schema, pool, state, _cover_dir) = setup_with_state(100).await;
     let points = PausePoints::default();
     let persisted = points.arm("mangadex-persisted");
     let a_schema = schema.clone();
@@ -2194,7 +2194,7 @@ async fn chapter_cache_fill_never_holds_the_reader_behind_the_series_key() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let engine = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let (_, pool, state) = setup_with_engine(100, &engine).await;
+    let (_, pool, state, _cover_dir) = setup_with_engine(100, &engine).await;
     let points = PausePoints::default();
     let point = points.arm("series-admin-locked");
     let a_pool = pool.foreground();
@@ -2277,7 +2277,7 @@ async fn notification_gc_passes_a_row_that_delete_comment_holds() {
 /// error, which moves the write gate for a failure no writer had.
 #[tokio::test]
 async fn read_helper_pool_timeout_is_counted_on_the_read_lane() {
-    let (_, pool, state) = setup_with_state(100).await;
+    let (_, pool, state, _cover_dir) = setup_with_state(100).await;
     assert_eq!(pool.read().options().get_max_connections(), 1);
     let reader = pool.read().acquire().await.unwrap();
     let (result, seen) = crate::db::test_counters::scope(reload_series(&state, BOB, "w_s1")).await;

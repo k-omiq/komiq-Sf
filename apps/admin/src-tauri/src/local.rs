@@ -884,6 +884,10 @@ pub fn server_env(launch: &Launch, attempt: &Attempt) -> Vec<(&'static str, Stri
         launch.data_dir.join("covers.sqlite3").display()
       ),
     ),
+    (
+      "KOMIKA_COVERS_DIR",
+      launch.data_dir.join("covers").display().to_string(),
+    ),
     ("SUWAYOMI_URL", attempt.engine.url.clone()),
     ("SUWAYOMI_PUBLIC_URL", attempt.engine.public_url.clone()),
     ("CORS_ORIGINS", APP_ORIGINS.to_string()),

@@ -80,7 +80,7 @@ Changes through the admin API apply at once on that server. A command-line chang
 
 ## What changes on the server
 
-A taken-down work leaves every list and cannot be opened. The server refuses its chapter pages and covers. It deletes stored covers and their resized versions. The cover pass skips the work while the takedown holds.
+A taken-down work leaves every list and cannot be opened. The server refuses its chapter pages and covers. It removes covers and their resized versions from the file index. Garbage collection removes files older than 24 hours with no entry in the index. The cover pass skips the work while the takedown holds.
 
 A work takedown also records a copy takedown for every copy the work has at that moment. Those rows keep the copies denied after later catalogue changes. Old merged-away ids are denied too, because cover links keep their original work id.
 

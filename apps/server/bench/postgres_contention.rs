@@ -146,7 +146,10 @@ async fn stored_catalogue_input(
 /// The shared state the real router serves: background pool by default, MangaDex
 /// off and the engine at an unavailable loopback port, so nothing reaches a network.
 /// Also used by the foundation handler tests in `database.rs`.
-pub(crate) fn app_state(pool: &db::Database, covers: &db::SqliteDatabase) -> Arc<AppState> {
+pub(crate) fn app_state(
+    pool: &db::Database,
+    covers: &crate::cover_store::CoverStore,
+) -> Arc<AppState> {
     let mangadex = Arc::new(mangadex::MangaDexClient::new(
         "postgres-overlap-benchmark",
         5.0,
@@ -177,8 +180,16 @@ pub(crate) fn app_state(pool: &db::Database, covers: &db::SqliteDatabase) -> Arc
     })
 }
 
-async fn make_router(pool: &db::Database) -> (Router, db::SqliteDatabase, ReadyDb) {
-    let covers = db::init_covers("sqlite::memory:").await.unwrap();
+async fn make_router(
+    pool: &db::Database,
+) -> (
+    Router,
+    crate::cover_store::CoverStore,
+    ReadyDb,
+    crate::cover_store::test_support::TestDir,
+) {
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
+    let covers = crate::cover_store::test_support::store(&cover_dir);
     let ready = ReadyDb::connect(pool).await.unwrap();
     let state = app_state(pool, &covers);
     let mut cfg = Config::from_env();
@@ -211,7 +222,7 @@ async fn make_router(pool: &db::Database) -> (Router, db::SqliteDatabase, ReadyD
         web_dir::Apps::from_config(&cfg),
         cfg.img_proxy_enabled,
     );
-    (router, covers, ready)
+    (router, covers, ready, cover_dir)
 }
 
 /// Every session this benchmark opens has an application name with this prefix.
@@ -3423,7 +3434,7 @@ async fn profile(bench: &Bench<'_>, load: Load<'_>, proof: ProofAccounts<'_>) ->
     .await
     .expect("fresh measured handle for the profile");
     let pool = &measured_pool;
-    let (router, covers, ready) = make_router(pool).await;
+    let (router, _covers, ready, _cover_dir) = make_router(pool).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -3689,7 +3700,6 @@ async fn profile(bench: &Bench<'_>, load: Load<'_>, proof: ProofAccounts<'_>) ->
     server.abort();
     let _ = server.await;
     ready.0.close().await;
-    covers.close().await;
     measured_pool.close().await;
     result
 }
@@ -4285,7 +4295,7 @@ async fn overlap_proof_needs_a_verified_user_write_inside_the_open_background_tr
             .bind(auth::hash_token(&token)).bind(id).execute(&pool).await.unwrap();
         accounts.push((token, id));
     }
-    let (router, covers, ready) = make_router(&pool).await;
+    let (router, _covers, ready, _cover_dir) = make_router(&pool).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/graphql", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -4573,7 +4583,6 @@ async fn overlap_proof_needs_a_verified_user_write_inside_the_open_background_tr
     let _ = server.await;
     pool.flush_deferred().await;
     ready.0.close().await;
-    covers.close().await;
     pool.close().await;
 }
 
@@ -4754,7 +4763,7 @@ async fn write_mix_is_accepted_by_the_real_router_and_every_effect_verifies() {
             .bind(auth::hash_token(&token)).bind(id).execute(&pool).await.unwrap();
         accounts.push((token, id));
     }
-    let (router, covers, ready) = make_router(&pool).await;
+    let (router, _covers, ready, _cover_dir) = make_router(&pool).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/graphql", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -4942,7 +4951,6 @@ async fn write_mix_is_accepted_by_the_real_router_and_every_effect_verifies() {
     let _ = server.await;
     pool.flush_deferred().await;
     ready.0.close().await;
-    covers.close().await;
     instruments.close().await;
     pool.close().await;
 }

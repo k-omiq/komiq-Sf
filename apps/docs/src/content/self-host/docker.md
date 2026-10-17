@@ -104,7 +104,7 @@ Use `KOMIQ_BIND=127.0.0.1` on a VPS that you reach through a Cloudflare Tunnel. 
 
 ## Storage and upgrades
 
-PostgreSQL data lives in `komiq_postgres-data`. Covers remain a SQLite cache in `komiq_server-data`, alongside connector files. Engine data lives in `komiq_engine-data`.
+PostgreSQL data, the cover index and new cover uploads live in `komiq_postgres-data`. Cover images and extension icons are cached as files in `/data/covers` in `komiq_server-data`, alongside connector files. Engine data lives in `komiq_engine-data`.
 
 Follow [Update and back up](/self-host/update-and-backup) for PostgreSQL dumps and recovery. An old installation with `komika.sqlite3` must [start fresh](/self-host/update-and-backup#old-sqlite-install); this version cannot read or convert that file.
 

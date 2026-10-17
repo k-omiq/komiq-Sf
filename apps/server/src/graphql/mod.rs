@@ -325,9 +325,8 @@ pub struct AppState {
     /// The in-memory denied set (takedowns, site-wide rules) and the policy lease memo.
     pub(crate) policy: crate::media_policy::Policy,
     pub pool: Database,
-    /// Separate, un-replicated DB for cover blobs (`work_cover_blob`). Kept out of
-    /// `pool` so the main-database backup carries no covers; see `db::init_covers`.
-    pub cover_pool: crate::database::SqliteDatabase,
+    /// Cover files and the optional SQLite cache used while the copy runs.
+    pub cover_pool: crate::cover_store::CoverStore,
     pub suwayomi: SuwayomiClient,
     /// Direct MangaDex client — page resolution for canonical (MangaDex-mirrored)
     /// works via MangaDex@Home (CATALOGUE.md §5). Shared with the catalogue sync.
@@ -15979,7 +15978,7 @@ async fn persist_enriched_work_once(
 /// are atomic; rejection or a no-op approval also rechecks the pair under the writer.
 async fn resolve_merge_review_once(
     pool: &Database,
-    covers: &crate::database::SqliteDatabase,
+    covers: &crate::cover_store::CoverStore,
     id: &str,
     source_series_id: &str,
     source_work: Option<&str>,
@@ -16565,7 +16564,7 @@ enum ReconcileAction {
 /// `(merged, queued, skipped)`.
 pub(crate) async fn reconcile_provisional_works(
     pool: &Database,
-    covers: Option<&crate::database::SqliteDatabase>,
+    covers: Option<&crate::cover_store::CoverStore>,
 ) -> anyhow::Result<(i64, i64, i64)> {
     const BATCH: i64 = 200;
     let mut cursor = String::new();
@@ -16768,7 +16767,7 @@ async fn merge_pair_once(
 /// retry.
 async fn merge_pair_guarded(
     pool: &Database,
-    covers: Option<&crate::database::SqliteDatabase>,
+    covers: Option<&crate::cover_store::CoverStore>,
     source: &str,
     target: &str,
     expected: Option<(&catalog::WorkIdentity, &catalog::WorkIdentity)>,
@@ -17026,7 +17025,7 @@ struct ConsolidateOutcome {
 /// re-examining the same first `limit` groups forever.
 async fn consolidate_exact_duplicates_from(
     pool: &Database,
-    covers: Option<&crate::database::SqliteDatabase>,
+    covers: Option<&crate::cover_store::CoverStore>,
     limit: i64,
     cursor: &str,
 ) -> anyhow::Result<ConsolidateOutcome> {
@@ -17307,7 +17306,7 @@ async fn has_rival_target_on(
 /// a later automatic merge, should the works' metadata change.
 async fn sort_pending_reviews(
     pool: &Database,
-    covers: Option<&crate::database::SqliteDatabase>,
+    covers: Option<&crate::cover_store::CoverStore>,
     after: &str,
     limit: i64,
 ) -> anyhow::Result<ReviewOutcome> {
@@ -17422,7 +17421,7 @@ async fn sort_pending_reviews(
 /// earlier pairs may already be committed and their cover cleanup completed.
 pub(crate) async fn auto_merge_pending_reviews(
     pool: &Database,
-    covers: Option<&crate::database::SqliteDatabase>,
+    covers: Option<&crate::cover_store::CoverStore>,
 ) -> anyhow::Result<u64> {
     const BATCH: i64 = 200;
     let mut cursor = String::new();
@@ -17461,7 +17460,7 @@ pub struct DuplicateSweepResult {
 /// and advances `CONSOLIDATE_CURSOR`; the caller holds `RECONCILE_RUNNING`.
 async fn sweep_duplicates_once(
     pool: &Database,
-    covers: Option<&crate::database::SqliteDatabase>,
+    covers: Option<&crate::cover_store::CoverStore>,
     limit: i64,
 ) -> anyhow::Result<DuplicateSweepResult> {
     let mut cursor = CONSOLIDATE_CURSOR
@@ -17527,7 +17526,7 @@ async fn sweep_duplicates_once(
 /// correct where no covers pool exists.
 pub(crate) async fn run_post_ingest_dedup_ex(
     pool: &Database,
-    covers: Option<&crate::database::SqliteDatabase>,
+    covers: Option<&crate::cover_store::CoverStore>,
 ) {
     let Some(_running) =
         crate::job_lease::JobLease::try_take(pool, crate::job_lease::JobFamily::Reconcile).await
@@ -17609,7 +17608,7 @@ pub(crate) async fn run_post_ingest_dedup_ex(
 /// against the spine (excluding itself), then merge / queue / skip.
 async fn reconcile_one(
     pool: &Database,
-    covers: Option<&crate::database::SqliteDatabase>,
+    covers: Option<&crate::cover_store::CoverStore>,
     work_id: &str,
 ) -> anyhow::Result<ReconcileAction> {
     // A lock-free probe: it only says which unit to run. Each unit repeats the
@@ -19922,7 +19921,7 @@ mod tests {
     }
 
     pub(super) async fn setup_full(max: u32) -> (ApiSchema, Database) {
-        let (schema, pool, _) = setup_with_state(max).await;
+        let (schema, pool, _, _cover_dir) = setup_with_state(max).await;
         (schema, pool)
     }
 
@@ -20085,7 +20084,14 @@ mod tests {
         pool.close().await;
     }
 
-    async fn setup_with_state(max: u32) -> (ApiSchema, Database, std::sync::Arc<AppState>) {
+    async fn setup_with_state(
+        max: u32,
+    ) -> (
+        ApiSchema,
+        Database,
+        std::sync::Arc<AppState>,
+        std::sync::Arc<crate::cover_store::test_support::TestDir>,
+    ) {
         setup_with_engine(max, "http://127.0.0.1:1").await
     }
 
@@ -20094,7 +20100,12 @@ mod tests {
     async fn setup_with_engine(
         max: u32,
         engine_url: &str,
-    ) -> (ApiSchema, Database, std::sync::Arc<AppState>) {
+    ) -> (
+        ApiSchema,
+        Database,
+        std::sync::Arc<AppState>,
+        std::sync::Arc<crate::cover_store::test_support::TestDir>,
+    ) {
         setup_with_engine_inner(max, engine_url, false).await
     }
 
@@ -20102,7 +20113,12 @@ mod tests {
         max: u32,
         engine_url: &str,
         fenced: bool,
-    ) -> (ApiSchema, Database, std::sync::Arc<AppState>) {
+    ) -> (
+        ApiSchema,
+        Database,
+        std::sync::Arc<AppState>,
+        std::sync::Arc<crate::cover_store::test_support::TestDir>,
+    ) {
         let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -20153,12 +20169,10 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let covers = crate::database::SqliteDatabase::connect("sqlite::memory:")
-            .await
-            .unwrap();
+        let cover_dir = std::sync::Arc::new(crate::cover_store::test_support::TestDir::new());
+        let covers = crate::cover_store::test_support::store(&cover_dir);
         let mut suwayomi = crate::suwayomi::SuwayomiClient::new(engine_url.into(), None, None);
         if fenced {
-            sqlx::raw_sql("CREATE TABLE suwayomi_cover_blob(manga_id INTEGER PRIMARY KEY,webp BLOB,updated_at TEXT); CREATE TABLE cover_variant(asset_key TEXT,width INTEGER,webp BLOB)").execute(&covers).await.unwrap();
             crate::engine_generation::Fence::attach(&pool, &covers, &mut suwayomi)
                 .await
                 .unwrap();
@@ -20187,14 +20201,22 @@ mod tests {
             policy: Default::default(),
             setup_code: crate::instance::SetupCode::default(),
         });
-        (build_schema(state.clone(), false), pool, state)
+        (
+            schema_builder(state.clone(), false)
+                .data(cover_dir.clone())
+                .finish(),
+            pool,
+            state,
+            cover_dir,
+        )
     }
 
     #[tokio::test]
     async fn engine_generation_series_refresh_and_persist_catalogue_abort_moved_keys() {
         use crate::engine_generation::tests::{manga_json, MockEngine};
         let engine = MockEngine::spawn().await;
-        let (schema, pool, state) = setup_with_engine_inner(100, &engine.url, true).await;
+        let (schema, pool, state, _cover_dir) =
+            setup_with_engine_inner(100, &engine.url, true).await;
         let m = state.suwayomi.series(7).await.unwrap();
         crate::series_cache::put_series(&pool, &m).await.unwrap();
         let before: String =
@@ -20265,7 +20287,8 @@ mod tests {
         use crate::engine_generation::tests::MockEngine;
         for pause_at in ["pages-owner-resolved", "pages-listed"] {
             let engine = MockEngine::spawn().await;
-            let (schema, pool, state) = setup_with_engine_inner(100, &engine.url, true).await;
+            let (schema, pool, state, _cover_dir) =
+                setup_with_engine_inner(100, &engine.url, true).await;
             let (m, c) = state.suwayomi.series_and_chapters(7).await.unwrap();
             crate::series_cache::put_series(&pool, &m).await.unwrap();
             crate::series_cache::put_chapters(&pool, 7, &c)
@@ -20312,7 +20335,8 @@ mod tests {
     async fn numeric_library_edits_allow_epoch_zero_and_refuse_quarantine() {
         use crate::engine_generation::tests::MockEngine;
         let engine = MockEngine::spawn().await;
-        let (schema, pool, state) = setup_with_engine_inner(100, &engine.url, true).await;
+        let (schema, pool, state, _cover_dir) =
+            setup_with_engine_inner(100, &engine.url, true).await;
         let m = state.suwayomi.series(7).await.unwrap();
         crate::series_cache::put_series(&pool, &m).await.unwrap();
         let mutations = [
@@ -20359,7 +20383,8 @@ mod tests {
     async fn engine_generation_admin_state_numeric_quarantine_and_progress_epochs() {
         use crate::engine_generation::tests::{chapter_json, manga_json, MockEngine};
         let engine = MockEngine::spawn().await;
-        let (schema, pool, state) = setup_with_engine_inner(100, &engine.url, true).await;
+        let (schema, pool, state, _cover_dir) =
+            setup_with_engine_inner(100, &engine.url, true).await;
         let (m, c) = state.suwayomi.series_and_chapters(7).await.unwrap();
         crate::series_cache::put_series(&pool, &m).await.unwrap();
         crate::series_cache::put_chapters(&pool, 7, &c)
@@ -20739,7 +20764,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-        let (_, pool, state) = setup_with_engine(100, &url).await;
+        let (_, pool, state, _cover_dir) = setup_with_engine(100, &url).await;
         let budgets = std::sync::Arc::new(crate::request_budget::RequestBudgets::default());
         let search = {
             let budgets = budgets.clone();
@@ -20808,7 +20833,7 @@ mod tests {
             Duration::ZERO,
         )
         .await;
-        let (s, pool, _) = setup_with_engine(100, &engine.base_url).await;
+        let (s, pool, _, _cover_dir) = setup_with_engine(100, &engine.base_url).await;
         sqlx::query(
             r#"INSERT INTO source_extension (source_id, pkg_name, repo_url, is_nsfw, updated_at) VALUES ('src-9', 'org.example.ext', 'https://example/index.pb', FALSE, '2026-01-01T00:00:00Z')"#,
         )
@@ -20943,7 +20968,7 @@ mod tests {
             Duration::ZERO,
         )
         .await;
-        let (s, pool, _) = setup_with_engine(100, &engine.base_url).await;
+        let (s, pool, _, _cover_dir) = setup_with_engine(100, &engine.base_url).await;
         assert_eq!(
             recorded_source_nsfw(&pool, "1534").await,
             None,
@@ -21018,7 +21043,7 @@ mod tests {
             Duration::ZERO,
         )
         .await;
-        let (_, pool, st) = setup_with_engine(100, &engine.base_url).await;
+        let (_, pool, st, _cover_dir) = setup_with_engine(100, &engine.base_url).await;
         assert_eq!(
             resolve_source_nsfw(&st, "1534").await.unwrap(),
             SourceNsfw {
@@ -21036,7 +21061,7 @@ mod tests {
         assert_eq!(recorded_source_nsfw(&pool, "0").await, None);
 
         // No row and no engine (the default test engine address answers nothing).
-        let (_, pool, st) = setup_with_state(100).await;
+        let (_, pool, st, _cover_dir) = setup_with_state(100).await;
         let m = suwayomi_manga(77, "Unclassifiable", &["Action"], "ghost");
         let err = add_source_series_checked(&st, &m, None, false)
             .await
@@ -21080,7 +21105,7 @@ mod tests {
             Duration::ZERO,
         )
         .await;
-        let (s, pool, _) = setup_with_engine(100, &engine.base_url).await;
+        let (s, pool, _, _cover_dir) = setup_with_engine(100, &engine.base_url).await;
         // The extension is NSFW; the admin has to have opted in to install it.
         sqlx::query(r#"UPDATE users SET show_nsfw = TRUE WHERE id = '964771b0-a2fb-4849-857a-6198947115ec'"#)
             .execute(&pool)
@@ -21141,7 +21166,7 @@ mod tests {
             Duration::ZERO,
         )
         .await;
-        let (s, pool, _) = setup_with_engine(100, &engine.base_url).await;
+        let (s, pool, _, _cover_dir) = setup_with_engine(100, &engine.base_url).await;
         sqlx::query(r#"UPDATE users SET show_nsfw = TRUE WHERE id = '964771b0-a2fb-4849-857a-6198947115ec'"#)
             .execute(&pool)
             .await
@@ -21168,7 +21193,7 @@ mod tests {
     /// `markSourceNsfw(false)`.
     #[tokio::test]
     async fn mark_source_nsfw_sticks_for_series_added_later() {
-        let (s, pool, st) = setup_with_state(100).await;
+        let (s, pool, st, _cover_dir) = setup_with_state(100).await;
         // The engine calls source "1534" safe; that is what the record pass stores.
         let safe = crate::catalog::SourceExtensionInput {
             pkg_name: "pkg.x".into(),
@@ -22913,12 +22938,11 @@ mod tests {
             .run(pool.write())
             .await
             .unwrap();
+        let cover_dir = crate::cover_store::test_support::TestDir::new();
         let mk_state = || async {
             std::sync::Arc::new(AppState {
                 pool: pool.clone(),
-                cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
-                    .await
-                    .unwrap(),
+                cover_pool: crate::cover_store::test_support::store(&cover_dir),
                 suwayomi: crate::suwayomi::SuwayomiClient::new(
                     "http://127.0.0.1:1".into(),
                     None,
@@ -23158,11 +23182,10 @@ mod tests {
             .run(pool.write())
             .await
             .unwrap();
+        let cover_dir = crate::cover_store::test_support::TestDir::new();
         let state = std::sync::Arc::new(AppState {
             pool: pool.clone(),
-            cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
-                .await
-                .unwrap(),
+            cover_pool: crate::cover_store::test_support::store(&cover_dir),
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
             mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
                 "test-ua", 5.0, 40.0,
@@ -30136,13 +30159,18 @@ mod tests {
     }
 
     /// A fresh server: the shared fixture with nobody holding admin.
-    async fn setup_without_admin() -> (ApiSchema, Database, std::sync::Arc<AppState>) {
-        let (s, pool, st) = setup_with_state(100).await;
+    async fn setup_without_admin() -> (
+        ApiSchema,
+        Database,
+        std::sync::Arc<AppState>,
+        std::sync::Arc<crate::cover_store::test_support::TestDir>,
+    ) {
+        let (s, pool, st, _cover_dir) = setup_with_state(100).await;
         sqlx::query("UPDATE users SET is_admin = FALSE")
             .execute(&pool)
             .await
             .unwrap();
-        (s, pool, st)
+        (s, pool, st, _cover_dir)
     }
 
     fn create_owner_q(code: &str, username: &str) -> String {
@@ -30156,7 +30184,7 @@ mod tests {
 
     #[tokio::test]
     async fn instance_reports_setup_state_and_defaults() {
-        let (s, _, _) = setup_without_admin().await;
+        let (s, _, _, _cover_dir) = setup_without_admin().await;
         let r = exec(&s, INSTANCE_Q, None, "1.1.1.1").await;
         assert_eq!(r.cache_control.max_age, -1, "instance is never cacheable");
         let d = data(r);
@@ -30192,7 +30220,7 @@ mod tests {
     /// used up, and `instance` tells the setup screens to send the owner to a terminal.
     #[tokio::test]
     async fn create_owner_is_refused_in_the_clear_from_the_internet() {
-        let (s, pool, st) = setup_without_admin().await;
+        let (s, pool, st, _cover_dir) = setup_without_admin().await;
         let code = st.setup_code.issue();
         let in_the_clear = |query: &str| {
             async_graphql::Request::new(query)
@@ -30241,7 +30269,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_owner_works_once_with_the_logged_code() {
-        let (s, pool, st) = setup_without_admin().await;
+        let (s, pool, st, _cover_dir) = setup_without_admin().await;
         let code = st.setup_code.issue();
 
         // Wrong code: refused, nothing created.
@@ -30292,7 +30320,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_owner_is_refused_when_an_admin_exists() {
-        let (s, _, st) = setup_with_state(100).await;
+        let (s, _, st, _cover_dir) = setup_with_state(100).await;
         // Even with a live code (it never is at boot here, but be strict).
         let code = st.setup_code.issue();
         let r = exec(&s, &create_owner_q(&code, "owner"), None, "1.1.1.1").await;
@@ -30301,7 +30329,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_owner_is_rate_limited_per_ip() {
-        let (s, _, st) = setup_with_state(2).await;
+        let (s, _, st, _cover_dir) = setup_with_state(2).await;
         sqlx::query("UPDATE users SET is_admin = FALSE")
             .execute(&st.pool)
             .await
@@ -30364,7 +30392,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_create_user_flags_a_password_change() {
-        let (s, pool, _) = setup_with_state(100).await;
+        let (s, pool, _, _cover_dir) = setup_with_state(100).await;
         let q = r#"mutation { createUser(input:{username:"dave", email:"dave@e.com", password:"initial-pass"}) { id username isAdmin isBanned } }"#;
         let r = exec(&s, q, Some("bobtok"), "1.1.1.1").await;
         assert_eq!(first_error(&r), "Admin access required");
@@ -30421,7 +30449,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_reset_password_revokes_sessions_and_flags_a_change() {
-        let (s, pool, _) = setup_with_state(100).await;
+        let (s, pool, _, _cover_dir) = setup_with_state(100).await;
         let q = r#"mutation { resetUserPassword(userId:"ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c", password:"reset-pass-1") }"#;
         let r = exec(&s, q, Some("bobtok"), "1.1.1.1").await;
         assert_eq!(first_error(&r), "Admin access required");
@@ -30474,7 +30502,7 @@ mod tests {
 
     #[tokio::test]
     async fn change_password_checks_current_and_clears_the_flag() {
-        let (s, pool, _) = setup_with_state(100).await;
+        let (s, pool, _, _cover_dir) = setup_with_state(100).await;
         sqlx::query("UPDATE users SET must_change_password = TRUE WHERE id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'")
             .execute(&pool)
             .await
@@ -30565,7 +30593,7 @@ mod tests {
     /// flag set, a session reads itself and changes its password, and nothing else.
     #[tokio::test]
     async fn a_temporary_password_session_can_only_change_its_password() {
-        let (s, pool, _) = setup_with_state(100).await;
+        let (s, pool, _, _cover_dir) = setup_with_state(100).await;
         sqlx::query("UPDATE users SET must_change_password = TRUE")
             .execute(&pool)
             .await
@@ -30733,7 +30761,7 @@ mod tests {
 
     #[tokio::test]
     async fn password_jobs_reject_when_all_memory_slots_are_busy() {
-        let (s, _, app) = setup_with_state(100).await;
+        let (s, _, app, _cover_dir) = setup_with_state(100).await;
         let permits = app
             .password_work
             .clone()
@@ -31156,7 +31184,7 @@ mod tests {
     /// one is refused wherever in the thread it goes; other threads are not affected.
     #[tokio::test]
     async fn a_full_thread_takes_no_more_replies() {
-        let (s, pool, _st) = setup_with_state(100).await;
+        let (s, pool, _st, _cover_dir) = setup_with_state(100).await;
         // A top comment and a chain of replies under it, each a reply to the last.
         let mut tx = pool.begin().await.unwrap();
         for i in 0..=MAX_THREAD_REPLIES {
@@ -31660,11 +31688,10 @@ mod tests {
             .await
             .unwrap();
         }
+        let cover_dir = crate::cover_store::test_support::TestDir::new();
         let state = std::sync::Arc::new(AppState {
             pool: pool.clone(),
-            cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
-                .await
-                .unwrap(),
+            cover_pool: crate::cover_store::test_support::store(&cover_dir),
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
             mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
                 "test-ua", 5.0, 40.0,
@@ -32643,12 +32670,16 @@ mod tests {
 
     /// Build a minimal `AppState` around a migrated pool (Suwayomi points at a
     /// dead port; `map_series` never dials it, so read-shape tests stay offline).
-    async fn state_with_pool(pool: Database) -> std::sync::Arc<AppState> {
-        std::sync::Arc::new(AppState {
+    async fn state_with_pool(
+        pool: Database,
+    ) -> (
+        crate::cover_store::test_support::TestDir,
+        std::sync::Arc<AppState>,
+    ) {
+        let cover_dir = crate::cover_store::test_support::TestDir::new();
+        let state = std::sync::Arc::new(AppState {
             pool: pool.clone(),
-            cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
-                .await
-                .unwrap(),
+            cover_pool: crate::cover_store::test_support::store(&cover_dir),
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
             mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
                 "test-ua", 5.0, 40.0,
@@ -32669,7 +32700,8 @@ mod tests {
             media_manifests: None,
             policy: Default::default(),
             setup_code: crate::instance::SetupCode::default(),
-        })
+        });
+        (cover_dir, state)
     }
 
     /// REGRESSION — "the feed says 1 hour ago but the chapter is really days old".
@@ -32683,7 +32715,7 @@ mod tests {
     #[tokio::test]
     async fn latest_chapter_at_never_falls_back_to_the_poll_clock() {
         let pool = migrated_pool().await;
-        let st = state_with_pool(pool.clone()).await;
+        let (_cover_dir, st) = state_with_pool(pool.clone()).await;
         let now_secs = chrono::Utc::now().timestamp();
 
         // A live-fetched manga: no latestChapterAt, lastFetchedAt = the poll we just made.
@@ -32736,7 +32768,7 @@ mod tests {
     #[tokio::test]
     async fn scan_policy_exposes_raw_poll_override_nullable() {
         let pool = migrated_pool().await;
-        let st = state_with_pool(pool.clone()).await;
+        let (_cover_dir, st) = state_with_pool(pool.clone()).await;
         let m = suwayomi_manga(3, "AD1 Fixture", &["Action"], "src1");
 
         // No admin row: override is null, effective folds to the default.
@@ -34583,7 +34615,7 @@ mod tests {
                 async_graphql::Response::default()
             }
         }
-        let (_, _, state) = setup_with_state(100).await;
+        let (_, _, state, _cover_dir) = setup_with_state(100).await;
         let schema = schema_builder(state, false)
             .extension(ValidateOnly)
             .finish();
@@ -34663,7 +34695,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_limits_library_snapshot_batches_cards_and_propagates_failure() {
-        let (schema, pool, _) = setup_with_state(100).await;
+        let (schema, pool, _, _cover_dir) = setup_with_state(100).await;
         seed_target_series(&pool, "43").await;
         sqlx::query(r#"INSERT INTO suwayomi_series(id,title,status,source_id,updated_at,series_fetched_at) VALUES (43,'Other','ONGOING','src','2020-01-01T00:00:00Z',$1)"#)
             .bind(crate::db_types::date(&(crate::db_types::format_date(Utc::now()))).unwrap()).execute(&pool).await.unwrap();
@@ -34710,7 +34742,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_limits_batch_cache_reads_work_with_writer_held() {
-        let (_, pool, state) = setup_with_state(100).await;
+        let (_, pool, state, _cover_dir) = setup_with_state(100).await;
         sqlx::query(r#"INSERT INTO suwayomi_series(id,title,status,source_id,updated_at,series_fetched_at) VALUES(43,'Other','ONGOING','src','2020-01-01T00:00:00Z',$1)"#)
             .bind(crate::db_types::date(&(crate::db_types::format_date(Utc::now()))).unwrap()).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO suwayomi_chapter(id,manga_id,name,chapter_number,updated_at) VALUES(420,42,'First',1,$1), (430,43,'Second',2,$2)")
@@ -34754,7 +34786,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_limits_discovery_and_nsfw_errors_never_become_partial_successes() {
-        let (schema, pool, _) = setup_with_state(100).await;
+        let (schema, pool, _, _cover_dir) = setup_with_state(100).await;
         seed_target_series(&pool, "42").await;
         sqlx::query("UPDATE suwayomi_series SET in_library = TRUE WHERE id=42")
             .execute(&pool)
@@ -34784,7 +34816,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_limits_upstream_budget_is_shared_but_cache_hits_remain_available() {
-        let (schema, pool, state) = setup_with_state(100).await;
+        let (schema, pool, state, _cover_dir) = setup_with_state(100).await;
         state.mangadex.set_enabled(true);
         sqlx::query("UPDATE suwayomi_series SET series_fetched_at=$1 WHERE id=42")
             .bind(crate::db_types::date(&(crate::db_types::format_date(Utc::now()))).unwrap())
@@ -34821,7 +34853,7 @@ mod tests {
 
     #[tokio::test]
     async fn library_and_progress_include_all_entries_beyond_one_thousand() {
-        let (schema, pool, _) = setup_with_state(100).await;
+        let (schema, pool, _, _cover_dir) = setup_with_state(100).await;
         sqlx::query("WITH RECURSIVE n(id) AS (VALUES(10000) UNION ALL SELECT id+1 FROM n WHERE id<11004) INSERT INTO suwayomi_series(id,title,status,source_id,updated_at,series_fetched_at) SELECT id,'Bounded','ONGOING','src','2020-01-01T00:00:00Z'::timestamptz,$1 FROM n")
             .bind(crate::db_types::date(&(crate::db_types::format_date(Utc::now()))).unwrap()).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO user_library(user_id,series_id,created_at) SELECT 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c',CAST(id AS TEXT),'2020-01-01T00:00:00Z'::timestamptz FROM suwayomi_series WHERE id>=10000")
@@ -34875,7 +34907,7 @@ mod tests {
     async fn large_mixed_library_uses_local_batches_including_projection_and_cache_gaps() {
         let origin =
             crate::suwayomi::testsrv::spawn_error(503, "upstream must not be called").await;
-        let (schema, pool, _) = setup_with_engine(100, &origin.base_url).await;
+        let (schema, pool, _, _cover_dir) = setup_with_engine(100, &origin.base_url).await;
         // 1,005 numeric entries and 512 canonical entries cross six hydration
         // batches. The canonical half is deliberately older than the numeric half.
         sqlx::query("WITH RECURSIVE n(id) AS (VALUES(10000) UNION ALL SELECT id+1 FROM n WHERE id<11004) INSERT INTO suwayomi_series(id,title,status,source_id,chapter_count,updated_at,series_fetched_at) SELECT id,'Cached '||id,'ONGOING','src',1,'2020-01-01T00:00:00Z','2020-01-01T00:00:00Z' FROM n")
@@ -34977,7 +35009,7 @@ mod tests {
 
     #[tokio::test]
     async fn durable_writes_review_claim_rolls_back_with_failed_merge() {
-        let (schema, pool, _) = setup_with_state(100).await;
+        let (schema, pool, _, _cover_dir) = setup_with_state(100).await;
         let (source, target, review) = waiting_pair(
             &pool,
             "Ao",
@@ -35056,7 +35088,7 @@ mod tests {
 
     #[tokio::test]
     async fn durable_writes_explicit_review_checks_the_original_source_owner() {
-        let (_, pool, state) = setup_with_state(100).await;
+        let (_, pool, state, _cover_dir) = setup_with_state(100).await;
         let (source, target, review) =
             waiting_pair(&pool, "Ao", "AO!", None, None, "pending").await;
         let source_series: String = crate::db_types::query_scalar(
@@ -35187,7 +35219,7 @@ mod tests {
 
     #[tokio::test]
     async fn race_safety_mutual_admin_demotions_leave_an_active_admin() {
-        let (schema, pool, _) = setup_with_state(100).await;
+        let (schema, pool, _, _cover_dir) = setup_with_state(100).await;
         sqlx::query(
             "UPDATE users SET is_admin = TRUE WHERE id='ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'",
         )
@@ -35234,7 +35266,7 @@ mod tests {
 
     #[tokio::test]
     async fn race_safety_ban_wins_over_waiting_session_creation_and_rolls_back_on_failure() {
-        let (_, pool, _) = setup_with_state(100).await;
+        let (_, pool, _, _cover_dir) = setup_with_state(100).await;
         let mut blocker = pool.begin().await.unwrap();
         let waiting_pool = pool.clone();
         let login = tokio::spawn(async move {
@@ -35297,7 +35329,7 @@ mod tests {
 
     #[tokio::test]
     async fn race_safety_session_rechecks_the_verified_password_under_the_writer() {
-        let (_, pool, _) = setup_with_state(100).await;
+        let (_, pool, _, _cover_dir) = setup_with_state(100).await;
         let checked: String = crate::db_types::query_scalar(
             "SELECT password_hash FROM users WHERE id='ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'",
         )
@@ -35337,7 +35369,7 @@ mod tests {
 
     #[tokio::test]
     async fn race_safety_library_edit_and_merge_cannot_create_an_orphan() {
-        let (schema, pool, _) = setup_with_state(100).await;
+        let (schema, pool, _, _cover_dir) = setup_with_state(100).await;
         let source = catalog::create_work(
             &pool,
             &catalog::WorkInput {
@@ -35420,7 +35452,7 @@ mod tests {
 
     #[tokio::test]
     async fn race_safety_progress_resolves_its_owner_after_the_merge_commits() {
-        let (schema, pool, _) = setup_with_state(100).await;
+        let (schema, pool, _, _cover_dir) = setup_with_state(100).await;
         let source = catalog::upsert_work_from_mangadex(
             &pool,
             "progress-source",

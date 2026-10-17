@@ -8,7 +8,11 @@ mod chapter_label;
 mod cloudflare;
 mod config;
 mod cover;
+mod cover_copy;
+#[cfg(test)]
+mod cover_files_tests;
 mod cover_recompress;
+mod cover_store;
 mod database;
 mod db;
 mod db_types;
@@ -35,9 +39,9 @@ mod media_cache;
 #[cfg(test)]
 mod media_cache_tests;
 mod media_manifest;
-mod media_policy;
 #[cfg(test)]
 mod media_manifest_tests;
+mod media_policy;
 #[cfg(test)]
 mod media_policy_tests;
 mod media_routes;
@@ -310,9 +314,9 @@ struct RouterState {
     pool: crate::db::Database,
     ready_pool: ReadyDb,
     request_budgets: Arc<request_budget::RequestBudgets>,
-    /// Un-replicated cover-cache DB (`work_cover_blob`); served by `serve_cover`.
+    /// Content-addressed cover store; served by `serve_cover`.
     /// A newtype (`CoverDb`) distinguishes it from the main `pool` in `FromRef`.
-    cover_pool: crate::db::SqliteDatabase,
+    cover_pool: crate::cover_store::CoverStore,
     trusted_proxies: Arc<TrustedProxies>,
     /// Per-user sliding-window limiter for the CPU-bound upload routes
     /// (`/avatar`, `/comment-media`), so a single account can't flood the
@@ -368,10 +372,10 @@ impl FromRef<RouterState> for Arc<request_budget::RequestBudgets> {
         s.request_budgets.clone()
     }
 }
-/// Newtype for the cover-cache pool so a handler can extract it via `State`
+/// Newtype for the cover store so a handler can extract it via `State`
 /// without colliding with the main-pool `FromRef<RouterState> for Database`.
 #[derive(Clone)]
-struct CoverDb(crate::db::SqliteDatabase);
+struct CoverDb(crate::cover_store::CoverStore);
 impl FromRef<RouterState> for CoverDb {
     fn from_ref(s: &RouterState) -> Self {
         CoverDb(s.cover_pool.clone())
@@ -874,7 +878,7 @@ async fn save_avatar(
 
 /// `POST /admin/cover/{work_id}` — ADMIN multipart cover upload. Decodes the image,
 /// re-encodes it as a budgeted lossy WebP (`cover::process_cover`), stores it in
-/// `work_cover_blob`, flips `work.cover_cached_version`, and clears any recorded
+/// the cover store, flips `work.cover_cached_version`, and clears any recorded
 /// `work_cover_issue`. The manual-recovery path for covers the crawl can't process.
 /// Returns `{ "coverUrl": "/covers/<work_id>.webp?v=<version>" }`.
 async fn upload_cover(
@@ -965,7 +969,9 @@ async fn upload_cover(
         }
     };
 
-    if let Err(e) = cover::put_work_cover(&app.pool, &app.cover_pool, &work_id, &webp).await {
+    if let Err(e) =
+        cover::put_uploaded_work_cover(&app.pool, &app.cover_pool, &work_id, &webp).await
+    {
         tracing::error!(error = %e, work_id = %work_id, "cover upload: store failed");
         return database_error_response(e, "Could not save cover");
     }
@@ -1022,7 +1028,7 @@ async fn serve_ext_icon(
         return png_icon_response(bytes, &headers);
     }
     // Tier 2: previously fetched, or a live "no icon exists" tombstone.
-    match ext_icon::cached(&pool, pkg).await {
+    match ext_icon::cached(&app.pool, &pool, pkg).await {
         Ok(Some(bytes)) => return png_icon_response(bytes, &headers),
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(()) => {}
@@ -1065,7 +1071,7 @@ async fn serve_ext_icon(
         (None, _, Some(Ok(None))) => ext_icon::RepoLookup::Unknown,
         (None, _, _) => ext_icon::RepoLookup::Unavailable,
     };
-    match ext_icon::fetch_and_cache(&pool, pkg, repo).await {
+    match ext_icon::fetch_and_cache(&app.pool, &pool, pkg, repo).await {
         Some(bytes) => png_icon_response(bytes, &headers),
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -1152,7 +1158,7 @@ async fn serve_avatar(
     }
 }
 
-/// `GET /covers/{work_id}.webp` — public serve of a work cover from `work_cover_blob`.
+/// `GET /covers/{work_id}.webp` — public serve of a stored work cover.
 /// Current `?v=` URLs serve immutable bytes from one master/derivative snapshot;
 /// older versions and unversioned URLs redirect forward; newer versions get no-store. On a blob
 /// miss, MangaDex-anchored works keep the lazy fetch, mutable response and CDN
@@ -1175,8 +1181,20 @@ async fn serve_cover(
     }
     let width = cover::variant_width(query_param(&query, "w"));
     // Fast path: already-cached blob.
-    match read_work_cover_snapshot(&pool, work_id, width).await {
-        Ok(Some((master, version, derivative))) => {
+    match pool.read_master(&app.pool, work_id, width).await {
+        Ok(Some((master, derivative))) => {
+            let Some(version) = master.version else {
+                return cover_store_unavailable(
+                    anyhow::anyhow!("work cover has no version").into(),
+                );
+            };
+            #[cfg(test)]
+            if let Ok(points) = COVER_RESPONSE_PAUSE.try_with(Clone::clone) {
+                points.hit("cover-master-read").await;
+            }
+            if master.legacy {
+                defer_cover_copy(&app.pool, &pool, work_id);
+            }
             let requested = query_param(&query, "v");
             if requested
                 .and_then(|v| v.parse::<i64>().ok())
@@ -1261,7 +1279,13 @@ async fn serve_cover(
             } else {
                 image_delivery::MUTABLE_CACHE
             };
-            uncached_cover_response_at_width(&app.pool, &pool, work_id, width, webp, cache).await
+            let master = crate::cover_store::Master {
+                sha: crate::cover_store::sha256(&webp),
+                bytes: webp,
+                version: None,
+                legacy: true,
+            };
+            uncached_cover_response_at_width(&app.pool, &pool, work_id, width, master, cache).await
         }
         Ok(Err(e)) => {
             tracing::warn!(error = %e, work_id, "lazy cover resize failed; redirecting to CDN");
@@ -1328,7 +1352,7 @@ async fn serve_suwayomi_image(
 
 async fn serve_suwayomi_image_inner(
     app: Arc<graphql::AppState>,
-    covers: crate::db::SqliteDatabase,
+    covers: crate::cover_store::CoverStore,
     rest: String,
     query: Option<String>,
 ) -> axum::response::Response {
@@ -1839,9 +1863,9 @@ async fn serve_media_ready() -> axum::response::Response {
 /// A failed cover-store read is neither a cold miss nor a reason to fetch the source
 /// again. Pool exhaustion/closure answers a retryable 503; either way the failure is
 /// kept out of every cache.
-fn cover_store_unavailable(error: sqlx::Error) -> axum::response::Response {
+fn cover_store_unavailable(error: crate::cover_store::StoreError) -> axum::response::Response {
     let mut response = database_error_response(
-        db::observed_read_database_error(error.into()),
+        db::observed_read_database_error(error.0),
         "Cover cache unavailable",
     );
     response.headers_mut().insert(
@@ -1893,7 +1917,7 @@ fn thumbnail_manga_id(rest: &str) -> Option<i64> {
 /// resize is retried on a later request.
 async fn serve_suwayomi_cover(
     app: &graphql::AppState,
-    covers: &crate::db::SqliteDatabase,
+    covers: &crate::cover_store::CoverStore,
     manga_id: i64,
     width: Option<u32>,
 ) -> axum::response::Response {
@@ -1907,10 +1931,21 @@ async fn serve_suwayomi_cover(
     }
     let generation = app.suwayomi.fence.as_ref().and_then(|f| f.generation());
     let variant_key = cover::suwayomi_variant_key(manga_id);
-    match cover::read_suwayomi_cover(covers, manga_id).await {
-        Ok(Some(webp)) => {
-            return mutable_cover_response_at_width(&app.pool, covers, &variant_key, width, webp)
-                .await;
+    match cover::read_suwayomi_cover(&app.pool, covers, manga_id, width).await {
+        Ok(Some((master, derivative))) => {
+            if master.legacy {
+                defer_cover_copy(&app.pool, covers, &variant_key);
+            }
+            return cover_response_at_width(
+                &app.pool,
+                covers,
+                &variant_key,
+                width,
+                master,
+                derivative,
+                image_delivery::MUTABLE_CACHE,
+            )
+            .await;
         }
         Ok(None) => {}
         Err(error) => {
@@ -1968,7 +2003,13 @@ async fn serve_suwayomi_cover(
                 .await?;
                 Ok(())
             });
-            mutable_cover_response_at_width(&app.pool, covers, &variant_key, width, webp).await
+            let master = crate::cover_store::Master {
+                sha: crate::cover_store::sha256(&webp),
+                bytes: webp,
+                version: None,
+                legacy: true,
+            };
+            mutable_cover_response_at_width(&app.pool, covers, &variant_key, width, master).await
         }
         Ok(Err((err, bytes))) => {
             tracing::warn!(error = %err, manga_id, "suwayomi cover resize failed; serving raw");
@@ -1981,7 +2022,7 @@ async fn serve_suwayomi_cover(
     }
 }
 
-/// Materialize one Suwayomi cover into `suwayomi_cover_blob` OUT OF BAND, after the
+/// Materialize one Suwayomi cover into the store OUT OF BAND, after the
 /// request that discovered the miss has already returned a placeholder.
 ///
 /// Bounded twice over: it takes a slot from the client's small background pool (and does
@@ -2005,7 +2046,7 @@ async fn serve_suwayomi_cover(
 /// Returns the task so a test can await it; the request path drops the handle.
 fn spawn_suwayomi_cover_materialize(
     app: &graphql::AppState,
-    covers: &crate::db::SqliteDatabase,
+    covers: &crate::cover_store::CoverStore,
     manga_id: i64,
 ) -> Option<tokio::task::JoinHandle<()>> {
     // Background pool full: the drainer's warmer will get to it.
@@ -2132,46 +2173,28 @@ fn version_cache_control(requested: Option<&str>, current: i64) -> &'static str 
     }
 }
 
-async fn read_work_cover_snapshot(
-    covers: &crate::db::SqliteDatabase,
-    work_id: &str,
-    width: Option<u32>,
-) -> Result<Option<(Vec<u8>, i64, Option<Vec<u8>>)>, sqlx::Error> {
-    // A reader transaction pins the WAL snapshot without taking the cache writer.
-    let mut tx = covers.read().begin().await?;
-    let stored: Option<(Vec<u8>, i64)> =
-        sqlx::query_as("SELECT webp, version FROM work_cover_blob WHERE work_id = $1")
-            .bind(work_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    let result = if let Some((master, version)) = stored {
-        #[cfg(test)]
-        if let Ok(points) = COVER_RESPONSE_PAUSE.try_with(Clone::clone) {
-            points.hit("cover-master-read").await;
+fn defer_cover_copy(
+    main: &crate::db::Database,
+    covers: &crate::cover_store::CoverStore,
+    asset: &str,
+) {
+    let database = main.background();
+    let covers = covers.clone();
+    let asset = asset.to_owned();
+    main.defer(async move {
+        if let Err(error) = crate::cover_copy::copy_asset(&database, &covers, &asset).await {
+            tracing::warn!(error = %error, asset, "hot cover copy failed");
         }
-        let derivative = if let Some(w) = width {
-            sqlx::query_scalar("SELECT webp FROM cover_variant WHERE asset_key = $1 AND width = $2")
-                .bind(work_id)
-                .bind(w)
-                .fetch_optional(&mut *tx)
-                .await?
-        } else {
-            None
-        };
-        Some((master, version, derivative))
-    } else {
-        None
-    };
-    tx.commit().await?;
-    Ok(result)
+        Ok(())
+    });
 }
 
 async fn mutable_cover_response_at_width(
     main: &crate::db::Database,
-    covers: &crate::db::SqliteDatabase,
+    covers: &crate::cover_store::CoverStore,
     asset_key: &str,
     width: Option<u32>,
-    master: Vec<u8>,
+    master: crate::cover_store::Master,
 ) -> axum::response::Response {
     uncached_cover_response_at_width(
         main,
@@ -2187,14 +2210,14 @@ async fn mutable_cover_response_at_width(
 /// [`cover_response_at_width`] for a master that was not read with its derivative.
 async fn uncached_cover_response_at_width(
     main: &crate::db::Database,
-    covers: &crate::db::SqliteDatabase,
+    covers: &crate::cover_store::CoverStore,
     asset_key: &str,
     width: Option<u32>,
-    master: Vec<u8>,
+    master: crate::cover_store::Master,
     cache_control: &'static str,
 ) -> axum::response::Response {
     let derivative = if let Some(w) = width {
-        cover::variant_of_master(covers, asset_key, w, &master).await
+        cover::variant_of_master(main, covers, asset_key, w, &master).await
     } else {
         None
     };
@@ -2228,15 +2251,15 @@ async fn uncached_cover_response_at_width(
 /// master without caching it.
 async fn cover_response_at_width(
     main: &crate::db::Database,
-    covers: &crate::db::SqliteDatabase,
+    covers: &crate::cover_store::CoverStore,
     asset_key: &str,
     width: Option<u32>,
-    master: Vec<u8>,
+    master: crate::cover_store::Master,
     derivative: Option<Vec<u8>>,
     cache_control: &'static str,
 ) -> axum::response::Response {
     let Some(w) = width else {
-        return webp_cover_response(master, cache_control);
+        return webp_cover_response(master.bytes, cache_control);
     };
     if let Some(bytes) = derivative {
         return webp_cover_response(bytes, cache_control);
@@ -2249,7 +2272,7 @@ async fn cover_response_at_width(
     // Re-check under the permit: while we waited, another request for this same cover may
     // have stored it. Only a derivative of this exact master counts, so a newer master's
     // derivative is never served under this response.
-    if let Some(bytes) = cover::variant_of_master(covers, asset_key, w, &master).await {
+    if let Some(bytes) = cover::variant_of_master(main, covers, asset_key, w, &master).await {
         return webp_cover_response(bytes, cache_control);
     }
     // Decode + Lanczos3 resize + WebP encode is CPU-bound; keep it off the async runtime
@@ -2258,11 +2281,11 @@ async fn cover_response_at_width(
     if let Ok(points) = COVER_RESPONSE_PAUSE.try_with(Clone::clone) {
         points.hit("derivative-master-read").await;
     }
-    let source = master.clone();
+    let source = master.bytes.clone();
     let made = resize_cover_variant(permit, move || cover::downscale_variant(&source, w)).await;
     match made {
         // The master is already at or under `w` — serve it, store nothing.
-        Ok(Ok(None)) => webp_cover_response(master, cache_control),
+        Ok(Ok(None)) => webp_cover_response(master.bytes, cache_control),
         Ok(Ok(Some(bytes))) => {
             let writer = covers.clone();
             let asset = asset_key.to_owned();
@@ -2275,11 +2298,11 @@ async fn cover_response_at_width(
         }
         Ok(Err(e)) => {
             tracing::warn!(error = %e, asset_key, width = w, "cover variant resize failed");
-            webp_cover_response(master, "no-store")
+            webp_cover_response(master.bytes, "no-store")
         }
         Err(e) => {
             tracing::error!(error = %e, asset_key, width = w, "cover variant task panicked");
-            webp_cover_response(master, "no-store")
+            webp_cover_response(master.bytes, "no-store")
         }
     }
 }
@@ -2764,7 +2787,7 @@ fn public_router(
                 telemetry::MediaRoute::Avatar,
             )),
         )
-        // Public serve of DB-backed work covers (WebP BLOB in `work_cover_blob`).
+        // Public serve of stored work covers.
         // Lets the web reader load covers from our own origin instead of the CF
         // image Worker; the bytes are materialized by `cover::crawl_uncached_covers`
         // (admin `materializeCatalogueCovers`).
@@ -3111,7 +3134,13 @@ async fn main() -> anyhow::Result<()> {
     // `komika-server takedown add|remove|list` — operator takedowns (`media_policy`).
     if argv.first().map(String::as_str) == Some("takedown") {
         let pool = db::connect_existing(&cfg.database_url).await?;
-        let covers = db::connect_existing_covers(&cfg.covers_database_url).await?;
+        let covers = crate::cover_store::CoverStore::open(
+            &pool,
+            cfg.covers_dir.clone(),
+            &cfg.covers_database_url,
+            true,
+        )
+        .await?;
         let result = media_policy::run_cli(&pool, &covers, &argv[1..]).await;
         pool.close().await;
         covers.close().await;
@@ -3119,7 +3148,13 @@ async fn main() -> anyhow::Result<()> {
     }
     if argv.first().map(String::as_str) == Some("engine") {
         let pool = db::connect_existing(&cfg.database_url).await?;
-        let covers = db::connect_existing_covers(&cfg.covers_database_url).await?;
+        let covers = crate::cover_store::CoverStore::open(
+            &pool,
+            cfg.covers_dir.clone(),
+            &cfg.covers_database_url,
+            true,
+        )
+        .await?;
         let mut engine = SuwayomiClient::new(cfg.suwayomi_url.clone(), None, cfg.source_id.clone());
         let result = engine_generation::run_cli(&pool, &covers, &mut engine, &argv[1..]).await;
         pool.close().await;
@@ -3140,11 +3175,16 @@ async fn main() -> anyhow::Result<()> {
     }
     if argv.first().map(String::as_str) == Some("phase-f") {
         let pool = db::connect_existing(&cfg.database_url).await?;
-        let cover_pool = db::connect_existing_covers(&cfg.covers_database_url).await?;
+        let cover_pool = crate::cover_store::CoverStore::open(
+            &pool,
+            cfg.covers_dir.clone(),
+            &cfg.covers_database_url,
+            true,
+        )
+        .await?;
         let result =
             phase_f::run_cli(&pool, Some(&cover_pool), &cfg.suwayomi_url, &argv[1..]).await;
-        // Close both pools explicitly: a `merge` stage holds a WAL that a still-open
-        // pool would keep pinned, and this process runs alongside the live server.
+        // Close the database and legacy cache before this maintenance process exits.
         pool.close().await;
         cover_pool.close().await;
         return result;
@@ -3167,17 +3207,20 @@ async fn main() -> anyhow::Result<()> {
     }
     let pool = db::init(&cfg.database_url).await?;
     let ready_pool = ReadyDb::connect(&pool).await?;
-    // Separate, un-replicated DB for cover blobs — see `db::init_covers`. Kept out
-    // of the main DB so its backup carries only accounts/social/catalogue, never
-    // the large (re-derivable) cover thumbnails.
-    let cover_pool = db::init_covers(&cfg.covers_database_url).await?;
+    let cover_pool = crate::cover_store::CoverStore::open(
+        &pool,
+        cfg.covers_dir.clone(),
+        &cfg.covers_database_url,
+        false,
+    )
+    .await?;
 
-    // Covers are re-derivable. Repair dangling pointers in bounded transactions,
-    // including a partly lost cache and a cache recreated after corruption. An older
-    // local cache never replaces a newer published version from another server copy.
-    let repaired = db::reconcile_cover_pointers(&pool, &cover_pool).await?;
-    if repaired > 0 {
-        tracing::warn!(repaired, "reconciled missing or stale cover pointers");
+    // Wait for the copy before reconciling: a master may still live only in SQLite.
+    if cover_pool.copy_done() {
+        let repaired = db::reconcile_cover_pointers(&pool).await?;
+        if repaired > 0 {
+            tracing::warn!(repaired, "reconciled missing or stale cover pointers");
+        }
     }
 
     // Provision/promote configured admin accounts (idempotent). This is the only
@@ -3456,6 +3499,11 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("cover cache drainer disabled (COVER_CACHE=off)");
     }
 
+    // Resume the one-time SQLite cover copy in the background until it completes.
+    if !cover_pool.copy_done() {
+        cover_copy::spawn(pool.clone(), cover_pool.clone(), shutdown_tx.subscribe());
+    }
+
     // One-shot recompression of pre-switch LOSSLESS cover masters (150–200 KB each) into
     // the lossy encoding the pipeline produces today (20–40 KB). Pure local CPU — it
     // re-encodes the blob we already hold rather than refetching from MangaDex — so it
@@ -3656,6 +3704,52 @@ tokio::task_local! { static UPLOAD_MEDIA_PAUSE: crate::locks::pause_points::Paus
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cover_store::test_support::{legacy_pool, store, store_with_legacy, TestDir};
+
+    async fn stored_cover_master(
+        main: &crate::db::Database,
+        covers: &crate::cover_store::CoverStore,
+        asset: &str,
+    ) -> crate::cover_store::Master {
+        covers
+            .read_master(main, asset, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+    }
+
+    async fn seed_work_cover(
+        main: &crate::db::Database,
+        covers: &crate::cover_store::CoverStore,
+        work: &str,
+        bytes: &[u8],
+        version: i64,
+    ) {
+        let mut staged = covers.stage(bytes).await.unwrap();
+        let mut tx = main.begin().await.unwrap();
+        let _guards = cover::lock_assets_and_files(&mut tx, &[work], &[staged.sha])
+            .await
+            .unwrap();
+        covers.place(&mut staged).await.unwrap();
+        crate::cover_store::put_master(&mut tx, work, &staged, Some(version))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    async fn seed_cover_variant(
+        main: &crate::db::Database,
+        covers: &crate::cover_store::CoverStore,
+        asset: &str,
+        width: u32,
+        bytes: &[u8],
+    ) {
+        let master = stored_cover_master(main, covers, asset).await;
+        cover::put_current_variant(main, covers, asset, width, &master, bytes)
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn unoptimized_cover_fallback_is_never_an_immutable_cache_success() {
@@ -3689,41 +3783,50 @@ mod tests {
         }
     }
 
-    async fn own_origin_media_state() -> Arc<AppState> {
-        let main = crate::db::Database::connect("sqlite::memory:")
+    async fn own_origin_media_state() -> (TestDir, Arc<AppState>) {
+        let main = crate::database::TestPoolOptions::new()
+            .connect("sqlite::memory:")
             .await
             .unwrap()
             .foreground();
-        let covers = crate::db::init_covers("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations_pg")
+            .run(main.write())
+            .await
+            .unwrap();
+        let dir = TestDir::new();
+        let covers = store(&dir);
         sqlx::query("INSERT INTO work(id,created_at,updated_at) VALUES ('w_exact',NOW(),NOW())")
             .execute(&main)
             .await
             .unwrap();
-        Arc::new(AppState {
-            pool: main,
-            cover_pool: covers,
-            suwayomi: SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
-            mangadex: Arc::new(
-                mangadex::MangaDexClient::new("own-origin-test", 100.0, 100.0)
-                    .with_bases("http://127.0.0.1:1", "http://127.0.0.1:1"),
-            ),
-            admin_users: vec![],
-            scan_health: std::sync::Mutex::new(ScanHealth::default()),
-            auth_limiter: RateLimiter::new(100, 60),
-            comment_limiter: graphql::comment_limiter(),
-            rating_limiter: graphql::rating_limiter(),
-            password_work: Arc::new(tokio::sync::Semaphore::new(4)),
-            federated_limiter: RateLimiter::new(100, 60),
-            session_ttl_secs: 3600,
-            series_inflight: KeyedLocks::default(),
-            chapters_inflight: KeyedLocks::default(),
-            source_budgets: Default::default(),
-            catalogue_cover_phash: false,
-            ext_icons_dir: std::path::PathBuf::new(),
-            media_manifests: None,
-            policy: Default::default(),
-            setup_code: instance::SetupCode::default(),
-        })
+        (
+            dir,
+            Arc::new(AppState {
+                pool: main,
+                cover_pool: covers,
+                suwayomi: SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
+                mangadex: Arc::new(
+                    mangadex::MangaDexClient::new("own-origin-test", 100.0, 100.0)
+                        .with_bases("http://127.0.0.1:1", "http://127.0.0.1:1"),
+                ),
+                admin_users: vec![],
+                scan_health: std::sync::Mutex::new(ScanHealth::default()),
+                auth_limiter: RateLimiter::new(100, 60),
+                comment_limiter: graphql::comment_limiter(),
+                rating_limiter: graphql::rating_limiter(),
+                password_work: Arc::new(tokio::sync::Semaphore::new(4)),
+                federated_limiter: RateLimiter::new(100, 60),
+                session_ttl_secs: 3600,
+                series_inflight: KeyedLocks::default(),
+                chapters_inflight: KeyedLocks::default(),
+                source_budgets: Default::default(),
+                catalogue_cover_phash: false,
+                ext_icons_dir: std::path::PathBuf::new(),
+                media_manifests: None,
+                policy: Default::default(),
+                setup_code: instance::SetupCode::default(),
+            }),
+        )
     }
 
     async fn exact_cover_get(app: &Arc<AppState>, query: Option<&str>) -> axum::response::Response {
@@ -3775,15 +3878,9 @@ mod tests {
 
     #[tokio::test]
     async fn own_origin_cover_versions_redirect_or_serve_exact_bytes() {
-        let app = own_origin_media_state().await;
-        sqlx::query("INSERT INTO work_cover_blob VALUES ('w_exact',$1,7,'now')")
-            .bind(b"master".as_slice())
-            .execute(&app.cover_pool)
-            .await
-            .unwrap();
-        cover::put_cover_variant(&app.cover_pool, "w_exact", 192, b"derivative")
-            .await
-            .unwrap();
+        let (_dir, app) = own_origin_media_state().await;
+        seed_work_cover(&app.pool, &app.cover_pool, "w_exact", b"master", 7).await;
+        seed_cover_variant(&app.pool, &app.cover_pool, "w_exact", 192, b"derivative").await;
         for (query, expected) in [
             ("v=7", b"master".as_slice()),
             ("v=7&w=192", b"derivative"),
@@ -3833,7 +3930,7 @@ mod tests {
 
     #[tokio::test]
     async fn own_origin_stale_cover_request_repairs_a_failed_publication_without_restart() {
-        let app = own_origin_media_state().await;
+        let (dir, mut app) = own_origin_media_state().await;
         let work = format!("w_{}", uuid::Uuid::new_v4());
         sqlx::query("INSERT INTO work(id,cover_cached_version,created_at,updated_at) VALUES ($1,7,NOW(),NOW())")
             .bind(&work).execute(&app.pool).await.unwrap();
@@ -3843,27 +3940,18 @@ mod tests {
             .bind(&work).bind(cover::cover_path(&work, 7)).execute(&app.pool).await.unwrap();
         sqlx::query("INSERT INTO browse_catalogue(work_id,reader_id,title,created_at,cover_url) VALUES ($1,'7','Repair',NOW(),$2)")
             .bind(&work).bind(cover::cover_path(&work, 7)).execute(&app.pool).await.unwrap();
-        sqlx::query("INSERT INTO work_cover_blob VALUES ($1,$2,7,'now')")
+        // A master still in SQLite can be newer than the published pointer during the copy.
+        let legacy = legacy_pool().await;
+        let version = 8;
+        sqlx::query("INSERT INTO work_cover_blob VALUES ($1,$2,$3,'now')")
             .bind(&work)
-            .bind(b"old".as_slice())
-            .execute(&app.cover_pool)
+            .bind(b"new".as_slice())
+            .bind(version)
+            .execute(&legacy)
             .await
             .unwrap();
-        // Reject the first pointer write, after SQLite has already committed its blob.
-        sqlx::raw_sql("CREATE SEQUENCE reject_cover_once; CREATE FUNCTION reject_cover_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.cover_cached_version IS DISTINCT FROM OLD.cover_cached_version AND nextval('reject_cover_once') = 1 THEN RAISE EXCEPTION 'publication rejected'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_cover_once BEFORE UPDATE ON work FOR EACH ROW EXECUTE FUNCTION reject_cover_once()")
-            .execute(&app.pool).await.unwrap();
-        assert!(
-            cover::put_work_cover(&app.pool, &app.cover_pool, &work, b"new")
-                .await
-                .is_err()
-        );
-        let version: i64 =
-            sqlx::query_scalar("SELECT version FROM work_cover_blob WHERE work_id=$1")
-                .bind(&work)
-                .fetch_one(&app.cover_pool)
-                .await
-                .unwrap();
-        assert!(version > 7);
+        Arc::get_mut(&mut app).unwrap().cover_pool =
+            store_with_legacy(&dir, legacy, crate::cover_store::CopyCursor::default());
         let published: i64 =
             sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id=$1")
                 .bind(&work)
@@ -3894,8 +3982,8 @@ mod tests {
             assert_eq!(res.headers()[header::CACHE_CONTROL], "no-store");
         }
         assert!(
-            app.pool.deferred_queued() <= 1,
-            "hot cover queued duplicate repairs"
+            app.pool.deferred_queued() <= 21,
+            "twenty copy-ahead jobs queued more than one pointer repair"
         );
         held.commit().await.unwrap();
         drop(guard);
@@ -3920,8 +4008,9 @@ mod tests {
 
     #[tokio::test]
     async fn own_origin_stale_cover_request_preserves_newer_publication_from_another_copy() {
-        let app = own_origin_media_state().await;
-        let other_covers = db::init_covers("sqlite::memory:").await.unwrap();
+        let (dir, mut app) = own_origin_media_state().await;
+        let other_dir = TestDir::new();
+        let other_covers = store(&other_dir);
         let work = format!("w_{}", uuid::Uuid::new_v4());
         sqlx::query("INSERT INTO work(id,cover_cached_version,created_at,updated_at) VALUES ($1,9,NOW(),NOW())")
             .bind(&work).execute(&app.pool).await.unwrap();
@@ -3932,18 +4021,15 @@ mod tests {
             .bind(&work).bind(&url).execute(&app.pool).await.unwrap();
         sqlx::query("INSERT INTO browse_catalogue(work_id,reader_id,title,created_at,cover_url) VALUES ($1,'7','Cover',NOW(),$2)")
             .bind(&work).bind(&url).execute(&app.pool).await.unwrap();
-        for (cache, version, bytes) in [
-            (&app.cover_pool, 7_i64, b"version7".as_slice()),
-            (&other_covers, 9, b"version9".as_slice()),
-        ] {
-            sqlx::query("INSERT INTO work_cover_blob VALUES ($1,$2,$3,'now')")
-                .bind(&work)
-                .bind(bytes)
-                .bind(version)
-                .execute(cache)
-                .await
-                .unwrap();
-        }
+        let legacy = legacy_pool().await;
+        sqlx::query("INSERT INTO work_cover_blob VALUES ($1,$2,7,'now')")
+            .bind(&work)
+            .bind(b"version7".as_slice())
+            .execute(&legacy)
+            .await
+            .unwrap();
+        Arc::get_mut(&mut app).unwrap().cover_pool =
+            store_with_legacy(&dir, legacy, crate::cover_store::CopyCursor::default());
         let res = serve_cover(
             State(app.clone()),
             State(CoverDb(app.cover_pool.clone())),
@@ -3971,6 +4057,7 @@ mod tests {
                     .unwrap();
             assert_eq!(published_url, url, "{table}");
         }
+        seed_work_cover(&app.pool, &other_covers, &work, b"version9", 9).await;
         let res = serve_cover(
             State(app),
             State(CoverDb(other_covers)),
@@ -4004,7 +4091,7 @@ mod tests {
             (None, image_delivery::MUTABLE_CACHE),
         ] {
             // Each request starts with no blob, so both exercise the lazy path.
-            let mut app = own_origin_media_state().await;
+            let (_dir, mut app) = own_origin_media_state().await;
             Arc::get_mut(&mut app).unwrap().mangadex = Arc::new(
                 mangadex::MangaDexClient::new("own-origin-lazy-test", 100.0, 100.0)
                     .with_bases(&cdn.base_url, &cdn.base_url),
@@ -4016,12 +4103,12 @@ mod tests {
                 .unwrap();
             sqlx::query("INSERT INTO source_series(id,work_id,source_type,source_key,created_at) VALUES ('ss_exact','w_exact','mangadex','md-exact',NOW())")
                 .execute(&app.pool).await.unwrap();
-            let stored: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_blob WHERE work_id='w_exact'")
-                    .fetch_one(&app.cover_pool)
-                    .await
-                    .unwrap();
-            assert_eq!(stored, 0);
+            assert!(app
+                .cover_pool
+                .read_master(&app.pool, "w_exact", None)
+                .await
+                .unwrap()
+                .is_none());
 
             let response = exact_cover_get(&app, query).await;
             assert_eq!(response.status(), StatusCode::OK, "{query:?}");
@@ -4040,52 +4127,186 @@ mod tests {
                 "{query:?}"
             );
             app.pool.flush_deferred().await;
-            let stored: Vec<u8> =
-                sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id='w_exact'")
-                    .fetch_one(&app.cover_pool)
-                    .await
-                    .unwrap();
-            assert_eq!(stored, expected);
+            let stored = stored_cover_master(&app.pool, &app.cover_pool, "w_exact").await;
+            assert_eq!(stored.bytes, expected);
         }
         assert_eq!(cdn.hits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
+    async fn own_origin_missing_cover_file_restores_matching_upload() {
+        let (_dir, app) = own_origin_media_state().await;
+        cover::put_uploaded_work_cover(&app.pool, &app.cover_pool, "w_exact", b"uploaded master")
+            .await
+            .unwrap();
+        let master = stored_cover_master(&app.pool, &app.cover_pool, "w_exact").await;
+        let path = app.cover_pool.object_path(&master.sha);
+        std::fs::remove_file(&path).unwrap();
+        let response = exact_cover_get(&app, Some(&format!("v={}", master.version.unwrap()))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            image_delivery::IMMUTABLE_CACHE
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"uploaded master"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"uploaded master");
+        let restored = stored_cover_master(&app.pool, &app.cover_pool, "w_exact").await;
+        assert_eq!(restored.sha, master.sha);
+        assert_eq!(restored.version, master.version);
+    }
+
+    #[tokio::test]
+    async fn own_origin_missing_cover_file_without_matching_upload_uses_lazy_fill() {
+        let jpeg = crate::suwayomi::testsrv::jpeg(300, 450);
+        let expected = cover::process_cover(&jpeg).unwrap();
+        let cdn = crate::suwayomi::testsrv::spawn(jpeg, std::time::Duration::ZERO).await;
+        for mismatched_upload in [false, true] {
+            let (_dir, mut app) = own_origin_media_state().await;
+            Arc::get_mut(&mut app).unwrap().mangadex = Arc::new(
+                mangadex::MangaDexClient::new("missing-cover-test", 100.0, 100.0)
+                    .with_bases(&cdn.base_url, &cdn.base_url),
+            );
+            app.mangadex.set_enabled(true);
+            sqlx::query("UPDATE work SET cover_file_name='c.jpg' WHERE id='w_exact'")
+                .execute(&app.pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO source_series(id,work_id,source_type,source_key,created_at) VALUES ('ss_exact','w_exact','mangadex','md-exact',now())")
+                .execute(&app.pool).await.unwrap();
+            seed_work_cover(&app.pool, &app.cover_pool, "w_exact", b"lost master", 7).await;
+            if mismatched_upload {
+                sqlx::query("INSERT INTO cover_upload(work_id,bytes,sha256,created_at) VALUES ('w_exact',$1,$2,now())")
+                    .bind(b"older upload".as_slice())
+                    .bind(crate::cover_store::sha256(b"older upload").as_slice())
+                    .execute(&app.pool).await.unwrap();
+            }
+            let path = app
+                .cover_pool
+                .object_path(&crate::cover_store::sha256(b"lost master"));
+            std::fs::remove_file(&path).unwrap();
+            let response = exact_cover_get(&app, Some("v=7")).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                expected.as_slice()
+            );
+            app.pool.flush_deferred().await;
+            assert_eq!(
+                stored_cover_master(&app.pool, &app.cover_pool, "w_exact")
+                    .await
+                    .bytes,
+                expected
+            );
+        }
+        assert_eq!(cdn.hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn own_origin_legacy_cover_reads_only_before_the_copy_cursor() {
+        for passed in [false, true] {
+            let (dir, mut app) = own_origin_media_state().await;
+            let legacy = legacy_pool().await;
+            sqlx::query("INSERT INTO work_cover_blob VALUES ('w_exact',$1,7,'now')")
+                .bind(b"legacy master".as_slice())
+                .execute(&legacy)
+                .await
+                .unwrap();
+            let cursor = if passed {
+                crate::cover_store::CopyCursor {
+                    phase: crate::cover_store::CopyPhase::Work,
+                    after: "w_exact".into(),
+                }
+            } else {
+                crate::cover_store::CopyCursor::default()
+            };
+            Arc::get_mut(&mut app).unwrap().cover_pool = store_with_legacy(&dir, legacy, cursor);
+            let response = exact_cover_get(&app, Some("v=7")).await;
+            if passed {
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            } else {
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response.headers()[header::CACHE_CONTROL],
+                    image_delivery::IMMUTABLE_CACHE
+                );
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    b"legacy master"
+                );
+            }
+            app.pool.flush_deferred().await;
+            let indexed =
+                crate::cover_store::row(&app.pool, "w_exact", crate::cover_store::Kind::Master)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                indexed.is_some(),
+                !passed,
+                "only a legacy hit queues copy-ahead"
+            );
+            if !passed {
+                assert!(
+                    !stored_cover_master(&app.pool, &app.cover_pool, "w_exact")
+                        .await
+                        .legacy
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn own_origin_cover_variant_recheck_requires_the_same_master() {
-        let covers = crate::db::init_covers("sqlite::memory:").await.unwrap();
-        for (asset, store_master) in [
-            (
-                "w_exact",
-                "INSERT INTO work_cover_blob(work_id,webp,version,updated_at) VALUES ('w_exact',$1,7,'now') ON CONFLICT(work_id) DO UPDATE SET webp=excluded.webp, version=work_cover_blob.version+1",
-            ),
-            (
-                "s:7",
-                "INSERT INTO suwayomi_cover_blob(manga_id,webp,updated_at) VALUES (7,$1,'now') ON CONFLICT(manga_id) DO UPDATE SET webp=excluded.webp",
-            ),
-        ] {
-            for (master, derivative) in [
+        let (_dir, app) = own_origin_media_state().await;
+        for asset in ["w_exact", "s:7"] {
+            let mut old = None;
+            for (bytes, derivative) in [
                 (b"old master".as_slice(), b"old derivative".as_slice()),
                 (b"new master".as_slice(), b"new derivative".as_slice()),
             ] {
-                let mut tx = covers.begin().await.unwrap();
-                sqlx::query(store_master)
-                    .bind(master)
-                    .execute(&mut *tx)
-                    .await
-                    .unwrap();
-                cover::put_cover_variant(&mut *tx, asset, 192, derivative)
-                    .await
-                    .unwrap();
-                tx.commit().await.unwrap();
+                if asset == "w_exact" {
+                    cover::put_work_cover(&app.pool, &app.cover_pool, asset, bytes)
+                        .await
+                        .unwrap();
+                } else {
+                    cover::put_suwayomi_cover(&app.pool, &app.cover_pool, 7, bytes)
+                        .await
+                        .unwrap();
+                }
+                let master = stored_cover_master(&app.pool, &app.cover_pool, asset).await;
+                cover::put_current_variant(
+                    &app.pool,
+                    &app.cover_pool,
+                    asset,
+                    192,
+                    &master,
+                    derivative,
+                )
+                .await
+                .unwrap();
                 assert_eq!(
-                    cover::variant_of_master(&covers, asset, 192, master).await,
+                    cover::variant_of_master(&app.pool, &app.cover_pool, asset, 192, &master).await,
                     Some(derivative.to_vec()),
                     "{asset}"
                 );
+                old.get_or_insert(master);
             }
-            // A newer master and its derivative now exist; the old master must miss.
             assert_eq!(
-                cover::variant_of_master(&covers, asset, 192, b"old master").await,
+                cover::variant_of_master(&app.pool, &app.cover_pool, asset, 192, &old.unwrap())
+                    .await,
                 None,
                 "{asset}"
             );
@@ -4095,20 +4316,24 @@ mod tests {
     #[tokio::test]
     async fn own_origin_cover_derivative_uses_the_master_read_snapshot() {
         for has_derivative in [false, true] {
-            let app = own_origin_media_state().await;
+            let (_dir, app) = own_origin_media_state().await;
             let master = cover::process_cover(&crate::suwayomi::testsrv::jpeg(512, 768)).unwrap();
             cover::put_work_cover(&app.pool, &app.cover_pool, "w_exact", &master)
                 .await
                 .unwrap();
-            let version: i64 =
-                sqlx::query_scalar("SELECT version FROM work_cover_blob WHERE work_id='w_exact'")
-                    .fetch_one(&app.cover_pool)
-                    .await
-                    .unwrap();
+            let version = stored_cover_master(&app.pool, &app.cover_pool, "w_exact")
+                .await
+                .version
+                .unwrap();
             let expected = if has_derivative {
-                cover::put_cover_variant(&app.cover_pool, "w_exact", 192, b"old derivative")
-                    .await
-                    .unwrap();
+                seed_cover_variant(
+                    &app.pool,
+                    &app.cover_pool,
+                    "w_exact",
+                    192,
+                    b"old derivative",
+                )
+                .await;
                 b"old derivative".to_vec()
             } else {
                 cover::downscale_variant(&master, 192).unwrap().unwrap()
@@ -4125,16 +4350,14 @@ mod tests {
             cover::put_work_cover(&app.pool, &app.cover_pool, "w_exact", b"new master")
                 .await
                 .unwrap();
-            cover::put_current_variant(
+            seed_cover_variant(
                 &app.pool,
                 &app.cover_pool,
                 "w_exact",
                 192,
-                b"new master",
                 b"new derivative",
             )
-            .await
-            .unwrap();
+            .await;
             armed.release();
             let response = request.await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -4151,7 +4374,7 @@ mod tests {
             );
             app.pool.flush_deferred().await;
             assert_eq!(
-                cover::get_cover_variant(&app.cover_pool, "w_exact", 192)
+                cover::get_cover_variant(&app.pool, &app.cover_pool, "w_exact", 192)
                     .await
                     .unwrap(),
                 b"new derivative"
@@ -4161,13 +4384,16 @@ mod tests {
 
     #[tokio::test]
     async fn own_origin_cover_resize_failure_does_not_cache_the_master() {
-        let app = own_origin_media_state().await;
-        sqlx::query("INSERT INTO work_cover_blob VALUES ('w_exact',$1,7,'now')")
-            .bind(b"undecodable master".as_slice())
-            .execute(&app.cover_pool)
-            .await
-            .unwrap();
-        cover::put_suwayomi_cover(&app.cover_pool, 7, b"undecodable master")
+        let (_dir, app) = own_origin_media_state().await;
+        seed_work_cover(
+            &app.pool,
+            &app.cover_pool,
+            "w_exact",
+            b"undecodable master",
+            7,
+        )
+        .await;
+        cover::put_suwayomi_cover(&app.pool, &app.cover_pool, 7, b"undecodable master")
             .await
             .unwrap();
         for response in [
@@ -4286,7 +4512,7 @@ mod tests {
 
     #[tokio::test]
     async fn own_origin_media_not_found_is_never_cached() {
-        let app = own_origin_media_state().await;
+        let (_dir, app) = own_origin_media_state().await;
         for query in [None, Some("v=7"), Some("v=9999999999999")] {
             let response = exact_cover_get(&app, query).await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -4474,16 +4700,17 @@ mod tests {
     #[tokio::test]
     async fn both_cover_handlers_reject_a_derivative_of_a_replaced_master() {
         for source in [false, true] {
-            let main = crate::db::Database::connect("sqlite::memory:")
+            let main = crate::database::TestPoolOptions::new()
+                .connect("sqlite::memory:")
                 .await
                 .unwrap()
                 .foreground();
-            let covers = crate::database::SqliteTestPoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
+            sqlx::migrate!("./migrations_pg")
+                .run(main.write())
                 .await
                 .unwrap();
-            for ddl in ["CREATE TABLE work_cover_blob(work_id TEXT PRIMARY KEY,webp BLOB NOT NULL,version INTEGER NOT NULL,updated_at TEXT NOT NULL)", "CREATE TABLE suwayomi_cover_blob(manga_id INTEGER PRIMARY KEY,webp BLOB NOT NULL,updated_at TEXT NOT NULL)", "CREATE TABLE cover_variant(asset_key TEXT NOT NULL,width INTEGER NOT NULL,webp BLOB NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(asset_key,width))"] { sqlx::query(ddl).execute(&covers).await.unwrap(); }
+            let dir = TestDir::new();
+            let covers = store(&dir);
             sqlx::query(
                 "INSERT INTO work(id,created_at,updated_at) VALUES ('w_handler',now(),now())",
             )
@@ -4501,12 +4728,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            let version: Option<i64> =
-                sqlx::query_scalar("SELECT version FROM work_cover_blob WHERE work_id = $1")
-                    .bind(asset)
-                    .fetch_optional(&covers)
-                    .await
-                    .unwrap();
+            let version = stored_cover_master(&main, &covers, asset).await.version;
             let app = Arc::new(AppState {
                 pool: main.clone(),
                 cover_pool: covers.clone(),
@@ -4561,7 +4783,7 @@ mod tests {
             assert_eq!(first.await.unwrap().status(), StatusCode::OK);
             main.flush_deferred().await;
             assert!(
-                cover::get_cover_variant(&covers, asset, 192)
+                cover::get_cover_variant(&main, &covers, asset, 192)
                     .await
                     .is_none(),
                 "a derivative of the retired master was published"
@@ -4575,15 +4797,16 @@ mod tests {
     /// replaced the newer master and dropped its derivatives.
     #[tokio::test]
     async fn a_background_cover_materialization_never_replaces_a_published_master() {
-        let main = crate::db::Database::connect("sqlite::memory:")
-            .await
-            .unwrap();
-        let covers = crate::database::SqliteTestPoolOptions::new()
-            .max_connections(1)
+        let main = crate::database::TestPoolOptions::new()
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        for ddl in ["CREATE TABLE suwayomi_cover_blob(manga_id INTEGER PRIMARY KEY,webp BLOB NOT NULL,updated_at TEXT NOT NULL)", "CREATE TABLE cover_variant(asset_key TEXT NOT NULL,width INTEGER NOT NULL,webp BLOB NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(asset_key,width))"] { sqlx::query(ddl).execute(&covers).await.unwrap(); }
+        sqlx::migrate!("./migrations_pg")
+            .run(main.write())
+            .await
+            .unwrap();
+        let dir = TestDir::new();
+        let covers = store(&dir);
         let origin = crate::suwayomi::testsrv::spawn(
             crate::suwayomi::testsrv::jpeg(512, 768),
             std::time::Duration::ZERO,
@@ -4628,21 +4851,21 @@ mod tests {
         cover::publish_suwayomi_cover(&main, &covers, 7, b"published-meanwhile")
             .await
             .unwrap();
-        cover::put_cover_variant(&covers, "s:7", 192, b"its-derivative")
-            .await
-            .unwrap();
+        seed_cover_variant(&main, &covers, "s:7", 192, b"its-derivative").await;
         armed.release();
         tokio::time::timeout(std::time::Duration::from_secs(30), task)
             .await
             .expect("the materialization did not finish")
             .unwrap();
         assert_eq!(
-            cover::get_suwayomi_cover(&covers, 7).await.as_deref(),
+            cover::get_suwayomi_cover(&main, &covers, 7)
+                .await
+                .as_deref(),
             Some(b"published-meanwhile".as_slice()),
             "a late background fetch replaced a master published in the meantime"
         );
         assert_eq!(
-            cover::get_cover_variant(&covers, "s:7", 192)
+            cover::get_cover_variant(&main, &covers, "s:7", 192)
                 .await
                 .as_deref(),
             Some(b"its-derivative".as_slice()),
@@ -4656,84 +4879,102 @@ mod tests {
             .await
             .expect("the materialization did not finish")
             .unwrap();
-        assert!(cover::get_suwayomi_cover(&covers, 8).await.is_some());
+        assert!(cover::get_suwayomi_cover(&main, &covers, 8).await.is_some());
         assert_eq!(origin.hits.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
     async fn a_failed_cover_store_is_not_a_cold_miss_or_an_upstream_fetch() {
-        let main = crate::db::Database::connect("sqlite::memory:")
-            .await
-            .unwrap();
-        let covers = crate::database::SqliteTestPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        covers.close().await;
-        assert!(matches!(
-            cover::read_suwayomi_cover(&covers, 7).await,
-            Err(sqlx::Error::PoolClosed)
-        ));
         let origin = crate::suwayomi::testsrv::spawn(
             crate::suwayomi::testsrv::jpeg(8, 8),
             std::time::Duration::ZERO,
         )
         .await;
-        let app = AppState {
-            pool: main,
-            cover_pool: covers.clone(),
-            suwayomi: SuwayomiClient::new(origin.base_url.clone(), None, None),
-            mangadex: Arc::new(mangadex::MangaDexClient::new(
-                "cover-store-test",
-                100.0,
-                100.0,
-            )),
-            admin_users: vec![],
-            scan_health: std::sync::Mutex::new(ScanHealth::default()),
-            auth_limiter: RateLimiter::new(100, 60),
-            comment_limiter: graphql::comment_limiter(),
-            rating_limiter: graphql::rating_limiter(),
-            password_work: Arc::new(tokio::sync::Semaphore::new(4)),
-            federated_limiter: RateLimiter::new(100, 60),
-            session_ttl_secs: 3600,
-            series_inflight: KeyedLocks::default(),
-            chapters_inflight: KeyedLocks::default(),
-            source_budgets: Default::default(),
-            catalogue_cover_phash: false,
-            ext_icons_dir: std::path::PathBuf::new(),
-            media_manifests: None,
-            policy: Default::default(),
-            setup_code: instance::SetupCode::default(),
-        };
-        let app = Arc::new(app);
-        let response = serve_suwayomi_cover(&app, &covers, 7, Some(192)).await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            response.headers()[header::CACHE_CONTROL],
-            "no-store, must-revalidate"
-        );
+        for index_error in [false, true] {
+            let (_dir, mut app) = own_origin_media_state().await;
+            let state = Arc::get_mut(&mut app).unwrap();
+            state.suwayomi = SuwayomiClient::new(origin.base_url.clone(), None, None);
+            state.mangadex = Arc::new(
+                mangadex::MangaDexClient::new("cover-store-test", 100.0, 100.0)
+                    .with_bases(&origin.base_url, &origin.base_url),
+            );
+            app.mangadex.set_enabled(true);
+            sqlx::query("UPDATE work SET cover_file_name='c.jpg' WHERE id='w_exact'")
+                .execute(&app.pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO source_series(id,work_id,source_type,source_key,created_at) VALUES ('ss_exact','w_exact','mangadex','md-exact',now())")
+                .execute(&app.pool).await.unwrap();
+            if index_error {
+                sqlx::query("ALTER TABLE cover_object RENAME TO unavailable_cover_object")
+                    .execute(&app.pool)
+                    .await
+                    .unwrap();
+            } else {
+                seed_work_cover(&app.pool, &app.cover_pool, "w_exact", b"master", 7).await;
+                cover::put_suwayomi_cover(&app.pool, &app.cover_pool, 7, b"master")
+                    .await
+                    .unwrap();
+                let path = app
+                    .cover_pool
+                    .object_path(&crate::cover_store::sha256(b"master"));
+                std::fs::remove_file(&path).unwrap();
+                std::fs::create_dir(&path).unwrap();
+            }
+            assert!(
+                cover::read_suwayomi_cover(&app.pool, &app.cover_pool, 7, None)
+                    .await
+                    .is_err()
+            );
+            for response in [
+                serve_suwayomi_cover(&app, &app.cover_pool, 7, Some(192)).await,
+                exact_cover_get(&app, Some("v=7&w=192")).await,
+            ] {
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(
+                    response.headers()[header::CACHE_CONTROL],
+                    "no-store, must-revalidate"
+                );
+                assert!(!response.headers().contains_key(header::LOCATION));
+                assert_eq!(
+                    response.extensions().get::<telemetry::MediaOutcome>(),
+                    Some(&telemetry::MediaOutcome::StoreError),
+                );
+            }
+        }
         assert_eq!(origin.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
-        // Work covers too: a cold miss would look up the MangaDex anchor and answer
-        // 404 or redirect; a store fault answers before any of that, retryably.
-        let response = serve_cover(
-            State(app),
-            State(CoverDb(covers)),
-            UrlPath("w1.webp".to_string()),
-            RawQuery(Some("w=192".to_string())),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            response.headers()[header::CACHE_CONTROL],
-            "no-store, must-revalidate"
-        );
-        assert!(response.headers().get(header::LOCATION).is_none());
-        assert_eq!(
-            response.extensions().get::<telemetry::MediaOutcome>(),
-            Some(&telemetry::MediaOutcome::StoreError),
-            "the media telemetry reports a store fault, not a busy pool"
-        );
+    }
+
+    #[test]
+    fn cover_store_failures_preserve_status_cache_and_telemetry() {
+        for (error, status) in [
+            (
+                anyhow::Error::new(sqlx::Error::PoolClosed).context("cover index read"),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                anyhow::Error::new(sqlx::Error::PoolTimedOut).context("cover index read"),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            let response = cover_store_unavailable(error.into());
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "no-store, must-revalidate"
+            );
+            assert_eq!(
+                response.extensions().get::<telemetry::MediaOutcome>(),
+                Some(&telemetry::MediaOutcome::StoreError),
+            );
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                assert!(response.headers().contains_key(header::RETRY_AFTER));
+            }
+        }
     }
 
     #[tokio::test]
@@ -5049,7 +5290,8 @@ mod tests {
         pool.close().await;
     }
 
-    async fn production_router_fixture() -> (Config, RouterState, Arc<cloudflare::Manager>) {
+    async fn production_router_fixture() -> (TestDir, Config, RouterState, Arc<cloudflare::Manager>)
+    {
         let pool = crate::db::Database::connect("sqlite::memory:")
             .await
             .unwrap();
@@ -5057,9 +5299,13 @@ mod tests {
             .run(pool.write())
             .await
             .unwrap();
-        let covers = db::init_covers("sqlite::memory:").await.unwrap();
-        sqlx::query("INSERT INTO work_cover_blob(work_id, webp, version, updated_at) VALUES ('cached', X'0102', 1, 't')")
-            .execute(&covers).await.unwrap();
+        let dir = TestDir::new();
+        let covers = store(&dir);
+        sqlx::query("INSERT INTO work(id,created_at,updated_at) VALUES ('cached',now(),now())")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_work_cover(&pool, &covers, "cached", &[1, 2], 1).await;
         let reserved = ReadyDb::connect(&pool).await.unwrap();
         let budgets = Arc::new(request_budget::RequestBudgets::default());
         let mangadex = Arc::new(mangadex::MangaDexClient::new("router-test", 50.0, 600.0));
@@ -5100,6 +5346,7 @@ mod tests {
             .data(cloudflare.clone())
             .finish();
         (
+            dir,
             cfg,
             RouterState {
                 schema,
@@ -5118,7 +5365,7 @@ mod tests {
     #[tokio::test]
     async fn fallback_ignores_main_proxy_headers_for_client_rate_limits() {
         use tower::ServiceExt;
-        let (cfg, state, cloudflare) = production_router_fixture().await;
+        let (_covers_dir, cfg, state, cloudflare) = production_router_fixture().await;
         state.trusted_proxies.replace(&["172.17.0.0/16".into()]);
         let trusted = state.trusted_proxies.clone();
         for _ in 0..100 {
@@ -5179,7 +5426,7 @@ mod tests {
     #[tokio::test]
     async fn production_router_keeps_health_and_images_outside_graphql_admission() {
         use tower::ServiceExt;
-        let (cfg, state, cloudflare) = production_router_fixture().await;
+        let (_covers_dir, cfg, state, cloudflare) = production_router_fixture().await;
         let pool = state.pool.clone();
         let reserved = state.ready_pool.clone();
         let covers = state.cover_pool.clone();
@@ -5258,8 +5505,9 @@ mod tests {
     #[tokio::test]
     async fn production_fallback_router_shares_media_reserve_and_keeps_reader_and_api_available() {
         use tower::ServiceExt;
-        let (cfg, state, cloudflare) = production_router_fixture().await;
-        let dir = std::env::temp_dir().join(format!("komika-fallback-router-{}", uuid::Uuid::new_v4()));
+        let (_covers_dir, cfg, state, cloudflare) = production_router_fixture().await;
+        let dir =
+            std::env::temp_dir().join(format!("komika-fallback-router-{}", uuid::Uuid::new_v4()));
         for sub in ["reader", "admin"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
             std::fs::write(dir.join(sub).join("index.html"), format!("{sub}-index")).unwrap();
@@ -5495,17 +5743,8 @@ mod tests {
             .run(main.write())
             .await
             .unwrap();
-        let covers = crate::database::SqliteTestPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        for ddl in [
-            "CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL)",
-            "CREATE TABLE cover_variant (asset_key TEXT NOT NULL, width INTEGER NOT NULL, webp BLOB NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (asset_key, width))",
-        ] {
-            sqlx::query(ddl).execute(&covers).await.unwrap();
-        }
+        let dir = TestDir::new();
+        let covers = store(&dir);
         sqlx::query("INSERT INTO work (id, cover_file_name, created_at, updated_at) VALUES ('w1', 'c.jpg', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
             .execute(&main).await.unwrap();
         sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_key, created_at) VALUES ('ss1', 'w1', 'mangadex', 'md-1', '2026-01-01T00:00:00Z')")
@@ -5562,21 +5801,20 @@ mod tests {
 
         mangadex.set_enabled(true);
         let held_main_writer = main.begin().await.unwrap();
-        let held_cover_writer = covers.begin().await.unwrap();
         let res = tokio::time::timeout(std::time::Duration::from_secs(2), get())
             .await
             .expect("cover GET waited for a cache writer");
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(cdn.hits.load(Ordering::SeqCst), 1);
-        held_cover_writer.commit().await.unwrap();
         held_main_writer.commit().await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_blob")
-                    .fetch_one(&covers)
+                if covers
+                    .read_master(&main, "w1", None)
                     .await
-                    .unwrap();
-                if stored > 0 {
+                    .unwrap()
+                    .is_some()
+                {
                     break;
                 }
                 tokio::task::yield_now().await;

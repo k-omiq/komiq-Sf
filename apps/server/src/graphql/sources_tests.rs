@@ -105,11 +105,10 @@ pub(super) async fn fixture_with_users(
         .await
         .unwrap();
     }
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
     let state = Arc::new(AppState {
         pool: pool.clone(),
-        cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
-            .await
-            .unwrap(),
+        cover_pool: crate::cover_store::test_support::store(&cover_dir),
         suwayomi: SuwayomiClient::new(engine.to_string(), None, None),
         mangadex: Arc::new(
             crate::mangadex::MangaDexClient::new("sources-test", 50.0, 600.0)
@@ -132,7 +131,12 @@ pub(super) async fn fixture_with_users(
         policy: Default::default(),
         setup_code: crate::instance::SetupCode::default(),
     });
-    (build_schema(state.clone(), false), state)
+    (
+        schema_builder(state.clone(), false)
+            .data(cover_dir)
+            .finish(),
+        state,
+    )
 }
 
 pub(super) async fn run(

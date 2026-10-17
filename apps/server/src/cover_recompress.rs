@@ -10,37 +10,37 @@
 //! Migration 0065 explicitly deferred this, on the grounds that re-materializing ~88k
 //! covers means ~71 GB of MangaDex refetch traffic. **That premise does not hold.** A
 //! lossless master is a pixel-exact copy of the downscaled source, so the bytes needed
-//! to produce the lossy master are already on our own disk: decode the stored blob and
+//! to produce the lossy master are already on our own disk: decode the stored file and
 //! re-encode it. No network, no rate limiter, no upstream politeness budget — just CPU.
 //!
 //! # Shape of the pass
 //!
-//! A cursor walk over `work_cover_blob` by primary key, a bounded batch per tick:
+//! The one owner server runs this after the SQLite copy finishes. It walks work masters
+//! in the PostgreSQL file index by asset key, a bounded batch per tick:
 //!
-//!  * The batch is read as HEADERS ONLY (`substr(webp, 1, 16)`), which lets SQLite skip
-//!    the overflow pages holding the actual image; a row already encoded `VP8 ` is
-//!    dismissed without its ~170 KB ever leaving the disk.
+//!  * Only the first 16 bytes of each object file are read initially; a master already
+//!    encoded `VP8 ` is dismissed without reading its full contents.
 //!  * Everything else is re-encoded through `process_cover`, which is a no-op resize
 //!    here (the stored master is already inside the edge ladder's top rung) and so only
 //!    changes the ENCODING, never the dimensions.
 //!  * The result is kept only when it is meaningfully smaller ([`MIN_SHRINK_PCT`]), so a
 //!    cover that does not benefit is left exactly as it was.
 //!
-//! Writes go through `cover::put_work_cover`, which drops the stale derivatives and
+//! Writes go through `cover::put_work_cover_if_current`, which checks the old master,
+//! drops the stale derivatives, keeps uploaded bytes in step and
 //! bumps `work.cover_cached_version`. That version bump is what makes the saving VISIBLE:
 //! `/covers/{id}.webp` is served `immutable` for a year, so without a fresh `?v=` the
 //! edge would keep handing out the old fat bytes.
 //!
 //! # Why a durable cursor rather than a predicate
 //!
-//! "Still lossless" is not cheaply expressible in SQL — it needs the blob's 13th byte,
-//! and `substr()` over a 20 GB store would re-read every candidate on every tick. A
-//! monotonic cursor visits each row exactly once, survives restarts, and lets the pass
-//! declare itself finished and go quiet.
+//! "Still lossless" needs the file's header, not just its index row. A monotonic cursor
+//! in `instance_setting` visits each row exactly once, survives restarts, and lets the
+//! pass declare itself finished and go quiet.
 //!
 //! # Scope
 //!
-//! `work_cover_blob` only. `suwayomi_cover_blob` is deliberately untouched: those masters
+//! Work masters only. Numeric source masters are deliberately untouched: those masters
 //! are already lossy (the warmer that writes them postdates the switch), AND their public
 //! URL — `/api/v1/manga/{id}/thumbnail` — carries no version token, so a rewrite there
 //! could not bust the year-long edge entry anyway. Rewriting them would spend CPU for a
@@ -49,15 +49,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::database::SqliteDatabase;
 use crate::db::Database;
 use anyhow::Result;
-use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 
 use crate::cover;
-
-/// `cover_maintenance.key` for this pass.
-const CURSOR_KEY: &str = "work_cover_recompress";
+use crate::cover_store::{self, CoverStore};
 
 /// Keep a re-encode only when it saves at least this share of the original. A cover that
 /// barely shrinks is not worth a new `?v=` (which costs every client a refetch of bytes
@@ -81,34 +79,39 @@ pub struct Progress {
     pub finished: bool,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct Cursor {
+    after: String,
+    done: bool,
+}
+
 /// Read the stored cursor. A missing row means "never run" — start from before every
 /// possible `work_id`, i.e. the empty string.
-async fn load_cursor(covers: &SqliteDatabase) -> Result<Option<String>> {
-    let row: Option<(String, i64)> =
-        sqlx::query_as("SELECT cursor, done FROM cover_maintenance WHERE key = $1")
-            .bind(CURSOR_KEY)
-            .fetch_optional(covers)
+async fn load_cursor(main: &Database) -> Result<Cursor> {
+    let value: Option<String> =
+        sqlx::query_scalar("SELECT value FROM instance_setting WHERE key = $1")
+            .bind(crate::cover_copy::RECOMPRESS_SETTING)
+            .fetch_optional(main)
             .await?;
-    Ok(match row {
-        // `done` is terminal: the walk reached the end, so there is nothing left to do.
-        Some((_, done)) if done != 0 => None,
-        Some((cursor, _)) => Some(cursor),
-        None => Some(String::new()),
-    })
+    Ok(value
+        .map(|value| serde_json::from_str(&value))
+        .transpose()?
+        .unwrap_or_default())
 }
 
 /// Persist the cursor (and, at the end of the walk, the terminal `done` flag).
-async fn save_cursor(covers: &SqliteDatabase, cursor: &str, done: bool) -> Result<()> {
+async fn save_cursor(main: &Database, cursor: &str, done: bool) -> Result<()> {
     sqlx::query(
-        "INSERT INTO cover_maintenance (key, cursor, done, updated_at) VALUES ($1, $2, $3, $4) \
-         ON CONFLICT(key) DO UPDATE SET cursor = excluded.cursor, done = excluded.done, \
+        "INSERT INTO instance_setting (key, value, updated_at) VALUES ($1, $2, now()) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
          updated_at = excluded.updated_at",
     )
-    .bind(CURSOR_KEY)
-    .bind(cursor)
-    .bind(i64::from(done))
-    .bind(Utc::now().to_rfc3339())
-    .execute(covers)
+    .bind(crate::cover_copy::RECOMPRESS_SETTING)
+    .bind(serde_json::to_string(&Cursor {
+        after: cursor.to_owned(),
+        done,
+    })?)
+    .execute(main)
     .await?;
     Ok(())
 }
@@ -119,29 +122,31 @@ async fn save_cursor(covers: &SqliteDatabase, cursor: &str, done: bool) -> Resul
 /// Never returns an error for a single bad row — a master that will not decode is left
 /// alone and the cursor moves past it, because a cover we cannot re-encode is still a
 /// cover we can serve.
-pub async fn run_batch(main: &Database, covers: &SqliteDatabase, batch: i64) -> Result<Progress> {
-    let Some(start) = load_cursor(covers).await? else {
+pub async fn run_batch(main: &Database, covers: &CoverStore, batch: i64) -> Result<Progress> {
+    if !covers.copy_done() {
+        return Ok(Progress::default());
+    }
+    let cursor = load_cursor(main).await?;
+    if cursor.done {
         return Ok(Progress {
             finished: true,
             ..Default::default()
         });
-    };
+    }
+    let start = cursor.after;
 
-    // Headers only. `substr(blob, 1, N)` lets SQLite answer from the row's first page
-    // without walking the overflow chain, so a tick over already-converted rows costs
-    // kilobytes instead of tens of megabytes — which is what makes a large `batch` cheap
-    // and a re-run of a finished region nearly free.
-    let headers: Vec<(String, Vec<u8>)> = sqlx::query_as(
-        "SELECT work_id, substr(webp, 1, 16) FROM work_cover_blob \
-         WHERE work_id > $1 ORDER BY work_id LIMIT $2",
+    let masters: Vec<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT asset_key, sha256 FROM cover_object \
+         WHERE kind = 'master' AND asset_key LIKE 'w:%' AND asset_key > $1 \
+         ORDER BY asset_key LIMIT $2",
     )
-    .bind(&start)
+    .bind(format!("w:{start}"))
     .bind(batch)
-    .fetch_all(covers)
+    .fetch_all(main)
     .await?;
 
-    if headers.is_empty() {
-        save_cursor(covers, &start, true).await?;
+    if masters.is_empty() {
+        save_cursor(main, &start, true).await?;
         return Ok(Progress {
             finished: true,
             ..Default::default()
@@ -149,23 +154,27 @@ pub async fn run_batch(main: &Database, covers: &SqliteDatabase, batch: i64) -> 
     }
 
     let mut progress = Progress {
-        scanned: headers.len(),
+        scanned: masters.len(),
         ..Default::default()
     };
     let mut cursor = start;
-    for (work_id, header) in headers {
+    for (asset, sha) in masters {
+        let work_id = cover_store::asset_of(&asset).to_owned();
         cursor = work_id.clone();
+        let sha = cover_store::Sha::try_from(sha.as_slice())?;
+        // Already-lossy files need only a header read, even when their full bytes are large.
+        let file = match tokio::fs::File::open(covers.object_path(&sha)).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let mut header = Vec::with_capacity(16);
+        file.take(16).read_to_end(&mut header).await?;
         if cover::webp_is_lossy(&header) {
             continue;
         }
-        // Only now is the full master worth reading. A row that vanished since the header
-        // scan (the GC reclaiming an orphan) simply yields nothing and is stepped over.
-        let Some(master): Option<Vec<u8>> =
-            sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id = $1")
-                .bind(&work_id)
-                .fetch_optional(covers)
-                .await?
-        else {
+        // A file reclaimed since the index or header read is simply stepped over.
+        let Some(master) = covers.read_object(&sha).await? else {
             continue;
         };
         let original_len = master.len();
@@ -212,7 +221,7 @@ pub async fn run_batch(main: &Database, covers: &SqliteDatabase, batch: i64) -> 
 
     // Cursor last: a crash mid-batch simply replays the batch, and every step in it is
     // idempotent (a row already rewritten now reads as `VP8 ` and is skipped).
-    save_cursor(covers, &cursor, false).await?;
+    save_cursor(main, &cursor, false).await?;
     // Every rewrite minted a new `cover_cached_version`, so every memoized `coverUrl` for
     // one of these works still carries the PREVIOUS `?v=`. That URL is already in the edge
     // and browser caches behind a one-year `immutable` entry holding the fat, pre-recompress
@@ -227,13 +236,10 @@ pub async fn run_batch(main: &Database, covers: &SqliteDatabase, batch: i64) -> 
 /// Recurring, self-terminating background pass. Ticks every `interval_secs` until the
 /// walk completes, then stays idle for the rest of the process's life.
 ///
-/// Unlike the cover drainer this touches NO external service, so it is safe on every
-/// replica: each one owns its own `covers.sqlite3` and has its own leftovers to fix. The
-/// only shared write is `work.cover_cached_version`, where two replicas agreeing on
-/// "some fresh version" is all the correctness the `?v=` bust needs.
+/// The owner server publishes the files; this pass waits until the copy finishes.
 pub fn spawn(
     main: Database,
-    covers: SqliteDatabase,
+    covers: CoverStore,
     interval_secs: u64,
     batch: i64,
     shutdown: tokio::sync::watch::Receiver<bool>,
@@ -256,14 +262,14 @@ pub fn spawn(
 
 async fn run_loop(
     main: Database,
-    covers: SqliteDatabase,
+    covers: CoverStore,
     interval_secs: u64,
     batch: i64,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     // Start 210s in, behind the scanner (0s), the cover drainer (90s) and the GC (150s),
     // so the boot burst stays spread across the background loops rather than landing in
-    // one instant on SQLite's single writer.
+    // one instant on the database writer.
     let mut ticker = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(210),
         Duration::from_secs(interval_secs),
@@ -306,6 +312,7 @@ async fn run_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cover_store::test_support::{self, TestDir};
     use image::{DynamicImage, RgbImage};
 
     /// High-entropy art, so lossless encoding is genuinely expensive and the lossy
@@ -346,86 +353,53 @@ mod tests {
 
     /// Main DB with the version pointer and materialized URLs `put_work_cover` publishes.
     async fn main_db() -> Database {
-        let pool = Database::empty_for_test(2).await.unwrap();
-        sqlx::query("CREATE TABLE work (id TEXT PRIMARY KEY, cover_cached_version BIGINT)")
-            .execute(&pool)
+        let pool = crate::database::TestPoolOptions::new()
+            .connect("sqlite::memory:")
             .await
             .unwrap();
-        // A publication refuses a taken-down work (M5 `media_policy`).
-        sqlx::query("CREATE TABLE media_takedown (subject_kind TEXT, subject_id TEXT)")
-            .execute(&pool)
+        sqlx::migrate!("./migrations_pg")
+            .run(pool.write())
             .await
             .unwrap();
-        for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
-            sqlx::query(&format!(
-                "CREATE TABLE {table} (work_id TEXT PRIMARY KEY, cover_url TEXT)"
-            ))
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
         pool
     }
 
-    /// Covers DB with the two tables this pass reads and writes.
-    async fn covers_db() -> SqliteDatabase {
-        let pool = SqliteDatabase::connect("sqlite::memory:").await.unwrap();
-        for ddl in [
-            "CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, \
-             version INTEGER NOT NULL, updated_at TEXT NOT NULL)",
-            "CREATE TABLE cover_variant (asset_key TEXT NOT NULL, width INTEGER NOT NULL, \
-             webp BLOB NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (asset_key, width))",
-            "CREATE TABLE cover_maintenance (key TEXT PRIMARY KEY, cursor TEXT NOT NULL, \
-             done INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)",
-        ] {
-            sqlx::query(ddl).execute(&pool).await.unwrap();
-        }
-        pool
-    }
-
-    async fn insert_master(main: &Database, covers: &SqliteDatabase, id: &str, webp: &[u8]) {
-        sqlx::query("INSERT INTO work (id, cover_cached_version) VALUES ($1, 1)")
+    async fn insert_master(main: &Database, covers: &CoverStore, id: &str, webp: &[u8]) {
+        sqlx::query("INSERT INTO work (id, created_at, updated_at) VALUES ($1, now(), now())")
             .bind(id)
             .execute(main)
             .await
             .unwrap();
-        sqlx::query(
-            "INSERT INTO work_cover_blob (work_id, webp, version, updated_at) \
-             VALUES ($1, $2, 1, '2026-01-01T00:00:00Z')",
-        )
-        .bind(id)
-        .bind(webp)
-        .execute(covers)
-        .await
-        .unwrap();
+        cover::put_work_cover(main, covers, id, webp).await.unwrap();
     }
 
-    async fn stored(covers: &SqliteDatabase, id: &str) -> Vec<u8> {
-        sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id = $1")
-            .bind(id)
-            .fetch_one(covers)
-            .await
-            .unwrap()
+    async fn stored(main: &Database, covers: &CoverStore, id: &str) -> cover_store::Master {
+        covers.read_master(main, id, None).await.unwrap().unwrap().0
     }
 
     #[tokio::test]
     async fn a_lossless_master_is_re_encoded_and_gets_a_fresh_version() {
-        let (main, covers) = (main_db().await, covers_db().await);
+        let main = main_db().await;
+        let dir = TestDir::new();
+        let covers = test_support::store(&dir);
         let legacy = legacy_lossless_master(600, 900);
         insert_master(&main, &covers, "w_a", &legacy).await;
+        let before = stored(&main, &covers, "w_a").await;
         // A derivative of the OLD master, which must not survive the rewrite.
-        sqlx::query(
-            "INSERT INTO cover_variant (asset_key, width, webp, updated_at) \
-             VALUES ('w_a', 192, x'00', '2026-01-01T00:00:00Z')",
-        )
-        .execute(&covers)
-        .await
-        .unwrap();
+        cover::put_current_variant(&main, &covers, "w_a", 192, &before, &[0])
+            .await
+            .unwrap();
+        assert!(
+            cover_store::row(&main, "w_a", cover_store::Kind::Width(192))
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         let p = run_batch(&main, &covers, 10).await.unwrap();
         assert_eq!(p.rewritten, 1, "the lossless master must be rewritten");
 
-        let now = stored(&covers, "w_a").await;
+        let now = stored(&main, &covers, "w_a").await.bytes;
         assert!(cover::webp_is_lossy(&now), "rewritten as lossy WebP");
         assert!(
             now.len() * 2 < legacy.len(),
@@ -448,37 +422,50 @@ mod tests {
                 .fetch_one(&main)
                 .await
                 .unwrap();
-        assert!(version > 1, "cover_cached_version must be bumped");
+        assert!(
+            Some(version) > before.version,
+            "cover_cached_version must be bumped"
+        );
 
-        let variants: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM cover_variant WHERE asset_key = 'w_a'")
-                .fetch_one(&covers)
-                .await
-                .unwrap();
+        let variants: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM cover_object WHERE asset_key = 'w:w_a' AND kind <> 'master'",
+        )
+        .fetch_one(&main)
+        .await
+        .unwrap();
         assert_eq!(variants, 0, "derivatives of the old master must be dropped");
     }
 
     #[tokio::test]
     async fn an_already_lossy_master_is_left_alone() {
-        let (main, covers) = (main_db().await, covers_db().await);
+        let main = main_db().await;
+        let dir = TestDir::new();
+        let covers = test_support::store(&dir);
         let modern = cover::process_cover(&noisy_png(600, 900)).unwrap();
         insert_master(&main, &covers, "w_a", &modern).await;
+        let before = stored(&main, &covers, "w_a").await;
 
         let p = run_batch(&main, &covers, 10).await.unwrap();
         assert_eq!(p.scanned, 1);
         assert_eq!(p.rewritten, 0, "a lossy master needs no work");
-        assert_eq!(stored(&covers, "w_a").await, modern, "bytes untouched");
+        assert_eq!(
+            stored(&main, &covers, "w_a").await.bytes,
+            modern,
+            "bytes untouched"
+        );
         let version: i64 =
             crate::db_types::query_scalar("SELECT cover_cached_version FROM work WHERE id = 'w_a'")
                 .fetch_one(&main)
                 .await
                 .unwrap();
-        assert_eq!(version, 1, "no needless cache bust");
+        assert_eq!(Some(version), before.version, "no needless cache bust");
     }
 
     #[tokio::test]
     async fn the_walk_resumes_then_terminates() {
-        let (main, covers) = (main_db().await, covers_db().await);
+        let main = main_db().await;
+        let dir = TestDir::new();
+        let covers = test_support::store(&dir);
         let legacy = legacy_lossless_master(600, 900);
         for id in ["w_a", "w_b", "w_c"] {
             insert_master(&main, &covers, id, &legacy).await;
@@ -491,17 +478,14 @@ mod tests {
             assert_eq!(p.scanned, 1, "one row per tick");
             assert_eq!(p.rewritten, 1);
             assert!(!p.finished);
-            let cursor: String =
-                sqlx::query_scalar("SELECT cursor FROM cover_maintenance WHERE key = $1")
-                    .bind(CURSOR_KEY)
-                    .fetch_one(&covers)
-                    .await
-                    .unwrap();
-            assert_eq!(cursor, expected, "cursor advances one row at a time");
+            let cursor = load_cursor(&main).await.unwrap();
+            assert_eq!(cursor.after, expected, "cursor advances one row at a time");
+            assert!(!cursor.done);
         }
 
         let p = run_batch(&main, &covers, 1).await.unwrap();
         assert!(p.finished, "the walk must declare itself finished");
+        assert!(load_cursor(&main).await.unwrap().done);
         // …and stay finished, so the loop goes quiet instead of re-reading 20 GB forever.
         let again = run_batch(&main, &covers, 1).await.unwrap();
         assert_eq!(
@@ -516,7 +500,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_master_that_barely_shrinks_keeps_its_bytes_and_its_version() {
-        let (main, covers) = (main_db().await, covers_db().await);
+        let main = main_db().await;
+        let dir = TestDir::new();
+        let covers = test_support::store(&dir);
         // Flat art: lossless already encodes it in a few hundred bytes, so the lossy
         // re-encode cannot clear MIN_SHRINK_BYTES. Rewriting it would spend a cache bust
         // (every client refetches) to save nothing.
@@ -527,10 +513,72 @@ mod tests {
         ))
         .unwrap();
         insert_master(&main, &covers, "w_a", &flat).await;
+        let before = stored(&main, &covers, "w_a").await;
 
         let p = run_batch(&main, &covers, 10).await.unwrap();
         assert_eq!(p.scanned, 1);
         assert_eq!(p.rewritten, 0, "not worth a cache bust");
-        assert_eq!(stored(&covers, "w_a").await, flat, "bytes untouched");
+        let after = stored(&main, &covers, "w_a").await;
+        assert_eq!(after.bytes, flat, "bytes untouched");
+        assert_eq!(after.version, before.version, "no needless cache bust");
+    }
+
+    #[tokio::test]
+    async fn waits_for_the_copy_before_scanning_or_advancing() {
+        let main = main_db().await;
+        let dir = TestDir::new();
+        let covers = test_support::store_with_legacy(
+            &dir,
+            test_support::legacy_pool().await,
+            cover_store::CopyCursor::default(),
+        );
+        let legacy = legacy_lossless_master(600, 900);
+        insert_master(&main, &covers, "w_a", &legacy).await;
+
+        assert_eq!(
+            run_batch(&main, &covers, 10).await.unwrap(),
+            Progress::default()
+        );
+        assert_eq!(stored(&main, &covers, "w_a").await.bytes, legacy);
+        let cursor: Option<String> =
+            sqlx::query_scalar("SELECT value FROM instance_setting WHERE key = $1")
+                .bind(crate::cover_copy::RECOMPRESS_SETTING)
+                .fetch_optional(&main)
+                .await
+                .unwrap();
+        assert!(cursor.is_none(), "waiting must not advance the cursor");
+
+        covers.set_copy_cursor(cover_store::CopyCursor::done());
+        assert_eq!(run_batch(&main, &covers, 10).await.unwrap().rewritten, 1);
+    }
+
+    #[tokio::test]
+    async fn recompressing_an_upload_keeps_its_backup_equal_to_the_master() {
+        let main = main_db().await;
+        let dir = TestDir::new();
+        let covers = test_support::store(&dir);
+        sqlx::query("INSERT INTO work (id, created_at, updated_at) VALUES ('w_a', now(), now())")
+            .execute(&main)
+            .await
+            .unwrap();
+        let legacy = legacy_lossless_master(600, 900);
+        assert!(
+            cover::put_uploaded_work_cover(&main, &covers, "w_a", &legacy)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(run_batch(&main, &covers, 10).await.unwrap().rewritten, 1);
+        let master = stored(&main, &covers, "w_a").await;
+        assert!(cover::webp_is_lossy(&master.bytes));
+        assert_ne!(master.bytes, legacy);
+        let (bytes, sha): (Vec<u8>, Vec<u8>) =
+            sqlx::query_as("SELECT bytes, sha256 FROM cover_upload WHERE work_id = 'w_a'")
+                .fetch_one(&main)
+                .await
+                .unwrap();
+        assert_eq!(bytes, master.bytes);
+        assert_eq!(sha.as_slice(), master.sha.as_slice());
+        assert_eq!(cover_store::sha256(&bytes), master.sha);
     }
 }

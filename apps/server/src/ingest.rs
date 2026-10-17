@@ -982,11 +982,10 @@ mod tests {
     async fn cancelling_a_job_interrupts_the_listing_budget_wait_without_item_failures() {
         let pool = pool().await;
         let (base, hits) = flaky_browse_origin(0).await;
+        let cover_dir = crate::cover_store::test_support::TestDir::new();
         let state = Arc::new(AppState {
             pool: pool.clone(),
-            cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
-                .await
-                .unwrap(),
+            cover_pool: crate::cover_store::test_support::store(&cover_dir),
             suwayomi: SuwayomiClient::new(base, None, Some("src".into())),
             mangadex: Arc::new(
                 crate::mangadex::MangaDexClient::new("ingest-test", 50.0, 600.0)

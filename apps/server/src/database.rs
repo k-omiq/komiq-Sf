@@ -10,8 +10,6 @@
 //! with 1 the Parallel lane is the Serial connection.
 pub use crate::sqlite_database::SqliteDatabase;
 #[cfg(test)]
-pub use crate::sqlite_database::SqliteTestPoolOptions;
-#[cfg(test)]
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1770,7 +1768,8 @@ mod phase4_tests {
             ..Default::default()
         })
         .await;
-        let covers = crate::db::init_covers("sqlite::memory:").await.unwrap();
+        let cover_dir = crate::cover_store::test_support::TestDir::new();
+        let covers = crate::cover_store::test_support::store(&cover_dir);
         #[derive(Clone)]
         struct PageState(Arc<crate::graphql::AppState>, crate::CoverDb);
         impl FromRef<PageState> for Arc<crate::graphql::AppState> {
@@ -1827,7 +1826,6 @@ mod phase4_tests {
             axum::http::StatusCode::BAD_GATEWAY
         );
         assert_eq!(seen, Counters::default());
-        covers.close().await;
         pool.close().await;
     }
 

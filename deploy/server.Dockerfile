@@ -63,11 +63,13 @@ RUN chmod +x /usr/local/bin/komika-entrypoint.sh
 USER komika
 WORKDIR /data
 
-# Defaults; Compose supplies the main database password. Covers persist under
-# /data; main data and avatars live in PostgreSQL.
+# Defaults; Compose supplies the main database password. Cover files persist under
+# /data/covers (a cache, refetched when lost); main data, avatars and uploaded covers
+# live in PostgreSQL. covers.sqlite3 is the old cover cache, copied once into files.
 ENV PORT=8080 \
     DATABASE_URL=postgres://komika@postgres:5432/komika \
     COVERS_DATABASE_URL=sqlite:///data/covers.sqlite3 \
+    KOMIKA_COVERS_DIR=/data/covers \
     KOMIKA_FALLBACK_READER_DIR=/srv/web/reader \
     SUWAYOMI_URL=http://suwayomi:4567 \
     RUST_LOG=komika_server=info,tower_http=warn

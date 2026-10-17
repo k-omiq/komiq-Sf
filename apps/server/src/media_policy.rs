@@ -27,7 +27,6 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 use sqlx::{Postgres, Transaction};
 
-
 use crate::db::Database;
 use crate::media_verify::LeaseBody;
 
@@ -87,11 +86,10 @@ where
 
 /// Hold the epoch row until publication commits, so a policy change sees its copy.
 pub(crate) async fn hold_epoch(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
-    let epoch = sqlx::query_scalar::<_, i64>(
-        "SELECT epoch FROM media_policy WHERE singleton FOR SHARE",
-    )
-    .fetch_optional(&mut **tx)
-    .await?;
+    let epoch =
+        sqlx::query_scalar::<_, i64>("SELECT epoch FROM media_policy WHERE singleton FOR SHARE")
+            .fetch_optional(&mut **tx)
+            .await?;
     if let Some(epoch) = epoch {
         return Ok(epoch);
     }
@@ -101,11 +99,11 @@ pub(crate) async fn hold_epoch(tx: &mut Transaction<'_, Postgres>) -> Result<i64
     )
     .execute(&mut **tx)
     .await?;
-    Ok(sqlx::query_scalar(
-        "SELECT epoch FROM media_policy WHERE singleton FOR SHARE",
+    Ok(
+        sqlx::query_scalar("SELECT epoch FROM media_policy WHERE singleton FOR SHARE")
+            .fetch_one(&mut **tx)
+            .await?,
     )
-    .fetch_one(&mut **tx)
-    .await?)
 }
 
 /// Move the epoch inside the caller's transaction and return the new value. The row lock
@@ -436,12 +434,12 @@ pub(crate) async fn carry_split(
     Ok(())
 }
 
-/// After a work takedown commits: delete the work's cover blobs, under its id and every
-/// old id that redirects to it, and the engine covers of its series. Cross-database, so
-/// best effort: the cover routes refuse a denied work whether or not this ran.
+/// After a work takedown commits: delete its cover index rows and upload, including
+/// redirected ids and the engine covers of its series. Best effort: the cover routes
+/// refuse a denied work whether or not this ran.
 pub(crate) async fn after_work_takedown(
     pool: &Database,
-    covers: &crate::db::SqliteDatabase,
+    covers: &crate::cover_store::CoverStore,
     work_id: &str,
 ) -> Result<()> {
     let mut works: Vec<String> =
@@ -466,7 +464,7 @@ pub(crate) async fn after_work_takedown(
 /// anything changed.
 pub(crate) async fn take_down(
     pool: &Database,
-    covers: &crate::db::SqliteDatabase,
+    covers: &crate::cover_store::CoverStore,
     kind: Kind,
     subject: &str,
     reason: &str,
@@ -515,7 +513,7 @@ const CLI_USAGE: &str = "usage: komika-server takedown add work|copy <id> --reas
 /// `EPOCH_CHECK`.
 pub(crate) async fn run_cli(
     pool: &Database,
-    covers: &crate::db::SqliteDatabase,
+    covers: &crate::cover_store::CoverStore,
     args: &[String],
 ) -> Result<()> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -639,13 +637,12 @@ impl Snapshot {
             ),
             None => HashSet::new(),
         };
-        let mut denied_copies: BTreeSet<String> = sqlx::query_scalar(
-            "SELECT subject_id FROM media_takedown WHERE subject_kind = 'copy'",
-        )
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .collect();
+        let mut denied_copies: BTreeSet<String> =
+            sqlx::query_scalar("SELECT subject_id FROM media_takedown WHERE subject_kind = 'copy'")
+                .fetch_all(pool)
+                .await?
+                .into_iter()
+                .collect();
         let closed: Vec<i64> = takedown_manga.union(&blocked_manga).copied().collect();
         if exact_media && !closed.is_empty() {
             // For the lease and the manifest route: every copy of a closed series.
@@ -666,7 +663,7 @@ impl Snapshot {
             Vec::new()
         } else {
             sqlx::query_as(
-            "SELECT c.chapter_id, c.manga_id FROM media_takedown t \
+                "SELECT c.chapter_id, c.manga_id FROM media_takedown t \
              JOIN media_copy cp ON cp.id = t.subject_id \
              JOIN engine_manga_key m ON m.source_id = cp.source_id AND m.manga_key = cp.manga_key \
              JOIN engine_generation g ON g.id = m.generation AND g.state = 'active' \
@@ -786,8 +783,7 @@ impl Policy {
                 held.snapshot.epoch == epoch
                     && held.snapshot.generation == generation
                     && held.loaded.elapsed() < REBUILD_EVERY
-            })
-            {
+            }) {
                 held.checked = Instant::now();
                 return Ok(held.snapshot.clone());
             }

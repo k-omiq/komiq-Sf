@@ -9,7 +9,8 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::db::{Database, SqliteDatabase};
+use crate::cover_store::CoverStore;
+use crate::db::Database;
 use crate::suwayomi::SuwayomiClient;
 
 const MARKER: &str = "komiq.engine.generation";
@@ -77,7 +78,7 @@ struct Gate {
 
 pub struct Fence {
     pool: Database,
-    covers: SqliteDatabase,
+    covers: CoverStore,
     // This clone deliberately has no fence: identity checks must bypass the gate.
     engine: SuwayomiClient,
     gate: RwLock<Gate>,
@@ -96,7 +97,7 @@ impl std::fmt::Debug for Fence {
 impl Fence {
     pub async fn attach(
         pool: &Database,
-        covers: &SqliteDatabase,
+        covers: &CoverStore,
         engine: &mut SuwayomiClient,
     ) -> Result<Arc<Self>> {
         if current_on(&mut *pool.acquire().await?).await?.is_none() {
@@ -164,7 +165,10 @@ impl Fence {
         let revision = self.revision();
         match tokio::time::timeout(CHECK_TIMEOUT, self.check_inner(revision)).await {
             Ok(Ok(())) => {
-                self.gate.write().unwrap_or_else(|e| e.into_inner()).unreachable = false;
+                self.gate
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .unreachable = false;
             }
             Ok(Err(error)) => {
                 let unreachable = crate::suwayomi::is_connection_error(&error);
@@ -218,8 +222,17 @@ impl Fence {
         }
         if self.is_blocked() || self.generation().is_none() {
             // An engine that is down or still starting (a fresh install) says so plainly.
-            let unreachable = self.gate.read().unwrap_or_else(|e| e.into_inner()).unreachable;
-            return Err(if unreachable { FenceError::Unreachable } else { FenceError::Unavailable }.into());
+            let unreachable = self
+                .gate
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .unreachable;
+            return Err(if unreachable {
+                FenceError::Unreachable
+            } else {
+                FenceError::Unavailable
+            }
+            .into());
         }
         Ok(())
     }
@@ -373,7 +386,7 @@ impl Fence {
         let changed = sqlx::query("UPDATE engine_generation SET state='quarantined',reason=$2,since=now() WHERE id=$1 AND (state <> 'quarantined' OR reason IS DISTINCT FROM $2)")
             .bind(id).bind(reason).execute(&mut *tx).await?.rows_affected() > 0;
         if changed {
-            purge_covers(&self.covers).await?;
+            purge_covers(&mut tx, &self.covers).await?;
         }
         tx.commit().await?;
         crate::graphql::clear_feed_caches();
@@ -552,7 +565,7 @@ impl Fence {
             .execute(&mut *tx)
             .await?;
         }
-        purge_covers(&self.covers).await?;
+        purge_covers(&mut tx, &self.covers).await?;
         tx.commit().await?;
         self.engine.clear_numeric_memos();
         self.check_locked().await;
@@ -642,7 +655,7 @@ impl Fence {
             .bind(chrono::Utc::now().timestamp()).execute(&mut *tx).await?;
         self.gate.write().unwrap_or_else(|e| e.into_inner()).blocked = true;
         self.engine.clear_numeric_memos();
-        purge_covers(&self.covers).await?;
+        purge_covers(&mut tx, &self.covers).await?;
         tx.commit().await?;
         {
             let mut gate = self.gate.write().unwrap_or_else(|e| e.into_inner());
@@ -740,11 +753,31 @@ async fn detach_numeric_rows(
     .await?;
     // series_admin is the scanner's per-engine-series row: it never moves to a work.
     for (table, column, key, user) in [
-        ("user_library", "series_id", "jsonb_build_array(user_id,series_id)", "user_id"),
+        (
+            "user_library",
+            "series_id",
+            "jsonb_build_array(user_id,series_id)",
+            "user_id",
+        ),
         ("reviews", "series_id", "jsonb_build_array(id)", "user_id"),
-        ("series_admin", "series_id", "jsonb_build_array(series_id)", "NULL::uuid"),
-        ("series_views", "series_key", "jsonb_build_array(series_key)", "NULL::uuid"),
-        ("series_view_bucket", "series_key", "jsonb_build_array(series_key,hour_ts)", "NULL::uuid"),
+        (
+            "series_admin",
+            "series_id",
+            "jsonb_build_array(series_id)",
+            "NULL::uuid",
+        ),
+        (
+            "series_views",
+            "series_key",
+            "jsonb_build_array(series_key)",
+            "NULL::uuid",
+        ),
+        (
+            "series_view_bucket",
+            "series_key",
+            "jsonb_build_array(series_key,hour_ts)",
+            "NULL::uuid",
+        ),
     ] {
         sqlx::query(&format!("INSERT INTO engine_detached_row(generation,source_table,row_key,user_id,data) SELECT $1,'{table}',{key}::text,{user},to_jsonb(t) FROM {table} t WHERE {column} ~ '^[0-9]+$'"))
             .bind(old)
@@ -899,9 +932,7 @@ pub async fn shared(conn: &mut sqlx::PgConnection, expected: Option<Uuid>) -> Re
 /// The current generation id. Read it before loading numeric rows that a later write
 /// checks with [`shared`].
 pub async fn current(pool: &Database) -> Result<Option<Uuid>> {
-    Ok(current_on(&mut *pool.acquire().await?)
-        .await?
-        .map(|r| r.0))
+    Ok(current_on(&mut *pool.acquire().await?).await?.map(|r| r.0))
 }
 pub async fn wait(pool: &Database) -> Result<()> {
     if let Some(fence) = pool.engine_fence.get().and_then(std::sync::Weak::upgrade) {
@@ -961,15 +992,20 @@ pub fn observe_write<T>(pool: &Database, result: Result<T>) -> Result<T> {
     }
     result
 }
-pub async fn purge_covers(pool: &SqliteDatabase) -> Result<()> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM suwayomi_cover_blob")
+pub async fn purge_covers(tx: &mut sqlx::PgConnection, covers: &CoverStore) -> Result<()> {
+    sqlx::query("DELETE FROM cover_object WHERE asset_key LIKE 's:%'")
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM cover_variant WHERE asset_key LIKE 's:%'")
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
+    if let Some(legacy) = covers.legacy() {
+        let mut legacy_tx = legacy.begin().await?;
+        sqlx::query("DELETE FROM suwayomi_cover_blob")
+            .execute(&mut *legacy_tx)
+            .await?;
+        sqlx::query("DELETE FROM cover_variant WHERE asset_key LIKE 's:%'")
+            .execute(&mut *legacy_tx)
+            .await?;
+        legacy_tx.commit().await?;
+    }
     Ok(())
 }
 pub async fn numeric_epoch(pool: &Database) -> Result<i64> {
@@ -995,7 +1031,7 @@ pub async fn progress_guard(conn: &mut sqlx::PgConnection, epoch: Option<i64>) -
 
 pub async fn run_cli(
     pool: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     engine: &mut SuwayomiClient,
     args: &[String],
 ) -> Result<()> {

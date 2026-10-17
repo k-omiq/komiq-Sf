@@ -58,7 +58,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::database::SqliteDatabase;
+use crate::cover_store::CoverStore;
 use crate::db::Database;
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -682,7 +682,7 @@ pub struct StepReport {
 /// steps resolves all 496 without either one having to guess.
 pub async fn merge_anchorless(
     pool: &Database,
-    covers: Option<&SqliteDatabase>,
+    covers: Option<&CoverStore>,
     apply: Apply,
 ) -> Result<StepReport> {
     let rows = classify(pool).await?;
@@ -1212,7 +1212,7 @@ pub async fn delete_redundant(
 ///   * `delete`  — the destructive step; needs `--apply --confirm <token>`.
 pub async fn run_cli(
     pool: &Database,
-    covers: Option<&SqliteDatabase>,
+    covers: Option<&CoverStore>,
     suwayomi_url: &str,
     args: &[String],
 ) -> Result<()> {

@@ -37,7 +37,7 @@ The API server lives in `apps/server` and compiles to a native binary named `kom
 
 The server provides a unified GraphQL API implemented in `apps/server/src/graphql/`, with the client schema contract in `packages/api/src/schema/komika.graphql`. It stores user accounts, password hashes, sessions, reviews, comments, and catalog state in PostgreSQL 18 using sqlx, a Rust database library. It federates calls to Suwayomi over HTTP to resolve upstream sources and chapters. When configured with a static web directory, the server serves the reader and admin web applications directly.
 
-Covers remain a separate SQLite cache. Docker runs PostgreSQL privately beside the server; the desktop admin app bundles it. For an old main database, read [Old SQLite install](/self-host/update-and-backup#old-sqlite-install) to start fresh. For backups, self-host Docker uses PostgreSQL dumps, the desktop app saves a local dump when the newest is at least 20 hours old, and the global deployment packages pgBackRest backups to object storage.
+Covers and extension icons are cached as files under `KOMIKA_COVERS_DIR`; PostgreSQL holds their index and new cover uploads. Backups include the index and uploads, and missing files refill. Docker runs PostgreSQL privately beside the server; the desktop admin app bundles it. For an old main database, read [Old SQLite install](/self-host/update-and-backup#old-sqlite-install) to start fresh. For backups, self-host Docker uses PostgreSQL dumps, the desktop app saves a local dump when the newest is at least 20 hours old, and the global deployment packages pgBackRest backups to object storage.
 
 ### Source engine
 

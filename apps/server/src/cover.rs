@@ -16,6 +16,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::cover_store::{self, CoverStore};
 use crate::database::SqliteDatabase;
 use crate::db::Database;
 use crate::source_budget::{SourceBudgets, SourceUse};
@@ -297,133 +298,72 @@ pub fn downscale_variant(master: &[u8], width: u32) -> Result<Option<Vec<u8>>> {
     encode_webp_lossy(&resized, quality).map(Some)
 }
 
-/// Read a stored cover derivative, or `None` when it has not been generated yet.
-/// `asset_key` namespaces the two cover families that share this table — canonical
-/// works (`w_…`) and Suwayomi source covers (`s:<manga_id>`) — so one lazy-generate
-/// path serves both.
+/// A stored derivative of `asset` at `width`, made from whichever master it names.
+/// Fixtures only; serving uses [`variant_of_master`].
+#[cfg(test)]
 pub async fn get_cover_variant(
-    covers: &SqliteDatabase,
+    main: &Database,
+    covers: &CoverStore,
     asset_key: &str,
     width: u32,
 ) -> Option<Vec<u8>> {
-    sqlx::query_scalar("SELECT webp FROM cover_variant WHERE asset_key = $1 AND width = $2")
-        .bind(asset_key)
-        .bind(width)
-        .fetch_optional(covers)
+    let row = cover_store::row(main, asset_key, cover_store::Kind::Width(width))
         .await
-        .inspect_err(crate::db::record_read_database_error)
         .ok()
-        .flatten()
+        .flatten()?;
+    covers.read_object(&row.sha).await.ok().flatten()
 }
 
-/// Store (or replace) a cover derivative in the un-replicated covers DB.
-pub async fn put_cover_variant<'e, E>(
-    covers: E,
-    asset_key: &str,
-    width: u32,
-    webp: &[u8],
-) -> Result<()>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
-{
-    let ts = Utc::now().to_rfc3339();
-    sqlx::query(
-        "INSERT INTO cover_variant (asset_key, width, webp, updated_at) VALUES ($1, $2, $3, $4) \
-         ON CONFLICT(asset_key, width) DO UPDATE SET webp = excluded.webp, \
-         updated_at = excluded.updated_at",
-    )
-    .bind(asset_key)
-    .bind(width)
-    .bind(webp)
-    .bind(&ts)
-    .execute(covers)
-    .await?;
-    Ok(())
-}
-
-/// Drop every derivative of one cover. Called whenever a master is (re)written, so a
-/// re-saved cover cannot keep serving a derivative of the OLD art. The public URL is
-/// `?v=`-busted for works, but the Suwayomi cover path has no version token at all —
-/// there, this delete is the only thing keeping the two in step.
-#[allow(dead_code)]
-pub async fn clear_cover_variants(covers: &SqliteDatabase, asset_key: &str) {
-    if let Err(e) = sqlx::query("DELETE FROM cover_variant WHERE asset_key = $1")
-        .bind(asset_key)
-        .execute(covers)
-        .await
-    {
-        let e = crate::db::observed_database_error(e.into());
-        tracing::warn!(error = %e, asset_key, "cover variant invalidation failed");
-    }
-}
-
-/// The `cover_variant.asset_key` for a Suwayomi source cover.
+/// The asset key (lock string) for a Suwayomi source cover.
 pub fn suwayomi_variant_key(manga_id: i64) -> String {
     format!("s:{manga_id}")
 }
 
-/// Distinguish a cold cover from a failed cache store. Public serving paths must
+/// Distinguish a cold cover from a failed cover store. Public serving paths must
 /// not turn a storage outage into a new source fetch.
 pub async fn read_suwayomi_cover(
-    covers: &SqliteDatabase,
+    main: &Database,
+    covers: &CoverStore,
     manga_id: i64,
-) -> std::result::Result<Option<Vec<u8>>, sqlx::Error> {
-    sqlx::query_scalar("SELECT webp FROM suwayomi_cover_blob WHERE manga_id = $1")
-        .bind(manga_id)
-        .fetch_optional(covers)
+    width: Option<u32>,
+) -> std::result::Result<Option<(cover_store::Master, Option<Vec<u8>>)>, cover_store::StoreError> {
+    covers
+        .read_master(main, &suwayomi_variant_key(manga_id), width)
         .await
 }
 
 /// Best-effort fixture lookup. Serving uses the error-preserving helper above.
 #[cfg(test)]
-pub async fn get_suwayomi_cover(covers: &SqliteDatabase, manga_id: i64) -> Option<Vec<u8>> {
-    read_suwayomi_cover(covers, manga_id)
+pub async fn get_suwayomi_cover(
+    main: &Database,
+    covers: &CoverStore,
+    manga_id: i64,
+) -> Option<Vec<u8>> {
+    read_suwayomi_cover(main, covers, manga_id, None)
         .await
-        .inspect_err(crate::db::record_read_database_error)
         .ok()
         .flatten()
+        .map(|(master, _)| master.bytes)
 }
 
-/// Store (or replace) a resized Suwayomi source cover in the un-replicated covers DB.
-///
-/// Test fixtures only. It takes the process-local asset mutex but not the PostgreSQL
-/// Cover key and overwrites whatever master is there, so no production path may use it:
-/// they publish through [`publish_suwayomi_cover`] or
-/// [`publish_suwayomi_cover_if_missing`] (T080).
+/// Store (or replace) a Suwayomi source cover with no generation or takedown check.
+/// Test fixtures only: production paths publish through
+/// [`publish_suwayomi_cover_in_generation`] or
+/// [`publish_suwayomi_cover_if_missing_in_generation`].
 #[cfg(test)]
-pub async fn put_suwayomi_cover(covers: &SqliteDatabase, manga_id: i64, webp: &[u8]) -> Result<()> {
-    let _asset = asset_mutex(&suwayomi_variant_key(manga_id)).await;
-    put_suwayomi_cover_on(covers, manga_id, webp).await
-}
-
-async fn put_suwayomi_cover_on(covers: &SqliteDatabase, manga_id: i64, webp: &[u8]) -> Result<()> {
-    let mut cache = covers.begin().await?;
-    write_suwayomi_cover_on(&mut cache, manga_id, webp).await?;
-    cache.commit().await?;
-    Ok(())
-}
-
-async fn write_suwayomi_cover_on(
-    cache: &mut sqlx::SqliteConnection,
+pub async fn put_suwayomi_cover(
+    main: &Database,
+    covers: &CoverStore,
     manga_id: i64,
     webp: &[u8],
 ) -> Result<()> {
-    let ts = Utc::now().to_rfc3339();
-    sqlx::query(
-        "INSERT INTO suwayomi_cover_blob (manga_id, webp, updated_at) VALUES ($1, $2, $3) \
-         ON CONFLICT(manga_id) DO UPDATE SET webp = excluded.webp, updated_at = excluded.updated_at",
-    )
-    .bind(manga_id)
-    .bind(webp)
-    .bind(&ts)
-    .execute(&mut *cache)
-    .await?;
-    // This path has no `?v=` token in its public URL, so a stale derivative would
-    // outlive its master indefinitely. Dropping them here is the only invalidation.
-    sqlx::query("DELETE FROM cover_variant WHERE asset_key = $1")
-        .bind(suwayomi_variant_key(manga_id))
-        .execute(&mut *cache)
-        .await?;
+    let key = suwayomi_variant_key(manga_id);
+    let mut staged = covers.stage(webp).await?;
+    let mut tx = main.begin().await?;
+    let _asset = lock_assets_and_files(&mut tx, &[&key], &[staged.sha]).await?;
+    covers.place(&mut staged).await?;
+    cover_store::put_master(&mut tx, &key, &staged, None).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -481,17 +421,8 @@ pub async fn mangadex_cover_anchor(main: &Database, work_id: &str) -> Option<(St
     }
 }
 
-/// Store (or replace) a work's cover blob (in the separate `covers` DB) and flip
-/// `work.cover_cached_version` (in the `main` DB) to the new version. The version
-/// is a wall-clock timestamp — monotonic enough to bust caches on every re-save.
-///
-/// The blob and its version pointer live in DIFFERENT databases (covers is
-/// un-replicated; see `db::init_covers`), so a single cross-DB transaction is
-/// impossible. We preserve the invariant "`cover_cached_version` set ⇒ blob exists"
-/// by ORDERING: write the blob first, set the pointer second. A crash in between
-/// leaves a blob with no pointer — harmless: the resolver falls back to the proxy
-/// URL, and the drainer re-runs (it selects `cover_cached_version IS NULL`) and
-/// re-sets the pointer. The reverse order could point at a missing blob → 404.
+/// The process-local guard of one cover asset. Every publication also holds the
+/// asset's PostgreSQL `Cover` key, taken first (see [`lock_assets_and_files`]).
 pub async fn asset_mutex(asset: &str) -> tokio::sync::OwnedMutexGuard<()> {
     type Assets = std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>;
     static ASSETS: std::sync::LazyLock<std::sync::Mutex<Assets>> =
@@ -526,22 +457,24 @@ pub async fn lock_asset(
     Ok(asset_mutex(asset).await)
 }
 
-/// [`lock_asset`] for several assets of one transaction: every Cover key in ONE sorted
-/// advisory call, then the in-process guards in sorted order.
-///
-/// A single-asset holder takes its advisory key before its in-process guard as well, so
-/// a holder of one in-process guard never waits for a key this call already holds.
-pub async fn lock_assets(
+/// The publish locks: the `Cover` key of each asset and the `CoverFile` key of each
+/// object a publication places, in ONE sorted advisory call (the protocol takes every
+/// non-membership advisory key together, before work rows), then the in-process asset
+/// guards in sorted order. GC takes the same `CoverFile` key before it unlinks, so a file
+/// a publication renames or touches cannot be removed before that publication commits.
+pub async fn lock_assets_and_files(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     assets: &[&str],
+    files: &[cover_store::Sha],
 ) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
     let mut assets = assets.to_vec();
     assets.sort_unstable();
     assets.dedup();
-    let keys: Vec<_> = assets
+    let mut keys: Vec<_> = assets
         .iter()
         .map(|asset| crate::locks::AdvisoryKey::new(crate::locks::KeyClass::Cover, &[*asset]))
         .collect();
+    keys.extend(files.iter().map(cover_store::file_key));
     crate::locks::advisory(tx, &keys).await?;
     let mut guards = Vec::with_capacity(assets.len());
     for asset in assets {
@@ -551,10 +484,21 @@ pub async fn lock_assets(
 }
 
 /// A stored derivative of `asset` at `width`, but only while `master` is still the
-/// current master: both are read in one snapshot, so a derivative already written for
-/// a newer master is never returned for an older one.
+/// current master: both are checked in one index read, so a derivative already written
+/// for a newer master is never returned for an older one.
 pub async fn variant_of_master(
-    covers: &SqliteDatabase,
+    main: &Database,
+    covers: &CoverStore,
+    asset: &str,
+    width: u32,
+    master: &cover_store::Master,
+) -> Option<Vec<u8>> {
+    covers.derivative_of(main, asset, width, master).await
+}
+
+/// [`variant_of_master`] for a master still read from the SQLite cache during the copy.
+pub async fn legacy_variant_of_master(
+    legacy: &SqliteDatabase,
     asset: &str,
     width: u32,
     master: &[u8],
@@ -571,7 +515,7 @@ pub async fn variant_of_master(
         .bind(width)
         .bind(id)
         .bind(master)
-        .fetch_optional(covers)
+        .fetch_optional(legacy)
         .await
     } else {
         sqlx::query_scalar(
@@ -582,7 +526,7 @@ pub async fn variant_of_master(
         .bind(width)
         .bind(asset)
         .bind(master)
-        .fetch_optional(covers)
+        .fetch_optional(legacy)
         .await
     };
     result
@@ -591,43 +535,118 @@ pub async fn variant_of_master(
         .flatten()
 }
 
+/// Store a derivative made from `master`, only while `master` is still the indexed
+/// master. A master read from the SQLite cache is not indexed yet: its derivative is
+/// served but not stored (the copy brings the SQLite derivatives along).
 pub async fn put_current_variant(
     main: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     asset: &str,
     width: u32,
-    master: &[u8],
+    master: &cover_store::Master,
     derivative: &[u8],
 ) -> Result<()> {
+    if master.legacy {
+        return Ok(());
+    }
+    let mut staged = covers.stage(derivative).await?;
     let mut tx = main.begin().await?;
     if asset.starts_with("s:") {
         crate::engine_generation::shared(&mut tx, None).await?;
     }
-    let _asset = lock_asset(&mut tx, asset).await?;
-    let mut cache = covers.begin().await?;
-    let current: Option<Vec<u8>> = if let Some(id) = asset.strip_prefix("s:") {
-        sqlx::query_scalar("SELECT webp FROM suwayomi_cover_blob WHERE manga_id = $1")
-            .bind(id.parse::<i64>()?)
-            .fetch_optional(&mut *cache)
-            .await?
-    } else {
-        sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id = $1")
-            .bind(asset)
-            .fetch_optional(&mut *cache)
-            .await?
-    };
-    if current.as_deref() == Some(master) {
-        put_cover_variant(&mut *cache, asset, width, derivative).await?;
+    let _asset = lock_assets_and_files(&mut tx, &[asset], &[staged.sha]).await?;
+    let current = cover_store::row(&mut *tx, asset, cover_store::Kind::Master).await?;
+    if current.is_some_and(|row| row.sha == master.sha) {
+        covers.place(&mut staged).await?;
+        cover_store::put_derivative(&mut tx, asset, width, &staged, &master.sha).await?;
     }
-    cache.commit().await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// The master a publication finds under its locks.
+enum CurrentMaster {
+    None,
+    Indexed(cover_store::ObjectRow),
+    /// Only in the SQLite cache, which the copy has not reached yet.
+    Legacy {
+        bytes: Vec<u8>,
+        version: Option<i64>,
+    },
+}
+
+impl CurrentMaster {
+    /// Whether this is the master a guarded publication expects. `None` expects no
+    /// master; a row whose file is gone counts as no master.
+    fn is(&self, expected: Option<&[u8]>, expected_sha: Option<&cover_store::Sha>) -> bool {
+        match (self, expected) {
+            (CurrentMaster::None, None) => true,
+            (CurrentMaster::Indexed(row), Some(_)) => Some(&row.sha) == expected_sha,
+            (CurrentMaster::Legacy { bytes, .. }, Some(expected)) => bytes.as_slice() == expected,
+            _ => false,
+        }
+    }
+
+    fn version(&self) -> Option<i64> {
+        match self {
+            CurrentMaster::None => None,
+            CurrentMaster::Indexed(row) => row.version,
+            CurrentMaster::Legacy { version, .. } => *version,
+        }
+    }
+}
+
+/// Read the current master of `asset` under its publish locks. An indexed row whose file
+/// is missing is no master, so a guarded fill can replace it.
+async fn current_master(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    covers: &CoverStore,
+    asset: &str,
+) -> Result<CurrentMaster> {
+    if let Some(row) = cover_store::row(&mut **tx, asset, cover_store::Kind::Master).await? {
+        if covers.object_exists(&row.sha).await? {
+            return Ok(CurrentMaster::Indexed(row));
+        }
+        // A lost file of an uploaded cover is not a missing master: the upload row still
+        // holds its bytes and the next read restores them. Treating it as missing would let
+        // a source fill replace the upload and delete that backup.
+        let uploaded: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM cover_upload WHERE work_id = $1 AND sha256 = $2)",
+        )
+        .bind(asset)
+        .bind(row.sha.as_slice())
+        .fetch_one(&mut **tx)
+        .await?;
+        return Ok(if uploaded {
+            CurrentMaster::Indexed(row)
+        } else {
+            CurrentMaster::None
+        });
+    }
+    let Some(legacy) = covers.legacy_for_read(asset) else {
+        return Ok(CurrentMaster::None);
+    };
+    let stored: Option<(Vec<u8>, Option<i64>)> = if let Some(id) = asset.strip_prefix("s:") {
+        sqlx::query_as("SELECT webp, NULL FROM suwayomi_cover_blob WHERE manga_id = $1")
+            .bind(id.parse::<i64>()?)
+            .fetch_optional(legacy)
+            .await?
+    } else {
+        sqlx::query_as("SELECT webp, version FROM work_cover_blob WHERE work_id = $1")
+            .bind(asset)
+            .fetch_optional(legacy)
+            .await?
+    };
+    Ok(match stored {
+        Some((bytes, version)) => CurrentMaster::Legacy { bytes, version },
+        None => CurrentMaster::None,
+    })
 }
 
 #[cfg(test)]
 pub async fn publish_suwayomi_cover(
     main: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     manga_id: i64,
     webp: &[u8],
 ) -> Result<()> {
@@ -636,29 +655,19 @@ pub async fn publish_suwayomi_cover(
 
 async fn publish_suwayomi_cover_in_generation(
     main: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     manga_id: i64,
     webp: &[u8],
     generation: Option<uuid::Uuid>,
 ) -> Result<()> {
-    crate::engine_generation::wait(main).await?;
-    let mut tx = main.begin().await?;
-    crate::engine_generation::shared(&mut tx, generation).await?;
-    let _asset = lock_asset(&mut tx, &suwayomi_variant_key(manga_id)).await?;
-    if crate::media_policy::engine_series_taken_down(&mut *tx, manga_id).await? {
-        tx.rollback().await?;
-        return Ok(());
-    }
-    put_suwayomi_cover_on(covers, manga_id, webp).await?;
-    crate::engine_generation::commit_ready(main)?;
-    tx.commit().await?;
+    publish_suwayomi_master(main, covers, manga_id, webp, generation, false).await?;
     Ok(())
 }
 
 #[cfg(test)]
 pub async fn publish_suwayomi_cover_if_missing(
     main: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     manga_id: i64,
     webp: &[u8],
 ) -> Result<bool> {
@@ -667,32 +676,46 @@ pub async fn publish_suwayomi_cover_if_missing(
 
 pub async fn publish_suwayomi_cover_if_missing_in_generation(
     main: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     manga_id: i64,
     webp: &[u8],
     generation: Option<uuid::Uuid>,
 ) -> Result<bool> {
+    publish_suwayomi_master(main, covers, manga_id, webp, generation, true).await
+}
+
+/// The one publication of a numeric source master: under the shared generation lock
+/// (checked against `generation` when given), its asset and file keys, refusing a
+/// taken-down series; `only_if_missing` keeps a master that is already there.
+async fn publish_suwayomi_master(
+    main: &Database,
+    covers: &CoverStore,
+    manga_id: i64,
+    webp: &[u8],
+    generation: Option<uuid::Uuid>,
+    only_if_missing: bool,
+) -> Result<bool> {
+    let key = suwayomi_variant_key(manga_id);
+    let mut staged = covers.stage(webp).await?;
     crate::engine_generation::wait(main).await?;
     let mut tx = main.begin().await?;
     crate::engine_generation::shared(&mut tx, generation).await?;
-    let _asset = lock_asset(&mut tx, &suwayomi_variant_key(manga_id)).await?;
+    let _asset = lock_assets_and_files(&mut tx, &[&key], &[staged.sha]).await?;
     if crate::media_policy::engine_series_taken_down(&mut *tx, manga_id).await? {
         tx.rollback().await?;
         return Ok(false);
     }
-    let mut cache = covers.begin().await?;
-    let present: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM suwayomi_cover_blob WHERE manga_id = $1)")
-            .bind(manga_id)
-            .fetch_one(&mut *cache)
-            .await?;
-    if present {
-        cache.rollback().await?;
+    if only_if_missing
+        && !matches!(
+            current_master(&mut tx, covers, &key).await?,
+            CurrentMaster::None
+        )
+    {
         tx.rollback().await?;
         return Ok(false);
     }
-    write_suwayomi_cover_on(&mut cache, manga_id, webp).await?;
-    cache.commit().await?;
+    covers.place(&mut staged).await?;
+    cover_store::put_master(&mut tx, &key, &staged, None).await?;
     crate::engine_generation::commit_ready(main)?;
     tx.commit().await?;
     Ok(true)
@@ -701,29 +724,82 @@ pub async fn publish_suwayomi_cover_if_missing_in_generation(
 #[cfg(test)]
 tokio::task_local! { pub(crate) static COVER_PUBLICATION_PAUSE: crate::locks::pause_points::PausePoints; }
 
+/// Where a work master comes from. It decides what happens to the work's
+/// `cover_upload` row, which must always name the current master or not exist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoverOrigin {
+    /// Fetched from a source: an uploaded cover it replaces is gone.
+    Source,
+    /// The admin uploaded it: kept in PostgreSQL so it survives the loss of the files.
+    Upload,
+    /// The same art re-encoded: an uploaded original follows it.
+    Recompress,
+}
+
 pub async fn put_work_cover(
     main: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     work_id: &str,
     webp: &[u8],
 ) -> Result<()> {
-    publish_work_cover(main, covers, work_id, webp, None, None, None).await?;
+    publish_work_cover(
+        main,
+        covers,
+        work_id,
+        webp,
+        None,
+        None,
+        None,
+        CoverOrigin::Source,
+    )
+    .await?;
     Ok(())
 }
 
+/// The admin upload: published like any cover, and kept in `cover_upload`.
+pub async fn put_uploaded_work_cover(
+    main: &Database,
+    covers: &CoverStore,
+    work_id: &str,
+    webp: &[u8],
+) -> Result<bool> {
+    publish_work_cover(
+        main,
+        covers,
+        work_id,
+        webp,
+        None,
+        None,
+        None,
+        CoverOrigin::Upload,
+    )
+    .await
+}
+
+/// Recompression: replace the master only while it is still `expected`.
 pub async fn put_work_cover_if_current(
     main: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     work_id: &str,
     webp: &[u8],
     expected: Option<&[u8]>,
 ) -> Result<bool> {
-    publish_work_cover(main, covers, work_id, webp, Some(expected), None, None).await
+    publish_work_cover(
+        main,
+        covers,
+        work_id,
+        webp,
+        Some(expected),
+        None,
+        None,
+        CoverOrigin::Recompress,
+    )
+    .await
 }
 
 pub async fn put_work_cover_for_missing_anchor(
     main: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     work_id: &str,
     webp: &[u8],
     mangadex_id: &str,
@@ -737,6 +813,7 @@ pub async fn put_work_cover_for_missing_anchor(
         Some(None),
         Some((mangadex_id, file_name)),
         None,
+        CoverOrigin::Source,
     )
     .await
 }
@@ -746,7 +823,7 @@ pub async fn put_work_cover_for_missing_anchor(
 /// crawl job can outlive a generation change, and the number may name another series.
 pub async fn put_work_cover_for_suwayomi_anchor(
     main: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     work_id: &str,
     webp: &[u8],
     generation: Option<uuid::Uuid>,
@@ -760,22 +837,32 @@ pub async fn put_work_cover_for_suwayomi_anchor(
         Some(None),
         None,
         Some((generation, thumbnail_url)),
+        CoverOrigin::Source,
     )
     .await
 }
 
+/// The one publication of a work master. The file is staged before any lock; then ONE
+/// PostgreSQL transaction takes the generation lock (Suwayomi anchor only), the work's
+/// `Cover` key with the object's `CoverFile` key, and the work row; checks the guards;
+/// places the file; and writes the index row, drops the old derivatives, and publishes
+/// the version and every materialized card URL. A crash anywhere before commit leaves the
+/// old cover in place.
+#[allow(clippy::too_many_arguments)]
 async fn publish_work_cover(
     main: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     work_id: &str,
     webp: &[u8],
     expected: Option<Option<&[u8]>>,
     expected_anchor: Option<(&str, &str)>,
     expected_suwayomi: Option<(Option<uuid::Uuid>, &str)>,
+    origin: CoverOrigin,
 ) -> Result<bool> {
     let now = Utc::now();
-
-    let ts = now.to_rfc3339();
+    // Hashing and the temp file write stay outside every lock.
+    let expected_sha = expected.flatten().map(cover_store::sha256);
+    let mut staged = covers.stage(webp).await?;
     #[cfg(test)]
     if let Ok(points) = COVER_PUBLICATION_PAUSE.try_with(Clone::clone) {
         points.hit("cover-before-lock").await;
@@ -793,7 +880,7 @@ async fn publish_work_cover(
             Err(e) => return Err(e),
         }
     }
-    let _asset = lock_asset(&mut tx, work_id).await?;
+    let _asset = lock_assets_and_files(&mut tx, &[work_id], &[staged.sha]).await?;
     if !crate::locks::lock_works(&mut tx, &[work_id])
         .await?
         .missing
@@ -839,22 +926,14 @@ async fn publish_work_cover(
             return Ok(false);
         }
     }
+    let current = current_master(&mut tx, covers, work_id).await?;
     if let Some(expected) = expected {
-        let current: Option<Vec<u8>> =
-            sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id = $1")
-                .bind(work_id)
-                .fetch_optional(covers)
-                .await?;
-        if current.as_deref() != expected {
+        if !current.is(expected, expected_sha.as_ref()) {
             tx.rollback().await?;
             return Ok(false);
         }
     }
-    let previous: Option<i64> =
-        sqlx::query_scalar("SELECT version FROM work_cover_blob WHERE work_id = $1")
-            .bind(work_id)
-            .fetch_optional(covers)
-            .await?;
+    let previous = current.version();
     let published: Option<i64> =
         sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id = $1")
             .bind(work_id)
@@ -871,38 +950,48 @@ async fn publish_work_cover(
     if let Ok(points) = COVER_PUBLICATION_PAUSE.try_with(Clone::clone) {
         points.hit("cover-locked").await;
     }
-    let mut cache = covers.begin().await?;
-    // 1) Blob first, into the un-replicated covers DB.
-    sqlx::query(
-        "INSERT INTO work_cover_blob (work_id, webp, version, updated_at) \
-         VALUES ($1, $2, $3, $4) \
-         ON CONFLICT(work_id) DO UPDATE SET \
-           webp = excluded.webp, version = excluded.version, updated_at = excluded.updated_at",
-    )
-    .bind(work_id)
-    .bind(webp)
-    .bind(version)
-    .bind(&ts)
-    .execute(&mut *cache)
-    .await?;
-    // Derivatives of the PREVIOUS master are now wrong art. Drop them here rather than
-    // relying on the `?v=` bust: that only stops browsers and the edge from reusing the
-    // old bytes, it does not touch what we would hand the next cold request.
-    sqlx::query("DELETE FROM cover_variant WHERE asset_key = $1")
-        .bind(work_id)
-        .execute(&mut *cache)
-        .await?;
-    cache.commit().await?;
-    // 2) Publish the version and every materialized card URL atomically. Updating
-    // only work left library/browse cards pointing at immutable damaged thumbnails
-    // even after an admin had successfully fetched a replacement.
+    covers.place(&mut staged).await?;
+    // The index row replaces the old master and drops its derivatives: they are the old
+    // art. The `?v=` bust only stops browsers and the edge from reusing old bytes.
+    cover_store::put_master(&mut tx, work_id, &staged, Some(version)).await?;
+    match origin {
+        CoverOrigin::Upload => {
+            sqlx::query(
+                "INSERT INTO cover_upload (work_id, bytes, sha256, created_at) VALUES ($1, $2, $3, now()) \
+                 ON CONFLICT (work_id) DO UPDATE SET bytes = excluded.bytes, sha256 = excluded.sha256, \
+                   created_at = excluded.created_at",
+            )
+            .bind(work_id)
+            .bind(webp)
+            .bind(staged.sha.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        }
+        CoverOrigin::Recompress => {
+            sqlx::query("UPDATE cover_upload SET bytes = $2, sha256 = $3 WHERE work_id = $1")
+                .bind(work_id)
+                .bind(webp)
+                .bind(staged.sha.as_slice())
+                .execute(&mut *tx)
+                .await?;
+        }
+        CoverOrigin::Source => {
+            sqlx::query("DELETE FROM cover_upload WHERE work_id = $1")
+                .bind(work_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    // Publish the version and every materialized card URL in the same transaction.
+    // Updating only work left library/browse cards pointing at immutable damaged
+    // thumbnails even after an admin had successfully fetched a replacement.
     publish_work_cover_version(&mut tx, work_id, version).await?;
     tx.commit().await?;
     Ok(true)
 }
 
 /// Caller holds the Cover asset lock and work row lock, as in publish_work_cover.
-async fn publish_work_cover_version(
+pub(crate) async fn publish_work_cover_version(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     work_id: &str,
     version: i64,
@@ -928,13 +1017,14 @@ async fn publish_work_cover_version(
 }
 
 /// A work takedown (M5 `media_policy`): delete the stored covers of `work_ids` (the work
-/// and its merged-away ids) and of the engine series `manga_ids`, with every derivative,
-/// and clear each work's cover pointer. Under the same locks a publication takes, one
-/// asset at a time. The cover routes refuse a denied work before any lazy fill, and the
-/// drainer skips it, so nothing fetches the art again while the takedown holds.
+/// and its merged-away ids) and of the engine series `manga_ids`, with every derivative
+/// and any uploaded original, and clear each work's cover pointer. Under the same locks a
+/// publication takes, one asset at a time. The cover routes refuse a denied work before
+/// any lazy fill, and the drainer skips it, so nothing fetches the art again while the
+/// takedown holds. The files go with GC once nothing names them.
 pub async fn delete_for_takedown(
     main: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     work_ids: &[String],
     manga_ids: &[i64],
 ) -> Result<()> {
@@ -942,19 +1032,26 @@ pub async fn delete_for_takedown(
         let mut tx = main.begin().await?;
         let _asset = lock_asset(&mut tx, work_id).await?;
         crate::locks::lock_works(&mut tx, &[work_id.as_str()]).await?;
-        let mut cache = covers.begin().await?;
-        sqlx::query("DELETE FROM work_cover_blob WHERE work_id = $1")
+        cover_store::delete_asset(&mut tx, work_id).await?;
+        sqlx::query("DELETE FROM cover_upload WHERE work_id = $1")
+            .bind(work_id)
+            .execute(&mut *tx)
+            .await?;
+        if let Some(legacy) = covers.legacy() {
+            let mut cache = legacy.begin().await?;
+            sqlx::query("DELETE FROM work_cover_blob WHERE work_id = $1")
+                .bind(work_id)
+                .execute(&mut *cache)
+                .await?;
+            sqlx::query(
+                "DELETE FROM cover_variant WHERE asset_key = $1 \
+                 OR substr(asset_key, 1, length($1) + 2) = $1 || '@v'",
+            )
             .bind(work_id)
             .execute(&mut *cache)
             .await?;
-        sqlx::query(
-            "DELETE FROM cover_variant WHERE asset_key = $1 \
-             OR substr(asset_key, 1, length($1) + 2) = $1 || '@v'",
-        )
-        .bind(work_id)
-        .execute(&mut *cache)
-        .await?;
-        cache.commit().await?;
+            cache.commit().await?;
+        }
         sqlx::query(
             "UPDATE work SET cover_cached_version = NULL \
              WHERE id = $1 AND cover_cached_version IS NOT NULL",
@@ -968,30 +1065,59 @@ pub async fn delete_for_takedown(
         let key = suwayomi_variant_key(manga_id);
         let mut tx = main.begin().await?;
         let _asset = lock_asset(&mut tx, &key).await?;
-        let mut cache = covers.begin().await?;
-        sqlx::query("DELETE FROM suwayomi_cover_blob WHERE manga_id = $1")
-            .bind(manga_id)
+        cover_store::delete_asset(&mut tx, &key).await?;
+        if let Some(legacy) = covers.legacy() {
+            let mut cache = legacy.begin().await?;
+            sqlx::query("DELETE FROM suwayomi_cover_blob WHERE manga_id = $1")
+                .bind(manga_id)
+                .execute(&mut *cache)
+                .await?;
+            sqlx::query(
+                "DELETE FROM cover_variant WHERE asset_key = $1 \
+                 OR substr(asset_key, 1, length($1) + 2) = $1 || '@v'",
+            )
+            .bind(&key)
             .execute(&mut *cache)
             .await?;
-        sqlx::query(
-            "DELETE FROM cover_variant WHERE asset_key = $1 \
-             OR substr(asset_key, 1, length($1) + 2) = $1 || '@v'",
-        )
-        .bind(&key)
-        .execute(&mut *cache)
-        .await?;
-        cache.commit().await?;
+            cache.commit().await?;
+        }
         tx.commit().await?;
     }
     Ok(())
 }
 
-/// Request-time counterpart of db::reconcile_cover_pointers. Re-read the blob under
-/// the publication locks: a queued repair must not republish its request's old snapshot
-/// or roll back a newer version published by a server with a different local cache.
+/// The stored version of `work_id`'s master: the index row, or the SQLite cache for a
+/// work the copy has not reached.
+async fn stored_work_version<'e, E>(
+    conn: E,
+    covers: &CoverStore,
+    work_id: &str,
+) -> Result<Option<i64>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    if let Some(row) = cover_store::row(conn, work_id, cover_store::Kind::Master).await? {
+        return Ok(row.version);
+    }
+    let Some(legacy) = covers.legacy_for_read(work_id) else {
+        return Ok(None);
+    };
+    Ok(
+        sqlx::query_scalar("SELECT version FROM work_cover_blob WHERE work_id = $1")
+            .bind(work_id)
+            .fetch_optional(legacy)
+            .await?,
+    )
+}
+
+/// Move a work's published pointer up to its stored master's version. The index row and
+/// the pointer change together, so a lower pointer is only left behind by a master the
+/// SQLite cache still holds (published there before the copy), or by the copy itself.
+/// Re-read under the publication locks: a queued repair must not republish its request's
+/// old snapshot, and never lowers a pointer.
 async fn repair_work_cover_version(
     main: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     work_id: &str,
 ) -> Result<bool> {
     // Most old links merely came from a browser cache. As at startup, probe first
@@ -1004,12 +1130,7 @@ async fn repair_work_cover_version(
     let Some(published) = published else {
         return Ok(false);
     };
-    let version: Option<i64> =
-        sqlx::query_scalar("SELECT version FROM work_cover_blob WHERE work_id = $1")
-            .bind(work_id)
-            .fetch_optional(covers)
-            .await?;
-    let Some(version) = version else {
+    let Some(version) = stored_work_version(main, covers, work_id).await? else {
         return Ok(false);
     };
     if published.is_some_and(|published| published >= version) {
@@ -1025,12 +1146,7 @@ async fn repair_work_cover_version(
         tx.rollback().await?;
         return Ok(false);
     }
-    let version: Option<i64> =
-        sqlx::query_scalar("SELECT version FROM work_cover_blob WHERE work_id = $1")
-            .bind(work_id)
-            .fetch_optional(covers)
-            .await?;
-    let Some(version) = version else {
+    let Some(version) = stored_work_version(&mut *tx, covers, work_id).await? else {
         tx.rollback().await?;
         return Ok(false);
     };
@@ -1066,7 +1182,7 @@ impl RecentCoverRepairs {
 static RECENT_COVER_REPAIRS: std::sync::LazyLock<std::sync::Mutex<RecentCoverRepairs>> =
     std::sync::LazyLock::new(Default::default);
 
-pub fn defer_work_cover_version_repair(main: &Database, covers: &SqliteDatabase, work_id: &str) {
+pub fn defer_work_cover_version_repair(main: &Database, covers: &CoverStore, work_id: &str) {
     if !RECENT_COVER_REPAIRS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1666,7 +1782,7 @@ where
 /// if every source fails.
 pub async fn retry_one_cover(
     main: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     mangadex: &MangaDexClient,
     suwayomi: &crate::suwayomi::SuwayomiClient,
     work_id: &str,
@@ -1722,7 +1838,7 @@ pub async fn retry_one_cover(
 /// time). Best-effort per work — one failure never aborts the crawl.
 pub async fn crawl_uncached_covers(
     main: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     mangadex: &MangaDexClient,
     suwayomi: &crate::suwayomi::SuwayomiClient,
     limit: Option<i64>,
@@ -2072,16 +2188,33 @@ pub const WARM_CURSOR_START: i64 = i64::MAX;
 /// blob for ANY manga id the browser asks for, including Browse results that were never
 /// enrolled into `suwayomi_series`. So the table is a superset of the candidate set and
 /// `COUNT(*)` on it is not a coverage figure — see [`pending_suwayomi_cover_count`].
+///
+/// The index holds the copied and newly published masters; during the copy the SQLite
+/// cache adds those not copied yet.
 async fn cached_suwayomi_cover_ids(
-    covers: &SqliteDatabase,
+    main: &Database,
+    covers: &CoverStore,
 ) -> Result<std::collections::HashSet<i64>> {
-    Ok(
-        sqlx::query_scalar::<_, i64>("SELECT manga_id FROM suwayomi_cover_blob")
-            .fetch_all(covers)
-            .await?
-            .into_iter()
-            .collect(),
+    let mut ids: std::collections::HashSet<i64> = sqlx::query_scalar::<_, String>(
+        "SELECT substr(asset_key, 3) FROM cover_object WHERE asset_key LIKE 's:%' AND kind = 'master'",
     )
+    .fetch_all(main)
+    .await?
+    .into_iter()
+    .filter_map(|id| id.parse().ok())
+    .collect();
+    if let Some(legacy) = covers.legacy() {
+        // Only ids the copy has not passed: serving no longer reads SQLite for the others.
+        let cursor = covers.copy_cursor();
+        ids.extend(
+            sqlx::query_scalar::<_, i64>("SELECT manga_id FROM suwayomi_cover_blob")
+                .fetch_all(legacy)
+                .await?
+                .into_iter()
+                .filter(|id| !cursor.passed(&format!("s:{id}"))),
+        );
+    }
+    Ok(ids)
 }
 
 /// Cached series that have a usable thumbnail, newest id first, restricted to
@@ -2164,7 +2297,7 @@ async fn warm_candidates(main: &Database, before_id: i64) -> Result<Vec<WarmCand
 #[cfg(test)]
 async fn uncached_suwayomi_cover_ids(
     main: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     limit: i64,
     before_id: i64,
 ) -> Result<Vec<i64>> {
@@ -2181,11 +2314,11 @@ async fn uncached_suwayomi_cover_ids(
 /// needs (source id, fetched-at fingerprint, "has a marker row").
 async fn uncached_suwayomi_cover_candidates(
     main: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     limit: i64,
     before_id: i64,
 ) -> Result<Vec<WarmCandidate>> {
-    let cached = cached_suwayomi_cover_ids(covers).await?;
+    let cached = cached_suwayomi_cover_ids(main, covers).await?;
     Ok(warm_candidates(main, before_id)
         .await?
         .into_iter()
@@ -2204,8 +2337,8 @@ async fn uncached_suwayomi_cover_candidates(
 /// cached count, understate the gap, and once they outnumber the real gap this reports 0
 /// and the drainer concludes "fully warm" while genuine candidates remain — the warmer
 /// would then never run again.
-pub async fn pending_suwayomi_cover_count(main: &Database, covers: &SqliteDatabase) -> Result<i64> {
-    let cached = cached_suwayomi_cover_ids(covers).await?;
+pub async fn pending_suwayomi_cover_count(main: &Database, covers: &CoverStore) -> Result<i64> {
+    let cached = cached_suwayomi_cover_ids(main, covers).await?;
     Ok(thumbnailed_series_ids(main, WARM_CURSOR_START)
         .await?
         .into_iter()
@@ -2248,7 +2381,7 @@ pub async fn pending_suwayomi_cover_count(main: &Database, covers: &SqliteDataba
 /// `work_cover_blob` is the single cache, this warmer disappears, and the
 /// `cover_cached_version` pointer covers every surface.
 pub async fn warm_suwayomi_covers(
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     main: &Database,
     suwayomi: &crate::suwayomi::SuwayomiClient,
     limit: i64,
@@ -2502,7 +2635,7 @@ async fn update_source_backoffs(
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     main: Database,
-    covers: SqliteDatabase,
+    covers: CoverStore,
     mangadex: Arc<MangaDexClient>,
     suwayomi: crate::suwayomi::SuwayomiClient,
     interval_secs: u64,
@@ -2536,7 +2669,7 @@ pub fn spawn(
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     main: Database,
-    covers: SqliteDatabase,
+    covers: CoverStore,
     mangadex: Arc<MangaDexClient>,
     suwayomi: crate::suwayomi::SuwayomiClient,
     interval_secs: u64,
@@ -2648,19 +2781,47 @@ pub(crate) async fn wait_for_writer_lock(pool: &Database) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cover_store::test_support::{legacy_pool, store, store_with_legacy, TestDir};
     use image::{DynamicImage, RgbImage};
     use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 
-    async fn publication_pools() -> (Database, SqliteDatabase) {
-        let (main, covers) = warm_test_pools().await;
-        sqlx::query("CREATE TABLE work_cover_blob(work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL)").execute(&covers).await.unwrap();
+    async fn publication_pools() -> (Database, CoverStore, TestDir) {
+        let (main, covers, dir) = warm_test_pools().await;
         sqlx::query(
             "INSERT INTO work(id,created_at,updated_at) VALUES ('w_publication',now(),now())",
         )
         .execute(&main)
         .await
         .unwrap();
-        (main.foreground(), covers)
+        (main.foreground(), covers, dir)
+    }
+
+    async fn stored_work(main: &Database, covers: &CoverStore, work_id: &str) -> (Vec<u8>, i64) {
+        let (master, _) = covers
+            .read_master(main, work_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        (master.bytes, master.version.unwrap())
+    }
+
+    async fn seed_version(main: &Database, covers: &CoverStore, version: i64) {
+        let mut staged = covers.stage(b"initial").await.unwrap();
+        let mut tx = main.begin().await.unwrap();
+        let _guards = lock_assets_and_files(&mut tx, &["w_publication"], &[staged.sha])
+            .await
+            .unwrap();
+        crate::locks::lock_works(&mut tx, &["w_publication"])
+            .await
+            .unwrap();
+        covers.place(&mut staged).await.unwrap();
+        cover_store::put_master(&mut tx, "w_publication", &staged, Some(version))
+            .await
+            .unwrap();
+        publish_work_cover_version(&mut tx, "w_publication", version)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
     }
 
     #[test]
@@ -2680,14 +2841,16 @@ mod tests {
 
     #[tokio::test]
     async fn stale_cover_repair_rechecks_under_publication_locks_and_is_a_noop_when_equal() {
-        let (main, covers) = publication_pools().await;
+        let (main, _covers, dir) = publication_pools().await;
+        let legacy = legacy_pool().await;
+        let covers = store_with_legacy(&dir, legacy.clone(), cover_store::CopyCursor::default());
         sqlx::query("UPDATE work SET cover_cached_version=7 WHERE id='w_publication'")
             .execute(&main)
             .await
             .unwrap();
         sqlx::query("INSERT INTO work_cover_blob VALUES ('w_publication',$1,8,'now')")
             .bind(b"version8".as_slice())
-            .execute(&covers)
+            .execute(&legacy)
             .await
             .unwrap();
         let mut held = main.begin().await.unwrap();
@@ -2703,7 +2866,7 @@ mod tests {
         wait_for_writer_lock(&main).await;
         // A later blob committed before the repair gets the guards must win.
         sqlx::query("UPDATE work_cover_blob SET version=9 WHERE work_id='w_publication'")
-            .execute(&covers)
+            .execute(&legacy)
             .await
             .unwrap();
         held.commit().await.unwrap();
@@ -2744,7 +2907,7 @@ mod tests {
             .await
             .unwrap());
         sqlx::query("DELETE FROM work_cover_blob")
-            .execute(&covers)
+            .execute(&legacy)
             .await
             .unwrap();
         assert!(!repair_work_cover_version(&main, &covers, "w_publication")
@@ -2754,14 +2917,16 @@ mod tests {
 
     #[tokio::test]
     async fn stale_cover_repair_never_replaces_a_newer_published_version() {
-        let (main, covers) = publication_pools().await;
+        let (main, _covers, dir) = publication_pools().await;
+        let legacy = legacy_pool().await;
+        let covers = store_with_legacy(&dir, legacy.clone(), cover_store::CopyCursor::default());
         sqlx::query("UPDATE work SET cover_cached_version=9 WHERE id='w_publication'")
             .execute(&main)
             .await
             .unwrap();
         sqlx::query("INSERT INTO work_cover_blob VALUES ('w_publication',$1,7,'now')")
             .bind(b"local-version7".as_slice())
-            .execute(&covers)
+            .execute(&legacy)
             .await
             .unwrap();
         let url = cover_path("w_publication", 9);
@@ -2846,45 +3011,55 @@ mod tests {
 
     #[tokio::test]
     async fn variant_lookup_compares_binary_master_and_never_returns_orphan_derivatives() {
-        let covers = crate::db::init_covers("sqlite::memory:").await.unwrap();
-        let master = [0, 255, 1, 0];
-        for (asset, insert, delete) in [
-            (
-                "work-binary",
-                "INSERT INTO work_cover_blob VALUES ('work-binary',$1,7,'now')",
-                "DELETE FROM work_cover_blob",
-            ),
-            (
-                "s:7",
-                "INSERT INTO suwayomi_cover_blob VALUES (7,$1,'now')",
-                "DELETE FROM suwayomi_cover_blob",
-            ),
-        ] {
-            sqlx::query(insert)
-                .bind(master.as_slice())
-                .execute(&covers)
+        let (main, covers, _dir) = publication_pools().await;
+        let bytes = [0, 255, 1, 0];
+        for asset in ["w_publication", "s:7"] {
+            if asset.starts_with("s:") {
+                put_suwayomi_cover(&main, &covers, 7, &bytes).await.unwrap();
+            } else {
+                put_work_cover(&main, &covers, asset, &bytes).await.unwrap();
+            }
+            let (master, _) = covers
+                .read_master(&main, asset, None)
                 .await
+                .unwrap()
                 .unwrap();
-            put_cover_variant(&covers, asset, 192, b"small")
+            put_current_variant(&main, &covers, asset, 192, &master, b"small")
                 .await
                 .unwrap();
             assert_eq!(
-                variant_of_master(&covers, asset, 192, &master).await,
+                variant_of_master(&main, &covers, asset, 192, &master).await,
                 Some(b"small".to_vec())
             );
+            let wrong = cover_store::Master {
+                bytes: vec![0, 255, 2, 0],
+                sha: cover_store::sha256(&[0, 255, 2, 0]),
+                ..master.clone()
+            };
             assert_eq!(
-                variant_of_master(&covers, asset, 192, &[0, 255, 2, 0]).await,
+                variant_of_master(&main, &covers, asset, 192, &wrong).await,
                 None
             );
-            assert_eq!(variant_of_master(&covers, asset, 320, &master).await, None);
-            sqlx::query(delete).execute(&covers).await.unwrap();
-            assert_eq!(variant_of_master(&covers, asset, 192, &master).await, None);
+            assert_eq!(
+                variant_of_master(&main, &covers, asset, 320, &master).await,
+                None
+            );
+            // Leave the derivative indexed to check that the master existence guard matters.
+            sqlx::query("DELETE FROM cover_object WHERE asset_key=$1 AND kind='master'")
+                .bind(cover_store::index_key(asset))
+                .execute(&main)
+                .await
+                .unwrap();
+            assert_eq!(
+                variant_of_master(&main, &covers, asset, 192, &master).await,
+                None
+            );
         }
     }
 
     #[tokio::test]
     async fn delayed_cover_misses_recheck_the_current_asset_and_work_anchor() {
-        let (main, covers) = publication_pools().await;
+        let (main, covers, _dir) = publication_pools().await;
         sqlx::query("INSERT INTO source_series(id,work_id,source_type,source_key,created_at,last_seen) VALUES ('rest-anchor','w_publication','mangadex','md-old',NOW(),NOW())").execute(&main).await.unwrap();
         sqlx::query("UPDATE work SET cover_file_name='old.jpg' WHERE id='w_publication'")
             .execute(&main)
@@ -2914,16 +3089,22 @@ mod tests {
         wait_for_writer_lock(&main).await;
         first.commit().await.unwrap();
         assert!(!second.await.unwrap().unwrap());
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM work_cover_blob WHERE work_id='w_publication')",
-        )
-        .fetch_one(&covers)
-        .await
-        .unwrap();
-        assert!(!exists);
+        assert!(
+            cover_store::row(&main, "w_publication", cover_store::Kind::Master)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut staged = covers.stage(b"fresh-source").await.unwrap();
         let mut first = main.begin().await.unwrap();
-        let _asset = lock_asset(&mut first, "s:7").await.unwrap();
-        put_suwayomi_cover_on(&covers, 7, b"fresh-source")
+        crate::engine_generation::shared(&mut first, None)
+            .await
+            .unwrap();
+        let _asset = lock_assets_and_files(&mut first, &["s:7"], &[staged.sha])
+            .await
+            .unwrap();
+        covers.place(&mut staged).await.unwrap();
+        cover_store::put_master(&mut first, "s:7", &staged, None)
             .await
             .unwrap();
         let writer = main.clone();
@@ -2936,7 +3117,7 @@ mod tests {
         drop(_asset);
         assert!(!second.await.unwrap().unwrap());
         assert_eq!(
-            get_suwayomi_cover(&covers, 7).await.unwrap(),
+            get_suwayomi_cover(&main, &covers, 7).await.unwrap(),
             b"fresh-source"
         );
     }
@@ -2944,7 +3125,7 @@ mod tests {
     #[tokio::test]
     async fn overlapping_cover_backoffs_recompute_all_three_ladders_under_the_guard() {
         for kind in 0..3 {
-            let (main, _) = publication_pools().await;
+            let (main, _covers, _dir) = publication_pools().await;
             insert_series(&main, 7, None).await;
             let points = crate::locks::pause_points::PausePoints::default();
             let armed = points.arm("backoff-locked");
@@ -3019,8 +3200,8 @@ mod tests {
     }
     #[tokio::test]
     async fn two_foreground_cover_saves_publish_matching_monotonic_versions() {
-        let (main, covers) = publication_pools().await;
-        sqlx::query("INSERT INTO work_cover_blob VALUES ('w_publication', x'00', 4102444800000, '2026-01-01')").execute(&covers).await.unwrap();
+        let (main, covers, _dir) = publication_pools().await;
+        seed_version(&main, &covers, 4102444800000).await;
         let points = crate::locks::pause_points::PausePoints::default();
         let armed = points.arm("cover-locked");
         let writer = main.clone();
@@ -3040,12 +3221,7 @@ mod tests {
         armed.release();
         first.await.unwrap().unwrap();
         second.await.unwrap().unwrap();
-        let (bytes, version): (Vec<u8>, i64) = sqlx::query_as(
-            "SELECT webp,version FROM work_cover_blob WHERE work_id='w_publication'",
-        )
-        .fetch_one(&covers)
-        .await
-        .unwrap();
+        let (bytes, version) = stored_work(&main, &covers, "w_publication").await;
         let pointer: i64 =
             sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id='w_publication'")
                 .fetch_one(&main)
@@ -3057,15 +3233,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn separate_cover_databases_mint_distinct_versions_under_the_publication_lock() {
-        let (main, first_covers) = publication_pools().await;
-        let second_covers = crate::db::init_covers("sqlite::memory:").await.unwrap();
-        sqlx::query(
-            "INSERT INTO work_cover_blob VALUES ('w_publication',x'00',4102444800000,'now')",
-        )
-        .execute(&first_covers)
-        .await
-        .unwrap();
+    async fn separate_cover_stores_mint_distinct_versions_under_the_publication_lock() {
+        let (main, first_covers, _dir) = publication_pools().await;
+        let second_dir = TestDir::new();
+        let second_covers = store(&second_dir);
+        seed_version(&main, &first_covers, 4102444800000).await;
         sqlx::query("UPDATE work SET cover_cached_version=4102444800001 WHERE id='w_publication'")
             .execute(&main)
             .await
@@ -3080,28 +3252,38 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(30), armed.reached())
             .await
             .unwrap();
+        let second_points = crate::locks::pause_points::PausePoints::default();
+        let second_locked = second_points.arm("cover-locked");
         let writer = main.clone();
         let cache = second_covers.clone();
-        let second = tokio::spawn(async move {
+        let second = tokio::spawn(COVER_PUBLICATION_PAUSE.scope(second_points, async move {
             put_work_cover(&writer, &cache, "w_publication", b"second").await
-        });
+        }));
         wait_for_writer_lock(&main).await;
         armed.release();
         first.await.unwrap().unwrap();
-        second.await.unwrap().unwrap();
-
-        for (cache, bytes, version) in [
-            (&first_covers, b"first".as_slice(), 4102444800002_i64),
-            (&second_covers, b"second".as_slice(), 4102444800003_i64),
-        ] {
-            let stored: (Vec<u8>, i64) = sqlx::query_as(
-                "SELECT webp,version FROM work_cover_blob WHERE work_id='w_publication'",
-            )
-            .fetch_one(cache)
+        tokio::time::timeout(Duration::from_secs(30), second_locked.reached())
             .await
             .unwrap();
-            assert_eq!(stored, (bytes.to_vec(), version));
-        }
+        assert_eq!(
+            stored_work(&main, &first_covers, "w_publication").await,
+            (b"first".to_vec(), 4102444800002)
+        );
+        second_locked.release();
+        second.await.unwrap().unwrap();
+
+        // One index serves both stores; the old file remains immutable in the first dir.
+        assert_eq!(
+            first_covers
+                .read_object(&cover_store::sha256(b"first"))
+                .await
+                .unwrap(),
+            Some(b"first".to_vec())
+        );
+        assert_eq!(
+            stored_work(&main, &second_covers, "w_publication").await,
+            (b"second".to_vec(), 4102444800003)
+        );
         let published: i64 =
             sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id='w_publication'")
                 .fetch_one(&main)
@@ -3113,7 +3295,7 @@ mod tests {
     #[tokio::test]
     async fn a_delayed_crawl_fill_cannot_replace_an_admin_upload() {
         for mangadex_anchor in [true, false] {
-            let (main, covers) = publication_pools().await;
+            let (main, covers, _dir) = publication_pools().await;
             sqlx::query("UPDATE work SET cover_file_name='cover.jpg' WHERE id='w_publication'")
                 .execute(&main)
                 .await
@@ -3158,26 +3340,16 @@ mod tests {
                 .await
                 .unwrap();
             // The fetch and encoding finished, but publication has not taken its locks.
-            put_work_cover(&main, &covers, "w_publication", b"admin-upload")
+            put_uploaded_work_cover(&main, &covers, "w_publication", b"admin-upload")
                 .await
                 .unwrap();
-            let uploaded: (Vec<u8>, i64) = sqlx::query_as(
-                "SELECT webp,version FROM work_cover_blob WHERE work_id='w_publication'",
-            )
-            .fetch_one(&covers)
-            .await
-            .unwrap();
+            let uploaded = stored_work(&main, &covers, "w_publication").await;
             armed.release();
             tokio::time::timeout(Duration::from_secs(30), crawl)
                 .await
                 .unwrap()
                 .unwrap();
-            let stored: (Vec<u8>, i64) = sqlx::query_as(
-                "SELECT webp,version FROM work_cover_blob WHERE work_id='w_publication'",
-            )
-            .fetch_one(&covers)
-            .await
-            .unwrap();
+            let stored = stored_work(&main, &covers, "w_publication").await;
             assert_eq!(stored, uploaded, "{source_type} crawl replaced the upload");
             let published: i64 = sqlx::query_scalar(
                 "SELECT cover_cached_version FROM work WHERE id='w_publication'",
@@ -3192,9 +3364,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_delayed_derivative_cannot_publish_after_master_replacement() {
-        let (main, covers) = publication_pools().await;
+        let (main, covers, _dir) = publication_pools().await;
         put_work_cover(&main, &covers, "w_publication", b"old")
             .await
+            .unwrap();
+        let (old, _) = covers
+            .read_master(&main, "w_publication", None)
+            .await
+            .unwrap()
             .unwrap();
         let points = crate::locks::pause_points::PausePoints::default();
         let armed = points.arm("cover-locked");
@@ -3214,7 +3391,7 @@ mod tests {
                 &cache,
                 "w_publication",
                 CARD_VARIANT_WIDTH,
-                b"old",
+                &old,
                 b"old-small",
             )
             .await
@@ -3224,7 +3401,7 @@ mod tests {
         first.await.unwrap().unwrap();
         second.await.unwrap().unwrap();
         assert!(
-            get_cover_variant(&covers, "w_publication", CARD_VARIANT_WIDTH)
+            get_cover_variant(&main, &covers, "w_publication", CARD_VARIANT_WIDTH)
                 .await
                 .is_none()
         );
@@ -3234,7 +3411,7 @@ mod tests {
     /// a lazy miss expects no master, recompression expects the bytes it re-encoded.
     #[tokio::test]
     async fn a_stale_fetch_or_recompression_cannot_replace_a_newer_master() {
-        let (main, covers) = publication_pools().await;
+        let (main, covers, _dir) = publication_pools().await;
         assert!(
             put_work_cover_if_current(&main, &covers, "w_publication", b"old", None)
                 .await
@@ -3245,12 +3422,7 @@ mod tests {
             .await
             .unwrap();
         let published = || async {
-            let blob: (Vec<u8>, i64) = sqlx::query_as(
-                "SELECT webp,version FROM work_cover_blob WHERE work_id='w_publication'",
-            )
-            .fetch_one(&covers)
-            .await
-            .unwrap();
+            let blob = stored_work(&main, &covers, "w_publication").await;
             let pointer: i64 = sqlx::query_scalar(
                 "SELECT cover_cached_version FROM work WHERE id='w_publication'",
             )
@@ -3734,129 +3906,55 @@ mod tests {
 
     #[tokio::test]
     async fn re_saving_a_master_drops_its_stale_derivatives() {
-        use crate::database::TestPoolOptions;
-        let main = TestPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::migrate!("./migrations_pg")
-            .run(main.write())
-            .await
-            .unwrap();
-        let covers = crate::sqlite_database::SqliteTestPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::query(
-            "CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, \
-             version INTEGER NOT NULL, updated_at TEXT NOT NULL)",
-        )
-        .execute(&covers)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE TABLE suwayomi_cover_blob (manga_id INTEGER PRIMARY KEY, \
-             webp BLOB NOT NULL, updated_at TEXT NOT NULL)",
-        )
-        .execute(&covers)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE TABLE cover_variant (asset_key TEXT NOT NULL, width INTEGER NOT NULL, \
-             webp BLOB NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (asset_key, width))",
-        )
-        .execute(&covers)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO work (id, created_at, updated_at) \
-             VALUES ('w_a', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-        )
-        .execute(&main)
-        .await
-        .unwrap();
-
+        let (main, covers, _dir) = publication_pools().await;
         let old_art = process_cover(&noisy_png(400, 600)).unwrap();
         let variant = downscale_variant(&old_art, CARD_VARIANT_WIDTH)
             .unwrap()
             .expect("a 400x600 master is wider than a card");
-        put_cover_variant(&covers, "w_a", CARD_VARIANT_WIDTH, &variant)
+        put_work_cover(&main, &covers, "w_publication", &old_art)
             .await
             .unwrap();
-        put_cover_variant(
-            &covers,
-            &suwayomi_variant_key(7),
-            CARD_VARIANT_WIDTH,
-            &variant,
-        )
-        .await
-        .unwrap();
-        assert!(
-            get_cover_variant(&covers, "w_a", CARD_VARIANT_WIDTH)
+        put_suwayomi_cover(&main, &covers, 7, &old_art)
+            .await
+            .unwrap();
+        for asset in ["w_publication", "s:7"] {
+            let (master, _) = covers
+                .read_master(&main, asset, None)
                 .await
-                .is_some(),
-            "precondition: the derivative is stored"
-        );
+                .unwrap()
+                .unwrap();
+            put_current_variant(&main, &covers, asset, CARD_VARIANT_WIDTH, &master, &variant)
+                .await
+                .unwrap();
+            assert!(
+                get_cover_variant(&main, &covers, asset, CARD_VARIANT_WIDTH)
+                    .await
+                    .is_some(),
+                "precondition: the derivative is stored"
+            );
+        }
 
-        // New art for the SAME work. Without invalidation the derivative below would keep
-        // serving the old cover to every 1x viewer — and for the Suwayomi family, whose
-        // public URL carries no `?v=` token, it would do so for ever.
+        // New art for the same asset must invalidate the old card in both families.
         let new_art = process_cover(&noisy_png(500, 750)).unwrap();
-        put_work_cover(&main, &covers, "w_a", &new_art)
+        put_work_cover(&main, &covers, "w_publication", &new_art)
             .await
             .unwrap();
-        assert!(
-            get_cover_variant(&covers, "w_a", CARD_VARIANT_WIDTH)
-                .await
-                .is_none(),
-            "a re-saved work master must drop its derivatives"
-        );
-
-        put_suwayomi_cover(&covers, 7, &new_art).await.unwrap();
-        assert!(
-            get_cover_variant(&covers, &suwayomi_variant_key(7), CARD_VARIANT_WIDTH)
-                .await
-                .is_none(),
-            "a re-saved Suwayomi master must drop its derivatives"
-        );
+        put_suwayomi_cover(&main, &covers, 7, &new_art)
+            .await
+            .unwrap();
+        for asset in ["w_publication", "s:7"] {
+            assert!(
+                get_cover_variant(&main, &covers, asset, CARD_VARIANT_WIDTH)
+                    .await
+                    .is_none(),
+                "a re-saved {asset} master must drop its derivatives"
+            );
+        }
     }
 
     #[tokio::test]
     async fn put_work_cover_stores_blob_and_flips_version() {
-        use crate::database::TestPoolOptions;
-        // Main (replicated) DB: `work` + the `cover_cached_version` pointer. After
-        // migration 0040 it has NO `work_cover_blob` table.
-        let main = TestPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::migrate!("./migrations_pg")
-            .run(main.write())
-            .await
-            .unwrap();
-        // Covers (un-replicated) DB: just the blob table, as `db::init_covers` builds.
-        let covers = crate::sqlite_database::SqliteTestPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::query(
-            "CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, \
-             version INTEGER NOT NULL, updated_at TEXT NOT NULL)",
-        )
-        .execute(&covers)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE TABLE cover_variant (asset_key TEXT NOT NULL, width INTEGER NOT NULL, \
-             webp BLOB NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (asset_key, width))",
-        )
-        .execute(&covers)
-        .await
-        .unwrap();
+        let (main, covers, _dir) = warm_test_pools().await;
         sqlx::query(
             "INSERT INTO work (id, created_at, updated_at) \
              VALUES ('w_test', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
@@ -3886,13 +3984,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Blob is stored in the covers DB and the work's version pointer (main DB)
-        // matches it (invariant: no version pointer without the bytes behind it).
-        let (blob, blob_ver): (Vec<u8>, i64) =
-            sqlx::query_as("SELECT webp, version FROM work_cover_blob WHERE work_id = 'w_test'")
-                .fetch_one(&covers)
-                .await
-                .unwrap();
+        // The indexed file and the work's version pointer are published together.
+        let (blob, blob_ver) = stored_work(&main, &covers, "w_test").await;
         let work_ver: Option<i64> = crate::db_types::query_scalar(
             "SELECT cover_cached_version FROM work WHERE id = 'w_test'",
         )
@@ -4038,9 +4131,7 @@ mod tests {
     #[tokio::test]
     async fn repair_uses_suwayomi_without_mangadex_or_cached_metadata_and_keeps_old_cover_on_failure(
     ) {
-        let (main, covers) = warm_test_pools().await;
-        sqlx::query("CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL)")
-            .execute(&covers).await.unwrap();
+        let (main, covers, _dir) = warm_test_pools().await;
         sqlx::query("INSERT INTO work (id, created_at, updated_at) VALUES ('w_repair', '2026-01-01', '2026-01-01')")
             .execute(&main).await.unwrap();
         sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_key, created_at) VALUES ('ss_repair', 'w_repair', 'suwayomi', '7', '2026-01-01')")
@@ -4064,11 +4155,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let before: (Vec<u8>, i64) =
-            sqlx::query_as("SELECT webp, version FROM work_cover_blob WHERE work_id = 'w_repair'")
-                .fetch_one(&covers)
-                .await
-                .unwrap();
+        let before = stored_work(&main, &covers, "w_repair").await;
         assert_eq!(
             image::load_from_memory(&before.0).unwrap().dimensions(),
             (300, 450)
@@ -4090,11 +4177,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        let after: (Vec<u8>, i64) =
-            sqlx::query_as("SELECT webp, version FROM work_cover_blob WHERE work_id = 'w_repair'")
-                .fetch_one(&covers)
-                .await
-                .unwrap();
+        let after = stored_work(&main, &covers, "w_repair").await;
         assert_eq!(
             after, before,
             "failed sources must not replace the stored cover"
@@ -4103,9 +4186,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_mangadex_off_a_cover_repair_uses_the_suwayomi_sources() {
-        let (main, covers) = warm_test_pools().await;
-        sqlx::query("CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL)")
-            .execute(&covers).await.unwrap();
+        let (main, covers, _dir) = warm_test_pools().await;
         sqlx::query(r#"INSERT INTO work (id, cover_file_name, created_at, updated_at) VALUES ('w_both', 'c.jpg', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#)
             .execute(&main).await.unwrap();
         sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_key, created_at) VALUES ('a', 'w_both', 'mangadex', 'md-uuid', '2026-01-01'), ('b', 'w_both', 'suwayomi', '9', '2026-01-02')")
@@ -4146,9 +4227,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_mangadex_off_the_crawl_skips_only_its_mangadex_pass() {
-        let (main, covers) = warm_test_pools().await;
-        sqlx::query("CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL)")
-            .execute(&covers).await.unwrap();
+        let (main, covers, _dir) = warm_test_pools().await;
         // One MangaDex-anchored work and one Suwayomi-anchored work, both uncached.
         sqlx::query("INSERT INTO work (id, cover_file_name, created_at, updated_at) VALUES ('w_md', 'c.jpg', '2026-01-01', '2026-01-01'), ('w_suw', NULL, '2026-01-01', '2026-01-01')")
             .execute(&main).await.unwrap();
@@ -4177,8 +4256,8 @@ mod tests {
         )
         .await;
 
-        let cached: Vec<String> = sqlx::query_scalar("SELECT work_id FROM work_cover_blob")
-            .fetch_all(&covers)
+        let cached: Vec<String> = sqlx::query_scalar("SELECT work_id FROM cover_object WHERE kind='master' AND work_id IS NOT NULL ORDER BY work_id")
+            .fetch_all(&main)
             .await
             .unwrap();
         assert_eq!(
@@ -4294,13 +4373,11 @@ mod tests {
     // suwayomi_cover_blob warmer (P1)
     // ---------------------------------------------------------------------------
 
-    /// Build the two-DB pair the warmer works across: main (migrated, holds
-    /// `suwayomi_series`) and covers (holds `suwayomi_cover_blob`), exactly as
-    /// `db::init_covers` shapes it.
-    async fn warm_test_pools() -> (Database, SqliteDatabase) {
+    /// Keep the directory alive alongside the migrated database and file store.
+    async fn warm_test_pools() -> (Database, CoverStore, TestDir) {
         use crate::database::TestPoolOptions;
         let main = TestPoolOptions::new()
-            .max_connections(1)
+            .max_connections(4)
             .connect("sqlite::memory:")
             .await
             .unwrap();
@@ -4308,29 +4385,9 @@ mod tests {
             .run(main.write())
             .await
             .unwrap();
-        let covers = crate::sqlite_database::SqliteTestPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::query(
-            "CREATE TABLE suwayomi_cover_blob (manga_id INTEGER PRIMARY KEY, \
-             webp BLOB NOT NULL, updated_at TEXT NOT NULL)",
-        )
-        .execute(&covers)
-        .await
-        .unwrap();
-        // Mirrors `db::init_covers`. Without it, `put_suwayomi_cover`'s invalidation hits
-        // a missing table — and because that failure is deliberately swallowed, every
-        // test through this pool would keep passing while proving less than it looks.
-        sqlx::query(
-            "CREATE TABLE cover_variant (asset_key TEXT NOT NULL, width INTEGER NOT NULL, \
-             webp BLOB NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (asset_key, width))",
-        )
-        .execute(&covers)
-        .await
-        .unwrap();
-        (main, covers)
+        let dir = TestDir::new();
+        let covers = store(&dir);
+        (main, covers, dir)
     }
 
     async fn insert_series(main: &Database, id: i64, thumb: Option<&str>) {
@@ -4374,18 +4431,17 @@ mod tests {
         .unwrap()
     }
 
-    /// The candidate query is the "LEFT JOIN across two SQLite files" that the missing
-    /// warmer never had: only series with a usable thumbnail and NO blob yet, newest
-    /// first, capped.
+    /// Only series with a usable thumbnail and no indexed master are candidates,
+    /// newest first, capped.
     #[tokio::test]
     async fn uncached_ids_excludes_cached_and_thumbless_series() {
-        let (main, covers) = warm_test_pools().await;
+        let (main, covers, _dir) = warm_test_pools().await;
         insert_series(&main, 10, Some("/api/v1/manga/10/thumbnail")).await;
         insert_series(&main, 11, Some("/api/v1/manga/11/thumbnail")).await;
         insert_series(&main, 12, None).await; // no thumbnail → not a candidate
         insert_series(&main, 13, Some("")).await; // empty thumbnail → not a candidate
         insert_series(&main, 14, Some("/api/v1/manga/14/thumbnail")).await;
-        put_suwayomi_cover(&covers, 11, b"already-warm")
+        put_suwayomi_cover(&main, &covers, 11, b"already-warm")
             .await
             .unwrap();
 
@@ -4409,20 +4465,16 @@ mod tests {
         assert_eq!(one, vec![14]);
     }
 
-    /// THE regression test for the outage: the warmer must populate
-    /// `suwayomi_cover_blob` — the table the reader's home/discovery feeds actually read
-    /// — for an uncached in-library series. Before this pass nothing wrote that table at
-    /// all (the drainer's Suwayomi pass writes `work_cover_blob` keyed by work id), so
-    /// coverage sat at 1,253/13,847 and every cold home cover was a live source-CDN
-    /// fetch on the request path.
+    /// The warmer must populate the numeric assets the reader actually reads;
+    /// warming canonical work covers alone leaves discovery covers cold.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn warmer_populates_the_cache_the_reader_reads() {
-        let (main, covers) = warm_test_pools().await;
+        let (main, covers, _dir) = warm_test_pools().await;
         for id in [21, 22, 23] {
             insert_series(&main, id, Some(&format!("/api/v1/manga/{id}/thumbnail"))).await;
         }
         // 22 is already warm; the warmer must not refetch it.
-        put_suwayomi_cover(&covers, 22, b"already-warm")
+        put_suwayomi_cover(&main, &covers, 22, b"already-warm")
             .await
             .unwrap();
 
@@ -4450,7 +4502,7 @@ mod tests {
 
         // Exactly what `serve_suwayomi_cover` reads on the request path.
         for id in [21, 23] {
-            let blob = get_suwayomi_cover(&covers, id)
+            let blob = get_suwayomi_cover(&main, &covers, id)
                 .await
                 .unwrap_or_else(|| panic!("manga {id} must now be cached"));
             assert!(
@@ -4462,7 +4514,7 @@ mod tests {
         }
         // The already-warm row is untouched (no wasted upstream fetch, no re-encode).
         assert_eq!(
-            get_suwayomi_cover(&covers, 22).await.as_deref(),
+            get_suwayomi_cover(&main, &covers, 22).await.as_deref(),
             Some(&b"already-warm"[..])
         );
         assert_eq!(
@@ -4495,7 +4547,7 @@ mod tests {
     /// on-demand request fail fast — that would trade the outage for a different one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn warmer_leaves_headroom_for_on_demand_requests() {
-        let (main, covers) = warm_test_pools().await;
+        let (main, covers, _dir) = warm_test_pools().await;
         for id in 1..=40 {
             insert_series(&main, id, Some(&format!("/api/v1/manga/{id}/thumbnail"))).await;
         }
@@ -4558,7 +4610,7 @@ mod tests {
     /// through a shutting-down process.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn warmer_honours_shutdown() {
-        let (main, covers) = warm_test_pools().await;
+        let (main, covers, _dir) = warm_test_pools().await;
         for id in 1..=30 {
             insert_series(&main, id, Some(&format!("/api/v1/manga/{id}/thumbnail"))).await;
         }
@@ -4594,7 +4646,7 @@ mod tests {
     /// regardless of outcome, and wrap at the bottom.
     #[tokio::test]
     async fn warmer_rotates_past_a_persistently_failing_batch() {
-        let (main, covers) = warm_test_pools().await;
+        let (main, covers, _dir) = warm_test_pools().await;
         for id in 1..=6 {
             insert_series(&main, id, Some(&format!("/api/v1/manga/{id}/thumbnail"))).await;
         }
@@ -4666,19 +4718,21 @@ mod tests {
     }
 
     /// The coverage gauge must be a SET DIFFERENCE, not `series - COUNT(*)`.
-    /// `suwayomi_cover_blob` also holds blobs the request path materialized for Browse
+    /// The index also holds covers the request path materialized for Browse
     /// manga that were never enrolled in `suwayomi_series`; counting those as coverage
     /// drives `pending` to 0 while real candidates remain, and the drainer then skips the
     /// warmer forever.
     #[tokio::test]
     async fn pending_count_ignores_blobs_for_unenrolled_manga() {
-        let (main, covers) = warm_test_pools().await;
+        let (main, covers, _dir) = warm_test_pools().await;
         for id in [31, 32] {
             insert_series(&main, id, Some(&format!("/api/v1/manga/{id}/thumbnail"))).await;
         }
         // Three Browse covers cached on the request path; none is an enrolled series.
         for id in [900, 901, 902] {
-            put_suwayomi_cover(&covers, id, b"browse").await.unwrap();
+            put_suwayomi_cover(&main, &covers, id, b"browse")
+                .await
+                .unwrap();
         }
         assert_eq!(
             pending_suwayomi_cover_count(&main, &covers).await.unwrap(),
@@ -4752,7 +4806,7 @@ mod tests {
     /// fetched ONCE and then skipped on the next cycle.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn permanently_failing_cover_is_not_retried_next_cycle() {
-        let (main, covers) = warm_test_pools().await;
+        let (main, covers, _dir) = warm_test_pools().await;
         insert_series(&main, 7, Some(&thumb_path(7))).await;
         let origin = crate::suwayomi::testsrv::spawn_error(
             400,
@@ -4814,7 +4868,7 @@ mod tests {
     /// open, retried (with a longer window) once it elapses.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn transient_failure_is_retried_once_its_backoff_elapses() {
-        let (main, covers) = warm_test_pools().await;
+        let (main, covers, _dir) = warm_test_pools().await;
         // Below SOURCE_BACKOFF_THRESHOLD, so this exercises the per-cover ladder only.
         insert_series(&main, 8, Some(&thumb_path(8))).await;
         let origin = crate::suwayomi::testsrv::spawn_error(503, "upstream is sulking").await;
@@ -4886,7 +4940,7 @@ mod tests {
     /// Self-healing #1: a fetch that works clears the marker outright.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_successful_fetch_clears_the_marker() {
-        let (main, covers) = warm_test_pools().await;
+        let (main, covers, _dir) = warm_test_pools().await;
         insert_series(&main, 9, Some(&thumb_path(9))).await;
         // A marker from an earlier failure whose window has already elapsed.
         record_suwayomi_cover_issue(
@@ -4930,7 +4984,7 @@ mod tests {
             issue_row(&main, 9).await.is_none(),
             "success clears the marker"
         );
-        assert!(get_suwayomi_cover(&covers, 9).await.is_some());
+        assert!(get_suwayomi_cover(&main, &covers, 9).await.is_some());
     }
 
     /// Self-healing #2: a PERMANENT marker is void the moment the extension re-fetches
@@ -4938,7 +4992,7 @@ mod tests {
     /// it must not wait out the 30-day window.
     #[tokio::test]
     async fn a_re_fetched_series_voids_even_a_permanent_marker() {
-        let (main, _covers) = warm_test_pools().await;
+        let (main, _covers, _dir) = warm_test_pools().await;
         insert_series_from(
             &main,
             12,
@@ -5001,7 +5055,7 @@ mod tests {
     /// their own. A healthy source in the same tick is untouched.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_wholly_failing_source_is_parked_for_all_its_covers() {
-        let (main, covers) = warm_test_pools().await;
+        let (main, covers, _dir) = warm_test_pools().await;
         for id in 41..=43 {
             insert_series_from(&main, id, Some(&thumb_path(id)), "philia", None).await;
         }
@@ -5077,7 +5131,7 @@ mod tests {
     /// A park is lifted by a single success — no operator action, no manual DELETE.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_source_park_lifts_as_soon_as_one_cover_succeeds() {
-        let (main, covers) = warm_test_pools().await;
+        let (main, covers, _dir) = warm_test_pools().await;
         for id in 51..=53 {
             insert_series_from(&main, id, Some(&thumb_path(id)), "philia", None).await;
         }

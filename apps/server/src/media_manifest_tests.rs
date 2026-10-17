@@ -65,7 +65,8 @@ impl Engine {
         let pages = Arc::new(Mutex::new(vec![image_bytes(1), image_bytes(2)]));
         let chapter_url = Arc::new(Mutex::new("/chapter".to_string()));
         let reorder_on_page = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let page_pause: Arc<Mutex<Option<crate::locks::pause_points::PausePoints>>> = Default::default();
+        let page_pause: Arc<Mutex<Option<crate::locks::pause_points::PausePoints>>> =
+            Default::default();
         let order = Arc::new(std::sync::atomic::AtomicI32::new(0));
         let routes = Router::new()
             .route("/api/graphql", post({
@@ -137,7 +138,15 @@ impl Engine {
     }
 }
 
-async fn fixture(enabled: bool) -> (TempDir, Engine, Arc<AppState>) {
+async fn fixture(
+    enabled: bool,
+) -> (
+    TempDir,
+    Engine,
+    Arc<AppState>,
+    crate::cover_store::test_support::TestDir,
+) {
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
     let dir = TempDir::new();
     let engine = Engine::spawn().await;
     let pool = db::Database::connect("sqlite::memory:")
@@ -154,7 +163,7 @@ async fn fixture(enabled: bool) -> (TempDir, Engine, Arc<AppState>) {
     config.media_signing_key_file = dir.0.join("signing.key");
     let app = Arc::new(AppState {
         pool,
-        cover_pool: db::init_covers("sqlite::memory:").await.unwrap(),
+        cover_pool: crate::cover_store::test_support::store(&cover_dir),
         suwayomi: SuwayomiClient::new(engine.url.clone(), None, None),
         mangadex: Arc::new(
             mangadex::MangaDexClient::new("media-manifest-test", 100.0, 100.0)
@@ -177,7 +186,7 @@ async fn fixture(enabled: bool) -> (TempDir, Engine, Arc<AppState>) {
         policy: media_policy::Policy::new(enabled),
         media_manifests: media_manifest::MediaState::from_config(&config).unwrap(),
     });
-    (dir, engine, app)
+    (dir, engine, app, cover_dir)
 }
 
 fn router(app: Arc<AppState>) -> Router {
@@ -291,7 +300,7 @@ async fn insert_orphan_object(app: &AppState, bytes: &[u8]) -> Vec<u8> {
 
 #[tokio::test]
 async fn source_order_art_revisions_and_unchanged_ingest() {
-    let (_dir, engine, app) = fixture(true).await;
+    let (_dir, engine, app, _cover_dir) = fixture(true).await;
     let mut copy = String::new();
     for rev in 1..=4 {
         {
@@ -337,7 +346,7 @@ async fn source_order_art_revisions_and_unchanged_ingest() {
 
 #[tokio::test]
 async fn object_mismatch_marks_stale_and_pages_stop_exact_paths() {
-    let (_dir, engine, app) = fixture(true).await;
+    let (_dir, engine, app, _cover_dir) = fixture(true).await;
     // Opening a chapter before its first ingest hands out no exact paths and writes no row.
     let before = pages(&app).await;
     assert!(before[0]["mediaPath"].is_null());
@@ -360,7 +369,10 @@ async fn object_mismatch_marks_stale_and_pages_stop_exact_paths() {
         .unwrap()
         .parse()
         .unwrap();
-    assert!((1..=media_policy::LEASE_SECS).contains(&s_maxage), "{cache}");
+    assert!(
+        (1..=media_policy::LEASE_SECS).contains(&s_maxage),
+        "{cache}"
+    );
     assert_eq!(body(response).await, engine.pages.lock().unwrap()[0]);
     engine.pages.lock().unwrap()[0] = image_bytes(9);
     let response = get_media(&app, path).await;
@@ -389,7 +401,7 @@ async fn object_mismatch_marks_stale_and_pages_stop_exact_paths() {
 #[tokio::test]
 async fn object_fill_rechecks_copy_and_work_takedowns_after_fetch() {
     for kind in [media_policy::Kind::Copy, media_policy::Kind::Work] {
-        let (_dir, engine, app) = fixture(true).await;
+        let (_dir, engine, app, _cover_dir) = fixture(true).await;
         sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES('w_fill',now(),now()); INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES('ss_fill','w_fill','suwayomi','source','7',now())")
             .execute(&app.pool).await.unwrap();
         ingest_chapter(&app, 8).await.unwrap();
@@ -436,7 +448,7 @@ async fn object_fill_rechecks_copy_and_work_takedowns_after_fetch() {
 
 #[tokio::test]
 async fn signed_manifest_keys_superseded_records_and_pruning() {
-    let (_dir, engine, app) = fixture(true).await;
+    let (_dir, engine, app, _cover_dir) = fixture(true).await;
     ingest_chapter(&app, 8).await.unwrap();
     let copy = store::existing_copy_for_chapter(&app.pool, 8)
         .await
@@ -498,7 +510,7 @@ async fn signed_manifest_keys_superseded_records_and_pruning() {
 
 #[tokio::test]
 async fn publish_retries_when_prune_removes_an_object_before_key_share() {
-    let (_dir, engine, app) = fixture(true).await;
+    let (_dir, engine, app, _cover_dir) = fixture(true).await;
     let expected = {
         let mut pages = engine.pages.lock().unwrap();
         let repeated = pages[0].clone();
@@ -558,7 +570,7 @@ async fn publish_retries_when_prune_removes_an_object_before_key_share() {
 
 #[tokio::test]
 async fn prune_skips_an_object_held_by_publish_key_share() {
-    let (_dir, engine, app) = fixture(true).await;
+    let (_dir, engine, app, _cover_dir) = fixture(true).await;
     let expected = engine.pages.lock().unwrap().clone();
     let hash = insert_orphan_object(&app, &expected[0]).await;
     insert_orphan_object(&app, &image_bytes(9)).await;
@@ -612,7 +624,7 @@ async fn prune_skips_an_object_held_by_publish_key_share() {
 
 #[tokio::test]
 async fn manifests_off_pages_and_routes_do_not_touch_media_tables() {
-    let (dir, _engine, app) = fixture(false).await;
+    let (dir, _engine, app, _cover_dir) = fixture(false).await;
     sqlx::raw_sql("DROP TABLE media_manifest_page; DROP TABLE media_manifest; DROP TABLE media_object; DROP TABLE media_copy;")
         .execute(&app.pool).await.unwrap();
     assert!(pages(&app)
@@ -706,7 +718,7 @@ fn key_file_config_reads_only_the_named_settings() {
 
 #[tokio::test]
 async fn ingest_refuses_a_chapter_id_the_engine_now_answers_with_other_keys() {
-    let (_dir, engine, app) = fixture(true).await;
+    let (_dir, engine, app, _cover_dir) = fixture(true).await;
     // An engine renumbered without a detected change: chapter 8 is now another chapter.
     *engine.chapter_url.lock().unwrap() = "/another-chapter".into();
     let error = ingest_chapter(&app, 8).await.unwrap_err();
@@ -727,7 +739,7 @@ async fn ingest_refuses_a_chapter_id_the_engine_now_answers_with_other_keys() {
 
 #[tokio::test]
 async fn publish_refuses_a_pass_collected_under_another_generation() {
-    let (_dir, _engine, app) = fixture(true).await;
+    let (_dir, _engine, app, _cover_dir) = fixture(true).await;
     let (identity, _) = store::identity_for_chapter(&app.pool, 8)
         .await
         .unwrap()
@@ -752,7 +764,7 @@ async fn publish_refuses_a_pass_collected_under_another_generation() {
 
 #[tokio::test]
 async fn ingest_publishes_nothing_when_the_engine_reorders_during_the_pass() {
-    let (_dir, engine, app) = fixture(true).await;
+    let (_dir, engine, app, _cover_dir) = fixture(true).await;
     engine
         .reorder_on_page
         .store(true, std::sync::atomic::Ordering::SeqCst);

@@ -179,14 +179,18 @@ impl Engine {
     }
 }
 
-async fn app_state(mut suwayomi: SuwayomiClient, wait: Duration) -> Arc<AppState> {
+async fn app_state(
+    mut suwayomi: SuwayomiClient,
+    wait: Duration,
+) -> (crate::cover_store::test_support::TestDir, Arc<AppState>) {
     suwayomi.page_locator = Arc::new(page_locator::PageLocator::with_refresh_wait(wait));
     let pool = db::Database::connect("sqlite::memory:")
         .await
         .unwrap()
         .foreground();
-    let covers = db::init_covers("sqlite::memory:").await.unwrap();
-    Arc::new(AppState {
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
+    let covers = crate::cover_store::test_support::store(&cover_dir);
+    let app = Arc::new(AppState {
         pool,
         cover_pool: covers,
         mangadex: Arc::new(
@@ -210,17 +214,22 @@ async fn app_state(mut suwayomi: SuwayomiClient, wait: Duration) -> Arc<AppState
         media_manifests: None,
         policy: Default::default(),
         setup_code: instance::SetupCode::default(),
-    })
+    });
+    (cover_dir, app)
 }
 
-async fn fixture() -> (Engine, Arc<AppState>) {
+async fn fixture() -> (
+    Engine,
+    Arc<AppState>,
+    crate::cover_store::test_support::TestDir,
+) {
     let engine = Engine::spawn().await;
-    let app = app_state(
+    let (cover_dir, app) = app_state(
         SuwayomiClient::new(engine.url.clone(), None, None),
         page_locator::REFRESH_WAIT,
     )
     .await;
-    (engine, app)
+    (engine, app, cover_dir)
 }
 
 fn router(app: Arc<AppState>) -> Router {
@@ -290,7 +299,7 @@ fn assert_busy(response: &axum::response::Response) {
 #[tokio::test]
 async fn warm_locator_survives_reorder_through_both_refresh_methods() {
     for combined in [false, true] {
-        let (engine, app) = fixture().await;
+        let (engine, app, _cover_dir) = fixture().await;
         assert_page(get_page(app.clone(), "/media/v1/c/8/0").await, 8).await;
         assert_page(get_page(app.clone(), "/media/v1/c/8/0").await, 8).await;
         assert_eq!(engine.co(), 1);
@@ -309,7 +318,7 @@ async fn warm_locator_survives_reorder_through_both_refresh_methods() {
 
 #[tokio::test]
 async fn in_flight_page_drops_neighbour_bytes_and_retries() {
-    let (engine, app) = fixture().await;
+    let (engine, app, _cover_dir) = fixture().await;
     let pause = Arc::new(Pause::default());
     engine.state.lock().unwrap().page_pause = Some(pause.clone());
     let page = tokio::spawn(get_page(app.clone(), "/media/v1/c/8/0"));
@@ -323,7 +332,7 @@ async fn in_flight_page_drops_neighbour_bytes_and_retries() {
 
 #[tokio::test]
 async fn lookup_overlapping_refresh_is_repeated_before_page_fetch() {
-    let (engine, app) = fixture().await;
+    let (engine, app, _cover_dir) = fixture().await;
     let pause = Arc::new(Pause::default());
     engine.state.lock().unwrap().lookup_pause = Some(pause.clone());
     let page = tokio::spawn(get_page(app.clone(), "/media/v1/c/8/0"));
@@ -337,7 +346,7 @@ async fn lookup_overlapping_refresh_is_repeated_before_page_fetch() {
 
 #[tokio::test]
 async fn a_chapter_opening_all_pages_at_once_sends_one_cold_lookup() {
-    let (engine, app) = fixture().await;
+    let (engine, app, _cover_dir) = fixture().await;
     let pause = Arc::new(Pause::default());
     engine.state.lock().unwrap().lookup_pause = Some(pause.clone());
     let first = tokio::spawn(get_page(app.clone(), "/media/v1/c/8/0"));
@@ -356,7 +365,7 @@ async fn a_chapter_opening_all_pages_at_once_sends_one_cold_lookup() {
 
 #[tokio::test]
 async fn page_waits_for_refresh_then_succeeds() {
-    let (engine, app) = fixture().await;
+    let (engine, app, _cover_dir) = fixture().await;
     let pause = Arc::new(Pause::default());
     engine.state.lock().unwrap().refresh_pause = Some(pause.clone());
     let client = app.suwayomi.clone();
@@ -374,7 +383,7 @@ async fn page_waits_for_refresh_then_succeeds() {
 #[tokio::test]
 async fn page_and_legacy_waits_expire_without_fetching_bytes() {
     let engine = Engine::spawn().await;
-    let app = app_state(
+    let (_cover_dir, app) = app_state(
         SuwayomiClient::new(engine.url.clone(), None, None),
         Duration::from_millis(50),
     )
@@ -399,7 +408,7 @@ async fn transport_failure_disables_memo_but_graphql_failure_does_not() {
         RefreshAnswer::ProxyError,
     ] {
         let transport = !matches!(answer, RefreshAnswer::GraphqlError);
-        let (engine, app) = fixture().await;
+        let (engine, app, _cover_dir) = fixture().await;
         assert_page(get_page(app.clone(), "/media/v1/c/8/0").await, 8).await;
         engine.state.lock().unwrap().answer = answer;
         let (_, provenance) = app.suwayomi.chapters_with_provenance(7).await.unwrap();
@@ -432,7 +441,7 @@ async fn transport_failure_disables_memo_but_graphql_failure_does_not() {
 
 #[tokio::test]
 async fn unknown_outcome_refresh_late_reorder_is_never_cached() {
-    let (engine, app) = fixture().await;
+    let (engine, app, _cover_dir) = fixture().await;
     assert_page(get_page(app.clone(), "/media/v1/c/8/0").await, 8).await;
     engine.state.lock().unwrap().answer = RefreshAnswer::ProxyError;
     let (_, provenance) = app.suwayomi.chapters_with_provenance(7).await.unwrap();
@@ -451,7 +460,7 @@ async fn unknown_outcome_refresh_late_reorder_is_never_cached() {
 
 #[tokio::test]
 async fn path_validation_unknown_chapters_and_legacy_index_path() {
-    let (engine, app) = fixture().await;
+    let (engine, app, _cover_dir) = fixture().await;
     for path in [
         "/media/v1/c/a/0",
         "/media/v1/c/8/a",
@@ -478,7 +487,7 @@ async fn path_validation_unknown_chapters_and_legacy_index_path() {
 async fn pages_use_locator_only_for_active_generation_keys() {
     let engine = Engine::spawn().await;
     // The Docker image's setting: image URLs are relative to this server.
-    let app = app_state(
+    let (_cover_dir, app) = app_state(
         SuwayomiClient::new(engine.url.clone(), Some("/".into()), None),
         page_locator::REFRESH_WAIT,
     )
@@ -539,7 +548,7 @@ async fn pages_keep_engine_urls_when_images_point_at_the_engine() {
         (engine.url.clone(), Some(engine.url.clone())),
         (with_login, Some(format!("{}/", engine.url))),
     ] {
-        let app = app_state(
+        let (_cover_dir, app) = app_state(
             SuwayomiClient::new(url, public, None),
             page_locator::REFRESH_WAIT,
         )
@@ -566,7 +575,7 @@ async fn pages_keep_engine_urls_when_images_point_at_the_engine() {
 #[tokio::test]
 async fn locator_urls_never_use_a_public_engine_host() {
     let engine = Engine::spawn().await;
-    let app = app_state(
+    let (_cover_dir, app) = app_state(
         SuwayomiClient::new(
             engine.url.clone(),
             Some("https://suwayomi.example".into()),
@@ -604,7 +613,7 @@ async fn locator_urls_never_use_a_public_engine_host() {
 
 #[tokio::test]
 async fn block_rules_refuse_both_page_paths_and_fail_closed_on_read_errors() {
-    let (engine, app) = fixture().await;
+    let (engine, app, _cover_dir) = fixture().await;
     sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES('w_blocked',now(),now()); INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES('ss_blocked','w_blocked','suwayomi','source','7',now())")
         .execute(&app.pool).await.unwrap();
     let rule = block::BlockRule::new(Vec::<String>::new(), ["safe"]).unwrap();
@@ -631,7 +640,7 @@ async fn block_rules_refuse_both_page_paths_and_fail_closed_on_read_errors() {
 #[tokio::test]
 async fn quarantine_refuses_locator_without_any_page_fetch() {
     let engine = MockEngine::spawn().await;
-    let mut app = app_state(
+    let (_cover_dir, mut app) = app_state(
         SuwayomiClient::new(engine.url.clone(), None, None),
         page_locator::REFRESH_WAIT,
     )

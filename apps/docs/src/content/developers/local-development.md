@@ -27,7 +27,7 @@ The command installs dependencies across all workspaces and establishes internal
 
 ## Start a local database
 
-The server needs PostgreSQL 18 and a separate SQLite cover cache. Use native PostgreSQL tools to create a private development cluster from the repository root. Do this once, in a directory that does not already contain a cluster:
+The server needs PostgreSQL 18 and a writable cover directory. Use native PostgreSQL tools to create a private development cluster from the repository root. Do this once, in a directory that does not already contain a cluster:
 
 ```sh
 initdb -D .komiq-pg --encoding=UTF8 --locale-provider=builtin \
@@ -57,10 +57,12 @@ PORT=8080 GRAPHIQL_ENABLED=on CATALOGUE_SYNC=on CORS_ORIGINS='http://localhost:5
 
 On startup, the server performs these steps:
 
-1. Connects to the PostgreSQL database supplied in `DATABASE_URL` and initializes the separate SQLite covers cache.
+1. Connects to PostgreSQL through `DATABASE_URL` and opens the file cache under `KOMIKA_COVERS_DIR`, defaulting to `covers` beside the covers SQLite file.
 2. Applies migrations from `apps/server/migrations_pg/`. An old `komika.sqlite3` blocks startup when PostgreSQL is empty. Read [Old SQLite install](/self-host/update-and-backup#old-sqlite-install) to start fresh.
 3. If no admin account exists, prints a one-time setup code to the terminal log.
 4. Binds to port 8080.
+
+Cover images and extension icons are files; PostgreSQL holds their index and uploaded covers. `COVERS_DATABASE_URL` still places the data-directory lock, default covers directory and old cache copy source. Read [Data model](/developers/data-model) for the background copy, backups and recovery.
 
 You can verify that the server is active:
 

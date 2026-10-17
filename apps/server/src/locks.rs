@@ -63,6 +63,9 @@ pub enum KeyClass {
     InstanceSetting = 0x4b0d,
     MatchDomain = 0x4b0e,
     Cover = 0x4b0f,
+    /// One content-addressed cover file (`cover_store`): orders its placement by a
+    /// publication against its removal by GC.
+    CoverFile = 0x4b10,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

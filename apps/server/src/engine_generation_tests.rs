@@ -1,5 +1,9 @@
 use super::*;
-use crate::database::{SqliteTestPoolOptions, TestPoolOptions};
+use crate::cover_store::{
+    self,
+    test_support::{legacy_pool, store, store_with_legacy, TestDir},
+};
+use crate::database::TestPoolOptions;
 use crate::suwayomi::{testsrv, SuwayomiChapter, SuwayomiManga};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -106,26 +110,27 @@ pub(crate) fn chapter_json(id: i64, manga: i64) -> Value {
 }
 async fn setup() -> (
     Database,
-    SqliteDatabase,
+    CoverStore,
     MockEngine,
     SuwayomiClient,
     Arc<Fence>,
+    TestDir,
 ) {
     let pool = TestPoolOptions::new()
         .max_connections(4)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    let covers = SqliteTestPoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+    sqlx::migrate!("./migrations_pg")
+        .run(pool.write())
         .await
         .unwrap();
-    sqlx::raw_sql("CREATE TABLE suwayomi_cover_blob(manga_id INTEGER PRIMARY KEY,webp BLOB,updated_at TEXT); CREATE TABLE cover_variant(asset_key TEXT,width INTEGER,webp BLOB)").execute(&covers).await.unwrap();
+    let dir = TestDir::new();
+    let covers = store(&dir);
     let engine = MockEngine::spawn().await;
     let mut client = SuwayomiClient::new(engine.url.clone(), None, None);
     let fence = Fence::attach(&pool, &covers, &mut client).await.unwrap();
-    (pool, covers, engine, client, fence)
+    (pool, covers, engine, client, fence, dir)
 }
 async fn bind(pool: &Database, client: &SuwayomiClient) -> (SuwayomiManga, Vec<SuwayomiChapter>) {
     let (m, c) = client.series_and_chapters(7).await.unwrap();
@@ -143,7 +148,7 @@ async fn bind(pool: &Database, client: &SuwayomiClient) -> (SuwayomiManga, Vec<S
 
 #[tokio::test]
 async fn first_deploy_adopts_and_reads_back_marker_even_with_existing_references() {
-    let (pool, _covers, engine, client, fence) = setup().await;
+    let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
     assert_eq!(
         engine.data.lock().await.marker,
         fence.generation().map(|id| id.to_string())
@@ -189,7 +194,7 @@ async fn marker_missing_as_null_or_graphql_error_and_no_meta_support() {
             Marker::Missing
         ));
     }
-    let (pool, _covers, engine, client, fence) = setup().await;
+    let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
     bind(&pool, &client).await;
     engine.data.lock().await.meta = false;
     fence.check().await;
@@ -207,9 +212,9 @@ async fn marker_missing_as_null_or_graphql_error_and_no_meta_support() {
 #[tokio::test]
 async fn colliding_ids_and_same_relative_keys_under_other_source_quarantine_and_purge() {
     for change_source in [false, true] {
-        let (pool, covers, engine, client, fence) = setup().await;
+        let (pool, covers, engine, client, fence, _cover_dir) = setup().await;
         bind(&pool, &client).await;
-        sqlx::raw_sql("INSERT INTO suwayomi_cover_blob VALUES(7,X'01','now'); INSERT INTO cover_variant VALUES('s:7',192,X'02'); INSERT INTO cover_variant VALUES('w_kept',192,X'03')").execute(&covers).await.unwrap();
+        seed_covers(&pool, &covers).await;
         client.pages(8).await.unwrap();
         client.chapter_manga_id(8).await.unwrap();
         assert!(client.reader_pages_cached(8));
@@ -240,8 +245,7 @@ async fn colliding_ids_and_same_relative_keys_under_other_source_quarantine_and_
         )
         .await
         .is_err());
-        let counts:(i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM suwayomi_cover_blob),(SELECT count(*) FROM cover_variant)").fetch_one(&covers).await.unwrap();
-        assert_eq!(counts, (0, 1));
+        assert_purged_covers(&pool).await;
         // File-copy restore brings the marker AND original ids back, and resumes.
         engine.data.lock().await.mangas = vec![manga_json(7)];
         fence.check().await;
@@ -252,7 +256,7 @@ async fn colliding_ids_and_same_relative_keys_under_other_source_quarantine_and_
 #[tokio::test]
 async fn empty_replacement_adopts_only_without_any_numeric_reference() {
     for referenced in [false, true] {
-        let (pool, _covers, engine, client, fence) = setup().await;
+        let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
         if referenced {
             bind(&pool, &client).await;
         }
@@ -272,7 +276,7 @@ async fn empty_replacement_adopts_only_without_any_numeric_reference() {
 
 #[tokio::test]
 async fn removed_sample_is_replaced_without_quarantine() {
-    let (pool, _covers, engine, client, fence) = setup().await;
+    let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
     {
         let mut d = engine.data.lock().await;
         d.chapters = (8..28).map(|id| chapter_json(id, 7)).collect();
@@ -299,7 +303,7 @@ async fn removed_sample_is_replaced_without_quarantine() {
 
 #[tokio::test]
 async fn restored_marker_requires_a_verified_binding() {
-    let (pool, _covers, engine, client, fence) = setup().await;
+    let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
     bind(&pool, &client).await;
     let marker = engine.data.lock().await.marker.clone();
     engine.data.lock().await.marker = None;
@@ -328,12 +332,15 @@ async fn restored_marker_requires_a_verified_binding() {
         d.chapters = vec![chapter_json(8, 7)];
     }
     fence.check().await;
-    assert!(!fence.is_blocked(), "the original engine's bindings can return");
+    assert!(
+        !fence.is_blocked(),
+        "the original engine's bindings can return"
+    );
 }
 
 #[tokio::test]
 async fn timed_out_fingerprint_cannot_reopen_gate_without_a_verified_binding() {
-    let (pool, _covers, engine, client, fence) = setup().await;
+    let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
     bind(&pool, &client).await;
     let marker = engine.data.lock().await.marker.take();
     fence.check().await;
@@ -372,15 +379,15 @@ async fn an_engine_that_is_not_up_yet_reads_as_unreachable() {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    let covers = SqliteTestPoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
+    let dir = TestDir::new();
+    let covers = store(&dir);
     let mut client = SuwayomiClient::new("http://127.0.0.1:9".into(), None, None);
     let fence = Fence::attach(&pool, &covers, &mut client).await.unwrap();
     let error = fence.wait().await.unwrap_err();
-    assert_eq!(error.downcast_ref::<FenceError>(), Some(&FenceError::Unreachable));
+    assert_eq!(
+        error.downcast_ref::<FenceError>(),
+        Some(&FenceError::Unreachable)
+    );
     assert_eq!(error.to_string(), crate::graphql::ENGINE_UNREACHABLE);
 }
 
@@ -388,22 +395,31 @@ async fn an_engine_that_is_not_up_yet_reads_as_unreachable() {
 async fn references_without_captured_keys_stay_active_after_adoption() {
     // Right after the first adoption no key row is captured yet while Suwayomi
     // references already exist: that is not a failed verification.
-    let (pool, _covers, _engine, _client, fence) = setup().await;
+    let (pool, _covers, _engine, _client, fence, _cover_dir) = setup().await;
     fence.check().await;
     let generation = fence.generation().unwrap();
     sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES('w_a',now(),now()); INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES('ss_keyless','w_a','suwayomi','source','7',now())")
         .execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM engine_manga_key").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM engine_chapter_key").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM engine_manga_key")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM engine_chapter_key")
+        .execute(&pool)
+        .await
+        .unwrap();
     fence.check().await;
     assert!(!fence.is_blocked());
     let state = states(&pool).await.unwrap().remove(0);
-    assert_eq!((state.state.as_str(), fence.generation()), ("active", Some(generation)));
+    assert_eq!(
+        (state.state.as_str(), fence.generation()),
+        ("active", Some(generation))
+    );
 }
 
 #[tokio::test]
 async fn missing_fingerprint_batch_resamples_other_stored_bindings() {
-    let (pool, _covers, engine, _client, fence) = setup().await;
+    let (pool, _covers, engine, _client, fence, _cover_dir) = setup().await;
     let generation = fence.generation().unwrap();
     sqlx::query("INSERT INTO engine_manga_key(generation,manga_id,source_id,manga_key,updated_at) SELECT $1,n,'source','/manga/' || n,now() FROM generate_series(1,33) n")
         .bind(generation).execute(&pool).await.unwrap();
@@ -421,7 +437,7 @@ async fn missing_fingerprint_batch_resamples_other_stored_bindings() {
 
 #[tokio::test]
 async fn reattach_checks_all_bindings_and_moves_keys_without_resetting_progress_epoch() {
-    let (pool, _covers, engine, client, fence) = setup().await;
+    let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
     {
         let mut d = engine.data.lock().await;
         d.chapters = (8..28).map(|id| chapter_json(id, 7)).collect();
@@ -449,7 +465,7 @@ async fn reattach_checks_all_bindings_and_moves_keys_without_resetting_progress_
 
 #[tokio::test]
 async fn delayed_writers_and_empty_replacements_cannot_cross_generation_change() {
-    let (pool, _covers, _engine, client, fence) = setup().await;
+    let (pool, _covers, _engine, client, fence, _cover_dir) = setup().await;
     let (m, c) = bind(&pool, &client).await;
     let old = crate::engine_keys::token(m.engine_generation.as_deref()).unwrap();
     fence.start_new_generation(Replace::Force).await.unwrap();
@@ -483,7 +499,7 @@ async fn delayed_writers_and_empty_replacements_cannot_cross_generation_change()
 
 #[tokio::test]
 async fn connection_loss_closes_gate_until_check_passes_but_slow_periodic_read_does_not() {
-    let (pool, _covers, engine, client, fence) = setup().await;
+    let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
     bind(&pool, &client).await;
     engine.data.lock().await.delay = CHECK_TIMEOUT + Duration::from_millis(100);
     fence.check().await;
@@ -507,7 +523,7 @@ async fn connection_loss_closes_gate_until_check_passes_but_slow_periodic_read_d
 
 #[tokio::test]
 async fn known_marker_mismatch_closes_gate_before_a_slow_fingerprint() {
-    let (pool, _covers, engine, client, fence) = setup().await;
+    let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
     bind(&pool, &client).await;
     {
         let mut d = engine.data.lock().await;
@@ -515,13 +531,16 @@ async fn known_marker_mismatch_closes_gate_before_a_slow_fingerprint() {
         d.fingerprint_delay = CHECK_TIMEOUT + Duration::from_millis(100);
     }
     fence.check().await;
-    assert!(fence.is_blocked(), "a replaced engine must not serve old ids");
+    assert!(
+        fence.is_blocked(),
+        "a replaced engine must not serve old ids"
+    );
     assert!(fence.wait().await.is_err());
 }
 
 #[tokio::test]
 async fn fingerprint_mismatch_closes_gate_before_a_delayed_reference_check() {
-    let (pool, _covers, engine, client, fence) = setup().await;
+    let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
     bind(&pool, &client).await;
     let revision = fence.revision();
     engine.data.lock().await.mangas[0]["url"] = json!("/wrong");
@@ -548,7 +567,7 @@ async fn fingerprint_mismatch_closes_gate_before_a_delayed_reference_check() {
 
 #[tokio::test]
 async fn numeric_epoch_survives_rolled_back_state() {
-    let (pool, _covers, _engine, _client, fence) = setup().await;
+    let (pool, _covers, _engine, _client, fence, _cover_dir) = setup().await;
     assert_eq!(numeric_epoch(&pool).await.unwrap(), 0);
     let started = chrono::Utc::now().timestamp();
     fence.start_new_generation(Replace::Force).await.unwrap();
@@ -583,7 +602,7 @@ async fn numeric_epoch_survives_rolled_back_state() {
 
 #[tokio::test]
 async fn new_generation_removes_numeric_browse_rows_and_keeps_work_rows() {
-    let (pool, _covers, _engine, client, fence) = setup().await;
+    let (pool, _covers, _engine, client, fence, _cover_dir) = setup().await;
     bind(&pool, &client).await;
     sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES('w_old',now(),now()),('w_kept',now(),now()); INSERT INTO browse_catalogue(work_id,reader_id,title,created_at) VALUES('w_old','7','Old series',now()),('w_kept','w_kept','Kept work',now())")
         .execute(&pool).await.unwrap();
@@ -602,7 +621,7 @@ async fn new_generation_removes_numeric_browse_rows_and_keeps_work_rows() {
 
 #[tokio::test]
 async fn start_new_generation_requires_the_shown_quarantined_generation() {
-    let (pool, _covers, engine, client, fence) = setup().await;
+    let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
     bind(&pool, &client).await;
     let old = fence.generation().unwrap();
     let marker = engine.data.lock().await.marker.clone();
@@ -631,16 +650,18 @@ async fn start_new_generation_requires_the_shown_quarantined_generation() {
 
 #[tokio::test]
 async fn new_generation_sets_numeric_references_aside_so_an_empty_engine_adopts() {
-    let (pool, _covers, engine, client, fence) = setup().await;
+    let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
     bind(&pool, &client).await;
     sqlx::query("INSERT INTO series_views(series_key,total,updated_at) VALUES('7',3,now())")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO series_admin(series_id,paused_override,updated_at) VALUES('7',true,now())")
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO series_admin(series_id,paused_override,updated_at) VALUES('7',true,now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     let old = fence.generation().unwrap();
     {
         let mut d = engine.data.lock().await;
@@ -670,7 +691,7 @@ async fn new_generation_sets_numeric_references_aside_so_an_empty_engine_adopts(
 
 #[tokio::test]
 async fn reattach_commits_before_the_marker_and_the_next_check_writes_it() {
-    let (pool, _covers, engine, client, fence) = setup().await;
+    let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
     bind(&pool, &client).await;
     let old = fence.generation().unwrap();
     engine.data.lock().await.marker = None;
@@ -688,8 +709,7 @@ async fn reattach_commits_before_the_marker_and_the_next_check_writes_it() {
 
 #[tokio::test]
 async fn queued_work_cover_from_a_replaced_generation_is_not_published() {
-    let (pool, _covers, _engine, client, fence) = setup().await;
-    let covers = crate::db::init_covers("sqlite::memory:").await.unwrap();
+    let (pool, covers, _engine, client, fence, _cover_dir) = setup().await;
     let thumb = "/api/v1/manga/7/thumbnail";
     let anchor = |id: &'static str| {
         format!("INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES('{id}','w_a','suwayomi','source','7',now()); UPDATE suwayomi_series SET thumbnail_url='{thumb}' WHERE id=7")
@@ -701,17 +721,21 @@ async fn queued_work_cover_from_a_replaced_generation_is_not_published() {
         .unwrap();
     sqlx::raw_sql(&anchor("ss_a")).execute(&pool).await.unwrap();
     let queued = current(&pool).await.unwrap();
-    assert!(crate::cover::put_work_cover_for_suwayomi_anchor(&pool, &covers, "w_a", b"one", queued, thumb)
-        .await
-        .unwrap());
+    assert!(crate::cover::put_work_cover_for_suwayomi_anchor(
+        &pool, &covers, "w_a", b"one", queued, thumb
+    )
+    .await
+    .unwrap());
     fence.start_new_generation(Replace::Force).await.unwrap();
     // Even with engine B's series 7 enrolled on the same work, the job's bytes came
     // from a number of the replaced generation.
     bind(&pool, &client).await;
     sqlx::raw_sql(&anchor("ss_b")).execute(&pool).await.unwrap();
-    assert!(!crate::cover::put_work_cover_for_suwayomi_anchor(&pool, &covers, "w_a", b"two", queued, thumb)
-        .await
-        .unwrap());
+    assert!(!crate::cover::put_work_cover_for_suwayomi_anchor(
+        &pool, &covers, "w_a", b"two", queued, thumb
+    )
+    .await
+    .unwrap());
     let other_anchor = crate::cover::put_work_cover_for_suwayomi_anchor(
         &pool,
         &covers,
@@ -723,16 +747,19 @@ async fn queued_work_cover_from_a_replaced_generation_is_not_published() {
     .await
     .unwrap();
     assert!(!other_anchor, "a job for another anchor is not published");
-    let stored: Vec<u8> = sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id='w_a'")
-        .fetch_one(&covers)
+    let stored = covers
+        .read_master(&pool, "w_a", None)
         .await
-        .unwrap();
+        .unwrap()
+        .unwrap()
+        .0
+        .bytes;
     assert_eq!(stored, b"one");
 }
 
 #[tokio::test]
 async fn shared_commit_guard_excludes_quarantine() {
-    let (pool, _covers, engine, client, fence) = setup().await;
+    let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
     bind(&pool, &client).await;
     let mut tx = pool.foreground().begin().await.unwrap();
     shared(&mut tx, fence.generation()).await.unwrap();
@@ -750,7 +777,7 @@ async fn shared_commit_guard_excludes_quarantine() {
 
 #[tokio::test]
 async fn write_guard_prioritizes_the_unsampled_offending_chapter_and_can_resume() {
-    let (pool, _covers, engine, client, fence) = setup().await;
+    let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
     engine.data.lock().await.chapters = (8..40).map(|id| chapter_json(id, 7)).collect();
     let (_, mut chapters) = bind(&pool, &client).await;
     engine.data.lock().await.chapters.last_mut().unwrap()["url"] = json!("/wrong");
@@ -793,31 +820,114 @@ fn missing_meta_keys_are_distinct_from_unsupported_meta_read_or_write_fields() {
     assert!(!missing_meta_key("Internal server error"));
 }
 
+async fn seed_covers(pool: &Database, covers: &CoverStore) {
+    sqlx::query("INSERT INTO work(id,created_at,updated_at) VALUES('w_kept',now(),now())")
+        .execute(pool)
+        .await
+        .unwrap();
+    crate::cover::put_work_cover(pool, covers, "w_kept", b"work")
+        .await
+        .unwrap();
+    for id in [7, 9] {
+        crate::cover::put_suwayomi_cover(pool, covers, id, b"source")
+            .await
+            .unwrap();
+    }
+    for asset in ["s:7", "s:9", "w_kept"] {
+        let master = cover_store::row(pool, asset, cover_store::Kind::Master)
+            .await
+            .unwrap()
+            .unwrap();
+        for width in [192, 320] {
+            let mut staged = covers
+                .stage(format!("{asset}:{width}").as_bytes())
+                .await
+                .unwrap();
+            let mut tx = pool.begin().await.unwrap();
+            if asset.starts_with("s:") {
+                shared(&mut tx, None).await.unwrap();
+            }
+            let _guards = crate::cover::lock_assets_and_files(&mut tx, &[asset], &[staged.sha])
+                .await
+                .unwrap();
+            covers.place(&mut staged).await.unwrap();
+            assert!(
+                cover_store::put_derivative(&mut tx, asset, width, &staged, &master.sha)
+                    .await
+                    .unwrap()
+            );
+            tx.commit().await.unwrap();
+        }
+    }
+}
+
+async fn assert_purged_covers(pool: &Database) {
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM cover_object WHERE asset_key LIKE 's:%'), \
+         (SELECT count(*) FROM cover_object WHERE asset_key = 'w:w_kept')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (0, 3));
+}
+
 #[tokio::test]
 async fn quarantine_cover_file_purge_keeps_work_assets() {
-    let covers = SqliteTestPoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::raw_sql("CREATE TABLE suwayomi_cover_blob(manga_id INTEGER PRIMARY KEY,webp BLOB); CREATE TABLE cover_variant(asset_key TEXT,width INTEGER,webp BLOB); CREATE TABLE work_cover_blob(work_id TEXT,webp BLOB); INSERT INTO suwayomi_cover_blob VALUES(7,X'01'); INSERT INTO cover_variant VALUES('s:7',192,X'02'),('s:7@v1',320,X'03'),('w_kept@v1',192,X'04'); INSERT INTO work_cover_blob VALUES('w_kept',X'05')")
-        .execute(&covers).await.unwrap();
-    purge_covers(&covers).await.unwrap();
+    let (pool, covers, _engine, _client, _fence, _dir) = setup().await;
+    seed_covers(&pool, &covers).await;
+    let mut tx = pool.begin().await.unwrap();
+    exclusive(&mut tx).await.unwrap();
+    purge_covers(&mut tx, &covers).await.unwrap();
+    tx.rollback().await.unwrap();
+    let numeric: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cover_object WHERE asset_key LIKE 's:%'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(numeric, 6, "a rolled-back generation purge keeps the index");
+    let mut tx = pool.begin().await.unwrap();
+    exclusive(&mut tx).await.unwrap();
+    purge_covers(&mut tx, &covers).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_purged_covers(&pool).await;
+}
+
+#[tokio::test]
+async fn quarantine_cover_purge_clears_legacy_numeric_rows_during_copy() {
+    let (pool, _covers, _engine, _client, _fence, _dir) = setup().await;
+    let dir = TestDir::new();
+    let covers = store_with_legacy(
+        &dir,
+        legacy_pool().await,
+        cover_store::CopyCursor::default(),
+    );
+    seed_covers(&pool, &covers).await;
+    let legacy = covers.legacy().unwrap();
+    sqlx::raw_sql("INSERT INTO suwayomi_cover_blob VALUES(7,X'01','now'); \
+        INSERT INTO cover_variant VALUES('s:7',192,X'02','now'),('s:7@v1',320,X'03','now'),('w_kept',192,X'04','now'),('w_kept@v1',192,X'06','now'); \
+        INSERT INTO work_cover_blob VALUES('w_kept',X'05',1,'now')")
+        .execute(legacy).await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    exclusive(&mut tx).await.unwrap();
+    purge_covers(&mut tx, &covers).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_purged_covers(&pool).await;
     let counts: (i64,i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM suwayomi_cover_blob),(SELECT count(*) FROM cover_variant),(SELECT count(*) FROM work_cover_blob)")
-        .fetch_one(&covers).await.unwrap();
-    assert_eq!(counts, (0, 1, 1));
-    let asset: String = sqlx::query_scalar("SELECT asset_key FROM cover_variant")
-        .fetch_one(&covers)
-        .await
-        .unwrap();
-    assert_eq!(asset, "w_kept@v1");
+        .fetch_one(legacy).await.unwrap();
+    assert_eq!(counts, (0, 2, 1));
+    let assets: Vec<String> =
+        sqlx::query_scalar("SELECT asset_key FROM cover_variant ORDER BY asset_key")
+            .fetch_all(legacy)
+            .await
+            .unwrap();
+    assert_eq!(assets, ["w_kept", "w_kept@v1"]);
 }
 
 #[tokio::test]
 async fn suwayomi_cover_locks_generation_before_work_during_replacement() {
-    let (pool, _covers, _engine, client, fence) = setup().await;
+    let (pool, covers, _engine, client, fence, _cover_dir) = setup().await;
     let pool = pool.foreground();
-    let covers = crate::db::init_covers("sqlite::memory:").await.unwrap();
     bind(&pool, &client).await;
     sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES('w_cover_generation_order',now(),now()); \
         INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES('ss_cover_generation_order','w_cover_generation_order','suwayomi','source','7',now()); \
@@ -939,7 +1049,7 @@ async fn new_generation_refuses_a_work_added_after_its_work_set_was_locked() {
         rows
     }
 
-    let (pool, covers, engine, client, fence) = setup().await;
+    let (pool, covers, engine, client, fence, _cover_dir) = setup().await;
     let pool = pool.foreground();
     bind(&pool, &client).await;
     sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES('w_z_initial',now(),now()),('w_a_added',now(),now()); \
@@ -951,8 +1061,7 @@ async fn new_generation_refuses_a_work_added_after_its_work_set_was_locked() {
         INSERT INTO series_views(series_key,total,updated_at) VALUES('7',3,now()); \
         INSERT INTO series_admin(series_id,paused_override,updated_at) VALUES('7',true,now())")
         .execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO suwayomi_cover_blob VALUES(7,x'01','now')")
-        .execute(&covers)
+    crate::cover::put_suwayomi_cover(&pool, &covers, 7, &[1])
         .await
         .unwrap();
     let generation = fence.generation();
@@ -1014,10 +1123,6 @@ async fn new_generation_refuses_a_work_added_after_its_work_set_was_locked() {
     );
     assert_eq!(fence.generation(), generation);
     assert_eq!(engine.data.lock().await.marker, marker);
-    let cached: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM suwayomi_cover_blob WHERE manga_id=7")
-            .fetch_one(&covers)
-            .await
-            .unwrap();
-    assert_eq!(cached, 1, "refusal must not purge covers");
+    let cached = crate::cover::get_suwayomi_cover(&pool, &covers, 7).await;
+    assert_eq!(cached, Some(vec![1]), "refusal must not purge covers");
 }

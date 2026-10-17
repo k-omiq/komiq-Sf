@@ -136,13 +136,15 @@ PostgreSQL 18 stores accounts, sessions, progress, libraries, discussions and ca
 
 `postgres-backup` runs pgBackRest for full and incremental backups to object storage. It also archives write-ahead logs (WAL), the transaction records needed for recovery. Configuration and restore procedures live in `deploy/postgres/`.
 
-The separate `/data/covers.sqlite3` cache stays in `server-data` and is excluded from PostgreSQL backups. An open or corruption failure preserves its files with a `.quarantined-<id>` suffix and recreates the cache. Accounts and libraries remain in PostgreSQL. Connector files are separate too; a database backup does not preserve filesystem credentials.
+Cover images and extension icons are files in `/data/covers` (`KOMIKA_COVERS_DIR`), inside `server-data`. Files are named by their SHA-256 content hash at `objects/<2 hex>/<sha256>`; `tmp/` holds writes in progress. PostgreSQL holds the cover index and uploads since this update. Backups include these records, not the cover files. After a database restore, missing files refill from sources on request or through the background crawl and warmer after garbage collection notices them. Uploads return from PostgreSQL. Connector files remain separate; a database backup does not preserve filesystem credentials.
+
+Old installations copy `/data/covers.sqlite3` into files in the background. Open or corruption failures quarantine only this old cache during the copy. Earlier uploads copy too, but are not in database backups. Read [Update and back up](/self-host/update-and-backup) for disk space, restart recovery and when the owner can delete the old cache.
 
 ### Restoration
 
 Hosted recovery uses pgBackRest restore into an empty cluster directory with PostgreSQL stopped. The procedure, with its rehearsal, is `deploy/postgres/RESTORE.md`; it is a runbook for operators of this packaging, and this page does not repeat it. A point-in-time restore combines a backup with archived WAL up to the chosen recovery point. Review the restore tooling and verify the restored database before making it available to users. Keep recovery separate from ordinary startup; never substitute an empty database for a failed restore.
 
-`.komiq-server.lock` prevents concurrent servers using one covers directory. `phase-f` requires an existing, compatible schema and neither migrates nor recreates covers.
+`COVERS_DATABASE_URL` still places `.komiq-server.lock`, the default covers directory and the old copy source. Only the owner server writes covers under that data-directory lock. `phase-f` requires an existing, compatible schema and neither migrates nor recreates covers. Garbage collection removes cover files older than 24 hours with no entry in the index.
 
 ### Self-host and desktop
 
@@ -197,6 +199,7 @@ Production cutover, restore rehearsal and desktop installer validation are plann
 - `packages/api/src/image-provider.ts` and `apps/reader/src/lib/media.ts`: Owner origin lookup and image address rewriting.
 - `deploy/server-entrypoint.sh`: Container startup checks and server process execution.
 - `deploy/postgres/`: PostgreSQL initialization, pgBackRest backup scheduling and restore tooling.
+- `apps/server/src/cover_store.rs` and `apps/server/src/cover_copy.rs`: cover files, index and legacy copy.
 - `deploy/postgres/RESTORE.md`: the hosted backup, restore and rehearsal procedure.
 - `deploy/postgres/STANDBY.md` and `deploy/docker-compose.standby.yml`: the optional standby, its fence and manual promotion.
 - `deploy/postgres/hosted.py`: fence checks, `standby-init`, `promote` and the replication status.

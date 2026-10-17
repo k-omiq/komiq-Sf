@@ -1,4 +1,4 @@
-//! Background garbage collection of orphaned staged uploads and cover blobs.
+//! Background garbage collection of orphaned staged uploads and cover files.
 //!
 //! `POST /comment-media` inserts a `comment_media` row with `comment_id = NULL`
 //! (a staged draft owned by the uploader); `postComment` later links it to the new
@@ -7,12 +7,12 @@
 //! hourly and deletes staged rows older than [`STAGED_TTL_HOURS`], bounding
 //! unbounded main-database growth (and the backup volume it drives).
 //!
-//! The same loop reconciles the SEPARATE cover-cache DB (`db::init_covers`) against
-//! the main one — see [`sweep_cover_blobs`].
+//! The same loop reclaims cover files and repairs missing objects against the
+//! PostgreSQL index — see [`sweep_cover_store`].
 
 use std::time::Duration;
 
-use crate::database::SqliteDatabase;
+use crate::cover_store::{self, CoverStore};
 use crate::db::Database;
 
 /// Staged (unlinked) uploads older than this are swept. A user posting a comment
@@ -60,7 +60,7 @@ const READ_NOTIFICATION_PRUNE_SQL: &str = "DELETE FROM notifications WHERE id IN
        ORDER BY id FOR UPDATE SKIP LOCKED)";
 
 /// Spawn the recurring GC sweep. Runs until `shutdown` resolves.
-pub fn spawn(pool: Database, covers: SqliteDatabase, shutdown: tokio::sync::watch::Receiver<bool>) {
+pub fn spawn(pool: Database, covers: CoverStore, shutdown: tokio::sync::watch::Receiver<bool>) {
     // Panic-supervised (crate::task::supervise): a panic in `sweep` used to end the GC
     // job silently for the process lifetime, letting the staged-media BLOB store grow
     // unbounded. `factory` re-clones the pools + shutdown handle on each restart.
@@ -79,7 +79,7 @@ pub fn spawn(pool: Database, covers: SqliteDatabase, shutdown: tokio::sync::watc
 
 async fn run_loop(
     pool: Database,
-    covers: SqliteDatabase,
+    covers: CoverStore,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     // Start 150s behind the scanner so the boot burst is spread across the five
@@ -90,11 +90,12 @@ async fn run_loop(
     );
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tracing::info!("GC sweep started");
+    let mut repair_cursor = CoverRepairCursor::default();
     loop {
         tokio::select! {
             _ = ticker.tick() => {
                 sweep(&pool, &shutdown).await;
-                sweep_cover_blobs(&pool, &covers, &shutdown).await;
+                sweep_cover_store(&pool, &covers, &shutdown, &mut repair_cursor).await;
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
@@ -215,426 +216,358 @@ pub(crate) async fn prune_read_notifications(
 }
 
 // ---------------------------------------------------------------------------------
-// Orphaned cover blobs
+// Cover files and their PostgreSQL index
 // ---------------------------------------------------------------------------------
 
-/// Ids read from the covers DB per batch. Kept well under SQLite's bind-variable limit
-/// because each id becomes one `?` in the liveness probe against the main DB.
 const COVER_SCAN_BATCH: usize = 500;
+const COVER_SWEEP_BUDGET: usize = 1_000;
+/// Index rows checked for a missing file per tick. A stat is cheap; at this rate a full
+/// pass over a ~400k-row index takes about eight hourly ticks after a restore without files
+/// (requested covers refill at once through the cover routes).
+const COVER_REPAIR_SCAN_BUDGET: usize = 50_000;
+const COVER_FILE_GRACE: Duration = Duration::from_secs(24 * 3600);
 
-/// Hard cap on blobs deleted per sweep run, per table. Two jobs: it bounds how long the
-/// covers DB's single writer is held on any one tick, and it bounds the blast radius if
-/// the liveness probe were ever wrong — a mistake costs at most this many re-derivable
-/// thumbnails before the next tick's logs make it visible.
-const COVER_DELETE_BUDGET: usize = 1000;
+#[derive(Clone, Default)]
+struct CoverRepairCursor {
+    asset: String,
+    kind: String,
+}
 
-/// A blob written more recently than this is never a candidate, no matter what the
-/// liveness probe says. See `sweep_cover_blobs` for why this is belt-and-braces rather
-/// than the primary safety property.
-const COVER_ORPHAN_MIN_AGE_HOURS: i64 = 24;
-
-/// Refuse to sweep at all unless the main DB holds at least this many works / cached
-/// series. A host that restored `komika.sqlite3` but is still replaying, or one pointed
-/// at a fresh/empty DB, would otherwise look like "every blob is orphaned" and the sweep
-/// would happily empty a 20 GB cache. Production carries 112,760 works and 13,802 cached
-/// series, so these floors are three orders of magnitude below normal and only trip on a
-/// genuinely broken main DB.
-const COVER_SWEEP_MIN_WORKS: i64 = 10_000;
-const COVER_SWEEP_MIN_SERIES: i64 = 1_000;
-
-/// Ids probed BEFORE any delete, to estimate what share of the store the sweep is
-/// about to consider orphaned. See [`orphan_rate_sane`].
-const COVER_RATIO_SAMPLE: usize = 2_000;
-
-/// Abort the sweep when more than this percentage of the pre-flight sample looks
-/// orphaned.
-///
-/// The row-count floors above only catch a main DB that is EMPTY. They do nothing for
-/// the realistic misconfiguration: a process pointed at a *different but populated*
-/// main DB (a staging copy, a rolled-back restore, a swapped `DATABASE_URL`) while
-/// `COVERS_DATABASE_URL` still points at the production cover store. Every id then
-/// probes as missing, the floor passes, and the sweep quietly eats the 20 GB cache at
-/// [`COVER_DELETE_BUDGET`] rows an hour.
-///
-/// Measured on production, the true orphan rate is 7.30% globally (8,868 of 121,552),
-/// and a 2,000-id prefix sample estimates it at 7.75% — work ids are `w_` + a random
-/// UUID, so a lexicographic prefix IS a uniform sample of the key space. 25% leaves
-/// better than 3x headroom over normal while the failure mode it guards against sits
-/// near 100%.
-///
-/// Suwayomi manga ids are sequential rather than random, so their prefix is the OLDEST
-/// cohort and therefore the orphan-richest — the estimate is biased HIGH, which is the
-/// safe direction (it aborts more readily, it never permits more deleting). At today's
-/// 1,084 rows the sample covers the whole table and the estimate is exact.
-const COVER_MAX_ORPHAN_PCT: u64 = 25;
-
-/// Reclaim cover blobs whose owning row no longer exists in the MAIN database.
-///
-/// `work_cover_blob` / `suwayomi_cover_blob` live in a separate SQLite file with no FK
-/// to `work` / `suwayomi_series` (see `db::init_covers`), so no cascade in the main DB
-/// can ever reach them. `catalog::reclaim_cover_blob` covers merges going forward, but
-/// `delete_work_cascade` and the foreign-language purge do not, and neither touched the
-/// backlog: a live audit measured 8,868 orphaned work blobs (1,464 MiB of a 20.4 GB
-/// store) plus 78 orphaned Suwayomi blobs.
-///
-/// # Why this is safe against a concurrent insert
-///
-/// The sweep reads ids from the covers DB, asks the main DB which of them are live, then
-/// deletes the rest — two databases, two pools, so the check and the delete cannot be one
-/// transaction. What makes the window harmless is that **a work id is never reused**:
-/// `catalog` mints them with `new_id("w_")` (a fresh UUID), so an id that is missing from
-/// `work` at probe time cannot be re-created between the probe and the delete. The only
-/// thing that can happen in the window is a work being *deleted*, which merely defers its
-/// blob to the next tick. The write ordering points the same way: `cover::put_work_cover`
-/// writes the blob for a work that already exists, never before it, so "blob present,
-/// work absent" strictly implies the work was removed.
-///
-/// The "never before the work" write ordering is *almost* exact. `serve_cover` and the
-/// cover drainer both check the work exists, then spend an unbounded network fetch plus
-/// a CPU resize before calling `put_work_cover` — so a work deleted inside that window
-/// does get a blob written after its row is gone. [`COVER_ORPHAN_MIN_AGE_HOURS`] covers
-/// exactly that case: such a blob is stamped `now`, so it is protected for a full day.
-///
-/// Three further guards make a *wrong* answer survivable rather than destructive:
-/// [`COVER_ORPHAN_MIN_AGE_HOURS`] excludes anything written in the last day (re-checked
-/// atomically inside the DELETE, so a blob re-materialized after the probe is skipped),
-/// [`COVER_MAX_ORPHAN_PCT`] aborts the run outright when the store and the main DB
-/// disagree implausibly widely (see it for the misconfiguration this catches and the
-/// row-count floors do not), and [`COVER_DELETE_BUDGET`] caps a single run. And the
-/// payload itself is re-derivable — a wrongly-dropped cover re-caches on the next
-/// request or crawl.
-///
-/// Deleting rows does NOT shrink the 20.5 GB file: the freed pages go on SQLite's
-/// freelist and are reused by subsequent cover writes. That is the intended outcome
-/// (the store stops growing) — reclaiming the disk itself would need a `VACUUM`, which
-/// rewrites all 20.5 GB and is deliberately not done here.
-async fn sweep_cover_blobs(
+async fn sweep_cover_store(
     pool: &Database,
-    covers: &SqliteDatabase,
+    covers: &CoverStore,
     shutdown: &tokio::sync::watch::Receiver<bool>,
+    repair_cursor: &mut CoverRepairCursor,
 ) {
-    let cutoff =
-        (chrono::Utc::now() - chrono::Duration::hours(COVER_ORPHAN_MIN_AGE_HOURS)).to_rfc3339();
-
-    match sweep_work_cover_blobs(pool, covers, &cutoff, shutdown).await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(deleted = n, "gc: reclaimed orphaned work cover blobs"),
-        Err(e) => {
-            let e = crate::db::observed_database_error(e);
-            tracing::warn!(error = %e, "gc: work cover blob sweep failed");
-        }
-    }
-    if *shutdown.borrow() {
-        return;
-    }
-    match sweep_suwayomi_cover_blobs(pool, covers, &cutoff, shutdown).await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(deleted = n, "gc: reclaimed orphaned suwayomi cover blobs"),
-        Err(e) => {
-            let e = crate::db::observed_database_error(e);
-            tracing::warn!(error = %e, "gc: suwayomi cover blob sweep failed");
-        }
-    }
-}
-
-/// Drop every derivative of the given cover keys. Called right after a master is
-/// reclaimed: `cover_variant` lives in the same file with no foreign key, so nothing
-/// else would ever remove these rows. A no-op on an empty slice.
-async fn purge_cover_variants<'e, K, E>(covers: E, keys: &[K]) -> anyhow::Result<()>
-where
-    K: AsRef<str>,
-    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
-{
-    if keys.is_empty() {
-        return Ok(());
-    }
-    let placeholders = crate::sql_params::placeholders(1, keys.len());
-    let sql = format!("DELETE FROM cover_variant WHERE asset_key IN ({placeholders})");
-    let mut q = sqlx::query(&sql);
-    for k in keys {
-        q = q.bind(k.as_ref());
-    }
-    q.execute(covers).await?;
-    Ok(())
-}
-
-#[cfg(test)]
-tokio::task_local! { static GC_DISCOVERY_PAUSE: crate::locks::pause_points::PausePoints; }
-
-async fn sweep_work_cover_blobs(
-    pool: &Database,
-    covers: &SqliteDatabase,
-    cutoff: &str,
-    shutdown: &tokio::sync::watch::Receiver<bool>,
-) -> anyhow::Result<u64> {
-    let live_works: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
-        .fetch_one(pool)
-        .await?;
-    if live_works < COVER_SWEEP_MIN_WORKS {
-        tracing::warn!(
-            live_works,
-            floor = COVER_SWEEP_MIN_WORKS,
-            "gc: main DB has implausibly few works — skipping the cover blob sweep"
-        );
-        return Ok(0);
-    }
-
-    // Pre-flight: sample the key space and refuse to delete anything if the orphan rate
-    // is implausible. Runs BEFORE the first DELETE, every run, so a main DB that is
-    // merely populated-but-wrong (which the row-count floor above waves through) costs
-    // four probe queries instead of the cover store.
-    let sample: Vec<String> =
-        sqlx::query_scalar("SELECT work_id FROM work_cover_blob ORDER BY work_id LIMIT $1")
-            .bind(COVER_RATIO_SAMPLE as i64)
-            .fetch_all(covers)
-            .await?;
-    let mut sample_orphans = 0usize;
-    for chunk in sample.chunks(COVER_SCAN_BATCH) {
-        sample_orphans += missing_work_ids(pool, chunk).await?.len();
-    }
-    if !orphan_rate_sane(sample_orphans, sample.len()) {
-        tracing::error!(
-            sampled = sample.len(),
-            orphans = sample_orphans,
-            max_pct = COVER_MAX_ORPHAN_PCT,
-            "gc: implausible work cover orphan rate — is the main DB the right one? \
-             skipping the sweep"
-        );
-        return Ok(0);
-    }
-
-    let mut deleted = 0u64;
-    // Keyset pagination over the PK index. `work_id` is the whole index, so selecting
-    // only that column is an index-ONLY scan — it never touches the (blob-bearing) table
-    // rows, which is what keeps an hourly full pass over 121k rows off the 20 GB of blob
-    // pages.
-    let mut cursor = String::new();
-    loop {
-        if *shutdown.borrow() {
-            break;
-        }
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT work_id FROM work_cover_blob WHERE work_id > $1 ORDER BY work_id LIMIT $2",
-        )
-        .bind(&cursor)
-        .bind(COVER_SCAN_BATCH as i64)
-        .fetch_all(covers)
-        .await?;
-        let Some(last) = ids.last().cloned() else {
-            break;
-        };
-        cursor = last;
-
-        let orphans = missing_work_ids(pool, &ids).await?;
-        if !orphans.is_empty() {
-            #[cfg(test)]
-            if let Ok(points) = GC_DISCOVERY_PAUSE.try_with(Clone::clone) {
-                points.hit("gc-orphans-discovered").await;
-            }
-            for id in &orphans {
-                let mut tx = pool.begin().await?;
-                let _asset = crate::cover::lock_asset(&mut tx, id).await?;
-                #[cfg(test)]
-                if let Ok(points) = GC_DISCOVERY_PAUSE.try_with(Clone::clone) {
-                    points.hit("gc-asset-locked").await;
-                }
-                let live: bool =
-                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work WHERE id = $1)")
-                        .bind(id)
-                        .fetch_one(&mut *tx)
-                        .await?;
-                if !live {
-                    let version: Option<i64> = sqlx::query_scalar("SELECT version FROM work_cover_blob WHERE work_id = $1 AND updated_at < $2").bind(id).bind(cutoff).fetch_optional(covers).await?;
-                    if let Some(version) = version {
-                        let mut cache = covers.begin().await?;
-                        let n = sqlx::query("DELETE FROM work_cover_blob WHERE work_id = $1 AND version = $2 AND updated_at < $3").bind(id).bind(version).bind(cutoff).execute(&mut *cache).await?.rows_affected();
-                        deleted += n;
-                        if n > 0 {
-                            purge_cover_variants(&mut *cache, &[id]).await?;
-                        }
-                        cache.commit().await?;
+    macro_rules! sweep_step {
+        ($name:literal, $future:expr) => {
+            if !*shutdown.borrow() {
+                match $future.await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(count = n, concat!("gc: ", $name)),
+                    Err(e) => {
+                        let e = crate::db::observed_database_error(e);
+                        tracing::warn!(error = %e, concat!("gc: ", $name, " failed"));
                     }
                 }
-                tx.commit().await?;
             }
-            if deleted as usize >= COVER_DELETE_BUDGET {
-                tracing::info!(
-                    deleted,
-                    "gc: cover blob delete budget reached — resuming next tick"
-                );
-                break;
-            }
+        };
+    }
+    sweep_step!("swept cover temp files", sweep_temp_files(covers, shutdown));
+    sweep_step!(
+        "swept unreferenced cover files",
+        sweep_unreferenced_files(pool, covers, shutdown)
+    );
+    sweep_step!(
+        "swept orphan source covers",
+        sweep_orphan_source_covers(pool, shutdown)
+    );
+    sweep_step!(
+        "repaired missing cover files",
+        repair_missing_cover_files(pool, covers, shutdown, repair_cursor)
+    );
+}
+
+async fn file_older_than(
+    path: &std::path::Path,
+    cutoff: std::time::SystemTime,
+) -> std::io::Result<bool> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => Ok(metadata.is_file() && metadata.modified()? < cutoff),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+async fn unlink_file(path: &std::path::Path) -> std::io::Result<bool> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+async fn sweep_temp_files(
+    covers: &CoverStore,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<u64> {
+    let cutoff = std::time::SystemTime::now() - COVER_FILE_GRACE;
+    let mut entries = tokio::fs::read_dir(covers.tmp_dir()).await?;
+    let mut deleted = 0;
+    while !*shutdown.borrow() && deleted < COVER_SWEEP_BUDGET as u64 {
+        let Some(entry) = entries.next_entry().await? else {
+            break;
+        };
+        if file_older_than(&entry.path(), cutoff).await? && unlink_file(&entry.path()).await? {
+            deleted += 1;
         }
-        // Hand the covers writer back between batches so a cover materialization never
-        // queues behind the whole sweep.
-        tokio::task::yield_now().await;
     }
     Ok(deleted)
 }
 
-/// Whether `orphans` out of `sampled` probed ids is a believable orphan rate.
-///
-/// An empty sample means an empty cover store — nothing to delete, so nothing to guard;
-/// say yes rather than tripping the breaker on a legitimately fresh host. Integer
-/// arithmetic on `u64` (the sample is at most [`COVER_RATIO_SAMPLE`], so `* 100` cannot
-/// overflow).
-fn orphan_rate_sane(orphans: usize, sampled: usize) -> bool {
-    if sampled == 0 {
-        return true;
-    }
-    (orphans as u64) * 100 <= (sampled as u64) * COVER_MAX_ORPHAN_PCT
-}
-
-/// Of `ids`, those with no `work` row. One `IN (...)` probe per batch.
-async fn missing_work_ids(pool: &Database, ids: &[String]) -> anyhow::Result<Vec<String>> {
-    if ids.is_empty() {
-        return Ok(Vec::new()); // `IN ()` is a syntax error; never build it
-    }
-    let placeholders = crate::sql_params::placeholders(1, ids.len());
-    let sql = format!("SELECT id FROM work WHERE id IN ({placeholders})");
-    let mut q = crate::db_types::query_scalar::<String>(&sql);
-    for id in ids {
-        q = q.bind(id);
-    }
-    let live: std::collections::HashSet<String> = q.fetch_all(pool).await?.into_iter().collect();
-    Ok(ids
-        .iter()
-        .filter(|id| !live.contains(*id))
-        .cloned()
-        .collect())
-}
-
-/// Of `ids`, those with no `suwayomi_series` row. Bound as `?` parameters rather than
-/// interpolated: the SQL text is then identical for every full batch, so sqlx's prepared
-/// statement cache holds ONE entry instead of one per batch.
-async fn missing_series_ids(pool: &Database, ids: &[i64]) -> anyhow::Result<Vec<i64>> {
-    if ids.is_empty() {
-        return Ok(Vec::new()); // `IN ()` is a syntax error; never build it
-    }
-    let placeholders = crate::sql_params::placeholders(1, ids.len());
-    let sql = format!("SELECT id FROM suwayomi_series WHERE id IN ({placeholders})");
-    let mut q = crate::db_types::query_scalar::<i64>(&sql);
-    for id in ids {
-        q = q.bind(*id);
-    }
-    let live: std::collections::HashSet<i64> = q.fetch_all(pool).await?.into_iter().collect();
-    Ok(ids
-        .iter()
-        .copied()
-        .filter(|id| !live.contains(id))
-        .collect())
-}
-
-async fn sweep_suwayomi_cover_blobs(
+async fn sweep_unreferenced_files(
     pool: &Database,
-    covers: &SqliteDatabase,
-    cutoff: &str,
+    covers: &CoverStore,
     shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<u64> {
-    let live_series: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM suwayomi_series")
-        .fetch_one(pool)
-        .await?;
-    if live_series < COVER_SWEEP_MIN_SERIES {
-        tracing::warn!(
-            live_series,
-            floor = COVER_SWEEP_MIN_SERIES,
-            "gc: main DB has implausibly few cached series — skipping the suwayomi cover sweep"
-        );
-        return Ok(0);
-    }
-
-    // Same pre-flight breaker as the work sweep — see `orphan_rate_sane` and
-    // `COVER_MAX_ORPHAN_PCT`. The row-count floor above cannot tell a wrong-but-populated
-    // main DB from the right one; this can.
-    let sample: Vec<i64> =
-        sqlx::query_scalar("SELECT manga_id FROM suwayomi_cover_blob ORDER BY manga_id LIMIT $1")
-            .bind(COVER_RATIO_SAMPLE as i64)
-            .fetch_all(covers)
-            .await?;
-    let mut sample_orphans = 0usize;
-    for chunk in sample.chunks(COVER_SCAN_BATCH) {
-        sample_orphans += missing_series_ids(pool, chunk).await?.len();
-    }
-    if !orphan_rate_sane(sample_orphans, sample.len()) {
-        tracing::error!(
-            sampled = sample.len(),
-            orphans = sample_orphans,
-            max_pct = COVER_MAX_ORPHAN_PCT,
-            "gc: implausible suwayomi cover orphan rate — is the main DB the right one? \
-             skipping the sweep"
-        );
-        return Ok(0);
-    }
-
-    let mut deleted = 0u64;
-    let mut cursor: i64 = i64::MIN;
-    loop {
-        if *shutdown.borrow() {
-            break;
-        }
-        let ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT manga_id FROM suwayomi_cover_blob WHERE manga_id > $1 \
-             ORDER BY manga_id LIMIT $2",
-        )
-        .bind(cursor)
-        .bind(COVER_SCAN_BATCH as i64)
-        .fetch_all(covers)
-        .await?;
-        let Some(last) = ids.last().copied() else {
+    let cutoff = std::time::SystemTime::now() - COVER_FILE_GRACE;
+    let mut directories = tokio::fs::read_dir(covers.objects_dir()).await?;
+    let mut batch = Vec::with_capacity(COVER_SCAN_BATCH);
+    let mut deleted = 0;
+    while !*shutdown.borrow() && deleted < COVER_SWEEP_BUDGET as u64 {
+        let Some(directory) = directories.next_entry().await? else {
             break;
         };
-        cursor = last;
-
-        // Suwayomi ids come from the source rather than being minted by us, so the
-        // "never reused" property that makes the work sweep exact does NOT hold here,
-        // and "orphan" is weaker: `serve_suwayomi_image` materializes a downscaled cover
-        // for any manga id a browse/discovery feed returned, including ones never cached
-        // as a series. Measured live, 78 of 1,075 blobs are in that state, 9 of them
-        // written within the last day. The consequence of sweeping one is a single
-        // re-downscale on the next request, and the age gate then protects it for
-        // another day — so the worst case is one refetch per cover per 24h, which is
-        // the re-derivable-cache contract this store is built on.
-        let orphans = missing_series_ids(pool, &ids).await?;
-        if !orphans.is_empty() {
-            #[cfg(test)]
-            if let Ok(points) = GC_DISCOVERY_PAUSE.try_with(Clone::clone) {
-                points.hit("gc-orphans-discovered").await;
+        let prefix = directory.file_name();
+        let Some(prefix) = prefix
+            .to_str()
+            .filter(|s| s.len() == 2 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        else {
+            continue;
+        };
+        if !directory.file_type().await?.is_dir() {
+            continue;
+        }
+        let mut entries = tokio::fs::read_dir(directory.path()).await?;
+        while !*shutdown.borrow() && deleted < COVER_SWEEP_BUDGET as u64 {
+            let Some(entry) = entries.next_entry().await? else {
+                break;
+            };
+            let name = entry.file_name();
+            let Some(name) = name
+                .to_str()
+                .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            else {
+                continue;
+            };
+            if !name[..2].eq_ignore_ascii_case(prefix)
+                || !file_older_than(&entry.path(), cutoff).await?
+            {
+                continue;
             }
-            for id in &orphans {
-                let asset = crate::cover::suwayomi_variant_key(*id);
-                let mut tx = pool.begin().await?;
-                let _asset = crate::cover::lock_asset(&mut tx, &asset).await?;
-                #[cfg(test)]
-                if let Ok(points) = GC_DISCOVERY_PAUSE.try_with(Clone::clone) {
-                    points.hit("gc-asset-locked").await;
-                }
-                let live: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM suwayomi_series WHERE id = $1)",
+            let mut sha = [0; 32];
+            hex::decode_to_slice(name, &mut sha)?;
+            batch.push((sha, entry.path()));
+            if batch.len() == COVER_SCAN_BATCH {
+                deleted += sweep_unreferenced_batch(
+                    pool,
+                    &batch,
+                    cutoff,
+                    COVER_SWEEP_BUDGET - deleted as usize,
+                    shutdown,
                 )
-                .bind(id)
+                .await?;
+                batch.clear();
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+    if !batch.is_empty() && !*shutdown.borrow() && deleted < COVER_SWEEP_BUDGET as u64 {
+        deleted += sweep_unreferenced_batch(
+            pool,
+            &batch,
+            cutoff,
+            COVER_SWEEP_BUDGET - deleted as usize,
+            shutdown,
+        )
+        .await?;
+    }
+    Ok(deleted)
+}
+
+async fn sweep_unreferenced_batch(
+    pool: &Database,
+    batch: &[(cover_store::Sha, std::path::PathBuf)],
+    cutoff: std::time::SystemTime,
+    budget: usize,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<u64> {
+    let shas: Vec<Vec<u8>> = batch.iter().map(|(sha, _)| sha.to_vec()).collect();
+    let referenced: std::collections::HashSet<Vec<u8>> =
+        sqlx::query_scalar("SELECT sha256 FROM cover_object WHERE sha256 = ANY($1)")
+            .bind(&shas)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect();
+    let mut deleted = 0;
+    for (sha, path) in batch {
+        if *shutdown.borrow() || deleted >= budget as u64 {
+            break;
+        }
+        if referenced.contains(sha.as_slice()) {
+            continue;
+        }
+        let mut tx = pool.begin().await?;
+        crate::locks::advisory(&mut tx, &[cover_store::file_key(sha)]).await?;
+        let referenced: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cover_object WHERE sha256 = $1)")
+                .bind(sha.as_slice())
                 .fetch_one(&mut *tx)
                 .await?;
-                if !live {
-                    let stamp: Option<String> = sqlx::query_scalar("SELECT updated_at FROM suwayomi_cover_blob WHERE manga_id = $1 AND updated_at < $2").bind(id).bind(cutoff).fetch_optional(covers).await?;
-                    if let Some(stamp) = stamp {
-                        let mut cache = covers.begin().await?;
-                        let n = sqlx::query("DELETE FROM suwayomi_cover_blob WHERE manga_id = $1 AND updated_at = $2 AND updated_at < $3").bind(id).bind(stamp).bind(cutoff).execute(&mut *cache).await?.rows_affected();
-                        deleted += n;
-                        if n > 0 {
-                            purge_cover_variants(&mut *cache, &[asset]).await?;
-                        }
-                        cache.commit().await?;
-                    }
-                }
-                tx.commit().await?;
-            }
-            if deleted as usize >= COVER_DELETE_BUDGET {
+        // A publisher may have touched this file and rolled back while GC waited.
+        if !referenced && file_older_than(path, cutoff).await? && unlink_file(path).await? {
+            deleted += 1;
+        }
+        tx.commit().await?;
+    }
+    Ok(deleted)
+}
+
+async fn sweep_orphan_source_covers(
+    pool: &Database,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<u64> {
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+    let mut cursor = String::new();
+    let mut deleted = 0;
+    while !*shutdown.borrow() && deleted < COVER_SWEEP_BUDGET as u64 {
+        let assets: Vec<String> = sqlx::query_scalar(
+            "SELECT c.asset_key FROM cover_object c WHERE c.asset_key > $1 \
+             AND c.asset_key LIKE 's:%' AND c.kind = 'master' AND c.updated_at < $2 \
+             AND NOT EXISTS (SELECT 1 FROM suwayomi_series s WHERE 's:' || s.id::text = c.asset_key) \
+             ORDER BY c.asset_key LIMIT $3",
+        ).bind(&cursor).bind(cutoff).bind(COVER_SCAN_BATCH as i64).fetch_all(pool).await?;
+        if assets.is_empty() {
+            break;
+        }
+        for asset in assets {
+            if *shutdown.borrow() || deleted >= COVER_SWEEP_BUDGET as u64 {
                 break;
             }
+            cursor.clone_from(&asset);
+            let Some(id) = asset
+                .strip_prefix("s:")
+                .and_then(|id| id.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            let mut tx = pool.begin().await?;
+            crate::engine_generation::shared(&mut tx, None).await?;
+            let _asset = crate::cover::lock_asset(&mut tx, &asset).await?;
+            let orphan: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM cover_object WHERE asset_key = $1 \
+                 AND kind = 'master' AND updated_at < $2) \
+                 AND NOT EXISTS(SELECT 1 FROM suwayomi_series WHERE id = $3)",
+            )
+            .bind(&asset)
+            .bind(cutoff)
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if orphan {
+                cover_store::delete_asset(&mut tx, &asset).await?;
+                deleted += 1;
+            }
+            tx.commit().await?;
         }
         tokio::task::yield_now().await;
     }
     Ok(deleted)
+}
+
+async fn repair_missing_cover_files(
+    pool: &Database,
+    covers: &CoverStore,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+    cursor: &mut CoverRepairCursor,
+) -> anyhow::Result<u64> {
+    // While the SQLite copy runs, a cleared slot would let the copy install an older
+    // SQLite master over a newer cover whose file was lost. Reads still refill such a
+    // slot on demand; the repair waits until the copy is done.
+    if !covers.copy_done() {
+        return Ok(0);
+    }
+    let mut scanned = 0;
+    let mut repaired = 0;
+    while !*shutdown.borrow()
+        && scanned < COVER_REPAIR_SCAN_BUDGET
+        && repaired < COVER_SWEEP_BUDGET as u64
+    {
+        let rows: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT asset_key, kind, sha256 FROM cover_object WHERE (asset_key, kind) > ($1, $2) \
+             ORDER BY asset_key, kind LIMIT $3",
+        )
+        .bind(&cursor.asset)
+        .bind(&cursor.kind)
+        .bind(COVER_SCAN_BATCH.min(COVER_REPAIR_SCAN_BUDGET - scanned) as i64)
+        .fetch_all(pool)
+        .await?;
+        if rows.is_empty() {
+            *cursor = CoverRepairCursor::default();
+            break;
+        }
+        for (key, kind, raw_sha) in rows {
+            if *shutdown.borrow() || repaired >= COVER_SWEEP_BUDGET as u64 {
+                break;
+            }
+            let sha: cover_store::Sha = raw_sha.as_slice().try_into()?;
+            if !covers.object_exists(&sha).await? {
+                let asset = cover_store::asset_of(&key);
+                let work_id = key.strip_prefix("w:");
+                let upload: Option<Vec<u8>> = if kind == "master" && work_id.is_some() {
+                    sqlx::query_scalar(
+                        "SELECT bytes FROM cover_upload WHERE work_id = $1 AND sha256 = $2",
+                    )
+                    .bind(work_id)
+                    .bind(sha.as_slice())
+                    .fetch_optional(pool)
+                    .await?
+                } else {
+                    None
+                };
+                // Hash and sync the backup bytes before any publication locks.
+                let mut staged = match upload {
+                    Some(bytes) => {
+                        let staged = covers.stage(&bytes).await?;
+                        anyhow::ensure!(
+                            staged.sha == sha,
+                            "cover upload bytes disagree with their hash"
+                        );
+                        Some(staged)
+                    }
+                    None => None,
+                };
+                let mut tx = pool.begin().await?;
+                if asset.starts_with("s:") {
+                    crate::engine_generation::shared(&mut tx, None).await?;
+                }
+                let _assets =
+                    crate::cover::lock_assets_and_files(&mut tx, &[asset], &[sha]).await?;
+                if let Some(work_id) = work_id {
+                    crate::locks::lock_works(&mut tx, &[work_id]).await?;
+                }
+                let current: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM cover_object WHERE asset_key = $1 AND kind = $2 AND sha256 = $3)",
+                ).bind(&key).bind(&kind).bind(sha.as_slice()).fetch_one(&mut *tx).await?;
+                if current && !covers.object_exists(&sha).await? {
+                    if let Some(staged) = staged.as_mut() {
+                        covers.place(staged).await?;
+                    } else if kind == "master" {
+                        cover_store::delete_asset(&mut tx, asset).await?;
+                        if let Some(work_id) = work_id {
+                            sqlx::query(
+                                "UPDATE work SET cover_cached_version = NULL WHERE id = $1",
+                            )
+                            .bind(work_id)
+                            .execute(&mut *tx)
+                            .await?;
+                        }
+                    } else {
+                        sqlx::query("DELETE FROM cover_object WHERE asset_key = $1 AND kind = $2 AND sha256 = $3")
+                            .bind(&key).bind(&kind).bind(sha.as_slice()).execute(&mut *tx).await?;
+                    }
+                    repaired += 1;
+                }
+                tx.commit().await?;
+            }
+            cursor.asset = key;
+            cursor.kind = kind;
+            scanned += 1;
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(repaired)
 }
 
 #[cfg(test)]
@@ -642,212 +575,6 @@ mod tests {
     use super::*;
     use crate::database::TestPoolOptions;
 
-    /// What the other writer does to the orphan the sweep has already selected.
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    enum Overlap {
-        /// The owner comes back and publishes a new master and a derivative
-        /// before the sweep takes the asset guard.
-        Republished,
-        /// The owner comes back, the old blob is all it has.
-        RecreatedOnly,
-        /// The owner comes back while the sweep holds the asset guard; its
-        /// publication has to wait for the sweep's decision.
-        PublisherWaits,
-    }
-    const OVERLAPS: [Overlap; 3] = [
-        Overlap::Republished,
-        Overlap::RecreatedOnly,
-        Overlap::PublisherWaits,
-    ];
-    const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-
-    #[tokio::test]
-    async fn work_cover_gc_preserves_a_new_publication_and_its_derivatives() {
-        for overlap in OVERLAPS {
-            let pool = main_pool().await.foreground();
-            let covers = covers_pool().await;
-            seed_works(&pool, 0, COVER_SWEEP_MIN_WORKS).await;
-            seed_work_blobs(&covers, 0, 3, "2000-01-01T00:00:00Z").await;
-            sqlx::query(
-                "INSERT INTO work_cover_blob VALUES ('w_z',x'00',1,'2000-01-01T00:00:00Z')",
-            )
-            .execute(&covers)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT INTO cover_variant VALUES ('w_z',192,x'01','2000-01-01T00:00:00Z')",
-            )
-            .execute(&covers)
-            .await
-            .unwrap();
-            let points = crate::locks::pause_points::PausePoints::default();
-            let armed = points.arm(if overlap == Overlap::PublisherWaits {
-                "gc-asset-locked"
-            } else {
-                "gc-orphans-discovered"
-            });
-            let writer = pool.clone();
-            let cache = covers.clone();
-            let (_stop, rx) = tokio::sync::watch::channel(false);
-            let first = tokio::spawn(GC_DISCOVERY_PAUSE.scope(points, async move {
-                sweep_work_cover_blobs(&writer, &cache, "2025-01-01T00:00:00Z", &rx).await
-            }));
-            tokio::time::timeout(WAIT, armed.reached())
-                .await
-                .expect("the sweep never reached its pause point");
-            sqlx::query("INSERT INTO work(id,created_at,updated_at) VALUES ('w_z',now(),now())")
-                .execute(&pool)
-                .await
-                .unwrap();
-            let publisher = match overlap {
-                Overlap::Republished => {
-                    crate::cover::put_work_cover(&pool, &covers, "w_z", b"fresh")
-                        .await
-                        .unwrap();
-                    crate::cover::put_current_variant(
-                        &pool,
-                        &covers,
-                        "w_z",
-                        192,
-                        b"fresh",
-                        b"fresh-small",
-                    )
-                    .await
-                    .unwrap();
-                    None
-                }
-                Overlap::RecreatedOnly => None,
-                Overlap::PublisherWaits => {
-                    let writer = pool.clone();
-                    let cache = covers.clone();
-                    let publisher = tokio::spawn(async move {
-                        crate::cover::put_work_cover(&writer, &cache, "w_z", b"fresh").await
-                    });
-                    crate::cover::wait_for_writer_lock(&pool).await;
-                    Some(publisher)
-                }
-            };
-            armed.release();
-            assert_eq!(first.await.unwrap().unwrap(), 0, "{overlap:?}");
-            if let Some(publisher) = publisher {
-                publisher.await.unwrap().unwrap();
-            }
-            let master: Vec<u8> =
-                sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id='w_z'")
-                    .fetch_optional(&covers)
-                    .await
-                    .unwrap()
-                    .unwrap_or_else(|| {
-                        panic!("{overlap:?}: the sweep deleted a live work's cover")
-                    });
-            let variant = crate::cover::get_cover_variant(&covers, "w_z", 192).await;
-            match overlap {
-                Overlap::Republished => {
-                    assert_eq!(master, b"fresh");
-                    assert_eq!(variant.as_deref(), Some(b"fresh-small".as_slice()));
-                }
-                Overlap::RecreatedOnly => {
-                    assert_eq!(master, [0u8]);
-                    assert_eq!(variant.as_deref(), Some([1u8].as_slice()));
-                }
-                Overlap::PublisherWaits => {
-                    assert_eq!(master, b"fresh");
-                    assert_eq!(variant, None, "the old master's derivative survived");
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn source_cover_gc_rechecks_recreated_series_before_deleting_variants() {
-        for overlap in OVERLAPS {
-            let pool = main_pool().await.foreground();
-            let covers = covers_pool().await;
-            sqlx::query("INSERT INTO suwayomi_series(id,title,status,in_library,source_id,updated_at) SELECT n,'Series','ONGOING',true,'1',now() FROM generate_series(1,1000) n").execute(&pool).await.unwrap();
-            for id in [1, 2, 3, 1001] {
-                sqlx::query(
-                    "INSERT INTO suwayomi_cover_blob VALUES ($1,x'00','2000-01-01T00:00:00Z')",
-                )
-                .bind(id)
-                .execute(&covers)
-                .await
-                .unwrap();
-            }
-            sqlx::query(
-                "INSERT INTO cover_variant VALUES ('s:1001',192,x'01','2000-01-01T00:00:00Z')",
-            )
-            .execute(&covers)
-            .await
-            .unwrap();
-            let points = crate::locks::pause_points::PausePoints::default();
-            let armed = points.arm(if overlap == Overlap::PublisherWaits {
-                "gc-asset-locked"
-            } else {
-                "gc-orphans-discovered"
-            });
-            let writer = pool.clone();
-            let cache = covers.clone();
-            let (_stop, rx) = tokio::sync::watch::channel(false);
-            let first = tokio::spawn(GC_DISCOVERY_PAUSE.scope(points, async move {
-                sweep_suwayomi_cover_blobs(&writer, &cache, "2025-01-01T00:00:00Z", &rx).await
-            }));
-            tokio::time::timeout(WAIT, armed.reached())
-                .await
-                .expect("the sweep never reached its pause point");
-            sqlx::query("INSERT INTO suwayomi_series(id,title,status,in_library,source_id,updated_at) VALUES (1001,'Series','ONGOING',true,'1',now())").execute(&pool).await.unwrap();
-            let publisher = match overlap {
-                Overlap::Republished => {
-                    crate::cover::publish_suwayomi_cover(&pool, &covers, 1001, b"fresh")
-                        .await
-                        .unwrap();
-                    crate::cover::put_current_variant(
-                        &pool,
-                        &covers,
-                        "s:1001",
-                        192,
-                        b"fresh",
-                        b"fresh-small",
-                    )
-                    .await
-                    .unwrap();
-                    None
-                }
-                Overlap::RecreatedOnly => None,
-                Overlap::PublisherWaits => {
-                    let writer = pool.clone();
-                    let cache = covers.clone();
-                    let publisher = tokio::spawn(async move {
-                        crate::cover::publish_suwayomi_cover(&writer, &cache, 1001, b"fresh").await
-                    });
-                    crate::cover::wait_for_writer_lock(&pool).await;
-                    Some(publisher)
-                }
-            };
-            armed.release();
-            assert_eq!(first.await.unwrap().unwrap(), 0, "{overlap:?}");
-            if let Some(publisher) = publisher {
-                publisher.await.unwrap().unwrap();
-            }
-            let master = crate::cover::get_suwayomi_cover(&covers, 1001)
-                .await
-                .unwrap_or_else(|| panic!("{overlap:?}: the sweep deleted a live series' cover"));
-            let variant = crate::cover::get_cover_variant(&covers, "s:1001", 192).await;
-            match overlap {
-                Overlap::Republished => {
-                    assert_eq!(master, b"fresh");
-                    assert_eq!(variant.as_deref(), Some(b"fresh-small".as_slice()));
-                }
-                Overlap::RecreatedOnly => {
-                    assert_eq!(master, [0u8]);
-                    assert_eq!(variant.as_deref(), Some([1u8].as_slice()));
-                }
-                Overlap::PublisherWaits => {
-                    assert_eq!(master, b"fresh");
-                    assert_eq!(variant, None, "the old master's derivative survived");
-                }
-            }
-        }
-    }
     #[tokio::test]
     async fn notification_gc_keeps_unread_recent_boundary_and_release_history() {
         let pool = main_pool().await;
@@ -970,17 +697,21 @@ mod tests {
         (user, media)
     }
 
-    async fn social_schema(pool: &Database, user: &str) -> crate::graphql::ApiSchema {
+    async fn social_schema(
+        pool: &Database,
+        user: &str,
+    ) -> (cover_store::test_support::TestDir, crate::graphql::ApiSchema) {
         use crate::graphql::{AppState, RateLimiter};
         use std::sync::Arc;
 
         sqlx::query("INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES ($1,$2,now(),now()+interval '1 day')")
             .bind(crate::auth::hash_token("ov1-token")).bind(crate::db_types::uuid(user).unwrap())
             .execute(pool).await.unwrap();
-        crate::graphql::build_schema(
+        let cover_dir = cover_store::test_support::TestDir::new();
+        let schema = crate::graphql::build_schema(
             Arc::new(AppState {
                 pool: pool.foreground(),
-                cover_pool: SqliteDatabase::connect("sqlite::memory:").await.unwrap(),
+                cover_pool: cover_store::test_support::store(&cover_dir),
                 suwayomi: crate::suwayomi::SuwayomiClient::new(
                     "http://127.0.0.1:1".into(),
                     None,
@@ -1005,7 +736,8 @@ mod tests {
                 setup_code: Default::default(),
             }),
             false,
-        )
+        );
+        (cover_dir, schema)
     }
 
     async fn social_mutation(
@@ -1091,7 +823,7 @@ mod tests {
         let pool = pool().await;
         let work = work(&pool, "media target").await;
         let (user, media) = social_gc_fixture(&pool).await;
-        let schema = social_schema(&pool, &user).await;
+        let (_cover_dir, schema) = social_schema(&pool, &user).await;
         let (swept, posted) = overlap(
             &pool,
             |pool| async move { Ok(sweep_staged_media(&pool, "2026-07-10T12:00:00Z").await?) },
@@ -1120,7 +852,7 @@ mod tests {
         let pool = pool().await;
         let work = work(&pool, "media target").await;
         let (user, media) = social_gc_fixture(&pool).await;
-        let schema = social_schema(&pool, &user).await;
+        let (_cover_dir, schema) = social_schema(&pool, &user).await;
         let (gate, pid) = hold_social_commit(&pool, "comment_media").await;
         let post = tokio::spawn(async move { post_staged_media(&schema, &work, media).await });
         wait_for_social_commit(&pool, pid).await;
@@ -1197,7 +929,7 @@ mod tests {
 
         let pool = pool().await;
         let (user, id) = old_read_notification(&pool).await;
-        let schema = social_schema(&pool, &user).await;
+        let (_cover_dir, schema) = social_schema(&pool, &user).await;
         let (pruned, marked) = overlap(
             &pool,
             |pool| async move {
@@ -1231,7 +963,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let schema = social_schema(&pool, &user).await;
+        let (_cover_dir, schema) = social_schema(&pool, &user).await;
         let (gate, pid) = hold_social_commit(&pool, "notifications").await;
         let mark = tokio::spawn(async move { mark_gc_notification_read(&schema, id).await });
         wait_for_social_commit(&pool, pid).await;
@@ -1437,8 +1169,7 @@ mod tests {
         let _ = sqlx::Connection::close(holder).await;
     }
 
-    /// Main DB with the real schema. `max_connections(1)` because a `sqlite::memory:`
-    /// pool gives every connection its OWN empty database.
+    /// Main DB with the real schema through the PostgreSQL test harness.
     async fn main_pool() -> Database {
         let pool = TestPoolOptions::new()
             .max_connections(1)
@@ -1449,28 +1180,6 @@ mod tests {
             .run(pool.write())
             .await
             .unwrap();
-        pool
-    }
-
-    /// Covers DB, schema copied from `db::init_covers` (which can't be reused here: it
-    /// opens a 4-connection pool, and four `sqlite::memory:` connections are four
-    /// different databases).
-    async fn covers_pool() -> SqliteDatabase {
-        let pool = crate::sqlite_database::SqliteTestPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        for ddl in [
-            "CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, \
-             version INTEGER NOT NULL, updated_at TEXT NOT NULL)",
-            "CREATE TABLE suwayomi_cover_blob (manga_id INTEGER PRIMARY KEY, \
-             webp BLOB NOT NULL, updated_at TEXT NOT NULL)",
-            "CREATE TABLE cover_variant (asset_key TEXT NOT NULL, width INTEGER NOT NULL, \
-             webp BLOB NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (asset_key, width))",
-        ] {
-            sqlx::query(ddl).execute(&pool).await.unwrap();
-        }
         pool
     }
 
@@ -1490,31 +1199,6 @@ mod tests {
         .unwrap();
     }
 
-    async fn seed_work_blobs(covers: &SqliteDatabase, lo: i64, hi: i64, updated_at: &str) {
-        sqlx::query(
-            "INSERT INTO work_cover_blob (work_id, webp, version, updated_at) \
-             WITH RECURSIVE n(i) AS (SELECT $1 UNION ALL SELECT i + 1 FROM n WHERE i < $2) \
-             SELECT printf('w_%05d', i), x'00', 1, $3 FROM n",
-        )
-        .bind(lo)
-        .bind(hi - 1)
-        .bind(updated_at)
-        .execute(covers)
-        .await
-        .unwrap();
-    }
-
-    async fn blob_count(covers: &SqliteDatabase) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_blob")
-            .fetch_one(covers)
-            .await
-            .unwrap()
-    }
-
-    fn cutoff() -> String {
-        (chrono::Utc::now() - chrono::Duration::hours(COVER_ORPHAN_MIN_AGE_HOURS)).to_rfc3339()
-    }
-
     fn never_shutdown() -> (
         tokio::sync::watch::Sender<bool>,
         tokio::sync::watch::Receiver<bool>,
@@ -1522,331 +1206,598 @@ mod tests {
         tokio::sync::watch::channel(false)
     }
 
-    /// The decisive safety property: an aged orphan is reclaimed, and NOTHING else is.
-    /// A live work's blob and an orphan written inside `COVER_ORPHAN_MIN_AGE_HOURS`
-    /// both survive — the latter is the exact shape `serve_cover` leaves behind when a
-    /// work is deleted during its fetch+resize window (checked live → fetch → write).
-    #[tokio::test]
-    async fn work_sweep_reclaims_only_aged_orphans() {
-        let (pool, covers) = (main_pool().await, covers_pool().await);
-        // 10,000 live works, all with blobs (clears COVER_SWEEP_MIN_WORKS).
-        seed_works(&pool, 0, 10_000).await;
-        seed_work_blobs(&covers, 0, 10_000, "2020-01-01T00:00:00+00:00").await;
-        // 100 aged orphans + 10 orphans written just now.
-        seed_work_blobs(&covers, 90_000, 90_100, "2020-01-01T00:00:00+00:00").await;
-        seed_work_blobs(&covers, 91_000, 91_010, &chrono::Utc::now().to_rfc3339()).await;
-        assert_eq!(blob_count(&covers).await, 10_110);
+    fn age_file(path: &std::path::Path) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - COVER_FILE_GRACE - Duration::from_secs(60))
+            .unwrap();
+    }
 
-        let (_tx, rx) = never_shutdown();
-        let deleted = sweep_work_cover_blobs(&pool, &covers, &cutoff(), &rx)
+    async fn place_file(pool: &Database, covers: &CoverStore, bytes: &[u8]) -> cover_store::Sha {
+        let mut staged = covers.stage(bytes).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let _guards = crate::cover::lock_assets_and_files(&mut tx, &[], &[staged.sha])
             .await
             .unwrap();
-        assert_eq!(deleted, 100, "exactly the aged orphans");
-        assert_eq!(blob_count(&covers).await, 10_010);
+        covers.place(&mut staged).await.unwrap();
+        tx.commit().await.unwrap();
+        staged.sha
+    }
 
-        // Every live work still has its cover — the property whose violation would be
-        // silent data loss.
-        let live_kept: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_blob WHERE work_id < 'w_90000'")
-                .fetch_one(&covers)
+    async fn seed_object(
+        pool: &Database,
+        covers: &CoverStore,
+        asset: &str,
+        kind: &str,
+        bytes: &[u8],
+    ) -> cover_store::Sha {
+        let mut staged = covers.stage(bytes).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        if asset.starts_with("s:") {
+            crate::engine_generation::shared(&mut tx, None)
                 .await
                 .unwrap();
-        assert_eq!(live_kept, 10_000, "no live work lost its cover");
-        let fresh_kept: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_blob WHERE work_id >= 'w_91000'")
-                .fetch_one(&covers)
+        }
+        let _guards = crate::cover::lock_assets_and_files(&mut tx, &[asset], &[staged.sha])
+            .await
+            .unwrap();
+        if !asset.starts_with("s:") && !asset.starts_with("icon:") {
+            crate::locks::lock_works(&mut tx, &[asset]).await.unwrap();
+        }
+        covers.place(&mut staged).await.unwrap();
+        if kind == "master" {
+            let version = (!asset.starts_with("s:") && !asset.starts_with("icon:")).then_some(7);
+            cover_store::put_master(&mut tx, asset, &staged, version)
                 .await
                 .unwrap();
+        } else {
+            let master = cover_store::row(&mut *tx, asset, cover_store::Kind::Master)
+                .await
+                .unwrap()
+                .unwrap();
+            let width = kind.strip_prefix('w').unwrap().parse().unwrap();
+            assert!(
+                cover_store::put_derivative(&mut tx, asset, width, &staged, &master.sha)
+                    .await
+                    .unwrap()
+            );
+        }
+        tx.commit().await.unwrap();
+        staged.sha
+    }
+
+    async fn object_count(pool: &Database, asset: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM cover_object WHERE asset_key = $1")
+            .bind(cover_store::index_key(asset))
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unreferenced_old_cover_file_is_removed() {
+        let pool = main_pool().await;
+        let dir = cover_store::test_support::TestDir::new();
+        let covers = cover_store::test_support::store(&dir);
+        let sha = place_file(&pool, &covers, b"unreferenced").await;
+        let path = covers.object_path(&sha);
+        age_file(&path);
         assert_eq!(
-            fresh_kept, 10,
-            "the 24h age gate protected the fresh orphans"
+            sweep_unreferenced_files(&pool, &covers, &never_shutdown().1)
+                .await
+                .unwrap(),
+            1
         );
+        assert!(!path.exists());
+    }
 
-        // Idempotent: a second pass finds nothing left to do.
+    #[tokio::test]
+    async fn referenced_old_cover_file_is_kept() {
+        let pool = main_pool().await;
+        let dir = cover_store::test_support::TestDir::new();
+        let covers = cover_store::test_support::store(&dir);
+        let sha = place_file(&pool, &covers, b"referenced").await;
+        seed_object(&pool, &covers, "icon:kept", "master", b"referenced").await;
+        age_file(&covers.object_path(&sha));
         assert_eq!(
-            sweep_work_cover_blobs(&pool, &covers, &cutoff(), &rx)
+            sweep_unreferenced_files(&pool, &covers, &never_shutdown().1)
                 .await
                 .unwrap(),
             0
         );
+        assert!(covers.object_path(&sha).exists());
     }
 
-    /// The DR floor: a main DB with implausibly few works must delete NOTHING, even
-    /// though every single blob probes as orphaned.
     #[tokio::test]
-    async fn reclaiming_a_master_takes_its_derivatives_with_it() {
-        let (pool, covers) = (main_pool().await, covers_pool().await);
-        seed_works(&pool, 0, 10_000).await;
-        seed_work_blobs(&covers, 0, 10_000, "2020-01-01T00:00:00+00:00").await;
-        seed_work_blobs(&covers, 90_000, 90_100, "2020-01-01T00:00:00+00:00").await;
-
-        // A derivative for one LIVE work and one aged ORPHAN. `cover_variant` has no
-        // foreign key to the master, so only the sweep can remove the orphan's.
-        for key in ["w_00001", "w_90000"] {
-            sqlx::query(
-                "INSERT INTO cover_variant (asset_key, width, webp, updated_at) \
-                 VALUES ($1, 192, X'00', '2020-01-01T00:00:00+00:00')",
-            )
-            .bind(key)
-            .execute(&covers)
-            .await
-            .unwrap();
+    async fn young_unreferenced_cover_file_and_unknown_paths_are_kept() {
+        let pool = main_pool().await;
+        let dir = cover_store::test_support::TestDir::new();
+        let covers = cover_store::test_support::store(&dir);
+        let sha = place_file(&pool, &covers, b"young").await;
+        for relative in ["unknown/file", "ab/unknown", "ab/00", "cd/ab"] {
+            let path = covers.objects_dir().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"keep").unwrap();
+            age_file(&path);
         }
+        let wrong_prefix = covers.objects_dir().join("ab").join("cd".repeat(32));
+        std::fs::write(&wrong_prefix, b"keep").unwrap();
+        age_file(&wrong_prefix);
+        assert_eq!(
+            sweep_unreferenced_files(&pool, &covers, &never_shutdown().1)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(covers.object_path(&sha).exists());
+        assert!(wrong_prefix.exists());
+        assert!(covers.objects_dir().join("ab/unknown").exists());
+    }
 
-        let (_tx, rx) = never_shutdown();
-        sweep_work_cover_blobs(&pool, &covers, &cutoff(), &rx)
-            .await
-            .unwrap();
-
-        let remaining: Vec<String> =
-            sqlx::query_scalar("SELECT asset_key FROM cover_variant ORDER BY asset_key")
-                .fetch_all(&covers)
+    #[tokio::test]
+    async fn unreferenced_sweep_waits_for_a_publisher_and_rechecks_references_and_mtime() {
+        for commit in [true, false] {
+            let pool = main_pool().await.foreground();
+            let dir = cover_store::test_support::TestDir::new();
+            let covers = cover_store::test_support::store(&dir);
+            let sha = place_file(&pool, &covers, b"reused").await;
+            age_file(&covers.object_path(&sha));
+            let mut staged = covers.stage(b"reused").await.unwrap();
+            let mut holder = pool.begin().await.unwrap();
+            let guards = crate::cover::lock_assets_and_files(&mut holder, &["icon:reused"], &[sha])
                 .await
                 .unwrap();
+            sqlx::query(
+                "INSERT INTO cover_object(asset_key,kind,sha256,byte_length,updated_at) \
+                 VALUES ('icon:reused','master',$1,6,now())",
+            )
+            .bind(sha.as_slice())
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+            let (writer, store) = (pool.clone(), covers.clone());
+            let (_signal, shutdown) = never_shutdown();
+            let mut sweep =
+                tokio::spawn(
+                    async move { sweep_unreferenced_files(&writer, &store, &shutdown).await },
+                );
+            crate::cover::wait_for_writer_lock(&pool).await;
+            assert!(tokio::time::timeout(Duration::from_millis(50), &mut sweep)
+                .await
+                .is_err());
+            if !commit {
+                // Even a rolled-back publication restarts the file's grace period.
+                covers.place(&mut staged).await.unwrap();
+                holder.rollback().await.unwrap();
+            } else {
+                holder.commit().await.unwrap();
+            }
+            drop(guards);
+            assert_eq!(sweep.await.unwrap().unwrap(), 0);
+            assert!(covers.object_path(&sha).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn temp_file_sweep_keeps_young_files_and_directories() {
+        let dir = cover_store::test_support::TestDir::new();
+        let covers = cover_store::test_support::store(&dir);
+        let old = covers.tmp_dir().join("old");
+        let young = covers.tmp_dir().join("young");
+        let directory = covers.tmp_dir().join("directory");
+        std::fs::write(&old, b"old").unwrap();
+        std::fs::write(&young, b"young").unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        age_file(&old);
         assert_eq!(
-            remaining,
-            vec!["w_00001".to_string()],
-            "the orphan's derivative must go with its master, the live work's must stay"
+            sweep_temp_files(&covers, &never_shutdown().1)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!old.exists());
+        assert!(young.exists());
+        assert!(directory.exists());
+    }
+
+    #[tokio::test]
+    async fn temp_file_sweep_obeys_budget_and_shutdown() {
+        let dir = cover_store::test_support::TestDir::new();
+        let covers = cover_store::test_support::store(&dir);
+        for n in 0..=COVER_SWEEP_BUDGET {
+            let path = covers.tmp_dir().join(n.to_string());
+            std::fs::write(&path, b"old").unwrap();
+            age_file(&path);
+        }
+        let (_signal, shutdown) = tokio::sync::watch::channel(true);
+        assert_eq!(sweep_temp_files(&covers, &shutdown).await.unwrap(), 0);
+        assert_eq!(
+            sweep_temp_files(&covers, &never_shutdown().1)
+                .await
+                .unwrap(),
+            COVER_SWEEP_BUDGET as u64
+        );
+        assert_eq!(
+            sweep_temp_files(&covers, &never_shutdown().1)
+                .await
+                .unwrap(),
+            1
         );
     }
 
     #[tokio::test]
-    async fn suwayomi_sweep_takes_derivatives_under_the_prefixed_key() {
-        let (pool, covers) = (main_pool().await, covers_pool().await);
-        // A Suwayomi derivative is keyed `s:<manga_id>`, not the bare id — a sweep that
-        // reused the work key space would silently purge nothing here.
-        sqlx::query(
-            "INSERT INTO cover_variant (asset_key, width, webp, updated_at) \
-             VALUES ('s:4242', 192, X'00', '2020-01-01T00:00:00+00:00')",
+    async fn orphan_source_sweep_removes_only_old_unenrolled_numeric_assets() {
+        let pool = main_pool().await;
+        let dir = cover_store::test_support::TestDir::new();
+        let covers = cover_store::test_support::store(&dir);
+        sqlx::query("INSERT INTO suwayomi_series(id,title,status,source_id,updated_at) VALUES (1,'Live','ONGOING','1',now())")
+            .execute(&pool).await.unwrap();
+        for asset in ["s:1", "s:2", "s:3", "s:invalid", "icon:4"] {
+            seed_object(&pool, &covers, asset, "master", &[1; 32]).await;
+            seed_object(&pool, &covers, asset, "w192", &[2; 32]).await;
+        }
+        sqlx::query("UPDATE cover_object SET updated_at = now() - interval '25 hours' WHERE asset_key <> 's:3'")
+            .execute(&pool).await.unwrap();
+        assert_eq!(
+            sweep_orphan_source_covers(&pool, &never_shutdown().1)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(object_count(&pool, "s:2").await, 0);
+        for asset in ["s:1", "s:3", "s:invalid", "icon:4"] {
+            assert_eq!(object_count(&pool, asset).await, 2, "{asset}");
+        }
+    }
+
+    #[tokio::test]
+    async fn orphan_source_sweep_obeys_budget_and_shutdown() {
+        let pool = main_pool().await;
+        let dir = cover_store::test_support::TestDir::new();
+        let covers = cover_store::test_support::store(&dir);
+        for id in 1..=1001 {
+            seed_object(&pool, &covers, &format!("s:{id}"), "master", b"source").await;
+        }
+        sqlx::query("UPDATE cover_object SET updated_at = now() - interval '25 hours'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (_signal, shutdown) = tokio::sync::watch::channel(true);
+        assert_eq!(
+            sweep_orphan_source_covers(&pool, &shutdown).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            sweep_orphan_source_covers(&pool, &never_shutdown().1)
+                .await
+                .unwrap(),
+            1000
+        );
+        assert_eq!(
+            sweep_orphan_source_covers(&pool, &never_shutdown().1)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn source_cover_gc_rechecks_recreated_series_before_deleting_variants() {
+        for republish in [false, true] {
+            let pool = main_pool().await.foreground();
+            let dir = cover_store::test_support::TestDir::new();
+            let covers = cover_store::test_support::store(&dir);
+            seed_object(&pool, &covers, "s:42", "master", &[1; 32]).await;
+            seed_object(&pool, &covers, "s:42", "w192", &[2; 32]).await;
+            sqlx::query("UPDATE cover_object SET updated_at = now() - interval '25 hours'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let mut master = covers.stage(b"new master").await.unwrap();
+            let mut derivative = covers.stage(b"new derivative").await.unwrap();
+            let mut holder = pool.begin().await.unwrap();
+            crate::engine_generation::shared(&mut holder, None)
+                .await
+                .unwrap();
+            let guards = crate::cover::lock_assets_and_files(
+                &mut holder,
+                &["s:42"],
+                &[master.sha, derivative.sha],
+            )
+            .await
+            .unwrap();
+            let writer = pool.clone();
+            let (_signal, shutdown) = never_shutdown();
+            let mut sweep =
+                tokio::spawn(async move { sweep_orphan_source_covers(&writer, &shutdown).await });
+            crate::cover::wait_for_writer_lock(&pool).await;
+            assert!(tokio::time::timeout(Duration::from_millis(50), &mut sweep)
+                .await
+                .is_err());
+            sqlx::query("INSERT INTO suwayomi_series(id,title,status,source_id,updated_at) VALUES (42,'Recreated','ONGOING','1',now())")
+                .execute(&mut *holder).await.unwrap();
+            if republish {
+                covers.place(&mut master).await.unwrap();
+                cover_store::put_master(&mut holder, "s:42", &master, None)
+                    .await
+                    .unwrap();
+                covers.place(&mut derivative).await.unwrap();
+                assert!(cover_store::put_derivative(
+                    &mut holder,
+                    "s:42",
+                    192,
+                    &derivative,
+                    &master.sha
+                )
+                .await
+                .unwrap());
+            }
+            holder.commit().await.unwrap();
+            drop(guards);
+            assert_eq!(sweep.await.unwrap().unwrap(), 0);
+            assert_eq!(object_count(&pool, "s:42").await, 2);
+            let current = cover_store::row(&pool, "s:42", cover_store::Kind::Master)
+                .await
+                .unwrap()
+                .unwrap();
+            let small = cover_store::row(&pool, "s:42", cover_store::Kind::Width(192))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                current.sha,
+                if republish {
+                    master.sha
+                } else {
+                    cover_store::sha256(&[1; 32])
+                }
+            );
+            assert_eq!(
+                small.sha,
+                if republish {
+                    derivative.sha
+                } else {
+                    cover_store::sha256(&[2; 32])
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_master_file_deletes_asset_and_clears_pointer_but_keeps_cards() {
+        let pool = main_pool().await;
+        let dir = cover_store::test_support::TestDir::new();
+        let covers = cover_store::test_support::store(&dir);
+        seed_works(&pool, 0, 1).await;
+        let asset = "w_00000";
+        let sha = seed_object(&pool, &covers, asset, "master", &[1; 32]).await;
+        seed_object(&pool, &covers, asset, "w192", &[2; 32]).await;
+        seed_object(&pool, &covers, asset, "w320", &[3; 32]).await;
+        std::fs::remove_file(covers.object_path(&sha)).unwrap();
+        sqlx::query("UPDATE work SET cover_cached_version = 7 WHERE id=$1")
+            .bind(asset)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let url = crate::cover::cover_path(asset, 7);
+        sqlx::query("INSERT INTO feed_updates(work_id,title,latest_at,cover_url) VALUES ($1,'Cover',now(),$2)")
+            .bind(asset).bind(&url).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO feed_series_updates(work_id,reader_id,title,released_at,cover_url) VALUES ($1,$1,'Cover',now(),$2)")
+            .bind(asset).bind(&url).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO browse_catalogue(work_id,reader_id,title,created_at,cover_url) VALUES ($1,$1,'Cover',now(),$2)")
+            .bind(asset).bind(&url).execute(&pool).await.unwrap();
+        repair_missing_cover_files(
+            &pool,
+            &covers,
+            &never_shutdown().1,
+            &mut CoverRepairCursor::default(),
         )
-        .execute(&covers)
         .await
         .unwrap();
-        assert_eq!(
-            crate::cover::suwayomi_variant_key(4242),
-            "s:4242",
-            "the sweep and the serve path must agree on the key shape"
-        );
-
-        let keys = [crate::cover::suwayomi_variant_key(4242)];
-        purge_cover_variants(&covers, &keys).await.unwrap();
-
-        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cover_variant")
-            .fetch_one(&covers)
-            .await
-            .unwrap();
-        assert_eq!(
-            left, 0,
-            "the prefixed key must match what the serve path writes"
-        );
-        // Guard the empty case the sweep hits on every clean tick.
-        let none: [String; 0] = [];
-        purge_cover_variants(&covers, &none).await.unwrap();
-        let _ = &pool;
+        assert_eq!(object_count(&pool, asset).await, 0);
+        let pointer: Option<i64> =
+            sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id=$1")
+                .bind(asset)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pointer, None);
+        for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
+            let actual: String =
+                sqlx::query_scalar(&format!("SELECT cover_url FROM {table} WHERE work_id=$1"))
+                    .bind(asset)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(actual, url, "{table}");
+        }
     }
 
     #[tokio::test]
-    async fn work_sweep_refuses_when_the_main_db_looks_empty() {
-        let (pool, covers) = (main_pool().await, covers_pool().await);
-        seed_works(&pool, 0, 50).await;
-        seed_work_blobs(&covers, 0, 3_000, "2020-01-01T00:00:00+00:00").await;
-        let (_tx, rx) = never_shutdown();
+    async fn missing_uploaded_master_is_restored_with_its_index_and_pointer() {
+        let pool = main_pool().await;
+        let dir = cover_store::test_support::TestDir::new();
+        let covers = cover_store::test_support::store(&dir);
+        seed_works(&pool, 0, 1).await;
+        crate::cover::put_uploaded_work_cover(&pool, &covers, "w_00000", b"admin upload")
+            .await
+            .unwrap();
+        let before = cover_store::row(&pool, "w_00000", cover_store::Kind::Master)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(covers.object_path(&before.sha)).unwrap();
         assert_eq!(
-            sweep_work_cover_blobs(&pool, &covers, &cutoff(), &rx)
+            repair_missing_cover_files(
+                &pool,
+                &covers,
+                &never_shutdown().1,
+                &mut CoverRepairCursor::default()
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            covers.read_object(&before.sha).await.unwrap().as_deref(),
+            Some(b"admin upload".as_slice())
+        );
+        assert_eq!(
+            cover_store::row(&pool, "w_00000", cover_store::Kind::Master)
+                .await
+                .unwrap(),
+            Some(before.clone())
+        );
+        let pointer: Option<i64> =
+            sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id='w_00000'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pointer, before.version);
+    }
+
+    #[tokio::test]
+    async fn missing_derivative_deletes_only_that_row() {
+        let pool = main_pool().await;
+        let dir = cover_store::test_support::TestDir::new();
+        let covers = cover_store::test_support::store(&dir);
+        seed_works(&pool, 0, 1).await;
+        crate::cover::put_work_cover(&pool, &covers, "w_00000", b"master")
+            .await
+            .unwrap();
+        let (master, _) = covers
+            .read_master(&pool, "w_00000", None)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::cover::put_current_variant(&pool, &covers, "w_00000", 192, &master, b"small")
+            .await
+            .unwrap();
+        crate::cover::put_current_variant(&pool, &covers, "w_00000", 320, &master, b"large")
+            .await
+            .unwrap();
+        let derivative = cover_store::row(&pool, "w_00000", cover_store::Kind::Width(192))
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(covers.object_path(&derivative.sha)).unwrap();
+        assert_eq!(
+            repair_missing_cover_files(
+                &pool,
+                &covers,
+                &never_shutdown().1,
+                &mut CoverRepairCursor::default()
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert!(
+            cover_store::row(&pool, "w_00000", cover_store::Kind::Width(192))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(object_count(&pool, "w_00000").await, 2);
+        let pointer: Option<i64> =
+            sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id='w_00000'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pointer, master.version);
+    }
+
+    #[tokio::test]
+    async fn missing_file_repair_waits_for_the_sqlite_copy() {
+        let pool = main_pool().await;
+        let dir = cover_store::test_support::TestDir::new();
+        let legacy = cover_store::test_support::legacy_pool().await;
+        let covers = cover_store::test_support::store_with_legacy(
+            &dir,
+            legacy,
+            cover_store::CopyCursor::default(),
+        );
+        let sha = seed_object(&pool, &covers, "icon:pkg", "master", b"icon").await;
+        std::fs::remove_file(covers.object_path(&sha)).unwrap();
+        let mut cursor = CoverRepairCursor::default();
+        assert_eq!(
+            repair_missing_cover_files(&pool, &covers, &never_shutdown().1, &mut cursor)
                 .await
                 .unwrap(),
             0
         );
-        assert_eq!(blob_count(&covers).await, 3_000, "nothing was deleted");
-    }
-
-    /// The gap the row-count floor leaves open: a main DB that is POPULATED but WRONG
-    /// (a staging copy, a rolled-back restore, a swapped `DATABASE_URL`) sails past the
-    /// 10,000-work floor while every blob probes as orphaned. The orphan-rate breaker
-    /// is what stops the 20 GB cache being eaten 1,000 rows an hour.
-    #[tokio::test]
-    async fn work_sweep_refuses_an_implausible_orphan_rate() {
-        let (pool, covers) = (main_pool().await, covers_pool().await);
-        // 10,000 works — floor satisfied — but a disjoint id range from the blobs.
-        seed_works(&pool, 10_000, 20_000).await;
-        seed_work_blobs(&covers, 0, 3_000, "2020-01-01T00:00:00+00:00").await;
-        let (_tx, rx) = never_shutdown();
         assert_eq!(
-            sweep_work_cover_blobs(&pool, &covers, &cutoff(), &rx)
+            object_count(&pool, "icon:pkg").await,
+            1,
+            "the row waits for the copy"
+        );
+        covers.set_copy_cursor(cover_store::CopyCursor::done());
+        assert_eq!(
+            repair_missing_cover_files(&pool, &covers, &never_shutdown().1, &mut cursor)
                 .await
                 .unwrap(),
-            0,
-            "100% orphan rate must abort the sweep, not drive it"
+            1
         );
-        assert_eq!(blob_count(&covers).await, 3_000, "nothing was deleted");
+        assert_eq!(object_count(&pool, "icon:pkg").await, 0);
     }
 
-    /// A run is capped, and the cap does not lose ground: the next run resumes.
     #[tokio::test]
-    async fn work_sweep_honours_the_per_run_delete_budget() {
-        let (pool, covers) = (main_pool().await, covers_pool().await);
-        seed_works(&pool, 0, 10_000).await;
-        seed_work_blobs(&covers, 0, 10_000, "2020-01-01T00:00:00+00:00").await;
-        // 1,500 aged orphans — more than one run's budget.
-        seed_work_blobs(&covers, 90_000, 91_500, "2020-01-01T00:00:00+00:00").await;
-        let (_tx, rx) = never_shutdown();
-
-        let first = sweep_work_cover_blobs(&pool, &covers, &cutoff(), &rx)
-            .await
-            .unwrap();
-        assert!(
-            (COVER_DELETE_BUDGET as u64..COVER_DELETE_BUDGET as u64 + COVER_SCAN_BATCH as u64)
-                .contains(&first),
-            "one run stops at the budget (got {first})"
-        );
-        let second = sweep_work_cover_blobs(&pool, &covers, &cutoff(), &rx)
-            .await
-            .unwrap();
-        assert_eq!(first + second, 1_500, "the next run finishes the backlog");
-        assert_eq!(blob_count(&covers).await, 10_000, "live blobs untouched");
-    }
-
-    /// Suwayomi blobs use the same machinery against `suwayomi_series`.
-    #[tokio::test]
-    async fn suwayomi_sweep_reclaims_only_aged_orphans() {
-        let (pool, covers) = (main_pool().await, covers_pool().await);
+    async fn missing_file_repair_resumes_wraps_and_obeys_scan_and_repair_budgets() {
+        let pool = main_pool().await;
+        let dir = cover_store::test_support::TestDir::new();
+        let covers = cover_store::test_support::store(&dir);
+        let sha = place_file(&pool, &covers, b"shared").await;
+        let budget = COVER_REPAIR_SCAN_BUDGET;
+        let key = |n: usize| format!("icon:{n:06}");
         sqlx::query(
-            "INSERT INTO suwayomi_series (id, title, status, source_id, updated_at) \
-             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000) \
-             SELECT i, 'T', 'ONGOING', 'src', '2026-01-01T00:00:00Z' FROM n",
+            "INSERT INTO cover_object(asset_key,kind,sha256,byte_length,updated_at) \
+             SELECT 'icon:' || lpad(n::text,6,'0'),'master',$1,1,now() FROM generate_series(1,$2) n",
         )
+        .bind(sha.as_slice())
+        .bind(budget as i64)
         .execute(&pool)
         .await
         .unwrap();
-        // 100 blobs for live series — a realistic ratio, so the orphan-rate breaker
-        // (which would otherwise reject a fixture that is half orphans) stays out of
-        // the way. Production runs at 7.2%.
-        sqlx::query(
-            "INSERT INTO suwayomi_cover_blob (manga_id, webp, updated_at) \
-             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100) \
-             SELECT i, x'00', '2020-01-01T00:00:00+00:00' FROM n",
-        )
-        .execute(&covers)
-        .await
-        .unwrap();
-        for (id, at) in [
-            (90_001_i64, "2020-01-01T00:00:00+00:00".to_string()), // aged orphan
-            (90_002, chrono::Utc::now().to_rfc3339()),             // fresh orphan
-        ] {
-            sqlx::query(
-                "INSERT INTO suwayomi_cover_blob (manga_id, webp, updated_at) VALUES ($1, x'00', $2)",
-            )
-            .bind(id)
-            .bind(at)
-            .execute(&covers)
-            .await
-            .unwrap();
-        }
-
-        let (_tx, rx) = never_shutdown();
+        let missing = seed_object(&pool, &covers, &key(budget + 1), "master", &[0; 32]).await;
+        std::fs::remove_file(covers.object_path(&missing)).unwrap();
+        let mut cursor = CoverRepairCursor::default();
+        let (_signal, shutdown) = tokio::sync::watch::channel(true);
         assert_eq!(
-            sweep_suwayomi_cover_blobs(&pool, &covers, &cutoff(), &rx)
-                .await
-                .unwrap(),
-            1,
-            "only the aged orphan"
-        );
-        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM suwayomi_cover_blob")
-            .fetch_one(&covers)
-            .await
-            .unwrap();
-        assert_eq!(
-            left, 101,
-            "100 live + the fresh orphan the age gate protected"
-        );
-        let gone: Option<i64> =
-            sqlx::query_scalar("SELECT manga_id FROM suwayomi_cover_blob WHERE manga_id = 90001")
-                .fetch_optional(&covers)
-                .await
-                .unwrap();
-        assert!(gone.is_none());
-    }
-
-    /// The suwayomi floor, mirroring the work one.
-    #[tokio::test]
-    async fn suwayomi_sweep_refuses_when_the_main_db_looks_empty() {
-        let (pool, covers) = (main_pool().await, covers_pool().await);
-        sqlx::query(
-            "INSERT INTO suwayomi_cover_blob (manga_id, webp, updated_at) \
-             VALUES (7, x'00', '2020-01-01T00:00:00+00:00')",
-        )
-        .execute(&covers)
-        .await
-        .unwrap();
-        let (_tx, rx) = never_shutdown();
-        assert_eq!(
-            sweep_suwayomi_cover_blobs(&pool, &covers, &cutoff(), &rx)
+            repair_missing_cover_files(&pool, &covers, &shutdown, &mut cursor)
                 .await
                 .unwrap(),
             0
         );
-    }
-
-    #[test]
-    fn orphan_rate_breaker_thresholds() {
-        // An empty store is not a red flag — there is nothing to delete either way.
-        assert!(orphan_rate_sane(0, 0));
-        // Production today: 155 of a 2,000-id sample (7.75%).
-        assert!(orphan_rate_sane(155, 2_000));
-        // Exactly at the threshold is still allowed; one past it is not.
-        assert!(orphan_rate_sane(500, 2_000));
-        assert!(!orphan_rate_sane(501, 2_000));
-        // The misconfiguration this exists for.
-        assert!(!orphan_rate_sane(2_000, 2_000));
-    }
-
-    /// `IN ()` is a SQLite syntax error; neither probe may ever build one.
-    #[tokio::test]
-    async fn empty_probes_are_not_sent_to_sqlite() {
-        let pool = main_pool().await;
-        assert!(missing_work_ids(&pool, &[]).await.unwrap().is_empty());
-        assert!(missing_series_ids(&pool, &[]).await.unwrap().is_empty());
-    }
-
-    /// The age gate is a STRING comparison against a `to_rfc3339()` cutoff, and chrono
-    /// emits 0/3/6/9 fractional digits depending on the value — so the two sides can
-    /// differ in width. Ordering still has to be chronological, or the gate silently
-    /// fails open. It holds because '+' (0x2B) sorts below both '.' (0x2E) and every
-    /// digit, so a shorter fraction always compares as the earlier instant.
-    #[test]
-    fn rfc3339_string_ordering_matches_chronological_ordering() {
-        use chrono::{DateTime, Utc};
-        let stamps = [
-            "2026-07-20T14:28:07.629549225+00:00",
-            "2026-07-20T14:28:07.629549+00:00",
-            "2026-07-20T14:28:07.629+00:00",
-            "2026-07-20T14:28:07+00:00",
-            "2026-07-20T14:28:08+00:00",
-            "2026-07-21T00:00:00+00:00",
-        ];
-        for a in stamps {
-            for b in stamps {
-                let (ta, tb) = (
-                    DateTime::parse_from_rfc3339(a).unwrap().with_timezone(&Utc),
-                    DateTime::parse_from_rfc3339(b).unwrap().with_timezone(&Utc),
-                );
-                assert_eq!(
-                    a.cmp(b),
-                    ta.cmp(&tb),
-                    "string order must match time order for {a} vs {b}"
-                );
-            }
+        assert!(cursor.asset.is_empty());
+        assert_eq!(
+            repair_missing_cover_files(&pool, &covers, &never_shutdown().1, &mut cursor)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(cursor.asset, key(budget));
+        assert_eq!(object_count(&pool, &key(budget + 1)).await, 1);
+        assert_eq!(
+            repair_missing_cover_files(&pool, &covers, &never_shutdown().1, &mut cursor)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            cursor.asset.is_empty(),
+            "the cursor wraps after reaching the end"
+        );
+        std::fs::remove_file(covers.object_path(&sha)).unwrap();
+        for expected_cursor in [key(COVER_SWEEP_BUDGET), key(2 * COVER_SWEEP_BUDGET)] {
+            assert_eq!(
+                repair_missing_cover_files(&pool, &covers, &never_shutdown().1, &mut cursor)
+                    .await
+                    .unwrap(),
+                COVER_SWEEP_BUDGET as u64
+            );
+            assert_eq!(cursor.asset, expected_cursor);
         }
-        // And the shape the cutoff itself takes round-trips through the same ordering.
-        let cutoff =
-            (Utc::now() - chrono::Duration::hours(COVER_ORPHAN_MIN_AGE_HOURS)).to_rfc3339();
-        assert!(
-            stamps[0] < cutoff.as_str(),
-            "a 2026-07-20 blob is past a now-24h cutoff"
-        );
-        assert!(
-            Utc::now().to_rfc3339() > cutoff,
-            "a just-written blob is not"
-        );
     }
 }

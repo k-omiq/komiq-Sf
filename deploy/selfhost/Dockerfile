@@ -102,6 +102,7 @@ VOLUME /data
 ENV BIND_ADDR=0.0.0.0 \
     PORT=8080 \
     COVERS_DATABASE_URL=sqlite:///data/covers.sqlite3 \
+    KOMIKA_COVERS_DIR=/data/covers \
     KOMIKA_WEB_DIR=/srv/web \
     SUWAYOMI_URL=http://suwayomi:4567 \
     SUWAYOMI_PUBLIC_URL=/ \

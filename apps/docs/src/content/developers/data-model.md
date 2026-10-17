@@ -5,14 +5,16 @@ description: Understand the database schema, table relationships and migrations 
 
 Komiq is self-hostable: the admin app runs the server and gives you its management portal, and the reader app connects to a server. That server stores user accounts, authentication sessions, reading progress, community discussions and its canonical comic catalogue in PostgreSQL 18. This page explains storage and migrations.
 
-## Main database and cover cache
+## Main database and cover store
 
 The server separates durable application records from refetchable images:
 
-1. **Main database**: `DATABASE_URL` is a PostgreSQL connection URL. The standalone default is `postgres://localhost/komika`; Docker and desktop supervisors supply their own endpoint and application role. It holds accounts, sessions, reading history, social data and the canonical catalogue.
-2. **Cover cache**: `COVERS_DATABASE_URL` is a SQLite URL. The standalone default is `sqlite://covers.sqlite3`. It holds WebP covers and PNG extension icons. Docker sets `sqlite:///data/covers.sqlite3`.
+1. **Main database**: `DATABASE_URL` is a PostgreSQL connection URL. The standalone default is `postgres://localhost/komika`; Docker and desktop supervisors supply their own endpoint and application role. It holds accounts, sessions, reading history, social data, the canonical catalogue, the cover index and uploaded covers.
+2. **Cover store**: `KOMIKA_COVERS_DIR` holds cover images and extension icons as files. It defaults to `covers` beside the covers SQLite file: `/data/covers` in Docker and `server/covers` in the desktop app's data folder. `COVERS_DATABASE_URL` still places the data-directory lock, the default covers directory and the old cache read by the one-time copy. Its standalone default is `sqlite://covers.sqlite3`; Docker uses `sqlite:///data/covers.sqlite3`.
 
-Main backups use PostgreSQL tools. The global deployment packages pgBackRest, a backup manager that archives database files and transaction logs to object storage. Self-host Docker uses `pg_dump`, a consistent logical export. The desktop app saves a local dump when the newest is at least 20 hours old and keeps seven. Covers are excluded because they can be fetched again.
+Main backups use PostgreSQL tools. The global deployment packages pgBackRest, a backup manager that archives database files and transaction logs to object storage. Self-host Docker uses `pg_dump`, a consistent logical export. The desktop app saves a local dump when the newest is at least 20 hours old and keeps seven. These include the cover index and uploaded covers. Cover files are not backed up. After a database restore, missing files refill from sources on request, or through the background cover crawl and warmer after garbage collection notices them. Uploads return from PostgreSQL.
+
+Files are addressed by their SHA-256 content hash at `objects/<2 hex>/<sha256>` and written once. `tmp/` holds files being written. Only the owner server writes covers under its data-directory lock. Garbage collection removes files older than 24 hours with no entry in the index.
 
 ### Connections and native types
 
@@ -20,7 +22,7 @@ Main backups use PostgreSQL tools. The global deployment packages pgBackRest, a 
 
 The main schema uses native PostgreSQL values: UUID account identities, timezone-aware timestamps, Boolean flags and JSON values where the application treats them as structured data. Prefixed work IDs and other non-UUID identifiers stay text. API timestamps use UTC with six fractional digits and `+00:00`.
 
-Covers retain SQLite connection settings and recovery in `apps/server/src/db.rs`. PostgreSQL planner maintenance uses `ANALYZE`; the cover cache retains its separate SQLite maintenance path.
+SQLite cover connections and recovery are used only while copying the old cache. PostgreSQL planner maintenance uses `ANALYZE`.
 
 ### Old installations
 
@@ -98,15 +100,24 @@ Precomputed tables support browse and search:
 - `work_search_alias`: normalized titles and aliases with PostgreSQL full-text vectors and `pg_trgm` indexes for typo candidates.
 - `instance_setting`: a key-value store holding runtime configuration changed from the admin console, such as registration toggles and instance names.
 
-## Cover cache database schema
+## Cover index and uploads
 
-`apps/server/src/db.rs` creates these tables in `covers.sqlite3`:
+PostgreSQL stores two cover tables:
 
-- `work_cover_blob`: primary storage for canonical work covers. Keyed by `work_id`, it stores the downscaled WebP binary blob, a version integer and an update timestamp.
-- `suwayomi_cover_blob`: cached WebP covers for Suwayomi manga, keyed by numeric Suwayomi manga ID.
-- `cover_variant`: resized derivatives of master covers for specific display widths (such as thumbnail cards). Keyed by `(asset_key, width)`.
-- `cover_maintenance`: durable progress cursors for background maintenance passes over the cover database.
-- `extension_icon_blob`: PNG binary blobs for extension icons, keyed by package name.
+- `cover_object`: one index row per `(asset_key, kind)`. The asset identifies a work, Suwayomi manga or extension icon. Kind is `master`, `w192` or `w320`. Rows hold `sha256`, `byte_length`, `version` and, for a resized derivative, `master_sha256`, the master it came from. The index and the work's cover version change in one transaction.
+- `cover_upload`: the processed master bytes of an admin-uploaded cover, keyed by `work_id`, with its hash and creation time. These bytes are included in database backups and dumps so uploads survive loss of the cover files.
+
+## Legacy cover copy source
+
+The old `covers.sqlite3` cache is a copy source, not the active store. Its tables hold:
+
+- `work_cover_blob`: canonical work cover bytes, version and timestamp, keyed by `work_id`.
+- `suwayomi_cover_blob`: Suwayomi cover bytes, keyed by numeric manga ID.
+- `cover_variant`: resized covers keyed by `(asset_key, width)`.
+- `cover_maintenance`: old maintenance progress cursors.
+- `extension_icon_blob`: PNG icon bytes keyed by package name.
+
+The server copies these assets into files once, in the background, and resumes after a restart. It serves covers not yet reached from SQLite. Allow free disk space for about twice the cache size while both exist. After `cover copy finished` appears in the server log, the server no longer opens the old file. It stays on disk for the owner to delete. Covers uploaded before this update copy like any cover, but are not in `cover_upload` or database backups: the old cache did not identify uploads.
 
 ## How migrations work
 
@@ -116,7 +127,7 @@ The main migration history lives in `apps/server/migrations_pg/`. It begins with
 
 `apps/server/src/db.rs` applies main migrations with SQLx's PostgreSQL migrator. `_sqlx_migrations` records versions and checksums, so changing an applied historical migration causes a startup error. Add a new migration for a new schema change.
 
-The separate covers schema is initialized and checked on its own SQLite connection.
+The legacy covers schema is initialized and checked only while the cover copy needs it.
 
 ### Migration changes
 
@@ -127,8 +138,10 @@ Keep applied migrations immutable. Add new files for schema changes and backfill
 - `apps/server/migrations_pg/`: PostgreSQL baseline and migration history.
 - `apps/server/migrations/`: frozen SQLite migration history for historical tests.
 - `apps/server/src/media_policy.rs`: the policy epoch, takedowns and the in-memory denied set.
-- `apps/server/src/db.rs`: PostgreSQL initialization, migration runners and SQLite cover recovery.
+- `apps/server/src/db.rs`: PostgreSQL initialization, migration runners and legacy SQLite cover recovery.
 - `apps/server/src/catalog/`: Rust data access logic for canonical works, aliases, external IDs and duplicate merging.
-- `apps/server/src/cover.rs`: database read and write operations for cover blobs and image variants.
+- `apps/server/src/cover.rs`: cover fetching, processing and transactional publication.
+- `apps/server/src/cover_store.rs`: file storage, PostgreSQL index and upload recovery.
+- `apps/server/src/cover_copy.rs`: resumable copy from the old SQLite cover cache.
 - `apps/server/src/browse.rs`: queries and index interactions against the materialized `browse_catalogue` table.
 - `apps/server/src/auth.rs`: user authentication queries and SHA-256 session token hashing.

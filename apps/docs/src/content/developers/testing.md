@@ -21,7 +21,7 @@ The suites cover components of both apps and their shared tooling:
 
 The admin app's API server in `apps/server` includes tests for GraphQL resolvers, catalog deduplication, cover hash calculation, authentication, session tokens, and database migrations.
 
-The server tests provision a private PostgreSQL 18.6 cluster automatically and clone isolated databases. They require permission to start local processes and bind private sockets. The cover cache retains SQLite.
+The server tests provision a private PostgreSQL 18.6 cluster automatically and clone isolated databases. They require permission to start local processes and bind private sockets. Cover storage uses files with a PostgreSQL index and upload records. Only the legacy cover copy fixtures retain SQLite.
 
 To run the server test suite:
 

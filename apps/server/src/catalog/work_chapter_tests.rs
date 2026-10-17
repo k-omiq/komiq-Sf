@@ -1245,17 +1245,9 @@ async fn engine_reset_keeps_entries_and_refill_reuses_number_and_source_url_iden
     use crate::suwayomi::SuwayomiClient;
 
     let pool = pool().await;
-    // The catalogue is PostgreSQL; the fence's separate cover cache is SQLite,
-    // exactly as in engine_generation_tests.rs. No cover fixtures are needed.
-    let covers = crate::database::SqliteTestPoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::raw_sql(
-        "CREATE TABLE suwayomi_cover_blob(manga_id INTEGER PRIMARY KEY,webp BLOB,updated_at TEXT); \
-         CREATE TABLE cover_variant(asset_key TEXT,width INTEGER,webp BLOB)",
-    ).execute(&covers).await.unwrap();
+    // No cover fixtures are needed.
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
+    let covers = crate::cover_store::test_support::store(&cover_dir);
     let engine = MockEngine::spawn().await;
     let engine_rows = |manga_id, numbered_id, special_id| {
         let mut manga = manga_json(manga_id);

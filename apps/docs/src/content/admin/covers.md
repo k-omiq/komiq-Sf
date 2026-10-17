@@ -9,7 +9,7 @@ This guide explains how cover processing works, what causes covers to land in th
 
 ## How komiq processes covers
 
-To keep the reader responsive, your server stores optimized covers in the separate covers database's blob table (`work_cover_blob`). Covers are served locally at `/covers/{work_id}.webp`.
+To keep the reader responsive, your server caches optimized covers as files under `KOMIKA_COVERS_DIR`. PostgreSQL holds the file index in `cover_object`. Covers are served locally at `/covers/{work_id}.webp`.
 
 When enabled, the background cover crawler fetches and optimizes covers for eligible uncached works. The pipeline applies these processing steps:
 
@@ -21,7 +21,7 @@ When enabled, the background cover crawler fetches and optimizes covers for elig
 ```flow
 Your server fetches source cover -> validates source size at or below 24 MiB
 Ensures bytes are complete -> decodes and downscales longest edge
-Encodes lossy WebP with a 150 KiB target -> stores blob in database
+Encodes lossy WebP with a 150 KiB target -> saves file and indexes it in PostgreSQL
 ```
 
 The crawler records fetch, processing, and storage failures in `work_cover_issue` and surfaces the title on the Cover issues page. Other paths, such as lazy cover loading, do not record every failure in this queue.
@@ -49,7 +49,7 @@ The console gives these processing and storage errors readable labels:
 - **Unsupported or damaged file** (`unsupported`): The error message indicates an unsupported or corrupt image, or zero dimensions.
 - **Image is empty** (`empty`): The image processor received empty input.
 - **Could not convert** (`encode`): Other processing errors, including WebP encoding failures.
-- **Could not save** (`store`): Your server encountered a database error while attempting to commit the WebP blob to storage.
+- **Could not save** (`store`): Your server could not save the cover file or its database record.
 
 Other reasons appear as raw codes, including `truncated` and `fetch`.
 
@@ -64,7 +64,7 @@ If a failure was caused by a temporary network glitch, server timeout, or rate l
 1. Click **Retry** on the affected row.
 2. Your server tries MangaDex first when enabled and available, then linked Suwayomi sources until one supplies a processable image.
 3. Your server runs the image through the validation, resizing, and WebP compression pipeline.
-4. If processing succeeds, the cover is saved to the database, the cache version updates, and the item is automatically removed from the queue.
+4. If processing succeeds, the cover file is saved, its index and cover version update in one database transaction, and the item is automatically removed from the queue.
 5. A deterministic processing failure updates the attempt count and error details. If no image can be fetched, the existing issue remains unchanged. Truncated downloads are not recorded by manual retry.
 
 ### Upload a replacement image
@@ -73,10 +73,12 @@ When an upstream source is permanently unreachable, returns a 404 error, is bloc
 
 1. Click **Upload** on the affected row.
 2. Select an image file from your local file picker. Supported formats include standard web image types such as JPEG, PNG, and WebP.
-3. Your server receives the file, verifies that it is within size limits, processes it as lossy WebP with the 150 KiB target and smallest-encoding fallback, and stores it in the database.
+3. Your server receives the file, verifies that it is within size limits and processes it as lossy WebP with the 150 KiB target and smallest-encoding fallback. It caches the result as a file and keeps the processed master in PostgreSQL's `cover_upload` table for backups.
 4. The issue is marked resolved and disappears from the Cover issues list immediately.
 
 A background cover download already in progress cannot replace your uploaded cover.
+
+Cover files are not backed up. Missing files refill from their sources, and uploads since this update return from PostgreSQL. Covers uploaded before this update copy from the old cache, but are not in database backups. Read [Update and back up](/self-host/update-and-backup).
 
 ## Bulk cover storage
 

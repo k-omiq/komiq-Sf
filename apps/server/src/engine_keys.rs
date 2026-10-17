@@ -817,13 +817,8 @@ mod tests {
         use crate::catalog::phase4_tests::{overlap, pool};
         use crate::engine_generation::{Fence, FenceError, Replace};
         let pool = pool().await;
-        let covers = crate::database::SqliteTestPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::raw_sql("CREATE TABLE suwayomi_cover_blob(manga_id INTEGER PRIMARY KEY,webp BLOB,updated_at TEXT); CREATE TABLE cover_variant(asset_key TEXT,width INTEGER,webp BLOB)")
-            .execute(&covers).await.unwrap();
+        let cover_dir = crate::cover_store::test_support::TestDir::new();
+        let covers = crate::cover_store::test_support::store(&cover_dir);
         let engine = crate::engine_generation::tests::MockEngine::spawn().await;
         let mut engine_client = SuwayomiClient::new(engine.url.clone(), None, None);
         let fence = Fence::attach(&pool, &covers, &mut engine_client)

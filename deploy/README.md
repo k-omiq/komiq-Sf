@@ -94,9 +94,12 @@ the next daemon restart, not at the next `docker compose up`.
 - The reader's backend config is baked in **at build time** (Vite inlines `PUBLIC_*`), so
   the compose `reader` build args carry `PUBLIC_KOMIKA_API` / `PUBLIC_KOMIKA_IMG_MODE`.
   Rebuilding is automatic via `deploy.sh`.
-- **Persistence:** main data and avatars live in `postgres-data`. Covers remain a
-  refetchable SQLite cache in `server-data:/data/covers.sqlite3`; pgBackRest excludes
-  it. Suwayomi uses `suwayomi-data`. `down` retains volumes; `destroy` deletes all of them.
+- **Persistence:** main data, avatars and admin-uploaded covers live in `postgres-data`.
+  Cover files are a refetchable cache in `server-data:/data/covers` (indexed in
+  PostgreSQL); pgBackRest excludes them. The old SQLite cover cache
+  `server-data:/data/covers.sqlite3` is copied into files once in the background, then
+  no longer opened; delete it after the copy has finished. Suwayomi uses
+  `suwayomi-data`. `down` retains volumes; `destroy` deletes all of them.
 
 ## Auto-updating catalog
 

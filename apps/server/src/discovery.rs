@@ -622,10 +622,14 @@ mod tests {
 
     /// A minimal `AppState` around a migrated pool and a fake Suwayomi origin. Discovery
     /// touches only `pool` and `suwayomi`; the rest are defaults so the struct is whole.
-    async fn state(pool: Database, suwayomi_base: &str) -> AppState {
-        AppState {
+    async fn state(
+        pool: Database,
+        suwayomi_base: &str,
+    ) -> (crate::cover_store::test_support::TestDir, AppState) {
+        let cover_dir = crate::cover_store::test_support::TestDir::new();
+        let state = AppState {
             pool: pool.clone(),
-            cover_pool: crate::db::init_covers("sqlite::memory:").await.unwrap(),
+            cover_pool: crate::cover_store::test_support::store(&cover_dir),
             suwayomi: crate::suwayomi::SuwayomiClient::new(suwayomi_base.to_string(), None, None),
             mangadex: Arc::new(crate::mangadex::MangaDexClient::new("test-ua", 5.0, 40.0)),
             admin_users: vec![],
@@ -644,7 +648,8 @@ mod tests {
             media_manifests: None,
             policy: Default::default(),
             setup_code: crate::instance::SetupCode::default(),
-        }
+        };
+        (cover_dir, state)
     }
 
     async fn subscribe(pool: &Database, pkg: &str) {
@@ -706,7 +711,7 @@ mod tests {
         }
         let engine =
             fake_suwayomi::spawn(source_nodes(), vec![vec![10, 20, 30], vec![30, 10, 20]]).await;
-        let st = state(pool.clone(), &engine.base_url).await;
+        let (_cover_dir, st) = state(pool.clone(), &engine.base_url).await;
         let (_tx, shutdown) = watch::channel(false);
 
         // ---- THE ASSERTION THAT CATCHES AN INERT E5 -------------------------------------
@@ -781,7 +786,7 @@ mod tests {
         // (a) Nothing subscribed at all — the engine is never even asked.
         let pool = migrated_pool().await;
         let engine = fake_suwayomi::spawn(source_nodes(), vec![]).await;
-        let st = state(pool.clone(), &engine.base_url).await;
+        let (_cover_dir, st) = state(pool.clone(), &engine.base_url).await;
         assert!(subscribed_source_ids(&st).await.unwrap().is_empty());
 
         // A pass over an empty list must not reach upstream, and must not overwrite or
@@ -799,7 +804,7 @@ mod tests {
         // indistinguishable from health without the warning this returns.
         let pool = migrated_pool().await;
         subscribe(&pool, "com.nonexistent.extension").await;
-        let st = state(pool, &engine.base_url).await;
+        let (_cover_dir, st) = state(pool, &engine.base_url).await;
         assert!(
             subscribed_source_ids(&st).await.unwrap().is_empty(),
             "a subscription with no matching installed source resolves nothing"
@@ -819,7 +824,7 @@ mod tests {
             vec![vec![10, 20, 30]],
         )
         .await;
-        let st = state(pool, &engine.base_url).await;
+        let (_cover_dir, st) = state(pool, &engine.base_url).await;
         assert!(
             subscribed_source_ids(&st).await.unwrap().is_empty(),
             "`en-us` is not `en` — documenting the sharp edge, not endorsing it"
@@ -941,7 +946,7 @@ mod tests {
             vec![vec![10, 20, 30], vec![], vec![10, 20, 30]],
         )
         .await;
-        let st = state(pool.clone(), &engine.base_url).await;
+        let (_cover_dir, st) = state(pool.clone(), &engine.base_url).await;
         let (_tx, shutdown) = watch::channel(false);
 
         discovery_pass(&st, &shutdown).await;

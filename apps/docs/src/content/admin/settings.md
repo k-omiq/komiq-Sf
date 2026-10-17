@@ -139,7 +139,7 @@ The Extension updates section keeps installed extensions up to date to prevent s
 Maintenance jobs operate across your server’s entire catalogue. Each job asks for confirmation before starting:
 
 - `Save the whole catalogue`: Copies English series from the Suwayomi library into the database read-cache used by readers. Series details are persisted during the request, and chapter lists fill in the background.
-- `Store covers on this server`: Crawls the catalogue, downloads missing cover images, and stores them locally in the database as WebP images. This allows readers to load covers directly from `/covers/{id}.webp`. It runs slowly in the background to avoid rate limits.
+- `Store covers on this server`: Crawls the catalogue, downloads missing cover images, and caches them as WebP files indexed in PostgreSQL. This allows readers to load covers directly from `/covers/{id}.webp`. It runs slowly in the background to avoid rate limits.
 - `Merge duplicate works`: Reviews pending pairs, then scans groups of works sharing a title or alternative title (articles such as "the", "a", and "an" are ignored). The matching rules consider credits, descriptions, covers, native-script titles, years, and how specific a title is. A pair is merged automatically only when the rules approve it and exactly one target qualifies. Pairs that are clearly distinct works are closed. Unclear pairs remain queued in [Duplicates](/admin/duplicates) for manual review. Each batch examines up to 200 pending reviews and, once that queue is exhausted, up to 200 title groups. You can halt the run between batches with `Stop`. Merging permanently deletes the duplicate work record.
 
 ## About

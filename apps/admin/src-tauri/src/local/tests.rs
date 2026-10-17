@@ -670,4 +670,8 @@ fn database_stage_and_server_environment_contract() {
       launch.data_dir.join("covers.sqlite3").display()
     )
   );
+  assert_eq!(
+    env["KOMIKA_COVERS_DIR"],
+    launch.data_dir.join("covers").display().to_string()
+  );
 }
