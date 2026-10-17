@@ -55,8 +55,11 @@
 
 	const seriesTitle = $derived(data.seriesTitle);
 	const seriesHref = $derived(`/series/${data.seriesId}`);
-	const pages = $derived(data.pages);
-	const total = $derived(data.pages.length);
+	const loadedChapterId = $derived(data.chapterId);
+	const loadedPages = $derived(data.pages);
+	let relaidPages = $state<ReaderView['pages'] | null>(null);
+	const pages = $derived(relaidPages ?? loadedPages);
+	const total = $derived(pages.length);
 	const chNum = $derived(data.chNum);
 	const chTitle = $derived(data.chTitle);
 	// Guarded on `nextChapterId` FIRST: `ReaderChapterRef.id` is optional, so a bare
@@ -305,10 +308,20 @@
 		);
 	}
 
+	// A new page list from the load (another chapter, or this one loaded again) replaces
+	// a layout the media recovery put in place.
+	$effect(() => {
+		loadedPages;
+		untrack(() => {
+			relaidPages = null;
+		});
+	});
+
 	// Reset page + scroll position whenever the loaded chapter changes.
 	$effect(() => {
-		data.chapterId;
+		loadedChapterId;
 		untrack(() => {
+			relaidPages = null;
 			pageIdx = 0;
 			scrolledPage = 1;
 			scrollFraction = 0;
@@ -326,8 +339,8 @@
 	// The native image provider hands back `blob:` object URLs for pages; those pin
 	// memory until explicitly revoked, so a long reading session (chapter after
 	// chapter) leaks. Track the current chapter's page URLs and revoke the blob
-	// ones when the chapter changes (this effect's cleanup runs before it re-runs
-	// with the next chapter's pages) and on teardown. Web/proxy pages are plain
+	// ones when the chapter or layout changes (this effect's cleanup runs before it
+	// re-runs with the replacement pages) and on teardown. Web/proxy pages are plain
 	// http(s) strings — the `blob:` guard leaves those untouched.
 	$effect(() => {
 		const current = pages;
@@ -659,16 +672,53 @@
 	}
 	// Exact media objects (typed media routes): a failed regional object is retried once on
 	// the owner; when the owner fails too, the chapter's pages are fetched again ONCE with
-	// no HTTP cache and pages whose URL changed load again. Then the retry button.
+	// no HTTP cache. Changed URLs load again; a changed count replaces the layout in
+	// place. That spends the chapter's refresh, including for the replacement layout.
 	let pageUrl = $state<Record<number, string>>({});
 	const recovery = $derived.by(() => {
 		const router = currentMediaRouter();
-		const chapterId = data.chapterId;
-		if (!router || !chapterId || !pages.some((p) => p.media)) return null;
+		const chapterId = loadedChapterId;
+		const chapterPages = loadedPages;
+		const layout = pages;
+		const refreshed = relaidPages !== null;
+		if (!router || !chapterId || !layout.some((p) => p.media)) return null;
 		return new ChapterMediaRecovery(
 			router,
-			pages.map((p) => ({ url: p.url, media: p.media ?? null })),
-			() => freshRoutedPages(chapterId),
+			layout.map((p) => ({ url: p.url, media: p.media ?? null })),
+			() => (refreshed ? Promise.resolve([]) : freshRoutedPages(chapterId)),
+			(fresh) => {
+				if (loadedChapterId !== chapterId || loadedPages !== chapterPages || pages !== layout) {
+					for (const p of fresh) {
+						if (p.url.startsWith('blob:')) URL.revokeObjectURL(p.url);
+					}
+					return;
+				}
+				relaidPages = fresh.map(({ url, media }, index) => ({
+					url,
+					media,
+					index,
+					ratio: '800 / 1200',
+					label: String(index + 1).padStart(2, '0'),
+					dim: '',
+				}));
+				pageUrl = {};
+				pageError = {};
+				pageRatio = {};
+				settledPages.clear();
+				queueUntil = STARTER_PAGES;
+				warmedUrls.clear();
+				barHover = null;
+				pageIdx = Math.max(0, Math.min(pageIdx, fresh.length - 1));
+				scrolledPage = Math.min(scrolledPage, fresh.length);
+				maxScrolledPage = scrolledPage;
+				// The strip's old scroll offset means nothing in the new layout (it may sit
+				// past the last page): go to the start of the page being read.
+				const reading = scrolledPage - 1;
+				void tick().then(() => {
+					if (isStrip) jumpTo(reading);
+					updateStripProgress();
+				});
+			},
 		);
 	});
 	$effect(() => {
@@ -719,6 +769,7 @@
 	const PAGED_PREFETCH = 4;
 	$effect(() => {
 		if (mode === 'strip') return;
+		const layout = pages;
 		const from = pagedIdx + visiblePages.length;
 		for (let i = from; i < Math.min(total, from + PAGED_PREFETCH); i++) {
 			const pg = pages[i];
@@ -726,7 +777,9 @@
 			warmedUrls.add(pg.url);
 			const warm = new Image();
 			warm.decoding = 'async';
-			warm.onload = () => learnRatio(i, warm.naturalWidth, warm.naturalHeight);
+			warm.onload = () => {
+				if (pages === layout) learnRatio(i, warm.naturalWidth, warm.naturalHeight);
+			};
 			warm.src = pg.url;
 		}
 	});
@@ -1420,10 +1473,9 @@
 			</div>
 		{:else if isStrip}
 			<div class="strip" bind:this={stripEl}>
-				<!-- Keyed on the CHAPTER as well as the page index: `p.index` alone repeats
-				     across chapters, so Svelte reused each <img> and only patched `src`,
-				     leaving the previous chapter's decoded frame on screen. -->
-				{#each pages as p (`${data.chapterId}:${p.index}`)}
+				<!-- Chapter/layout changes remount images, discarding decoded frames and
+				     settling the new load queue even for URLs that stayed the same. -->
+				{#each pages as p (`${data.chapterId}:${relaidPages !== null}:${p.index}`)}
 					<div class="strip-cell" style="aspect-ratio:{pageRatio[p.index] ?? DEFAULT_RATIO}">
 						{#if p.url && !pageError[p.index]}
 							<img
@@ -1455,9 +1507,8 @@
 			</div>
 		{:else}
 			<div class="paged fit-{fit}" class:double={visiblePages.length > 1} class:rtl={dir === 'rtl'}>
-				<!-- Keyed on the chapter so a chapter change REMOUNTS each <img> instead of
-				     patching `src`, which left the previous chapter's frame on screen. -->
-				{#each visiblePages as p (`${data.chapterId}:${p.index}`)}
+				<!-- Remount images when the chapter or layout changes. -->
+				{#each visiblePages as p (`${data.chapterId}:${relaidPages !== null}:${p.index}`)}
 					{#if p.url && !pageError[p.index]}
 						<img
 							class="paged-img"

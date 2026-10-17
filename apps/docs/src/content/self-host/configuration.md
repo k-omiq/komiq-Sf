@@ -82,7 +82,9 @@ These variables configure connections to the Suwayomi source engine.
 | `SUWAYOMI_PUBLIC_URL` | unset                   | Public base URL for page and cover URLs. See below.      |
 | `SUWAYOMI_SOURCE_ID`  | unset                   | Pins requests to a specific Suwayomi source identifier.  |
 
-Set `SUWAYOMI_PUBLIC_URL` to this komiq server's public address, or to `/` as the Docker image does. Readers then fetch pages and covers through komiq. Pages use a chapter address (`/media/v1/c/...`) that only komiq answers. When the variable is unset, or equal to `SUWAYOMI_URL`, page and cover URLs point at Suwayomi itself, and readers must be able to reach it.
+Set `SUWAYOMI_PUBLIC_URL` to this komiq server's public address, or to `/` as the Docker image does. Readers then fetch pages and covers through komiq. When the variable is unset, or names the same address as `SUWAYOMI_URL`, page and cover URLs point at Suwayomi itself, and readers must be able to reach it. A user name and password in `SUWAYOMI_URL` do not count as a different address.
+
+Most pages use a chapter address (`/media/v1/c/...`) that only komiq answers. The server never builds it on `SUWAYOMI_PUBLIC_URL`, because that address can be a public Suwayomi server. The chapter address is a path, and the reader loads it from the server it is connected to. When the page and cover URLs point at Suwayomi itself, pages keep Suwayomi's own URLs.
 
 ## Exact media settings
 

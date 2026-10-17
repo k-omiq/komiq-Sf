@@ -346,18 +346,22 @@ export class MediaRouter {
 /**
  * Recovery for one open chapter's exact-object pages: one owner fallback per object, then
  * ONE fresh-transport refresh of the chapter's pages (`refresh`, which must skip every
- * HTTP cache), then nothing (the reader's retry button). Each page is replaced by the
- * refresh at most once, so a failing page can never loop.
+ * HTTP cache). A non-empty refresh with a different page count reports a new layout
+ * through `relayout`, when supplied; otherwise only changed URLs at the same count are
+ * replaced. Each page or layout is replaced at most once, then nothing (the reader's
+ * retry button), so a failing page can never loop.
  */
 export class ChapterMediaRecovery {
 	private readonly pages: RoutedPage[];
 	private refreshed: Promise<RoutedPage[] | null> | null = null;
 	private readonly replaced = new Set<number>();
+	private relaid = false;
 
 	constructor(
 		private readonly router: MediaRouter,
 		pages: readonly RoutedPage[],
 		private readonly refresh: () => Promise<RoutedPage[]>,
+		private readonly relayout?: (pages: RoutedPage[]) => void,
 	) {
 		this.pages = pages.map((p) => ({ ...p }));
 	}
@@ -366,7 +370,9 @@ export class ChapterMediaRecovery {
 	 * Page `index` failed to load `url`. Returns the pages to load again (index -> new
 	 * page): the owner copy of a regional object, or, after the owner failed too, every
 	 * page the one refresh changed. A failure of a URL the page has already moved past
-	 * returns the page's current URL. Empty = show the retry button.
+	 * returns the page's current URL. A non-empty refresh with a different page count
+	 * returns an empty map and calls `relayout` once if supplied; the caller replaces
+	 * that layout. Other empty results mean show retry.
 	 */
 	async recover(index: number, url: string): Promise<Map<number, RoutedPage>> {
 		const failed = this.pages[index];
@@ -383,9 +389,16 @@ export class ChapterMediaRecovery {
 		}
 		this.refreshed ??= this.refresh().catch(() => null);
 		const fresh = await this.refreshed;
-		// A different page count is a different chapter layout; remounting by index would
-		// show the wrong pages.
-		if (!fresh || fresh.length !== this.pages.length) return out;
+		if (!fresh?.length) return out;
+		// Index replacements only make sense at the same count. Let the reader replace
+		// the whole layout once, even when several failures await this shared refresh.
+		if (fresh.length !== this.pages.length) {
+			if (!this.relaid) {
+				this.relaid = true;
+				this.relayout?.(fresh);
+			}
+			return out;
+		}
 		fresh.forEach((page, i) => {
 			if (!page.url || this.replaced.has(i) || page.url === this.pages[i].url) return;
 			this.replaced.add(i);

@@ -6,6 +6,7 @@ import { registerHooks } from 'node:module';
 import { mock, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
+import type { RoutedPage } from '@komika/api';
 import './node-test-hooks.ts';
 
 registerHooks({
@@ -232,8 +233,10 @@ test('owner URLs with upper-case or mixed-case HTTP schemes stay absolute in eve
 			const cover = `${sourceOrigin}/covers/w_case.webp?v=17`;
 			const master = `${apiOrigin}/covers/w_case.webp?v=17&cache_policy=2`;
 			assert.equal(await images.resolveCover(cover), master);
-			assert.equal(images.coverCardSrcSet(cover),
-				`${master}&w=192 1x, ${master}&w=320 2x, ${master} 3x`);
+			assert.equal(
+				images.coverCardSrcSet(cover),
+				`${master}&w=192 1x, ${master}&w=320 2x, ${master} 3x`,
+			);
 		}
 	}
 });
@@ -431,15 +434,21 @@ test('one owner fallback per object, then ONE fresh refresh, then nothing: no lo
 		assert.equal(routed[0].url, `${SG}${PATH}`);
 		let refreshes = 0;
 		const moved = `/media/v1/o/mc_0123/${'c'.repeat(64)}`;
-		const recovery = new ChapterMediaRecovery(router, routed, async () => {
-			refreshes++;
-			// The bytes moved: page 0 has a new hash, page 1 falls back to its locator.
-			const m = { kind: 'media', routeId: router.current().id, path: moved };
-			return [
-				{ url: router.href(m), media: m },
-				{ url: `${API}/media/v1/c/7/1?cache_policy=2`, media: null },
-			];
-		});
+		const relayout = mock.fn();
+		const recovery = new ChapterMediaRecovery(
+			router,
+			routed,
+			async () => {
+				refreshes++;
+				// The bytes moved: page 0 has a new hash, page 1 falls back to its locator.
+				const m = { kind: 'media', routeId: router.current().id, path: moved };
+				return [
+					{ url: router.href(m), media: m },
+					{ url: `${API}/media/v1/c/7/1?cache_policy=2`, media: null },
+				];
+			},
+			relayout,
+		);
 		const B = `/media/v1/o/mc_0123/${'b'.repeat(64)}`;
 		const locator = `${API}/media/v1/c/7/1?cache_policy=2`;
 		// 1. A regional object fails: the same path on the owner; the region is down.
@@ -467,6 +476,7 @@ test('one owner fallback per object, then ONE fresh refresh, then nothing: no lo
 		assert.equal((await recovery.recover(1, locator)).size, 0);
 		assert.equal((await recovery.recover(0, `${API}${moved}`)).size, 0);
 		assert.equal(refreshes, 1);
+		assert.equal(relayout.mock.callCount(), 0, 'same-count refresh only replaces URLs');
 		// A legacy page (no exact object) never enters recovery.
 		const legacy = new ChapterMediaRecovery(
 			router,
@@ -477,6 +487,78 @@ test('one owner fallback per object, then ONE fresh refresh, then nothing: no lo
 		);
 		assert.equal((await legacy.recover(0, `${API}/x`)).size, 0);
 	}));
+
+function recoveryFixture() {
+	// Owner only: recovery never starts a probe or makes a network request.
+	const router = new MediaRouter({ routes: trustedMediaRoutes([], [], API) });
+	const routed: RoutedPage[] = [PATH, `/media/v1/o/mc_0123/${'b'.repeat(64)}`].map((path) => {
+		const media = router.pageMedia(page(path))!;
+		return { url: router.href(media), media };
+	});
+	return { router, routed };
+}
+
+for (const count of [1, 3]) {
+	test(`a fresh ${count}-page layout replaces two pages once across concurrent failures`, async () => {
+		const { router, routed } = recoveryFixture();
+		const fresh: RoutedPage[] = Array.from({ length: count }, (_, i) => ({
+			url: `${API}/fresh/${i}`,
+			media: null,
+		}));
+		let finish!: (pages: RoutedPage[]) => void;
+		const refresh = mock.fn(() => new Promise<RoutedPage[]>((resolve) => (finish = resolve)));
+		const relayout = mock.fn();
+		const recovery = new ChapterMediaRecovery(router, routed, refresh, relayout);
+		const first = recovery.recover(0, routed[0].url);
+		const second = recovery.recover(1, routed[1].url);
+		assert.equal(refresh.mock.callCount(), 1);
+		assert.equal(relayout.mock.callCount(), 0, 'both failures wait for the shared refresh');
+		finish(fresh);
+		const changes = await Promise.all([first, second]);
+		assert.deepEqual(
+			changes.map((c) => c.size),
+			[0, 0],
+		);
+		assert.equal(relayout.mock.callCount(), 1);
+		assert.equal(relayout.mock.calls[0].arguments[0], fresh);
+		assert.equal((await recovery.recover(0, routed[0].url)).size, 0);
+		assert.equal(refresh.mock.callCount(), 1);
+		assert.equal(relayout.mock.callCount(), 1, 'later failures cannot relayout again');
+	});
+}
+
+test('a changed page count without a relayout callback keeps the legacy empty-map result', async () => {
+	const { router, routed } = recoveryFixture();
+	const refresh = mock.fn(async () => [{ url: `${API}/fresh/0`, media: null }]);
+	const recovery = new ChapterMediaRecovery(router, routed, refresh);
+	const changes = await Promise.all(routed.map((p, i) => recovery.recover(i, p.url)));
+	assert.deepEqual(
+		changes.map((c) => c.size),
+		[0, 0],
+	);
+	assert.equal((await recovery.recover(0, routed[0].url)).size, 0);
+	assert.equal(refresh.mock.callCount(), 1);
+});
+
+for (const outcome of ['empty', 'failed']) {
+	test(`${outcome === 'empty' ? 'an empty' : 'a failed'} fresh refresh never relayouts or retries the refresh`, async () => {
+		const { router, routed } = recoveryFixture();
+		const refresh = mock.fn(async () => {
+			if (outcome === 'failed') throw new Error('refresh failed');
+			return [];
+		});
+		const relayout = mock.fn();
+		const recovery = new ChapterMediaRecovery(router, routed, refresh, relayout);
+		const changes = await Promise.all(routed.map((p, i) => recovery.recover(i, p.url)));
+		assert.deepEqual(
+			changes.map((c) => c.size),
+			[0, 0],
+		);
+		assert.equal((await recovery.recover(0, routed[0].url)).size, 0);
+		assert.equal(refresh.mock.callCount(), 1);
+		assert.equal(relayout.mock.callCount(), 0);
+	});
+}
 
 test('the refresh is a POST that skips a warm anonymous GET cache and sends no token', async () => {
 	const requests: { method: string; auth: string | null }[] = [];

@@ -532,9 +532,15 @@ async fn pages_use_locator_only_for_active_generation_keys() {
 #[tokio::test]
 async fn pages_keep_engine_urls_when_images_point_at_the_engine() {
     let engine = Engine::spawn().await;
-    for public in [None, Some(engine.url.clone())] {
+    // The desktop app calls the engine with a login and names it without one.
+    let with_login = engine.url.replacen("http://", "http://user:secret@", 1);
+    for (url, public) in [
+        (engine.url.clone(), None),
+        (engine.url.clone(), Some(engine.url.clone())),
+        (with_login, Some(format!("{}/", engine.url))),
+    ] {
         let app = app_state(
-            SuwayomiClient::new(engine.url.clone(), public, None),
+            SuwayomiClient::new(url, public, None),
             page_locator::REFRESH_WAIT,
         )
         .await;
@@ -551,6 +557,49 @@ async fn pages_keep_engine_urls_when_images_point_at_the_engine() {
             format!("{}/api/v1/manga/7/chapter/0/page/0", engine.url)
         );
     }
+}
+
+/// A `SUWAYOMI_PUBLIC_URL` naming another public Suwayomi host must not carry the
+/// locator: that host has no `/media/v1` route. The locator is relative to this server,
+/// whatever origin the owner media route names (a web reader would send a foreign
+/// owner origin through the image Worker, which refuses `/media/`).
+#[tokio::test]
+async fn locator_urls_never_use_a_public_engine_host() {
+    let engine = Engine::spawn().await;
+    let app = app_state(
+        SuwayomiClient::new(
+            engine.url.clone(),
+            Some("https://suwayomi.example".into()),
+            None,
+        ),
+        page_locator::REFRESH_WAIT,
+    )
+    .await;
+    let generation = engine_keys::adopt(&app.pool).await.unwrap();
+    sqlx::query("INSERT INTO engine_chapter_key(generation,chapter_id,manga_id,source_order,chapter_key,updated_at) VALUES($1,8,7,0,'/chapter/8',now())")
+        .bind(generation).execute(&app.pool).await.unwrap();
+    let result = graphql::build_schema(app.clone(), false)
+        .execute("{ pages(chapterId: \"8\") { sourceUrl } }")
+        .await;
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(
+        result.data.into_json().unwrap()["pages"][1]["sourceUrl"],
+        "/media/v1/c/8/1"
+    );
+    let owner = media_routes::MediaRoutes::parse(Some(
+        r#"[{"id":"main","kind":"owner","base":"https://komiq.example/"}]"#,
+    ))
+    .unwrap();
+    let result = graphql::build_schema(app.clone(), false)
+        .execute(
+            async_graphql::Request::new("{ pages(chapterId: \"8\") { sourceUrl } }").data(owner),
+        )
+        .await;
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(
+        result.data.into_json().unwrap()["pages"][1]["sourceUrl"],
+        "/media/v1/c/8/1"
+    );
 }
 
 #[tokio::test]

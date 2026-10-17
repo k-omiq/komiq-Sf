@@ -535,6 +535,9 @@ pub struct SuwayomiClient {
     /// Public base used when building image URLs (covers/pages) handed to the
     /// browser. Defaults to `base_url` when no public URL is configured.
     image_base_url: String,
+    /// `image_base_url` is the engine's own origin (no public URL, or one naming the
+    /// engine itself): browsers load the engine's URLs, and no locator URL is given.
+    images_on_engine: bool,
     http: reqwest::Client,
     /// Cached resolved source id; `Some` once resolved. `Arc<Mutex>` so cheap clones
     /// (e.g. into the cover drainer task) share the one resolved id rather than each
@@ -570,6 +573,13 @@ impl SuwayomiClient {
         let image_base_url = public_url
             .map(|u| u.trim_end_matches('/').to_string())
             .unwrap_or_else(|| base_url.clone());
+        // Origins ignore credentials: the desktop app passes the engine with a login in
+        // `SUWAYOMI_URL` and without one in `SUWAYOMI_PUBLIC_URL`.
+        let images_on_engine = image_base_url == base_url
+            || matches!(
+                (reqwest::Url::parse(&image_base_url), reqwest::Url::parse(&base_url)),
+                (Ok(public), Ok(engine)) if public.origin() == engine.origin()
+            );
         // Bound every request so a hung/slow upstream (Suwayomi proxies to source
         // sites, often via FlareSolverr, which routinely stalls) can't freeze the
         // scan scheduler or a reader cache-miss path forever. Mirrors
@@ -600,6 +610,7 @@ impl SuwayomiClient {
             page_locator: Arc::new(crate::page_locator::PageLocator::default()),
             base_url,
             image_base_url,
+            images_on_engine,
             http,
             source_id: std::sync::Arc::new(std::sync::Mutex::new(configured_source.clone())),
             configured_source,
@@ -686,12 +697,13 @@ impl SuwayomiClient {
         }
     }
 
-    /// A page's `/media/v1/c` locator URL. `None` while image URLs point at the engine
-    /// itself (`SUWAYOMI_PUBLIC_URL` unset or equal to `SUWAYOMI_URL`): only this server
-    /// answers that route.
+    /// A page's `/media/v1/c` locator URL, relative to the API origin. Only this server
+    /// answers that route, so the URL is never built on the image base, which may be a
+    /// public Suwayomi host. Every reader resolves it against the server it talks to.
+    /// `None` while image URLs point at the engine itself: those pages keep the engine's
+    /// URLs.
     pub fn page_locator_url(&self, chapter_id: i64, index: usize) -> Option<String> {
-        (self.image_base_url != self.base_url)
-            .then(|| self.abs(Some(&format!("/media/v1/c/{chapter_id}/{index}"))))
+        (!self.images_on_engine).then(|| format!("/media/v1/c/{chapter_id}/{index}"))
     }
 
     /// Fetch a cover thumbnail's raw bytes for server-side pHash (dedup signal,

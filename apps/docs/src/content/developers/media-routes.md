@@ -57,12 +57,13 @@ The first round picks the fastest route that answered. After that, a switch need
 Reader -> Regional route: exact object
 Reader -> Owner: same path, once (region marked down)
 Reader -> Server: pages again by POST, once per chapter
-Reader -> Reader: pages whose URL changed load again
+Reader -> Reader: changed pages load again, or a new page list
 ```
 
 1. A regional object that fails loads the same path once from the owner. The region is down for the rest of the session, and a probe round starts.
 2. If the owner fails too, the bytes have likely moved. The reader fetches the chapter's `pages` again, once per chapter, by POST. A POST skips the browser cache and the edge cache that hold anonymous GET answers. Every page whose URL changed loads again, unless it is already on screen.
-3. After that, a page that still fails shows the usual retry button. Each page is replaced by the refresh at most once, so a page never loops.
+3. If the refresh returns a different number of pages, the reader replaces the chapter's page list in place, without leaving the chapter. A page number past the new end moves to the new last page.
+4. After that, a page that still fails shows the usual retry button. Each page, and the page list, is replaced by the refresh at most once, so a page never loops.
 
 ## No tokens on media
 

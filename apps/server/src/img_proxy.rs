@@ -10,6 +10,8 @@
 //! proxy on our own origin is a far better SSRF/laundering primitive than one on a
 //! Worker:
 //!
+//! - **Media routes bypass the proxy** — decoded, slash-collapsed `/media` paths on
+//!   any host, undecodable paths, and regional media route hosts are refused.
 //! - **Host allowlist** ([`ALLOWED_SOURCE_HOSTS`]) — the Worker's `ALLOWED_SOURCE_HOSTS`
 //!   verbatim (a test pins the two together). Exact host or a dot-suffix. Nothing else
 //!   is ever fetched, whatever the URL.
@@ -73,6 +75,8 @@ const IMAGE_CACHE: &str = crate::image_delivery::MUTABLE_CACHE;
 pub struct ImgProxy {
     http: reqwest::Client,
     hosts: Vec<String>,
+    /// Exact hosts from `MediaRoutes::regional_hosts`.
+    media_hosts: Vec<String>,
     /// Production: false (default port only, as the Worker). Tests: true, because a
     /// mock server cannot listen on 80.
     allow_ports: bool,
@@ -83,10 +87,11 @@ pub struct ImgProxy {
 }
 
 impl ImgProxy {
-    pub fn new(mangadex: Arc<MangaDexClient>) -> Self {
+    pub fn new(mangadex: Arc<MangaDexClient>, media_hosts: Vec<String>) -> Self {
         Self::with(
             http_client(),
             ALLOWED_SOURCE_HOSTS.iter().map(|h| h.to_string()).collect(),
+            media_hosts,
             false,
             MAX_IMAGE_BYTES,
             mangadex,
@@ -96,6 +101,7 @@ impl ImgProxy {
     fn with(
         http: reqwest::Client,
         hosts: Vec<String>,
+        media_hosts: Vec<String>,
         allow_ports: bool,
         max_bytes: usize,
         mangadex: Arc<MangaDexClient>,
@@ -103,6 +109,7 @@ impl ImgProxy {
         Self {
             http,
             hosts,
+            media_hosts,
             allow_ports,
             max_bytes,
             inflight: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT)),
@@ -118,9 +125,49 @@ impl ImgProxy {
             .any(|a| host == *a || host.ends_with(&format!(".{a}")))
     }
 
-    /// The Worker's `safeUpstreamUrl` plus the allowlist and the MangaDex switch, in
-    /// one check that every hop goes through.
+    /// The Worker's `isMediaRouteTarget`: decode strictly, collapse slashes, then
+    /// match media paths on any host or the exact configured media hosts.
+    fn is_media_route_target(&self, url: &Url) -> bool {
+        let mut path = Vec::with_capacity(url.path().len());
+        let mut bytes = url.path().bytes();
+        while let Some(byte) = bytes.next() {
+            let byte = if byte == b'%' {
+                let Some((a, b)) = bytes.next().zip(bytes.next()) else {
+                    return true;
+                };
+                let mut decoded = [0];
+                if hex::decode_to_slice([a, b], &mut decoded).is_err() {
+                    return true;
+                }
+                decoded[0]
+            } else {
+                byte
+            };
+            if byte != b'/' || path.last() != Some(&b'/') {
+                path.push(byte);
+            }
+        }
+        let Ok(path) = std::str::from_utf8(&path) else {
+            return true;
+        };
+        let path = path.to_lowercase();
+        if path == "/media" || path.starts_with("/media/") {
+            return true;
+        }
+        let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+        let host = host.strip_suffix('.').unwrap_or(&host);
+        self.media_hosts.iter().any(|configured| host == configured)
+    }
+
+    /// The Worker's media exclusion, `safeUpstreamUrl`, allowlist and the MangaDex
+    /// switch, in one check that every hop goes through.
     fn check(&self, url: &Url) -> Result<(), Refusal> {
+        if self.is_media_route_target(url) {
+            return Err(Refusal {
+                status: StatusCode::FORBIDDEN,
+                message: "media routes are not proxied",
+            });
+        }
         let scheme_ok = matches!(url.scheme(), "http" | "https");
         let creds = !url.username().is_empty() || url.password().is_some();
         // `Url::port()` is None for the scheme's default port, as the Worker's `port === ''`.
@@ -184,6 +231,7 @@ impl ImgProxy {
                     .map_err(|_| Refusal::upstream("Upstream redirect to an invalid Location"))?;
                 self.check(&next).map_err(|r| Refusal {
                     message: match r.message {
+                        "media routes are not proxied" => "redirect to a media route refused",
                         "src host not allowed" => "redirect host not allowed",
                         m => m,
                     },
@@ -431,16 +479,17 @@ mod tests {
     async fn upstream() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
         let h = hits.clone();
-        let app = Router::new()
-            .route(
-                "/ok.jpg",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "image/jpeg")],
-                        crate::suwayomi::testsrv::jpeg(8, 8),
-                    )
-                }),
+        let image = get(|| async {
+            (
+                [(header::CONTENT_TYPE, "image/jpeg")],
+                crate::suwayomi::testsrv::jpeg(8, 8),
             )
+        });
+        let app = Router::new()
+            .route("/ok.jpg", image.clone())
+            .route("/mediafile.png", image.clone())
+            .route("/img/media/x", image.clone())
+            .route("/media/v1/o/x", image)
             .route(
                 "/invalid.jpg",
                 get(|| async {
@@ -490,6 +539,10 @@ mod tests {
                 get(|| async { (StatusCode::FOUND, [(header::LOCATION, "/ok.jpg")], "") }),
             )
             .route(
+                "/media-hop",
+                get(|| async { (StatusCode::FOUND, [(header::LOCATION, "/media/v1/o/x")], "") }),
+            )
+            .route(
                 "/away",
                 get(
                     |axum::extract::Query(q): axum::extract::Query<
@@ -527,12 +580,19 @@ mod tests {
     /// `/img` over a proxy whose allowlist is `uploads.mangadex.org` (MangaDex, so the
     /// switch applies) and `allowed.test`, both resolving to the mock; `blocked.test`
     /// resolves there too, so only the allowlist stands between it and a fetch.
-    fn proxy_app(addr: std::net::SocketAddr, mangadex_on: bool, max_bytes: usize) -> Router {
+    fn proxy_app(
+        addr: std::net::SocketAddr,
+        mangadex_on: bool,
+        max_bytes: usize,
+        media_hosts: Vec<String>,
+    ) -> Router {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5))
+            .no_proxy()
             .resolve("allowed.test", addr)
             .resolve("uploads.mangadex.org", addr)
+            .resolve("uploads.mangadex.org.", addr)
             .resolve("blocked.test", addr)
             .build()
             .unwrap();
@@ -541,6 +601,7 @@ mod tests {
         let proxy = ImgProxy::with(
             http,
             vec!["allowed.test".into(), "uploads.mangadex.org".into()],
+            media_hosts,
             true,
             max_bytes,
             md,
@@ -590,7 +651,7 @@ mod tests {
     #[tokio::test]
     async fn serves_an_allowlisted_image_with_long_cache() {
         let (addr, hits) = upstream().await;
-        let app = proxy_app(addr, true, MAX_IMAGE_BYTES);
+        let app = proxy_app(addr, true, MAX_IMAGE_BYTES, vec![]);
         let port = addr.port();
         let (status, ct, cache, body) =
             call(&app, &format!("http://allowed.test:{port}/ok.jpg")).await;
@@ -606,9 +667,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn media_paths_are_refused_before_any_fetch() {
+        let (addr, hits) = upstream().await;
+        let app = proxy_app(addr, true, MAX_IMAGE_BYTES, vec![]);
+        for host in ["allowed.test", "blocked.test"] {
+            for path in [
+                "/media/v1/o/x",
+                "/MEDIA/v1/c/1/0",
+                "//media//v1",
+                "/%6Dedia/v1/x",
+                "/media",
+                "/%FF%FE",
+                "/%2F%6dedia%2fv1",
+                "/%",
+                "/%GG",
+            ] {
+                let src = format!("http://{host}:{}{path}", addr.port());
+                let (status, _, cache, body) = call(&app, &src).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{src}");
+                assert_eq!(cache.as_deref(), Some("no-store"), "{src}");
+                assert_eq!(
+                    String::from_utf8_lossy(&body),
+                    "media routes are not proxied",
+                    "{src}"
+                );
+                assert_eq!(hits.load(Ordering::SeqCst), 0, "{src} must not be fetched");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn media_lookalike_paths_are_still_served() {
+        let (addr, hits) = upstream().await;
+        let app = proxy_app(addr, true, MAX_IMAGE_BYTES, vec![]);
+        for path in ["/mediafile.png", "/img/media/x"] {
+            let src = format!("http://allowed.test:{}{path}", addr.port());
+            let (status, _, cache, body) = call(&app, &src).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(cache.as_deref(), Some(IMAGE_CACHE), "{path}");
+            assert_eq!(body, crate::suwayomi::testsrv::jpeg(8, 8), "{path}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn configured_media_hosts_are_refused_before_any_fetch() {
+        let (addr, hits) = upstream().await;
+        let routes = crate::media_routes::MediaRoutes::parse(Some(
+            r#"[
+                {"id":"owner","kind":"owner","base":"https://Allowed.Test."},
+                {"id":"regional","kind":"regional","base":"https://Uploads.MangaDex.Org."}
+            ]"#,
+        ))
+        .unwrap();
+        let app = proxy_app(addr, true, MAX_IMAGE_BYTES, routes.regional_hosts());
+        // The owner's host also serves engine images: only its media paths are refused.
+        let (status, ..) = call(&app, &format!("http://allowed.test:{}/ok.jpg", addr.port())).await;
+        assert_eq!(status, StatusCode::OK);
+        hits.store(0, Ordering::SeqCst);
+        for host in ["uploads.mangadex.org", "UPLOADS.MANGADEX.ORG."] {
+            let src = format!("http://{host}:{}/ok.jpg", addr.port());
+            let (status, _, cache, body) = call(&app, &src).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{src}");
+            assert_eq!(cache.as_deref(), Some("no-store"), "{src}");
+            assert_eq!(
+                String::from_utf8_lossy(&body),
+                "media routes are not proxied",
+                "{src}"
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 0, "{src} must not be fetched");
+        }
+    }
+
+    #[tokio::test]
+    async fn redirects_to_media_paths_are_refused_before_the_target_is_fetched() {
+        let (addr, hits) = upstream().await;
+        let app = proxy_app(addr, true, MAX_IMAGE_BYTES, vec![]);
+        let (status, _, cache, body) = call(
+            &app,
+            &format!("http://allowed.test:{}/media-hop", addr.port()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(cache.as_deref(), Some("no-store"));
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "redirect to a media route refused"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "only the redirect was fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirects_to_configured_media_hosts_are_refused_before_the_target_is_fetched() {
+        let (addr, hits) = upstream().await;
+        let routes = crate::media_routes::MediaRoutes::parse(Some(
+            r#"[
+                {"id":"owner","kind":"owner"},
+                {"id":"regional","kind":"regional","base":"https://Uploads.MangaDex.Org."}
+            ]"#,
+        ))
+        .unwrap();
+        let app = proxy_app(addr, true, MAX_IMAGE_BYTES, routes.regional_hosts());
+        for host in ["uploads.mangadex.org", "UPLOADS.MANGADEX.ORG."] {
+            let before = hits.load(Ordering::SeqCst);
+            let to = encode(&format!("http://{host}:{}/ok.jpg", addr.port()));
+            let src = format!("http://allowed.test:{}/away?to={to}", addr.port());
+            let (status, _, cache, body) = call(&app, &src).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{src}");
+            assert_eq!(cache.as_deref(), Some("no-store"), "{src}");
+            assert_eq!(
+                String::from_utf8_lossy(&body),
+                "redirect to a media route refused",
+                "{src}"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst) - before,
+                1,
+                "only the redirect was fetched: {src}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn refuses_everything_that_would_make_it_an_open_proxy() {
         let (addr, hits) = upstream().await;
-        let app = proxy_app(addr, true, MAX_IMAGE_BYTES);
+        let app = proxy_app(addr, true, MAX_IMAGE_BYTES, vec![]);
         let port = addr.port();
 
         // Refused before any request leaves the server.
@@ -684,7 +871,7 @@ mod tests {
     async fn refuses_an_oversized_body() {
         let (addr, _) = upstream().await;
         // Cap below the 4 KiB body: refused (declared length) rather than truncated.
-        let app = proxy_app(addr, true, 1024);
+        let app = proxy_app(addr, true, 1024, vec![]);
         let port = addr.port();
         let (status, _, _, body) = call(&app, &format!("http://allowed.test:{port}/big.jpg")).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
@@ -697,7 +884,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_raster_bodies_are_not_immutable_successes() {
         let (addr, _) = upstream().await;
-        let app = proxy_app(addr, true, MAX_IMAGE_BYTES);
+        let app = proxy_app(addr, true, MAX_IMAGE_BYTES, vec![]);
         for path in [
             "invalid.jpg",
             "empty.jpg",
@@ -716,7 +903,7 @@ mod tests {
         let (addr, hits) = upstream().await;
         let port = addr.port();
         let src = format!("http://uploads.mangadex.org:{port}/ok.jpg");
-        let off = proxy_app(addr, false, MAX_IMAGE_BYTES);
+        let off = proxy_app(addr, false, MAX_IMAGE_BYTES, vec![]);
         let (status, _, _, body) = call(&off, &src).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(
@@ -728,16 +915,49 @@ mod tests {
         let (status, _, _, _) = call(&off, &format!("http://allowed.test:{port}/ok.jpg")).await;
         assert_eq!(status, StatusCode::OK);
 
-        let on = proxy_app(addr, true, MAX_IMAGE_BYTES);
+        let on = proxy_app(addr, true, MAX_IMAGE_BYTES, vec![]);
         let (status, _, _, _) = call(&on, &src).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test]
+    fn media_rules_precede_url_safety_and_match_hosts_exactly() {
+        let md = Arc::new(MangaDexClient::new("img-test", 5.0, 40.0));
+        md.set_enabled(true);
+        let routes = crate::media_routes::MediaRoutes::parse(Some(
+            r#"[{"id":"owner","kind":"owner"},{"id":"sg","kind":"regional","base":"https://Uploads.MangaDex.Org."}]"#,
+        ))
+        .unwrap();
+        let proxy = ImgProxy::new(md, routes.regional_hosts());
+        for src in [
+            "ftp://blocked.test/media/x",
+            "http://user:pw@blocked.test/media/x",
+            "https://blocked.test:8443/media/x",
+            "https://UPLOADS.MANGADEX.ORG.:8443/ok.jpg",
+        ] {
+            let refusal = proxy.check(&Url::parse(src).unwrap()).unwrap_err();
+            assert_eq!(refusal.status, StatusCode::FORBIDDEN, "{src}");
+            assert_eq!(refusal.message, "media routes are not proxied", "{src}");
+            assert_eq!(
+                refusal.into_response().headers()[header::CACHE_CONTROL],
+                "no-store",
+                "{src}"
+            );
+        }
+        let subdomain = Url::parse("https://cdn.uploads.mangadex.org/ok.jpg").unwrap();
+        assert!(proxy.check(&subdomain).is_ok());
+        let lookalike = Url::parse("https://uploads.mangadex.org.evil.test/ok.jpg").unwrap();
+        assert_eq!(
+            proxy.check(&lookalike).unwrap_err().message,
+            "src host not allowed"
+        );
     }
 
     #[test]
     fn production_proxy_refuses_ports() {
         let md = Arc::new(MangaDexClient::new("img-test", 5.0, 40.0));
         md.set_enabled(true);
-        let p = ImgProxy::new(md);
+        let p = ImgProxy::new(md, vec![]);
         let ok = Url::parse("https://uploads.mangadex.org/covers/x/y.jpg").unwrap();
         assert!(p.check(&ok).is_ok());
         let port = Url::parse("https://uploads.mangadex.org:8443/covers/x/y.jpg").unwrap();

@@ -2875,10 +2875,20 @@ fn public_router(
     // hosted API, which has the Worker, exposes no new route.
     let app = if img_proxy {
         tracing::info!("image proxy enabled at /img");
+        // The schema already carries the routes parsed at startup, including on
+        // the fallback listener, so both proxies use the same media exclusions.
+        let media_hosts = router_state
+            .schema
+            .data::<media_routes::MediaRoutes>()
+            .map(media_routes::MediaRoutes::regional_hosts)
+            .unwrap_or_default();
         app.route(
             "/img",
             get(img_proxy::serve)
-                .with_state(Arc::new(img_proxy::ImgProxy::new(mangadex.clone())))
+                .with_state(Arc::new(img_proxy::ImgProxy::new(
+                    mangadex.clone(),
+                    media_hosts,
+                )))
                 .layer(axum::middleware::from_fn_with_state(
                     std::time::Duration::from_secs(180),
                     request_budget::limit_image_time,

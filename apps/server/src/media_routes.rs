@@ -42,6 +42,21 @@ impl MediaRoutes {
         }])
     }
 
+    /// Regional media hosts, for the image proxy to refuse as the Worker's
+    /// `MEDIA_ROUTE_HOSTS`. The owner is left out: its host also serves the API and
+    /// engine images, and its media paths are refused by path.
+    pub fn regional_hosts(&self) -> Vec<String> {
+        self.0
+            .iter()
+            .filter(|route| route.kind == MediaRouteKind::Regional)
+            .filter_map(|route| reqwest::Url::parse(&route.base).ok())
+            .filter_map(|url| {
+                url.host_str()
+                    .map(|host| host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase())
+            })
+            .collect()
+    }
+
     pub fn parse(raw: Option<&str>) -> Result<Self, String> {
         let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
             return Ok(Self::owner_only());
@@ -140,6 +155,19 @@ mod tests {
         for raw in [None, Some(""), Some("  ")] {
             assert_eq!(MediaRoutes::parse(raw).unwrap().0, expected);
         }
+    }
+
+    #[test]
+    fn regional_hosts_leave_out_the_owner_and_drop_trailing_dots_and_ports() {
+        assert!(MediaRoutes::owner_only().regional_hosts().is_empty());
+        let routes = MediaRoutes::parse(Some(
+            r#"[
+                {"id":"owner","kind":"owner","base":"https://Owner.Example.:8443"},
+                {"id":"regional","kind":"regional","base":"http://Media.Example.:8080"}
+            ]"#,
+        ))
+        .unwrap();
+        assert_eq!(routes.regional_hosts(), vec!["media.example"]);
     }
 
     #[test]
