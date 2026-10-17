@@ -11,6 +11,116 @@
         "accepted_on": "2026-10-10",
         "evidence": "Owner reply to the concrete ten-query review: Accept the ten listed search differences"
       }
+    },
+    {
+      "file": "tests/postgres_golden/graphql/chapters_1__anonymous.json",
+      "expected_sha256": "7a4f786e0e23939dc3c3d2265fe56d91bde072590955a24c02d9f6b184ee4e43",
+      "actual_sha256": "355faee0ea944c26fb0ed45a301f7ad73a685c59b25eb8768143f2e6c42d4fc3",
+      "reason": "W3a (work chapter list): the admin title override of chapter 10.5 (\"Curated half chapter\") now applies to every chapter list, not only some. No other field changes.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-17",
+        "evidence": "Owner reply on 2026-10-17 to the concrete review of these W3a differences (chapter title override shown in every chapter list; unnumbered chapters keyed x:<chapter id> in the admin list): Yes i accept them."
+      }
+    },
+    {
+      "file": "tests/postgres_golden/graphql/chapters_1__user.json",
+      "expected_sha256": "4737ae7ad6d9c4fb105e14d8927aa7a34fd691d54a50992125b56fffed72ee4c",
+      "actual_sha256": "1213f1aea0fa450a642b81882509dafed46b0b31a724005ce0931cb4bd75a1a1",
+      "reason": "W3a (work chapter list): the admin title override of chapter 10.5 (\"Curated half chapter\") now applies to every chapter list, not only some. No other field changes.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-17",
+        "evidence": "Owner reply on 2026-10-17 to the concrete review of these W3a differences (chapter title override shown in every chapter list; unnumbered chapters keyed x:<chapter id> in the admin list): Yes i accept them."
+      }
+    },
+    {
+      "file": "tests/postgres_golden/graphql/chapters_1__admin.json",
+      "expected_sha256": "0fcdd4d0bc046b22a440dc45ee921a21ae87bc81adfb007790efb92b5d126144",
+      "actual_sha256": "f8e7437152b2516891f3417c3eed5d3e260b27d53831df67a395f35478f79428",
+      "reason": "W3a (work chapter list): the admin title override of chapter 10.5 (\"Curated half chapter\") now applies to every chapter list, not only some. No other field changes.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-17",
+        "evidence": "Owner reply on 2026-10-17 to the concrete review of these W3a differences (chapter title override shown in every chapter list; unnumbered chapters keyed x:<chapter id> in the admin list): Yes i accept them."
+      }
+    },
+    {
+      "file": "tests/postgres_golden/graphql/chapters_1__nsfw_user.json",
+      "expected_sha256": "0721b4346f4395a49e4203d4ccab095b05e5c0c7e7e415978462ffb7026bce00",
+      "actual_sha256": "232201d5b37fd1c0d292cc1fa2e49cc7c222e3c1ab20839c1fae6fe7995cc72e",
+      "reason": "W3a (work chapter list): the admin title override of chapter 10.5 (\"Curated half chapter\") now applies to every chapter list, not only some. No other field changes.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-17",
+        "evidence": "Owner reply on 2026-10-17 to the concrete review of these W3a differences (chapter title override shown in every chapter list; unnumbered chapters keyed x:<chapter id> in the admin list): Yes i accept them."
+      }
+    },
+    {
+      "file": "tests/postgres_golden/graphql/series_bundle__anonymous.json",
+      "expected_sha256": "c31f96b46a5f2086a8894c73d8b2840b1e39f73536f2220451bb21085e68239f",
+      "actual_sha256": "01f7879a53207ecadb3e956b4a4fc7f403ff82031dc7d1342ff7be5d6da5f4a4",
+      "reason": "W3a (work chapter list): the admin title override of chapter 10.5 (\"Curated half chapter\") now applies to the source lists and the spine of the series page, not only some. No other field changes.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-17",
+        "evidence": "Owner reply on 2026-10-17 to the concrete review of these W3a differences (chapter title override shown in every chapter list; unnumbered chapters keyed x:<chapter id> in the admin list): Yes i accept them."
+      }
+    },
+    {
+      "file": "tests/postgres_golden/graphql/admin_detail__admin.json",
+      "expected_sha256": "7974089320e80b3f90d44c5cadb9642aedfddd49f4181fa916c02279b4ea7e20",
+      "actual_sha256": "dedb4cee07269da5e38c38ab5822bb598d343f78a992ba22e54d15937ff07fa9",
+      "reason": "W3a (work chapter list): unnumbered chapters (Oneshot, Extra) get their own admin override key x:<chapter id> instead of sharing key 0 with the real chapter 0. No other field changes.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-17",
+        "evidence": "Owner reply on 2026-10-17 to the concrete review of these W3a differences (chapter title override shown in every chapter list; unnumbered chapters keyed x:<chapter id> in the admin list): Yes i accept them."
+      }
+    },
+    {
+      "file": "tests/postgres_golden/graphql/cached_source__anonymous.json",
+      "expected_sha256": "0cd89401c1a04c410934b4c6fb3032315f147fba210435a2903b6de4886ea733",
+      "actual_sha256": "70b88541acfe1b18884ab795cde3a3512d0bcefc353cf1f270d8267285a0a0f8",
+      "reason": "W3a (work chapter list): the admin title override of chapter 10.5 (\"Curated half chapter\") now applies to every chapter list, not only some. No other field changes.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-17",
+        "evidence": "Owner reply on 2026-10-17 to the concrete review of these W3a differences (chapter title override shown in every chapter list; unnumbered chapters keyed x:<chapter id> in the admin list): Yes i accept them."
+      }
+    },
+    {
+      "file": "tests/postgres_golden/graphql/cached_source__user.json",
+      "expected_sha256": "a90af885e81446251c9743c8ca4330c4bf2fb7b838fb9b59bc7836a7471cbc77",
+      "actual_sha256": "8d56a59d62ca75cdf26a0f0697b414466eb3c95515424cd654859d9fbb86c3d1",
+      "reason": "W3a (work chapter list): the admin title override of chapter 10.5 (\"Curated half chapter\") now applies to every chapter list, not only some. No other field changes.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-17",
+        "evidence": "Owner reply on 2026-10-17 to the concrete review of these W3a differences (chapter title override shown in every chapter list; unnumbered chapters keyed x:<chapter id> in the admin list): Yes i accept them."
+      }
+    },
+    {
+      "file": "tests/postgres_golden/graphql/cached_source__admin.json",
+      "expected_sha256": "a90af885e81446251c9743c8ca4330c4bf2fb7b838fb9b59bc7836a7471cbc77",
+      "actual_sha256": "8d56a59d62ca75cdf26a0f0697b414466eb3c95515424cd654859d9fbb86c3d1",
+      "reason": "W3a (work chapter list): the admin title override of chapter 10.5 (\"Curated half chapter\") now applies to every chapter list, not only some. No other field changes.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-17",
+        "evidence": "Owner reply on 2026-10-17 to the concrete review of these W3a differences (chapter title override shown in every chapter list; unnumbered chapters keyed x:<chapter id> in the admin list): Yes i accept them."
+      }
+    },
+    {
+      "file": "tests/postgres_golden/graphql/cached_source__nsfw_user.json",
+      "expected_sha256": "a90af885e81446251c9743c8ca4330c4bf2fb7b838fb9b59bc7836a7471cbc77",
+      "actual_sha256": "8d56a59d62ca75cdf26a0f0697b414466eb3c95515424cd654859d9fbb86c3d1",
+      "reason": "W3a (work chapter list): the admin title override of chapter 10.5 (\"Curated half chapter\") now applies to every chapter list, not only some. No other field changes.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-17",
+        "evidence": "Owner reply on 2026-10-17 to the concrete review of these W3a differences (chapter title override shown in every chapter list; unnumbered chapters keyed x:<chapter id> in the admin list): Yes i accept them."
+      }
     }
   ]
 }
