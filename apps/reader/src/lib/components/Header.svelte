@@ -38,6 +38,62 @@
 		theme.pref === 'system' ? 'System' : theme.pref === 'dark' ? 'Dark' : 'Light',
 	);
 
+	let menuEl = $state<HTMLElement>();
+	let triggerEl = $state<HTMLButtonElement>();
+	const menuItems = (): HTMLElement[] =>
+		Array.from(menuEl?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? []);
+
+	// Opening moves focus into the menu, as a menu button should, so the arrow keys
+	// work at once; closing with Escape gives focus back to the button.
+	$effect(() => {
+		if (menuOpen && menuEl) menuItems()[0]?.focus();
+	});
+
+	function closeMenu(refocus = false): void {
+		menuOpen = false;
+		if (refocus) triggerEl?.focus();
+	}
+
+	function onMenuKeydown(e: KeyboardEvent): void {
+		const items = menuItems();
+		const at = items.indexOf(document.activeElement as HTMLElement);
+		let next: number;
+		switch (e.key) {
+			case 'ArrowDown':
+				next = (at + 1) % items.length;
+				break;
+			case 'ArrowUp':
+				next = (at - 1 + items.length) % items.length;
+				break;
+			case 'Home':
+				next = 0;
+				break;
+			case 'End':
+				next = items.length - 1;
+				break;
+			case 'Tab':
+				menuOpen = false;
+				return;
+			default:
+				return;
+		}
+		e.preventDefault();
+		items[next]?.focus();
+	}
+
+	function onWindowKeydown(e: KeyboardEvent): void {
+		if (menuOpen && e.key === 'Escape') {
+			e.preventDefault();
+			closeMenu(true);
+		}
+	}
+
+	// A link closes the menu even when it points at the page already open, where no
+	// navigation happens.
+	function onMenuClick(e: MouseEvent): void {
+		if ((e.target as Element).closest('a')) menuOpen = false;
+	}
+
 	async function signOut(): Promise<void> {
 		menuOpen = false;
 		const r = await logout();
@@ -112,11 +168,13 @@
 			<NotificationBell />
 			<div class="account">
 				<button
+					bind:this={triggerEl}
 					class="avatar k-hit"
 					class:on={menuOpen || isActive('/profile')}
 					aria-label="Account menu"
 					aria-haspopup="menu"
 					aria-expanded={menuOpen}
+					aria-controls={menuOpen ? 'account-menu' : undefined}
 					onclick={() => (menuOpen = !menuOpen)}
 				>
 					<Avatar
@@ -127,35 +185,39 @@
 					/>
 				</button>
 				{#if menuOpen}
-					<button class="backdrop" aria-label="Close menu" onclick={() => (menuOpen = false)}
-					></button>
-					<div class="menu" role="menu">
-						<div class="menu-id">
-							<span class="menu-name">{auth.user.username}</span>
-							{#if auth.user.isAdmin}<span class="menu-badge">Admin</span>{/if}
-						</div>
-						<a class="menu-item" role="menuitem" href="/profile" onclick={() => (menuOpen = false)}
-							>Profile</a
-						>
-						<a class="menu-item" role="menuitem" href="/library" onclick={() => (menuOpen = false)}
-							>Library</a
-						>
-						<a
-							class="menu-item"
-							role="menuitem"
-							href="/scanlators"
-							onclick={() => (menuOpen = false)}>Scanlators</a
-						>
-						<a class="menu-item" role="menuitem" href="/settings" onclick={() => (menuOpen = false)}
-							>Settings</a
-						>
-						<a class="menu-item" role="menuitem" href="/support" onclick={() => (menuOpen = false)}
-							>Support</a
-						>
-						<a class="menu-item" role="menuitem" href="/about" onclick={() => (menuOpen = false)}
-							>About</a
-						>
-						<button class="menu-item danger" role="menuitem" onclick={signOut}>Sign out</button>
+					<button class="backdrop" aria-label="Close menu" onclick={() => closeMenu()}></button>
+					<div
+						bind:this={menuEl}
+						id="account-menu"
+						class="menu"
+						role="menu"
+						aria-label="Account"
+						tabindex="-1"
+						onkeydown={onMenuKeydown}
+						onclick={onMenuClick}
+					>
+						<a class="menu-profile" role="menuitem" href="/profile">
+							<Avatar
+								url={auth.user.avatarUrl}
+								name={auth.user.username}
+								colorKey={auth.user.id}
+								size={36}
+							/>
+							<span class="who">
+								<span class="who-line">
+									<span class="menu-name">{auth.user.displayName || auth.user.username}</span>
+									{#if auth.user.isAdmin}<span class="menu-badge">Admin</span>{/if}
+								</span>
+								<span class="menu-sub">View profile</span>
+							</span>
+						</a>
+						<div class="menu-sep" role="separator"></div>
+						{@render pages()}
+						<div class="menu-sep" role="separator"></div>
+						<button class="menu-item danger" role="menuitem" onclick={signOut}>
+							<span class="menu-icon"><Icon name="arrow-right" size={17} /></span>
+							Sign out
+						</button>
 					</div>
 				{/if}
 			</div>
@@ -167,11 +229,13 @@
 			     signed out, so these must never become URL-only. -->
 			<div class="account">
 				<button
+					bind:this={triggerEl}
 					class="icon-btn k-hit"
 					class:on={menuOpen}
 					aria-label="More"
 					aria-haspopup="menu"
 					aria-expanded={menuOpen}
+					aria-controls={menuOpen ? 'more-menu' : undefined}
 					onclick={() => (menuOpen = !menuOpen)}
 				>
 					<svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -181,24 +245,18 @@
 					</svg>
 				</button>
 				{#if menuOpen}
-					<button class="backdrop" aria-label="Close menu" onclick={() => (menuOpen = false)}
-					></button>
-					<div class="menu" role="menu">
-						<a
-							class="menu-item"
-							role="menuitem"
-							href="/scanlators"
-							onclick={() => (menuOpen = false)}>Scanlators</a
-						>
-						<a class="menu-item" role="menuitem" href="/settings" onclick={() => (menuOpen = false)}
-							>Settings</a
-						>
-						<a class="menu-item" role="menuitem" href="/support" onclick={() => (menuOpen = false)}
-							>Support</a
-						>
-						<a class="menu-item" role="menuitem" href="/about" onclick={() => (menuOpen = false)}
-							>About</a
-						>
+					<button class="backdrop" aria-label="Close menu" onclick={() => closeMenu()}></button>
+					<div
+						bind:this={menuEl}
+						id="more-menu"
+						class="menu"
+						role="menu"
+						aria-label="More"
+						tabindex="-1"
+						onkeydown={onMenuKeydown}
+						onclick={onMenuClick}
+					>
+						{@render pages()}
 					</div>
 				{/if}
 			</div>
@@ -206,6 +264,30 @@
 		{/if}
 	</div>
 </header>
+
+<svelte:window onkeydown={onWindowKeydown} />
+
+<!-- The pages both menus share. Library is not here: the header nav and the phone tab
+     bar already carry it. -->
+{#snippet pages()}
+	<a class="menu-item" role="menuitem" href="/scanlators">
+		<span class="menu-icon"><Icon name="users" size={17} /></span>
+		Scanlators
+	</a>
+	<a class="menu-item" role="menuitem" href="/settings">
+		<span class="menu-icon"><Icon name="gear" size={17} /></span>
+		Settings
+	</a>
+	<div class="menu-sep" role="separator"></div>
+	<a class="menu-item" role="menuitem" href="/support">
+		<span class="menu-icon"><Icon name="help" size={17} /></span>
+		Support
+	</a>
+	<a class="menu-item" role="menuitem" href="/about">
+		<span class="menu-icon"><Icon name="book-open" size={17} /></span>
+		About
+	</a>
+{/snippet}
 
 {#if signOutWarning}
 	<!-- Non-blocking: the local sign-out DID happen; this only warns that the
@@ -308,12 +390,15 @@
 		color: var(--k-text);
 		background: var(--k-hover-fill);
 	}
+	/* No outline: a soft ring of fill grows round the picture on hover and while the
+	   menu is open. */
 	.avatar {
 		width: 36px;
 		height: 36px;
 		border-radius: 50%;
 		background: var(--k-avatar);
-		border: 1px solid var(--k-border-2);
+		border: none;
+		box-shadow: 0 0 0 0 transparent;
 		display: flex;
 		align-items: center;
 		justify-content: center;
@@ -325,19 +410,18 @@
 		text-decoration: none;
 		cursor: pointer;
 		transition:
-			color 0.15s,
-			background-color 0.15s,
-			border-color 0.15s,
+			box-shadow var(--k-dur) var(--k-ease),
 			opacity 0.15s;
 	}
 	.avatar:hover,
 	.avatar.on {
-		border-color: var(--k-border-strong);
-		color: var(--k-text);
+		box-shadow: 0 0 0 3px color-mix(in srgb, var(--k-text) 14%, transparent);
+	}
+	.avatar:active {
+		transform: scale(0.96);
 	}
 	.avatar.skeleton {
 		background: var(--k-surface-4);
-		border-color: var(--k-border);
 	}
 	.signin {
 		display: flex;
@@ -390,73 +474,146 @@
 		border: none;
 		cursor: default;
 	}
+	/* The menu is one raised surface with no outline: a lighter fill than the page in
+	   dark, white on the warm page in light, and a soft shadow. Groups are split by
+	   space and a faint rule, not boxes. */
 	.menu {
 		position: absolute;
 		top: calc(100% + 10px);
 		right: 0;
 		z-index: 26;
-		min-width: 190px;
-		padding: var(--k-space-2);
-		background: var(--k-surface-3);
-		border: 1px solid var(--k-border-2);
-		border-radius: var(--k-radius-lg);
-		box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
+		width: 244px;
+		max-width: calc(100vw - 24px);
+		padding: 6px;
+		background: var(--k-surface-5);
+		border-radius: var(--k-radius-xl);
+		box-shadow: var(--k-shadow-3);
+		transform-origin: top right;
+		animation: menu-in var(--k-dur) var(--k-ease);
 	}
-	.menu-id {
+	:global(:root[data-theme='light']) .menu {
+		background: var(--k-surface);
+	}
+	@keyframes menu-in {
+		from {
+			opacity: 0;
+			transform: translateY(-4px) scale(0.98);
+		}
+	}
+	.menu:focus {
+		outline: none;
+	}
+	.menu-sep {
+		height: 1px;
+		margin: 6px 10px;
+		background: color-mix(in srgb, var(--k-text) 8%, transparent);
+	}
+	.menu-profile,
+	.menu-item {
+		display: flex;
+		align-items: center;
+		width: 100%;
+		border: none;
+		border-radius: var(--k-radius-lg);
+		background: transparent;
+		font-family: var(--k-font-sans);
+		text-align: left;
+		text-decoration: none;
+		cursor: pointer;
+		transition:
+			background-color 0.12s,
+			color 0.12s;
+	}
+	.menu-profile {
+		gap: var(--k-space-3);
+		padding: 8px 10px;
+	}
+	.who {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		min-width: 0;
+	}
+	.who-line {
 		display: flex;
 		align-items: center;
 		gap: var(--k-space-2);
-		padding: var(--k-space-2) var(--k-space-3) var(--k-space-3);
-		border-bottom: 1px solid var(--k-border);
-		margin-bottom: var(--k-space-2);
+		min-width: 0;
 	}
 	.menu-name {
-		font-size: 13px;
+		font-size: var(--k-text-md);
 		font-weight: 700;
 		color: var(--k-text-bright);
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
+	.menu-sub {
+		font-size: var(--k-text-xs);
+		font-weight: 600;
+		color: var(--k-text-dim);
+	}
+	/* The teal mixed toward the text colour reads on both themes: lighter on dark,
+	   deeper on light. */
 	.menu-badge {
+		flex: 0 0 auto;
 		font-size: 10px;
 		font-weight: 700;
 		letter-spacing: 0.04em;
 		text-transform: uppercase;
-		color: var(--k-accent-teal);
-		border: 1px solid rgba(95, 200, 207, 0.4);
-		border-radius: var(--k-radius-sm);
-		padding: 1px 5px;
+		color: color-mix(in srgb, var(--k-accent-teal) 50%, var(--k-text));
+		background: color-mix(in srgb, var(--k-accent-teal) 16%, transparent);
+		border-radius: var(--k-radius-pill);
+		padding: 2px 7px;
 	}
 	.menu-item {
-		display: block;
-		width: 100%;
-		text-align: left;
-		padding: 9px var(--k-space-3);
-		border: none;
-		border-radius: var(--k-radius);
-		background: transparent;
+		gap: var(--k-space-3);
+		min-height: 38px;
+		padding: 0 10px;
 		color: var(--k-text-2);
-		font-family: var(--k-font-sans);
-		font-size: 13px;
+		font-size: var(--k-text-md);
 		font-weight: 600;
-		text-decoration: none;
-		cursor: pointer;
-		transition: background 0.12s;
 	}
-	.menu-item:hover {
-		background: var(--k-hover-fill);
+	.menu-icon {
+		display: flex;
+		color: var(--k-text-dim);
+		transition: color 0.12s;
+	}
+	.menu-profile:hover,
+	.menu-profile:focus-visible,
+	.menu-item:hover,
+	.menu-item:focus-visible {
+		background: color-mix(in srgb, var(--k-text) 7%, transparent);
 		color: var(--k-text);
 	}
-	.menu-item.danger:hover {
-		color: var(--k-accent);
+	.menu-item:hover .menu-icon,
+	.menu-item:focus-visible .menu-icon {
+		color: var(--k-text);
+	}
+	/* The ring sits inside the row so the menu's rounded edge does not cut it off. */
+	.menu-profile:focus-visible,
+	.menu-item:focus-visible {
+		outline: 2px solid var(--k-focus-ring);
+		outline-offset: -2px;
+		border-radius: var(--k-radius-lg);
+	}
+	.menu-profile:active,
+	.menu-item:active {
+		transform: scale(0.985);
+	}
+	.menu-item.danger:hover,
+	.menu-item.danger:focus-visible {
+		background: var(--k-danger-soft);
+		color: var(--k-danger);
+	}
+	.menu-item.danger:hover .menu-icon,
+	.menu-item.danger:focus-visible .menu-icon {
+		color: var(--k-danger);
 	}
 	/* Touch: menu rows are full 44px targets, and the avatar lets its (round) hit box
 	   reach past its own circle. */
 	@media (pointer: coarse) {
 		.menu-item {
-			display: flex;
-			align-items: center;
 			min-height: 44px;
 		}
 		.avatar {
