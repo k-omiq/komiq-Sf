@@ -11,8 +11,9 @@
  *      arrived in. That is wrong twice over once copies exist: the neighbour of copy A of
  *      ch. 3 is copy B of ch. 3 (the button "advances" to the chapter you just read), and a
  *      list that arrives newest-first silently swaps prev and next. Here the order is always
- *      rebuilt — ascending by number, unnumbered chapters (oneshots/extras) last — and
- *      prev/next move to the adjacent DISTINCT number.
+ *      rebuilt — by work entry when every copy has a rank, otherwise ascending by number
+ *      with unnumbered chapters (oneshots/extras) last — and prev/next move to the adjacent
+ *      DISTINCT entry or legacy number.
  *
  *   2. WHICH COPY of the adjacent number. First the SOURCE: the series' default source
  *      when it carries the number, otherwise another source for that one chapter (the
@@ -34,6 +35,8 @@ export interface VersionedChapter {
 	number: number;
 	/** The server's display label ("45", "10.5", "Oneshot"). */
 	label?: string;
+	entryId?: string | null;
+	entryOrder?: number | null;
 	/** The scanlation group(s) of this copy; null/'' = unknown. */
 	scanlator?: string | null;
 }
@@ -64,22 +67,38 @@ export function isNumberedLabel(label: string | undefined): boolean {
 	return /^\d+(\.\d+)?$/.test(label.trim());
 }
 
-/** The identity of a chapter NUMBER: `round(number * 100)` like the server's spine key,
- *  or the chapter's own id for an unnumbered one (every oneshot is its own slot). */
-function slotKey(c: VersionedChapter): string {
+/**
+ * Whether a pool is ordered and grouped by the work's chapter list. Only when EVERY copy
+ * carries an entry: the server links copies before a work's list is ready, so a pool can
+ * hold linked and unlinked copies of one number, and mixing entry slots with number slots
+ * would split that number in two. One rule per pool keeps slots and order consistent.
+ */
+function entryPool(chapters: readonly VersionedChapter[]): boolean {
+	return chapters.every((c) => c.entryId != null && c.entryOrder != null);
+}
+
+/** The work entry's identity in an entry pool, otherwise the legacy chapter number or the
+ *  chapter's own id for an unnumbered one (every oneshot is its own slot). */
+function slotKey(c: VersionedChapter, byEntry: boolean): string {
+	if (byEntry) return `e:${c.entryId}`;
 	return isNumberedLabel(c.label) ? `n:${Math.round(c.number * 100)}` : `x:${c.id}`;
 }
 
 /**
  * Ascending reading order, rebuilt from scratch whatever order the list arrived in:
- * numbered chapters by number, unnumbered ones after them. STABLE — copies of one number,
- * and unnumbered chapters among themselves, keep their arrival order, which is what lets
- * "the first copy" mean the caller's default.
+ * work entry ranks when complete, otherwise numbered chapters by number, unnumbered ones
+ * after them. STABLE — equal ranks, copies of one number, and unnumbered chapters among
+ * themselves keep their arrival order, which lets "the first copy" mean the caller's default.
  */
 export function sortChaptersAsc<C extends VersionedChapter>(chapters: readonly C[]): C[] {
+	// Entry ranks are comparable only within a complete pool. A mixed pool keeps the
+	// legacy order throughout, so unlinked numbered chapters stay in place and the
+	// comparator remains transitive instead of switching rules between pairs.
+	const byEntryOrder = entryPool(chapters);
 	return chapters
 		.map((c, i) => ({ c, i, numbered: isNumberedLabel(c.label) }))
 		.sort((a, b) => {
+			if (byEntryOrder) return a.c.entryOrder! - b.c.entryOrder! || a.i - b.i;
 			if (a.numbered !== b.numbered) return a.numbered ? -1 : 1;
 			if (a.numbered && a.c.number !== b.c.number) return a.c.number - b.c.number;
 			return a.i - b.i;
@@ -90,8 +109,9 @@ export function sortChaptersAsc<C extends VersionedChapter>(chapters: readonly C
 /** Every copy that shares `target`'s chapter number (including `target` itself when it is
  *  in the list), in {@link sortChaptersAsc} order. */
 export function copiesOf<C extends VersionedChapter>(chapters: readonly C[], target: C): C[] {
-	const key = slotKey(target);
-	return sortChaptersAsc(chapters).filter((c) => c.id === target.id || slotKey(c) === key);
+	const byEntry = entryPool([...chapters, target]);
+	const key = slotKey(target, byEntry);
+	return sortChaptersAsc(chapters).filter((c) => c.id === target.id || slotKey(c, byEntry) === key);
 }
 
 /**
@@ -129,10 +149,11 @@ export function adjacentChapters<C extends VersionedChapter>(
 	tier: (c: C) => number = () => 0,
 ): { prev?: C; next?: C; order: C[] } {
 	const asc = sortChaptersAsc(pool.some((c) => c.id === target.id) ? pool : [...pool, target]);
+	const byEntry = entryPool(asc);
 	// Distinct numbers, in reading order (a Map keeps insertion order), each with its copies.
 	const slots = new Map<string, C[]>();
 	for (const c of asc) {
-		const key = slotKey(c);
+		const key = slotKey(c, byEntry);
 		const slot = slots.get(key);
 		if (slot) slot.push(c);
 		else slots.set(key, [c]);

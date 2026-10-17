@@ -90,6 +90,7 @@ These operations retrieve comic metadata, chapter lists, page image links and se
 - `canonicalPages`: page image URLs for a mirrored chapter.
 - Every `Chapter` (in `chapters`, `canonicalChapters` and `seriesPage`) carries `entryId`, the work's chapter-list entry the copy is linked to, and `entryOrder`, the entry's position in the list, counted from 1 (sort by it; copies with the same value are one chapter; positions move when entries are added). Both are null for a copy that is not linked yet. These lists also leave out hidden entries and show an entry's title override. Read [Canonical works](/developers/canonical-works) for the chapter list.
 - `chapterOrigin`: for a Suwayomi chapter, the source ID, the source's own manga and chapter keys, and the extension that provides the source. A reader app with its own engine uses them to find the same chapter there. The server answers from keys it stored earlier and asks the source engine only when it has none. It follows the same adult-content rule as `pages`.
+- `chapterWork(chapterId)`: returns the copy's current `workId` and nullable `entryId`. It follows work redirects and the viewer's adult-content preference. An unknown chapter or a copy without a work returns null. The reader uses it to follow a chapter moved to another series.
 
 The `search` query supports both full-text search and structured catalog browsing. When the `query` argument is empty, it queries the materialized `browse_catalogue` table:
 
@@ -128,8 +129,8 @@ These operations manage personal reading shelves, chapter progress and view coun
 - `setFavorite`: toggle the favorite status of a series.
 - `setProgress`: save last page read and chapter completion state. With `read: true` on a work whose chapter list is ready, it moves the reader's "read through" entry forward (see [Data model](/developers/data-model)). On a work that is not ready yet it runs the old catch-up that marks earlier chapters of the same source read. It clears the untick record of that chapter.
 - `setChapterRead`: mark one chapter read or unread. On a ready work it writes a mark for the entry; on other works an untick record, so catch-up does not mark that chapter read again. With `read: true` it clears the untick.
-- `saveProgress(chapterId, workId, lastPageRead, read, numericEpoch, revision)` and `saveChapterRead(chapterId, workId, read, numericEpoch, revision)`: the same writes with a stale-save check. `revision` is the value the client last read from `viewerProgress`. They return `ProgressResult { status, revision, workId }`. `APPLIED`: the revision matched and the change was saved. `PAGE_ONLY`: the revision was old, and only a higher page on the same chapter was saved. `REFUSED`: the revision was old and nothing was saved. `MOVED`: the chapter now belongs to the work in `workId`; nothing was saved. `setProgress` and `setChapterRead` keep returning a Boolean and do no revision check.
-- `viewerProgress(workId)`, and `viewerProgress` on `seriesPage`: the reader's `revision` and `throughEntryId` for one work. Null when signed out.
+- `saveProgress(chapterId, workId, lastPageRead, read, numericEpoch, revision)` and `saveChapterRead(chapterId, workId, read, numericEpoch, revision)`: the same writes with a stale-save check. `revision` is the value the client last read from `viewerProgress`. They return `ProgressResult { status, revision, workId }`. `APPLIED`: the revision matched and the change was saved. `PAGE_ONLY`: the revision was old, and only a higher page on the same chapter was saved from a `saveProgress` with `read: false`. `REFUSED`: the revision was old and nothing was saved. `MOVED`: the chapter now belongs to the work in `workId`; nothing was saved. `setProgress` and `setChapterRead` keep returning a Boolean and do no revision check.
+- `viewerProgress(workId)`, and `viewerProgress` on `seriesPage`: the reader's `revision` and `throughEntryId` for one work. Like the saves, the query accepts a work ID or a numeric series ID. Null when signed out.
 - `recordView`: record a chapter open to update trending counts.
 
 The `recordView` mutation requires no authentication. Readers send it when opening a chapter. The server applies an in-memory sliding-window rate limit per IP address and series ID to prevent tally manipulation.
@@ -180,6 +181,7 @@ Operations in this category require `isAdmin: true` on the authenticated user:
 - **Catalog curation**: `mergeQueue`, `resolveMergeCandidate`, `mergeWorks`, `splitSourceSeries`, `workSourceRows`, `workReviewDetail`, `consolidateExactDuplicates`, `reconcileCatalogue`, `resyncCatalogue`, `splitProgressReaders` (how many readers' progress a split would move), `addSourceSeries`, `bulkAddSourceSeries`, `coverIssues`, `retryCover`, `materializeCatalogueCovers`, `persistCatalogue`, `backfillMangadexMetadata`.
 - **Scanner and series administration**: `scanStatus`, `triggerScan`, `setSeriesPaused`, `rescanWork`, `updateSeriesAdmin`, `seriesAdminMeta`, `updateSeriesMetadata`, `addSeriesAltTitle`, `removeSeriesAltTitle`, `workChaptersAdmin`, `setChapterOverride`.
 - **Chapter list**: `workChapterList` returns a work's chapter-list entries in order, with hidden entries, entries that have no copies and each entry's linked copies, plus `ready`. `setWorkChapter` changes one entry's hidden flag, title override, special flag or position (`sortKey`). A new position changes the list order. The older `setChapterOverride` still works: it writes the override of a chapter key and updates the entry with that key, or the entry linked to a copy with that key.
+- **Chapter copies and merges**: `linkChapterCopy(chapterId, entryId)` moves a copy to another entry in the same work. A null `entryId` gives it a new entry of its own. `mergeWorkChapters(keepId, dropId)` moves the dropped entry's copies into the kept entry. Both preserve readers' read state.
 - **Adult sources**: `markSourceNsfw` flags a whole Suwayomi source as adult, updates the works already added from it, and remembers the choice for series added later. `rederiveSuwayomiNsfw` recomputes the flag for every work added from a Suwayomi source. The admin console has no control for these two; call them through GraphQL.
 - **Reader reports**: `reports`, `resolveReport`, `submitReport`. The `submitReport` mutation is open to unauthenticated users so readers can report catalog errors without signing in.
 
@@ -197,11 +199,27 @@ Client -> Server: retries query once with stripped document
 Server -> Client: returns valid data
 ```
 
+### Revisioned progress saves
+
+Use `saveProgress` and `saveChapterRead` with the work ID and a base revision, the progress version your app last saw. `GraphQLBackend` learns it from `viewerProgress` on the `seriesPage` bundle or from the `viewerProgress(workId)` query. An explicit `revision` takes precedence. Otherwise, the client uses its known revision, queries it if unknown, and falls back to 0 if no row is available.
+
+An `APPLIED` answer raises the known base revision. `PAGE_ONLY` keeps it. `REFUSED` and `MOVED` clear it, so the next save reads it again. `REFUSED` and `MOVED` call `onProgressConflict` listeners. The reader clears read marks shown before the save finished and refetches the current state. See [The reader app](/developers/reader-app) for offline replay.
+
 ### Opportunistic field stripping
 
 When a new reader application introduces an optional field from `OPTIONAL_SERIES_FIELDS` (such as `detectedAt` or `firstReleasedAt`), an older deployed server returns an `Unknown field` error.
 
 The `GraphQLBackend` class catches this error, removes the offending line from the query, retries the request, and caches the omission for the rest of the application session.
+
+The client selects optional `entryId` and `entryOrder` fields on chapter copies and aggregate rows, plus `special` on aggregate rows. It uses entry IDs to join copies, entry order to sort chapters and `special` to show the badge. Stripped fields leave the older lists grouped by chapter number.
+
+For nested `viewerProgress`, stripping removes the whole selection, including `revision` and `throughEntryId`. The standalone query has its own `viewerProgressUnsupported` flag and returns `undefined` when unsupported.
+
+Other capability flags handle missing operations:
+
+- `saveProgressUnsupported`: both revisioned saves fall back to `setProgress` or `setChapterRead` and return null. If the older chapter toggle is unavailable too, the client throws so the reader can undo its temporary mark.
+- `workChapterListUnsupported`: returns `undefined`, so the admin editor uses `workChaptersAdmin` and the old rename and hide table.
+- `chapterWorkUnsupported`: returns `undefined`, so a missing chapter keeps the empty reader.
 
 ### Opportunistic argument stripping
 

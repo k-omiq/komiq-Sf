@@ -9,3 +9,4 @@ export * from './composite-backend.js';
 export * from './local-suwayomi-backend.js';
 export * from './offline-queue.js';
 export * from './numeric-epoch.js';
+export * from './progress-conflict.js';

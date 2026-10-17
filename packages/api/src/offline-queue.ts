@@ -28,7 +28,15 @@ export interface StorageAdapter {
 /** A pending on-device reading-progress write, reconciled by canonical `chapterId`. */
 export interface ProgressOp {
 	kind: 'progress';
+	/** Stable identity lets queued successors survive collapse and reload. */
+	opId?: string;
 	chapterId: string;
+	/** Writes without a known work cannot participate in a revision chain. */
+	workId?: string | null;
+	/** The base revision is kept until an applied predecessor supplies its replacement. */
+	revision?: number | null;
+	/** This predecessor must finish before its successor can use an applied revision. */
+	chainedTo?: string | null;
 	lastPageRead: number;
 	read: boolean;
 	/** Enqueue timestamp (ms epoch); supplied by the caller / stamped at enqueue. */
@@ -69,8 +77,11 @@ export interface MarkOp {
 /** The queued write union. Discriminated by `kind`. */
 export type WriteOp = ProgressOp | MarkOp;
 
+/** Only an applied save advances the revision its queued successors must send. */
+export type FlushResult = { appliedRevision: number | null };
+
 /**
- * A single op minus the bookkeeping fields the queue owns (`ts`/`tries`), i.e.
+ * A single op minus the bookkeeping fields the queue owns (`ts`/`tries`/`opId`/`chainedTo`), i.e.
  * what a caller passes to {@link OfflineWriteQueue.enqueue}. `ts` may be supplied
  * (the composite can pass one) or omitted (the queue stamps `Date.now()`).
  */
@@ -78,6 +89,10 @@ export type EnqueueOp =
 	| {
 			kind: 'progress';
 			chapterId: string;
+			/** See {@link ProgressOp.workId}. */
+			workId?: string | null;
+			/** See {@link ProgressOp.revision}. */
+			revision?: number | null;
 			lastPageRead: number;
 			read: boolean;
 			ts?: number;
@@ -150,6 +165,7 @@ export class OfflineWriteQueue {
 	private ops: WriteOp[];
 	private replayGeneration = 0;
 	private replay: Promise<void> | undefined;
+	private inFlight: { op: WriteOp } | undefined;
 
 	constructor(private adapter: StorageAdapter) {
 		this.ops = this.read();
@@ -161,7 +177,13 @@ export class OfflineWriteQueue {
 		if (!raw) return [];
 		try {
 			const parsed = JSON.parse(raw);
-			return Array.isArray(parsed) ? (parsed as WriteOp[]) : [];
+			if (!Array.isArray(parsed)) return [];
+			const ops = parsed as WriteOp[];
+			// Legacy identities stay in memory until the next mutation persists them.
+			for (const op of ops) {
+				if (op.kind === 'progress') op.opId ??= createOpId();
+			}
+			return ops;
 		} catch {
 			return [];
 		}
@@ -172,12 +194,40 @@ export class OfflineWriteQueue {
 		this.adapter.save(JSON.stringify(this.ops));
 	}
 
+	/** A completed predecessor releases successors even when it did not advance the revision. */
+	private releaseSuccessors(op: WriteOp, appliedRevision?: number | null): void {
+		if (op.kind !== 'progress' || op.workId == null || op.opId == null) return;
+		for (const successor of this.ops) {
+			if (successor.kind === 'progress' && successor.chainedTo === op.opId) {
+				successor.chainedTo = null;
+				if (typeof appliedRevision === 'number') successor.revision = appliedRevision;
+			}
+		}
+	}
+
+	/** Identity filtering must not leave a retained write waiting on a removed predecessor. */
+	private clearMissingPredecessors(): void {
+		const ids = new Set(
+			this.ops
+				.filter((op): op is ProgressOp => op.kind === 'progress' && op.workId != null)
+				.map((op) => op.opId),
+		);
+		for (const op of this.ops) {
+			if (op.kind === 'progress' && op.chainedTo != null && !ids.has(op.chainedTo)) {
+				op.chainedTo = null;
+			}
+		}
+	}
+
 	/**
 	 * Append a write, collapsing duplicates so only the latest state survives: a
 	 * new `progress` for a `chapterId` replaces any pending `progress` for that
 	 * same chapter, and a new `mark` for a `seriesId` replaces any pending `mark`
 	 * for that series (latest wins). This keeps the queue bounded and correct —
 	 * intermediate progress/membership states are irrelevant once superseded.
+	 * An in-flight progress write with a work stays because its response may
+	 * advance the revision a later write needs. Successors of collapsed writes
+	 * inherit their dependencies so that revision hand-over still reaches them.
 	 * `tries` resets on collapse: a freshly-observed state deserves a clean retry
 	 * budget.
 	 */
@@ -188,7 +238,11 @@ export class OfflineWriteQueue {
 			op.kind === 'progress'
 				? {
 						kind: 'progress',
+						opId: createOpId(),
 						chapterId: op.chapterId,
+						workId: op.workId ?? null,
+						revision: op.revision ?? null,
+						chainedTo: null,
 						lastPageRead: op.lastPageRead,
 						read: op.read,
 						ts,
@@ -205,7 +259,37 @@ export class OfflineWriteQueue {
 						userId,
 						numericEpoch: op.numericEpoch ?? null,
 					};
-		this.ops = this.ops.filter((existing) => !sameTarget(existing, full));
+		this.ops = this.ops.filter((existing) => {
+			if (!sameTarget(existing, full)) return true;
+			if (existing === this.inFlight?.op && existing.kind === 'progress' && existing.workId != null)
+				return true;
+			if (existing.kind === 'progress' && existing.workId != null && existing.opId != null) {
+				for (const successor of this.ops) {
+					if (successor.kind === 'progress' && successor.chainedTo === existing.opId) {
+						successor.chainedTo = existing.chainedTo ?? null;
+						const revision = Math.max(
+							successor.revision ?? -Infinity,
+							existing.revision ?? -Infinity,
+						);
+						successor.revision = revision === -Infinity ? null : revision;
+					}
+				}
+			}
+			return false;
+		});
+		if (full.kind === 'progress' && full.workId != null) {
+			for (let i = this.ops.length - 1; i >= 0; i--) {
+				const predecessor = this.ops[i];
+				if (
+					predecessor.kind === 'progress' &&
+					predecessor.workId === full.workId &&
+					predecessor.userId === userId
+				) {
+					full.chainedTo = predecessor.opId ?? null;
+					break;
+				}
+			}
+		}
 		this.ops.push(full);
 		this.persist();
 	}
@@ -213,6 +297,13 @@ export class OfflineWriteQueue {
 	/** Number of pending ops. */
 	size(): number {
 		return this.ops.length;
+	}
+
+	/** Live saves must join an existing backlog for the same user and work. */
+	hasPendingProgress(userId: string | null, workId: string): boolean {
+		return this.ops.some(
+			(op) => op.kind === 'progress' && op.userId === userId && op.workId === workId,
+		);
 	}
 
 	/** A defensive copy of the pending ops, oldest-first (for tests/inspection). */
@@ -231,7 +322,10 @@ export class OfflineWriteQueue {
 		this.cancelReplay();
 		const before = this.ops.length;
 		this.ops = userId == null ? [] : this.ops.filter((op) => op.userId === userId);
-		if (this.ops.length !== before) this.persist();
+		if (this.ops.length !== before) {
+			this.clearMissingPredecessors();
+			this.persist();
+		}
 	}
 
 	/** Stop a drain at its next await boundary. Already-sent writes cannot be
@@ -257,7 +351,10 @@ export class OfflineWriteQueue {
 	 * `currentUserId` is purged up front — a foreign op can never be replayed under
 	 * this session — before the oldest-first flush of the remaining owned ops.
 	 */
-	async drain(flush: (op: WriteOp) => Promise<void>, currentUserId: string | null): Promise<void> {
+	async drain(
+		flush: (op: WriteOp) => Promise<FlushResult | void>,
+		currentUserId: string | null,
+	): Promise<void> {
 		// Identity unknown (e.g. token restored but session not yet validated): defer.
 		// Never drop here — the owner may still sign in and reclaim these ops.
 		if (currentUserId == null) return;
@@ -276,7 +373,7 @@ export class OfflineWriteQueue {
 	}
 
 	private async drainOwned(
-		flush: (op: WriteOp) => Promise<void>,
+		flush: (op: WriteOp) => Promise<FlushResult | void>,
 		currentUserId: string,
 		generation: number,
 	): Promise<void> {
@@ -286,21 +383,28 @@ export class OfflineWriteQueue {
 		// foreign op is impossible to replay even if an identity transition was missed.
 		const before = this.ops.length;
 		this.ops = this.ops.filter((op) => op.userId === currentUserId);
-		if (this.ops.length !== before) this.persist();
+		if (this.ops.length !== before) {
+			this.clearMissingPredecessors();
+			this.persist();
+		}
 		while (this.ops.length > 0 && generation === this.replayGeneration) {
 			const op = this.ops[0];
 			if (op.userId !== currentUserId) {
 				this.ops.shift();
+				this.clearMissingPredecessors();
 				this.persist();
 				continue;
 			}
+			const inFlight = { op };
+			this.inFlight = inFlight;
 			try {
-				await flush(op);
+				const result = await flush(op);
 				if (generation !== this.replayGeneration) return;
 				// Enqueue can replace the head with a newer state while a write waits.
 				// A late completion only removes the exact operation it sent.
 				if (this.ops[0] !== op) continue;
 				this.ops.shift();
+				this.releaseSuccessors(op, result?.appliedRevision);
 				this.persist();
 			} catch {
 				if (generation !== this.replayGeneration) return;
@@ -308,6 +412,7 @@ export class OfflineWriteQueue {
 				op.tries += 1;
 				if (op.tries >= MAX_TRIES) {
 					this.ops.shift();
+					this.releaseSuccessors(op);
 					this.persist();
 					console.warn(
 						`[offline-queue] dropping poison ${op.kind} op after ${op.tries} tries:`,
@@ -319,9 +424,20 @@ export class OfflineWriteQueue {
 				this.persist();
 				// Preserve order — stop and retry from this head on the next drain.
 				return;
+			} finally {
+				// A newer drain can await the same op, so only this request may clear its marker.
+				if (this.inFlight === inFlight) this.inFlight = undefined;
 			}
 		}
 	}
+}
+
+let opIdCounter = 0;
+
+/** Older webviews still need unique identities when randomUUID is unavailable. */
+function createOpId(): string {
+	if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+	return `${Date.now().toString(36)}-${++opIdCounter}-${Math.random().toString(36).slice(2)}`;
 }
 
 /** Whether two ops address the same reconciliation target (so `b` supersedes `a`). */

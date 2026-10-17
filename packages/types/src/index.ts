@@ -949,6 +949,21 @@ export interface ChapterSource {
  *  more sources (S2). Deduped by number; `sources` keeps per-source availability
  *  so the reader can pick which translator/source to read it from. */
 export interface AggregatedChapter {
+	/**
+	 * The work's chapter-list entry this row is, or null/absent while the work's list is not
+	 * built (or the API predates entries). OPTIONAL: opportunistically selected
+	 * (`OPTIONAL_SERIES_FIELDS`). When present, join copies by it, never by number.
+	 */
+	entryId?: string | null;
+	/**
+	 * The entry's 1-based position in the work's chapter list (equal values are one entry).
+	 * Sort by it when present. Positions shift when entries are added, so compare only
+	 * values from the same response.
+	 */
+	entryOrder?: number | null;
+	/** Whether the entry is a special (not marked read by finishing a later chapter);
+	 *  null/absent while the list is not built. */
+	special?: boolean | null;
 	number: number;
 	/** What to print (`"45"`, `"10.5"`, `"Oneshot"`). Optional only because older documents
 	 *  did not select it; the server has always provided it. */
@@ -993,6 +1008,12 @@ export interface AggregatedChapter {
 
 export interface Chapter {
 	id: Id;
+	/** The work's chapter-list entry this copy is linked to; null/absent while the list is
+	 *  not built (or the API predates entries). See {@link AggregatedChapter.entryId}. */
+	entryId?: string | null;
+	/** The entry's 1-based position in the work's chapter list. See
+	 *  {@link AggregatedChapter.entryOrder}. */
+	entryOrder?: number | null;
 	seriesId: Id;
 	/**
 	 * Chapter number as a float (supports 10.5 interludes), or `0` when the chapter has
@@ -1054,6 +1075,42 @@ export interface SeriesPageBundle {
 	sources: SeriesPageSourceEntry[];
 	/** Cross-source aggregation; present only when requested (`withAggregated`). */
 	aggregated?: AggregatedChapter[];
+	/**
+	 * The viewer's progress row for this work: the base revision every progress save must
+	 * send, and the entry the viewer has read through. Null when anonymous or the series
+	 * has no work; absent on an API that predates revisioned progress (nested optional).
+	 */
+	viewerProgress?: ViewerProgress | null;
+}
+
+/** The viewer's progress on one work (`viewerProgress`). */
+export interface ViewerProgress {
+	/** Grows by one on every accepted change; a save must send the one it last saw. */
+	revision: number;
+	/** The chapter-list entry the viewer has read through, or null. */
+	throughEntryId: string | null;
+}
+
+/**
+ * How the server took a revisioned progress save. `APPLIED`: the save is in.
+ * `PAGE_ONLY`: the base revision was stale, so only the forward page step was kept.
+ * `REFUSED`: stale and not a forward page step, so nothing changed. `MOVED`: the copy now
+ * belongs to another work (`workId`); nothing changed.
+ */
+export type ProgressStatus = 'APPLIED' | 'PAGE_ONLY' | 'REFUSED' | 'MOVED';
+
+export interface ProgressResult {
+	status: ProgressStatus;
+	/** The work's current revision (a new base only after `APPLIED`). */
+	revision: number;
+	/** The work the copy belongs to now; null for a copy with no work. */
+	workId: string | null;
+}
+
+/** `chapterWork(chapterId)`: the work and entry a chapter copy belongs to now. */
+export interface ChapterWork {
+	workId: string;
+	entryId: string | null;
 }
 
 /**

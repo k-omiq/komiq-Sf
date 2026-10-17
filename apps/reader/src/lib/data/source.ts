@@ -14,6 +14,7 @@ import type {
 	ComicType as DomainComicType,
 	DiscoveryFeed,
 	Page,
+	ProgressResult,
 	Report,
 	ReportInput,
 	Series,
@@ -22,8 +23,10 @@ import type {
 	TagInfo,
 	Translator,
 	UpdateFeedRow,
+	ViewerProgress,
 	WorkSource,
 } from '@komika/types';
+import { writable } from 'svelte/store';
 // The two Browse enums are wire vocabulary with no reader-side equivalent (there is no
 // "sort" or "content rating" in the view model), so they travel as the API's own tokens
 // rather than being mirrored into a view type that would only ever be mapped 1:1.
@@ -759,6 +762,7 @@ interface ResolvedWork {
 	 * legacy fan-out path — the caller then fetches `aggregatedChapters` itself.
 	 */
 	aggregated?: AggregatedChapter[];
+	viewerProgress?: ViewerProgress | null;
 }
 
 /**
@@ -1034,6 +1038,7 @@ async function resolveWork(
 			sourceId: mappingOf(wsList, c.view.suwayomiMangaId)?.sourceId ?? null,
 		})),
 		aggregated,
+		viewerProgress: bundle?.viewerProgress,
 	};
 }
 
@@ -1762,7 +1767,9 @@ export function getLibrary() {
 
 export interface SeriesChapterView {
 	id?: string;
+	entryId?: string | null;
 	n: number;
+	entryOrder?: number | null;
 	title: string;
 	/**
 	 * The chapter's RELEASE time, already formatted as natural English ("3 hours
@@ -1782,6 +1789,7 @@ export interface SeriesChapterView {
 	 */
 	foundDate: string;
 	isNew: boolean;
+	special: boolean;
 	read: boolean;
 	/** The Suwayomi manga id of the source that the WHOLE row opens (the reader's
 	 *  sensible default: the preferred translator when it carries the chapter, else
@@ -1955,6 +1963,7 @@ export interface RelatedView {
 export interface SeriesView {
 	detail: SeriesDetailView;
 	chapters: SeriesChapterView[];
+	viewerProgress?: ViewerProgress | null;
 	related: RelatedView[];
 	/** Available translators (sources) for this work; empty for single-source
 	 *  (numeric Suwayomi) series that have no per-source alternatives. */
@@ -2109,6 +2118,7 @@ function mapSeriesView(
 			date: chapterDateLabel(c.uploadedAt),
 			foundDate: chapterFoundLabel(c.foundAt, i >= asc.length - 3),
 			isNew: i >= asc.length - 3,
+			special: false,
 			read: c.read,
 			// Through the same validator the reader itself uses, so the badge and the
 			// hand-off agree: a `javascript:`/relative `externalUrl` is rejected by
@@ -2211,11 +2221,16 @@ function buildAggregatedChapters(
 	const selectedSourceId =
 		resolved.candidates.find((cand) => cand.suwayomiMangaId === selectedSuw)?.sourceId ?? null;
 	// The selected translator's OWN chapters are guaranteed readable (they came from
-	// `chapters(selectedSuw)` / the mirror). Index them by number so an aggregated
-	// chapter the translator also carries is read from IT (its real id + date +
-	// read-state), sidestepping any drift between the aggregation and a source's
-	// live `chapters()`.
-	const readable = new Map(resolved.chapters.map((c) => [c.number, c]));
+	// `chapters(selectedSuw)` / the mirror). Index them by entry when the list is ready,
+	// otherwise by number, so a chapter the translator also carries is read from IT
+	// (its real id + date + read-state), sidestepping any drift between the aggregation
+	// and a source's live `chapters()`.
+	const byEntry = agg.some((c) => c.entryId != null);
+	const readable = new Map<string | number, Chapter>(
+		byEntry
+			? resolved.chapters.filter((c) => c.entryId != null).map((c) => [c.entryId!, c])
+			: resolved.chapters.map((c) => [c.number, c]),
+	);
 	// Fallback source for numbers the selected translator lacks: any Suwayomi source
 	// (readable via `chapters()`), else the MangaDex mirror.
 	const pickSource = (sources: AggregatedChapter['sources']) =>
@@ -2230,9 +2245,17 @@ function buildAggregatedChapters(
 			new Map(candidate.chapters.map((chapter) => [chapter.id, chapter])),
 		]),
 	);
-	const asc = [...agg].sort((a, b) => a.number - b.number);
+	const asc = [...agg].sort((a, b) =>
+		byEntry
+			? (a.entryOrder ?? a.number) - (b.entryOrder ?? b.number) || a.number - b.number
+			: a.number - b.number,
+	);
 	return asc.map((c, i) => {
-		const own = readable.get(c.number);
+		const own = byEntry
+			? c.entryId != null
+				? readable.get(c.entryId)
+				: undefined
+			: readable.get(c.number);
 		const copies = copiesFor(c);
 		let id: string | undefined;
 		let src: string | null;
@@ -2305,12 +2328,15 @@ function buildAggregatedChapters(
 		return {
 			id,
 			n: c.number,
+			...(byEntry ? { entryId: c.entryId } : {}),
+			entryOrder: byEntry ? c.entryOrder : undefined,
 			title: c.title || `Chapter ${c.number}`,
 			date,
 			foundDate,
-			// "New" = the highest-numbered chapters (shown first when sorted newest), and
+			// "New" = the last chapters in reading order (shown first when sorted newest), and
 			// the "newest" half of the Found eligibility union — see `chapterFoundLabel`.
 			isNew: i >= asc.length - 3,
+			special: c.special === true,
 			read,
 			src,
 			sources,
@@ -2410,6 +2436,7 @@ export async function getSeries(id: string, fetch?: LoadFetch): Promise<SeriesRe
 				},
 				resolved.canonSeries,
 			);
+			if (resolved.viewerProgress !== undefined) view.viewerProgress = resolved.viewerProgress;
 			// THE CROSS-SOURCE UNION OWNS THE CHAPTER LIST. The series page has no
 			// per-source re-listing any more: one row per chapter number across ALL
 			// sources, each row opening its sensible default source (the preferred
@@ -2432,7 +2459,12 @@ export async function getSeries(id: string, fetch?: LoadFetch): Promise<SeriesRe
 				const rows = buildAggregatedChapters(agg, resolved);
 				view.chapters = rows;
 				view.detail.totalCh = rows.length;
-				const firstUnread = rows.find((c) => !c.read) ?? rows[0];
+				const through = resolved.viewerProgress?.throughEntryId;
+				const throughIndex = through ? rows.findIndex((c) => c.entryId === through) : -1;
+				const firstUnread =
+					(throughIndex >= 0 ? rows.slice(throughIndex + 1).find((c) => !c.read) : undefined) ??
+					rows.find((c) => !c.read) ??
+					rows[0];
 				view.detail.continueCh = firstUnread?.n ?? 1;
 				view.detail.startChapterId = firstUnread?.id;
 				view.detail.startChapterSrc = firstUnread?.src ?? null;
@@ -2696,6 +2728,7 @@ export async function saveProgress(
 	chapterId: string | undefined,
 	lastPageRead: number,
 	read: boolean,
+	workId?: string,
 ): Promise<void> {
 	if (!LIVE || !chapterId) return;
 	const scope = currentReaderScope();
@@ -2703,8 +2736,16 @@ export async function saveProgress(
 	// the server routes on id shape (canonical → `canonical_progress`) (CR6). The
 	// non-empty guard above is the only shape check the client needs.
 	try {
-		await backend.setProgress(chapterId, lastPageRead, read);
-		if (read && scope === currentReaderScope()) markCachedChapterRead(chapterId);
+		let result: ProgressResult | null = null;
+		if (backend.saveProgress && workId) {
+			result = await backend.saveProgress({ chapterId, workId, lastPageRead, read });
+		} else {
+			await backend.setProgress(chapterId, lastPageRead, read);
+		}
+		if (result && result.status !== 'APPLIED' && result.status !== 'PAGE_ONLY') return;
+		if (read && result?.status !== 'PAGE_ONLY' && scope === currentReaderScope()) {
+			markCachedChapterRead(chapterId);
+		}
 		await refreshLibraryIfShown();
 	} catch (err) {
 		console.warn('[komika] setProgress failed:', err);
@@ -2726,11 +2767,21 @@ export async function saveProgress(
  * would mark every earlier chapter read behind a click on one row, a change the list
  * would not show until reload.
  */
-export async function setChapterRead(chapterId: string, read: boolean): Promise<boolean> {
+export async function setChapterRead(
+	chapterId: string,
+	read: boolean,
+	workId?: string,
+): Promise<boolean> {
 	if (!LIVE || !chapterId) return false;
 	const scope = currentReaderScope();
 	try {
-		const done = (await backend.setChapterRead?.(chapterId, read)) ?? false;
+		let done: boolean;
+		if (backend.saveChapterRead && workId) {
+			const result = await backend.saveChapterRead({ chapterId, workId, read });
+			done = result === null || result.status === 'APPLIED';
+		} else {
+			done = (await backend.setChapterRead?.(chapterId, read)) ?? false;
+		}
 		if (!done) return false;
 		if (scope === currentReaderScope()) {
 			// Read state folds across sibling source copies on the server. Refetch the
@@ -2787,6 +2838,7 @@ export interface ReaderChapterRef {
 	 *  the chapter list can BADGE it — a reader shouldn't have to click to find out that
 	 *  a chapter opens somewhere else. Validated, so it is safe to put in an `href`. */
 	externalUrl?: string | null;
+	special?: boolean;
 }
 export interface ReaderView {
 	/** Viewer/backend generation under which this result was fetched, including preloads. */
@@ -2798,6 +2850,8 @@ export interface ReaderView {
 	seriesId: string;
 	seriesTitle: string;
 	chapterId?: string;
+	/** A missing copy can still be followed after an administrator moves it to another work. */
+	movedTo?: { workId: string; chapterId: string };
 	chNum: number;
 	chTitle: string;
 	pages: ReaderPageView[];
@@ -3043,6 +3097,7 @@ function buildReaderView(
 				title: c.title || `Chapter ${c.number}`,
 				src: m ? m.src : readingSrc,
 				externalUrl: chapterExternalUrl(c),
+				special: m?.special === true,
 			};
 		}),
 		prevChapterId: prev?.id,
@@ -3081,6 +3136,8 @@ function chapterFromCopy(
 		id: copy.chapterId,
 		seriesId,
 		number: agg.number,
+		entryId: agg.entryId,
+		entryOrder: agg.entryOrder,
 		label: agg.label ?? sibling?.label ?? String(agg.number),
 		externalUrl: copy.copyExternalUrl ?? null,
 		title: agg.title ?? sibling?.title ?? null,
@@ -3191,6 +3248,7 @@ interface PoolCopyMeta {
 	tier: number;
 	/** In its source's own list, as opposed to known to the aggregation only. */
 	listed: boolean;
+	special: boolean;
 }
 
 /**
@@ -3229,12 +3287,15 @@ function readerCopyPool(
 	}
 	const pool: Chapter[] = [];
 	const copyMeta = new Map<string, PoolCopyMeta>();
+	const special = new Set(
+		agg.filter((c) => c.special === true).flatMap((c) => c.sources.map((s) => s.chapterId)),
+	);
 	for (const { chapters, src, redundant } of sources) {
 		const tier = src === defaultSrc ? 0 : src === readingSrc ? 1 : redundant ? 3 : 2;
 		const listed = new Set(chapters.map((c) => c.id));
 		for (const c of copyPool(seriesId, agg, chapters, src)) {
 			if (copyMeta.has(c.id)) continue;
-			copyMeta.set(c.id, { src, tier, listed: listed.has(c.id) });
+			copyMeta.set(c.id, { src, tier, listed: listed.has(c.id), special: special.has(c.id) });
 			pool.push(c);
 		}
 	}
@@ -3358,6 +3419,18 @@ let readerWorkScope = '';
 export function clearReaderWorkCache(): void {
 	readerWorkCache.clear();
 	viewerCache.readerGeneration += 1;
+}
+
+/** A conflict invalidates optimistic list changes only for the work the save addressed. */
+export const workProgressGeneration = writable<Record<string, number>>({});
+
+export function dropWorkProgressState(workId: string): void {
+	workProgressGeneration.update((generations) => ({
+		...generations,
+		[workId]: (generations[workId] ?? 0) + 1,
+	}));
+	clearReaderWorkCache();
+	viewerCacheChanged();
 }
 
 /** Reflect a just-saved "read" in the memoized lists, so reopening that chapter within the
@@ -3601,6 +3674,16 @@ function loadReaderChapter(
 					// Genuinely unknown to every source — stay honest and render empty.
 					if (!hit || !spineCopy || !spineCand) {
 						const empty = emptyReader(effectiveId, tmeta);
+						if (!hit && backend.chapterWork) {
+							const owner = await backend.chapterWork(chParam).catch(() => null);
+							if (owner && owner.workId !== effectiveId && owner.workId !== seriesId) {
+								return {
+									...empty,
+									seriesTitle: resolved.meta?.title ?? '',
+									movedTo: { workId: owner.workId, chapterId: chParam },
+								};
+							}
+						}
 						return { ...empty, seriesTitle: resolved.meta?.title ?? '' };
 					}
 					const provisional = chapterFromCopy(effectiveId, hit.agg, spineCopy, undefined);
@@ -3625,6 +3708,18 @@ function loadReaderChapter(
 			}
 			const asc = sortChaptersAsc(activeChs);
 			const chosen: Chapter = target ?? asc.find((c) => !c.read) ?? asc[0];
+			// A `src` outside this work's mappings may belong to a work it was split into
+			// since the link was made; reading it here would save progress under this work.
+			if (chosen && activeChs === chs && readFromSrc && !cachedSrcChapters && backend.chapterWork) {
+				const owner = await backend.chapterWork(chosen.id).catch(() => null);
+				if (owner && owner.workId !== effectiveId && owner.workId !== seriesId) {
+					return {
+						...emptyReader(effectiveId, tmeta),
+						seriesTitle: resolved.meta?.title ?? '',
+						movedTo: { workId: owner.workId, chapterId: chosen.id },
+					};
+				}
+			}
 			// The page fetch must NOT be able to blank the reader. It used to run bare here,
 			// so one rejection — a dead Suwayomi engine answering `pages` with "Internal
 			// error", a MangaDex upload taken down upstream — escaped to `live()`, which

@@ -32,6 +32,7 @@ type Query {
 	aggregatedChapters(workId: ID!): [AggregatedChapter!]! # [komika] S2: a canonical work's chapters aggregated across ALL sources (installed Suwayomi sources + MangaDex mirror), deduped by number, each carrying per-source availability so the reader can pick a translator
 	pages(chapterId: ID!): [Page!]! # [suwayomi] fetchChapterPages -> normalized pages
 	chapterOrigin(chapterId: ID!): ChapterOrigin # [komika] where a Suwayomi chapter lives at its source, for a reader app that fetches pages with its own engine; null when unknown; NSFW-gated like pages
+	chapterWork(chapterId: ID!): ChapterWork # [komika] the work and entry a copy belongs to now; null for an unknown chapter or a copy without a work
 	mediaRoutes: [MediaRoute!]! # [komika] M5 typed media origins, the same for every viewer; clients intersect with their build-time allowlist; a server cannot add a host to a hosted reader
 	canonicalUpdates(page: Int = 1, includeNsfw: Boolean): [CanonicalUpdate!]! # [komika] MangaDex mirror updates, newest chapter first, NSFW-filtered (data feed). `includeNsfw` is the same admin-console-only escape hatch as on `search` — honoured for admins, ignored for everyone else
 	updatesFeed(page: Int = 1, type: ComicType): UpdateFeedPage! # [komika] the reader's merged Updates feed: the union of `updates` (scanner detections on Suwayomi library series) and `canonicalUpdates` (the MangaDex mirror), taken server-side and keyed by canonical work, newest REAL upstream release first. Supersedes merging page 1 of each in the client, which could not be paginated — a page of the merged list is not page N of either feed, and the client-side title dedupe left short pages that made `total`/`hasNextPage` wrong. `type` filters by format over the WHOLE feed; NSFW-gated by the viewer's own preference (no admin escape hatch — this is a reader surface)
@@ -40,6 +41,7 @@ type Query {
 	# shared Series/Chapter/Page shapes; NSFW-gated by the viewer's preference. CATALOGUE.md §6.
 	canonicalSeries(workId: ID!, includeFederated: Boolean = false): Series! # [komika] a work as a Series; a work with no MangaDex anchor only with includeFederated (then sourceId is "")
 	canonicalChapters(workId: ID!): [Chapter!]! # [komika] its chapters from the mirror, deduped/ordered
+	seriesPage(workId: ID!, includeFederated: Boolean = false): SeriesPageBundle! # [komika] the series, spine and every source's chapters in one request; workId follows merge redirects
 	canonicalPages(chapterId: ID!): [Page!]! # [komika] page URLs via MangaDex@Home (chapterId = MangaDex chapter uuid)
 	# native-embedded-Suwayomi source routing — per canonical work, the source
 	# mappings + extension coordinates a native client needs to fetch it directly.
@@ -50,6 +52,7 @@ type Query {
 	# library
 	library: [Series!]! # [suwayomi] mangas(condition:{inLibrary:true})
 	libraryProgress: [SeriesProgress!]! # [komika] per-series read/total for every in-library series, batched — shelves the Library/Profile screens without an N+1 chapters() fan-out
+	viewerProgress(workId: ID!): ViewerProgress # [komika] the viewer's revision and read-through entry; workId accepts any of the work's ids; null when anonymous or the work is unknown
 	# social
 	reviews(seriesId: ID!, page: Int = 1): ReviewPage! # [komika] the WORK's reviews, whichever of its ids you ask with (a `w_…` work id or any of its sources' numeric ids). ONE ROW PER AUTHOR — a reader holding a row under each id shape appears once, with their newest
 	myReview(seriesId: ID!): Review # [komika] the signed-in viewer's own review for a series, regardless of pagination (null if none / signed out). Resolved through the WORK, so it is found whichever of the work's ids the caller asks with — asking with the literal id showed a viewer who HAD rated an empty star row
@@ -89,6 +92,7 @@ type Query {
 	sourceIngestJobs(active: Boolean = false): [SourceIngestJob!]! # [komika] "add all from source" ingest jobs, newest first; active:true for only running ones — poll for progress (requires isAdmin)
 	seriesAdminMeta(seriesId: ID!): SeriesAdminMeta! # [komika] raw metadata-override state of a series' canonical work (pinned title/description/type/NSFW + curated tags) for the series-detail editor (requires isAdmin)
 	workChaptersAdmin(workId: ID!): [AdminChapter!]! # [komika] a work's aggregated chapters WITH override state (hidden/renamed), unfiltered, for the series-detail editor (requires isAdmin)
+	workChapterList(workId: ID!): WorkChapterList! # [komika] the work's chapter-list entries and linked copies, including hidden entries and entries without copies (requires isAdmin)
 }
 
 type Mutation {
@@ -96,6 +100,9 @@ type Mutation {
 	setLibraryStatus(seriesId: ID!, status: String, numericEpoch: Int): Series! # [komika] file a series under an explicit shelf (reading|completed|onhold|plan); null clears to auto-derive; adds to library if absent; numericEpoch as for mark
 	setFavorite(seriesId: ID!, favorite: Boolean!, numericEpoch: Int): Series! # [komika] toggle the viewer's favourite flag; adds to library if absent; numericEpoch as for mark
 	setProgress(chapterId: ID!, lastPageRead: Int!, read: Boolean!, numericEpoch: Int): Boolean! # [suwayomi] updateChapter. `numericEpoch` (M5): the `numericEpoch` the reader read for a numeric chapter id; a stale one is refused with code STALE_NUMERIC_EPOCH, and none at all is refused for 30 days after an engine generation change
+	setChapterRead(chapterId: ID!, read: Boolean!, numericEpoch: Int): Boolean! # [komika] set exactly one chapter's read state; unread clears every copy, without a catch-up cascade
+	saveProgress(chapterId: ID!, workId: ID, lastPageRead: Int!, read: Boolean!, numericEpoch: Int, revision: Int!): ProgressResult! # [komika] revisioned progress; send workId even for numeric series ids; numericEpoch has the same fence as setProgress
+	saveChapterRead(chapterId: ID!, workId: ID, read: Boolean!, numericEpoch: Int, revision: Int!): ProgressResult! # [komika] revisioned single-chapter tick/untick, with the same work and epoch checks as saveProgress
 	startNewEngineGeneration(generationId: ID!): [EngineGeneration!]! # [komika] admin — give up the quarantined engine data (generationId: the quarantined generation shown; anything else is refused): numeric progress, comment threads and numeric library/review/admin rows without a work set aside (rows with a work move to it), Suwayomi series removed for re-enrolment, numericEpoch bumped (requires isAdmin)
 	recordView(seriesId: ID!): Boolean! # [komika] record one view (chapter open) — no auth REQUIRED, counts anonymous + ordinary signed-in readers; an admin viewer's own reads are silently skipped so admin browsing can't move Trending; the popularity signal behind Trending
 	postReview(input: PostReviewInput!): Review! # [komika] upsert the viewer's review, one per (work, user). `seriesId` may be any of the work's ids; the row is FILED under the canonical work id so the rating counts on every surface that work appears on. `score` is 1..10 — to withdraw a rating use `deleteReview`, not score 0
@@ -150,6 +157,9 @@ type Mutation {
 	updateSeriesMetadata(input: SeriesMetadataInput!): Series! # [komika] admin series-detail editor — edit a work's title/description/type/NSFW/tags as an override layer (source data stays immutable); returns the recomputed series (requires isAdmin)
 	rescanWork(workId: ID!): Int! # [komika] admin — force an immediate re-scan of EVERY installed Suwayomi source of a canonical work; returns how many sources were scanned (requires isAdmin)
 	setChapterOverride(input: ChapterOverrideInput!): Boolean! # [komika] admin series-detail editor — soft-hide (reversible) or rename one chapter of a work by aggregate number; non-destructive (requires isAdmin)
+	setWorkChapter(entryId: ID!, hidden: Boolean, titleOverride: String, clearTitle: Boolean, special: Boolean, sortKey: Float): WorkChapterEntry! # [komika] edit one work-list entry; omitted arguments stay unchanged, clearTitle removes the title override, and sortKey must be finite within -1000000..1000000 (requires isAdmin)
+	linkChapterCopy(chapterId: ID!, entryId: ID): Boolean! # [komika] relink a copy to an entry; null entryId gives it a new entry of its own (requires isAdmin)
+	mergeWorkChapters(keepId: ID!, dropId: ID!): Boolean! # [komika] move the dropped entry's copies into the kept entry (requires isAdmin)
 	addSeriesAltTitle(id: ID!, title: String!): Series! # [komika] admin series-detail editor — add an alternative title to a work's alias index. May trigger an auto-merge of works sharing the normalized alias and at least 90% similar author names (≤8 of them) into the richest survivor, so the returned Series can be a DIFFERENT work than the one edited (requires isAdmin)
 	removeSeriesAltTitle(id: ID!, title: String!): Series! # [komika] admin series-detail editor — drop one alternative title from a work's alias index (requires isAdmin)
 	consolidateExactDuplicates(limit: Int = 100): DuplicateSweepResult! # [komika] admin duplicate sweep, one resumable batch: sorts up to `limit` waiting reviews, then up to `limit` groups of works sharing a title or alt title (articles ignored). Each pair is merged on evidence, closed as two different works, or left in mergeQueue with a score. `done` marks the end of a run. Single-flighted against reconcileCatalogue (requires isAdmin)
@@ -500,6 +510,11 @@ type ScanPolicy {
 type Chapter {
 	id: ID!
 	seriesId: ID!
+	# These work-list fields are null while the work's list is not ready.
+	entryId: ID
+	# A 1-based rank within this response's work list. Equal ranks mean the same entry;
+	# compare only within one response, because edits can change the order.
+	entryOrder: Int
 	# The chapter's number, or 0 when it has none. PREFER `label`: a oneshot arrives here
 	# as a hard-coded 0 with no way to tell it from a real Chapter 0, which is why the
 	# reader printed "Chapter 0" for 21,422 works (F2).
@@ -540,6 +555,46 @@ type SeriesProgress {
 	lastReadAt: String # RFC 3339, or null. MAX(updated_at) over the viewer's progress rows, so it
 	# moves on ANY progress, not just finishing a chapter. Orders the Profile's
 	# Continue-reading shelf and the Library's "Recently read" sort.
+}
+
+# Only APPLIED advances the caller's base revision. A stale unread save can keep a
+# higher page on the same copy without changing the work's revision (PAGE_ONLY).
+enum ProgressStatus {
+	APPLIED
+	PAGE_ONLY
+	REFUSED
+	MOVED
+}
+
+type ProgressResult {
+	status: ProgressStatus!
+	revision: Int! # current work revision; APPLIED increments it, or returns 0 for a copy without a work
+	workId: ID # the copy's current work; MOVED means the supplied work no longer matches
+}
+
+type ViewerProgress {
+	revision: Int!
+	throughEntryId: ID # the entry the viewer has read through, or null
+}
+
+type ChapterWork {
+	workId: ID!
+	entryId: ID
+}
+
+type SeriesPageBundle {
+	workId: ID! # effective work id after redirects
+	series: Series # null for a federation-only work
+	spineChapters: [Chapter!]!
+	sources: [SeriesPageSourceEntry!]!
+	aggregated: [AggregatedChapter!] # resolved only when selected; nullable so failure leaves the rest of the bundle usable
+	viewerProgress: ViewerProgress # null when anonymous; older servers omit this optional nested selection
+}
+
+type SeriesPageSourceEntry {
+	source: WorkSource!
+	chapters: [Chapter!]!
+	series: Series
 }
 
 # Upstream image URL; never used directly as <img src> — the client's
@@ -897,6 +952,43 @@ input ChapterOverrideInput {
 	chapterKey: String! # from AdminChapter.key
 	hidden: Boolean
 	title: String
+}
+
+# [komika] The work's own chapter list for the admin editor. Readers use it only
+# when every copy is linked and ready is true; otherwise they keep the old aggregates.
+type WorkChapterList {
+	workId: ID!
+	ready: Boolean!
+	entries: [WorkChapterEntry!]! # ordered by sortKey, then id
+}
+
+# [komika] One work-list entry, including hidden entries and entries without copies.
+type WorkChapterEntry {
+	id: ID!
+	matchKey: String
+	sortKey: Float!
+	sortKeyText: String! # the exact stored numeric text, without floating-point rounding
+	number: String
+	label: String
+	special: Boolean!
+	specialBy: String # "matcher" or "admin", or null when unset
+	hidden: Boolean!
+	titleOverride: String
+	copies: [WorkChapterCopy!]!
+}
+
+# [komika] One source chapter linked to an entry; its source-owned metadata stays intact.
+type WorkChapterCopy {
+	chapterId: ID!
+	sourceSeriesId: ID!
+	sourceType: String!
+	sourceId: String
+	number: String
+	title: String
+	lang: String
+	scanlator: String
+	releasedAt: String
+	linkedBy: String! # "matcher" or "admin"
 }
 
 # [komika] Aggregate health of the adaptive scan scheduler (admin console).
@@ -1371,6 +1463,12 @@ type SplitSourcesResult {
 # work now reflects the AGGREGATE (distinct chapter numbers across all sources), so a
 # work whose MangaDex spine has 0 chapters but whose asurascans source has 201 reports 201.
 type AggregatedChapter {
+	# These three fields are null while the work's list is not ready, and rows then
+	# remain the old number aggregates. Once ready, each row represents one entry.
+	entryId: ID
+	# A 1-based rank; equal ranks mean the same entry. Compare only within one response.
+	entryOrder: Int
+	special: Boolean
 	number: Float!
 	label: String! # what to print: "45", "10.5", "Oneshot" — the one server-side label rule (Phase A2)
 	title: String

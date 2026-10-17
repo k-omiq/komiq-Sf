@@ -860,6 +860,12 @@ impl ViewerProgress {
 }
 
 #[derive(SimpleObject, Clone)]
+pub struct ChapterWork {
+    pub work_id: ID,
+    pub entry_id: Option<ID>,
+}
+
+#[derive(SimpleObject, Clone)]
 pub struct Chapter {
     /// The chapter-list entry this copy is linked to; null while the work's list is not built.
     pub entry_id: Option<ID>,

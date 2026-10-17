@@ -50,6 +50,9 @@ import type {
 	WorkSource,
 	WorkSourceGroup,
 	WorkSourceRow,
+	ChapterWork,
+	ProgressResult,
+	ViewerProgress,
 } from '@komika/types';
 
 /**
@@ -244,6 +247,24 @@ export interface Backend {
 	 * Optional: only the unified Komika API implements it.
 	 */
 	setChapterRead?(chapterId: Id, read: boolean): Promise<boolean>;
+	/**
+	 * Revisioned progress save (M9). `workId` is the reader's series id for the work
+	 * (`w_` or numeric); `revision` defaults to the base revision this backend knows for
+	 * the work (from `viewerProgress`, raised by every `APPLIED` answer). Resolves `null`
+	 * when the server predates it: the save then went through {@link setProgress}.
+	 * `REFUSED` and `MOVED` also raise {@link onProgressConflict}.
+	 */
+	saveProgress?(input: SaveProgressInput): Promise<ProgressResult | null>;
+	/** Revisioned single-chapter tick/untick; `null` = old server, went through
+	 *  {@link setChapterRead} (whose `false` then means "not done"). */
+	saveChapterRead?(input: SaveChapterReadInput): Promise<ProgressResult | null>;
+	/** The viewer's progress row for a work; `undefined` = the server predates it. */
+	viewerProgress?(workId: Id): Promise<ViewerProgress | null | undefined>;
+	/** The base revision this backend knows for a work, if any (no request). */
+	knownRevision?(workId: Id): number | undefined;
+	/** The work a chapter copy belongs to now; `undefined` = the server predates it,
+	 *  `null` = unknown chapter. */
+	chapterWork?(chapterId: Id): Promise<ChapterWork | null | undefined>;
 	/** Record one view (a chapter open) for a series — the popularity signal behind
 	 * Trending and the series-page view counts. No auth: anonymous reads count too.
 	 * Best-effort; callers ignore failures. Optional: only the unified Komika API
@@ -404,6 +425,16 @@ export interface Backend {
 	/** Soft-hide (reversible) or rename one chapter of a work by aggregate number;
 	 * non-destructive. Optional. */
 	setChapterOverride?(input: ChapterOverrideInput): Promise<boolean>;
+	/** The work's own chapter list (entries + linked copies) for the admin editor.
+	 * `undefined` = the server predates chapter lists (use {@link workChaptersAdmin}). */
+	workChapterList?(workId: Id): Promise<WorkChapterList | undefined>;
+	/** Edit one chapter-list entry; returns the entry as stored. */
+	setWorkChapter?(entryId: Id, edit: WorkChapterEdit): Promise<WorkChapterEntry>;
+	/** Admin: link a copy to another entry of its work, or (null) to a new entry of its
+	 *  own. Read state is kept by the server. */
+	linkChapterCopy?(chapterId: Id, entryId: Id | null): Promise<boolean>;
+	/** Admin: merge entry `dropId` into `keepId`. */
+	mergeWorkChapters?(keepId: Id, dropId: Id): Promise<boolean>;
 
 	// --- admin moderation (requires an admin session) ---
 	/** Suspend (`banned: true`) or restore a user account. Optional: only the
@@ -1346,6 +1377,79 @@ export interface AdminChapter {
 	effectiveTitle: string | null;
 	hidden: boolean;
 	sourceCount: number;
+}
+
+/** {@link Backend.saveProgress} input. */
+export interface SaveProgressInput {
+	chapterId: Id;
+	workId: Id;
+	lastPageRead: number;
+	read: boolean;
+	numericEpoch?: number | null;
+	/** Base revision; omitted = the known one (fetched with `viewerProgress` if none). */
+	revision?: number;
+}
+
+/** {@link Backend.saveChapterRead} input. */
+export interface SaveChapterReadInput {
+	chapterId: Id;
+	workId: Id;
+	read: boolean;
+	numericEpoch?: number | null;
+	revision?: number;
+}
+
+/** One copy (a source's chapter) linked to a {@link WorkChapterEntry}. */
+export interface WorkChapterCopy {
+	chapterId: Id;
+	sourceSeriesId: Id;
+	sourceType: string;
+	sourceId: string | null;
+	number: string | null;
+	title: string | null;
+	lang: string | null;
+	scanlator: string | null;
+	releasedAt: string | null;
+	/** `matcher` or `admin`. */
+	linkedBy: string;
+}
+
+/** One entry of a work's own chapter list (admin view: hidden entries and entries
+ *  without copies included). */
+export interface WorkChapterEntry {
+	id: Id;
+	matchKey: string | null;
+	/** List position key; entries sort by it ascending. */
+	sortKey: number;
+	/** The exact stored `sortKey` (numeric text). */
+	sortKeyText: string;
+	number: string | null;
+	label: string | null;
+	special: boolean;
+	/** Who set `special` (`matcher`, `admin`), or null. */
+	specialBy: string | null;
+	hidden: boolean;
+	titleOverride: string | null;
+	copies: WorkChapterCopy[];
+}
+
+/** `workChapterList(workId)`: the work's chapter list for the admin editor. */
+export interface WorkChapterList {
+	workId: Id;
+	/** Every copy of the work is linked; readers see the list only when true. */
+	ready: boolean;
+	entries: WorkChapterEntry[];
+}
+
+/** `setWorkChapter` patch. Omitted fields stay unchanged; `clearTitle` removes the
+ *  title override (the source title shows again). */
+export interface WorkChapterEdit {
+	hidden?: boolean;
+	titleOverride?: string;
+	clearTitle?: boolean;
+	special?: boolean;
+	/** Finite, within -1000000..1000000. */
+	sortKey?: number;
 }
 
 /** Admin edit to one chapter (soft-hide / rename). Three-valued optionals. */

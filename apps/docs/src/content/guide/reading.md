@@ -9,11 +9,14 @@ Use the reader app to read chapters available through the server it is connected
 
 You can open a chapter from any series page.
 
-- The reading button opens the first unread chapter of a series, or the first chapter if all chapters are read. It reads Start reading, or Continue Ch. followed by the chapter number when you have read chapters or that number is greater than 1.
-- Browse the chapter list under the Chapters tab. Each row shows the chapter number, with a title, release date, and group or source when available. Click any row to open that chapter.
+- The reading button opens the first unread chapter after the chapter you have read through. If none remains after that point, it opens the first unread chapter in the list, or the first chapter if all are read. It reads Start reading, or Continue Ch. followed by the chapter number when you have read chapters or that number is greater than 1.
+- Browse the chapter list under the Chapters tab. The list follows the series' own chapter order, reversed when you sort newest first. Each row shows the chapter number, with a title, release date, and group or source when available. Click any row to open that chapter.
+- A SPECIAL badge marks special chapters.
 - When a chapter has more than one version, its row shows a button with a count, such as +1. Click the button to list every version of that chapter, then click a version to open that exact copy.
 
 Some chapters are hosted directly by external publishers. These chapters display an OFF-SITE badge in the chapter list. When you open an off-site chapter, komiq displays a message explaining that the publisher hosts the pages, along with a link to read the chapter on the publisher's website.
+
+If an administrator moves a chapter to another series, a link to that chapter opens it in its new series on current apps and servers. Older apps show an empty reader.
 
 ## Reading modes
 
@@ -69,6 +72,8 @@ Moving past chapter boundaries opens adjacent chapters:
 To reduce pauses between chapters, komiq prefetches the next chapter once you reach 40 percent of your current chapter, or whenever you move your pointer over a next chapter button.
 
 When you are signed in to the connected server, reading progress is saved to your account automatically when you finish a chapter, click to another chapter, switch browser tabs, or navigate away from the reader. Finishing a chapter also marks the chapters before it in the series' chapter list as read, on every source, except the ones you marked unread yourself. This includes chapters a source adds later. Special chapters, such as extras and side stories, are never marked read this way; you read or tick them yourself. While the server is still building a series' chapter list, finishing a chapter marks the earlier chapters of that source only. For more details on tracking your reading history, see [Library](/guide/library).
+
+If another device has moved your progress on, a save from your app's older view keeps the newer read state. The server can keep only a forward page step on the same chapter, if the save does not mark it finished. When the server refuses a save or reports that the chapter moved to another series, the app reloads the series to show its current state.
 
 ## Pick a source
 

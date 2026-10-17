@@ -24,6 +24,7 @@
 		getSeriesNsfwOverride,
 		setSeriesNsfw,
 		setChapterRead,
+		workProgressGeneration,
 	} from '$lib/data/source';
 	import { backend, images } from '$lib/context';
 	import { apiOrigin, config } from '$lib/config';
@@ -181,11 +182,13 @@
 	// the toggle exists only for a signed-in reader; signed out, the mark stays a static
 	// indicator. Optimistic: the override paints at once and is dropped again if the write
 	// fails, so the mark never claims a state the server did not take. Keyed by chapter id
-	// and cleared when the series changes — `view.chapters` is the truth after a reload.
+	// and cleared on a series change or progress conflict, since a reload carries the truth.
 	let readOverride = $state<Record<string, boolean>>({});
 	let readPending = $state<Record<string, boolean>>({});
+	const readGeneration = $derived($workProgressGeneration[seriesId] ?? 0);
 	$effect(() => {
 		void seriesId;
+		void readGeneration;
 		readOverride = {};
 		readPending = {};
 	});
@@ -201,9 +204,13 @@
 		// not fall back to it.
 		const previous = isChapterRead(c);
 		const next = !previous;
+		const workId = seriesId;
+		const generation = $workProgressGeneration[workId] ?? 0;
 		readOverride = { ...readOverride, [id]: next };
 		readPending = { ...readPending, [id]: true };
-		const ok = await setChapterRead(id, next);
+		const ok = await setChapterRead(id, next, workId);
+		// A conflict or navigation discarded this click's optimistic state while it saved.
+		if (seriesId !== workId || ($workProgressGeneration[workId] ?? 0) !== generation) return;
 		const { [id]: _done, ...rest } = readPending;
 		readPending = rest;
 		if (!ok) readOverride = { ...readOverride, [id]: previous };
@@ -456,10 +463,9 @@
 
 	const chapters = $derived.by(() => {
 		const chs = view?.chapters ?? [];
-		// The data layer delivers chapters ascending (oldest → newest), but sort
-		// explicitly by chapter number so display order never depends on a source's
-		// arrival order (some sources return newest-first). "Newest" = descending.
-		const asc = [...chs].sort((a, b) => a.n - b.n);
+		// Entry ranks preserve the work's reading order; older lists keep their number
+		// order regardless of a source's arrival order. "Newest" = descending.
+		const asc = [...chs].sort((a, b) => (a.entryOrder ?? a.n) - (b.entryOrder ?? b.n) || a.n - b.n);
 		return sort === 'newest' ? asc.reverse() : asc;
 	});
 
@@ -1523,6 +1529,11 @@
 												>{c.title}</span
 											>{/if}
 										{#if c.isNew}<span class="new">NEW</span>{/if}
+										{#if c.special}<span
+												class="special"
+												title="Special chapter: finishing a later chapter does not mark it read"
+												>SPECIAL</span
+											>{/if}
 										<!-- Off-site chapters (~35,000: MangaPlus, Comikey, NamiComi,
 									     BiliBili) have no pages for us to serve — badged here so
 									     the reader knows before tapping. -->
@@ -2576,15 +2587,22 @@
 	.read .ch-name {
 		color: var(--k-text-faint);
 	}
-	.new {
+	.new,
+	.special {
 		flex: 0 0 auto;
 		font-size: 9.5px;
 		font-weight: 800;
 		letter-spacing: 0.06em;
 		padding: 2px 6px;
 		border-radius: 4px;
+	}
+	.new {
 		background: var(--k-accent);
 		color: #fff;
+	}
+	.special {
+		background: var(--k-surface-4);
+		color: var(--k-text-dim);
 	}
 	.ext {
 		flex: 0 0 auto;

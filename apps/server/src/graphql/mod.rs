@@ -5,6 +5,9 @@ mod block_tests;
 #[cfg(test)]
 mod cache_refresh_tests;
 #[cfg(test)]
+#[path = "chapter_work_tests.rs"]
+mod chapter_work_tests;
+#[cfg(test)]
 mod postgres_golden_tests;
 #[cfg(test)]
 #[path = "progress_w3b_tests.rs"]
@@ -6217,11 +6220,82 @@ impl QueryRoot {
             return Ok(None);
         };
         let st = state(ctx);
-        let Some(work) = load_work_following_redirect(&st.pool, &work_id.0).await? else {
+        // Saves accept a numeric series id too, so the base revision must resolve it the same way.
+        let identity = if work_id.0.starts_with("w_") {
+            work_id.0
+        } else {
+            let mut conn = st.pool.acquire().await.map_err(gql_read_err)?;
+            resolve_library_identity_on(&mut conn, &work_id.0)
+                .await
+                .map_err(gql_read_err)?
+        };
+        let Some(work) = load_work_following_redirect(&st.pool, &identity).await? else {
             return Ok(None);
         };
         let read_state = progress::work_read_state(&st.pool, Some(&user.id), &work.work_id).await;
         Ok(ViewerProgress::from_state(&read_state))
+    }
+
+    /// Resolve a copy's current work so chapter URLs survive source splits and merges.
+    async fn chapter_work(&self, ctx: &Context<'_>, chapter_id: ID) -> Result<Option<ChapterWork>> {
+        let id = chapter_id.0;
+        if id.is_empty() {
+            return Ok(None);
+        }
+        let numeric = id.bytes().all(|b| b.is_ascii_digit());
+        let engine_id = if numeric {
+            let Ok(id) = id.parse::<i64>() else {
+                return Ok(None);
+            };
+            Some(id)
+        } else {
+            None
+        };
+        // Keep the engine's series constraint and mirror-first fallback aligned with
+        // progress_copy_on so stale mirrors cannot send a copy to its former work.
+        // Merge redirects are collapsed on write, so one hop matches
+        // load_work_following_redirect without loading the work's metadata.
+        let owner: Option<(String, Option<String>, bool)> = sqlx::query_as(
+            "WITH engine AS ( \
+                 SELECT manga_id::text AS series_id FROM suwayomi_chapter WHERE id = $3 \
+             ), spine AS ( \
+                 SELECT ss.work_id, l.work_chapter_id AS entry_id \
+                   FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
+                   LEFT JOIN work_chapter_link l ON l.chapter_id = c.id \
+                  WHERE c.external_id = $1 AND ss.source_type = $2 \
+                    AND (NOT EXISTS (SELECT 1 FROM engine) \
+                         OR ss.source_key = (SELECT series_id FROM engine)) \
+                  ORDER BY ss.id, c.id LIMIT 1 \
+             ), owner AS ( \
+                 SELECT work_id, entry_id FROM spine \
+                 UNION ALL \
+                 (SELECT ss.work_id, NULL::text FROM engine e \
+                    JOIN source_series ss ON ss.source_type = 'suwayomi' \
+                                         AND ss.source_key = e.series_id \
+                   WHERE NOT EXISTS (SELECT 1 FROM spine) \
+                   ORDER BY ss.id LIMIT 1) \
+             ) \
+             SELECT w.id, o.entry_id, COALESCE(w.is_nsfw_override, w.is_nsfw) \
+               FROM owner o LEFT JOIN work direct ON direct.id = o.work_id \
+               LEFT JOIN work_redirect r ON r.old_id = o.work_id AND direct.id IS NULL \
+               JOIN work w ON w.id = COALESCE(direct.id, r.new_id)",
+        )
+        .bind(&id)
+        .bind(if numeric { "suwayomi" } else { "mangadex" })
+        .bind(engine_id)
+        .fetch_optional(&state(ctx).pool)
+        .await
+        .map_err(gql_read_err)?;
+        let Some((work_id, entry_id, is_nsfw)) = owner else {
+            return Ok(None);
+        };
+        if is_nsfw && !viewer_show_nsfw(ctx).await? {
+            return Ok(None);
+        }
+        Ok(Some(ChapterWork {
+            work_id: ID(work_id),
+            entry_id: entry_id.map(ID),
+        }))
     }
 
     /// P2.1: the series/reader page in ONE round trip — see [`SeriesPageBundle`].

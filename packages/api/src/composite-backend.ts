@@ -5,6 +5,9 @@ import type {
 	CanonicalUpdate,
 	Chapter,
 	ChapterOrigin,
+	ChapterWork,
+	ProgressResult,
+	ViewerProgress,
 	ComicType,
 	Comment,
 	CommentVote,
@@ -70,6 +73,8 @@ import type {
 	PostReviewInput,
 	RegisterInput,
 	SearchFilters,
+	SaveProgressInput,
+	SaveChapterReadInput,
 	SeriesAdminInput,
 	SeriesAdminMeta,
 	SeriesMetadataInput,
@@ -82,6 +87,9 @@ import type {
 	CloudflareConnection,
 	CloudflareSetupInput,
 	CloudflareTokenCheck,
+	WorkChapterEdit,
+	WorkChapterEntry,
+	WorkChapterList,
 } from './backend.js';
 import type { ContentBackend, SourceRef } from './content-backend.js';
 import type { WorkSourceLike } from './local-suwayomi-backend.js';
@@ -163,6 +171,25 @@ export class CompositeBackend implements Backend {
 					if (!this.writeIsCurrent(owner, generation) || op.userId !== owner) {
 						return Promise.reject(new Error('Offline write identity changed'));
 					}
+					if (op.kind === 'progress' && op.workId != null && this.opts.hosted.saveProgress) {
+						return this.opts.hosted
+							.saveProgress({
+								chapterId: op.chapterId,
+								workId: op.workId,
+								lastPageRead: op.lastPageRead,
+								read: op.read,
+								numericEpoch: op.numericEpoch ?? null,
+								revision: op.revision ?? undefined,
+							})
+							.then((result) => ({
+								appliedRevision: result?.status === 'APPLIED' ? result.revision : null,
+							}))
+							.catch((e: unknown) => {
+								if (!isStaleNumericEpoch(e)) throw e;
+								dropStaleProgress(op.chapterId);
+								return { appliedRevision: null };
+							});
+					}
 					return op.kind === 'progress'
 						? this.opts.hosted
 								.setProgress(op.chapterId, op.lastPageRead, op.read, op.numericEpoch ?? null)
@@ -200,6 +227,8 @@ export class CompositeBackend implements Backend {
 	 */
 	private currentUserId: Id | null = null;
 	private writeGeneration = 0;
+	/** The last live revisioned save per user and work; see {@link saveProgress}. */
+	private liveProgress = new Map<string, Promise<unknown>>();
 	private queueToken: string | null | undefined;
 
 	private writeIsCurrent(owner: Id | null, generation: number): boolean {
@@ -501,6 +530,118 @@ export class CompositeBackend implements Backend {
 		}
 	}
 
+	/** A null answer also means the save joined the offline queue for later replay. */
+	async saveProgress(input: SaveProgressInput): Promise<ProgressResult | null> {
+		const hosted = this.opts.hosted;
+		if (!hosted.saveProgress) {
+			await this.setProgress(input.chapterId, input.lastPageRead, input.read, input.numericEpoch);
+			return null;
+		}
+		const queue = this.opts.queue;
+		if (!queue) return hosted.saveProgress(input);
+		const owner = this.currentUserId;
+		const generation = this.writeGeneration;
+		const epoch =
+			input.numericEpoch !== undefined || !isNumericChapterId(input.chapterId)
+				? (input.numericEpoch ?? null)
+				: await (hosted.numericEpoch?.() ?? Promise.resolve(null)).catch(() => null);
+		if (!this.writeIsCurrent(owner, generation)) return null;
+		const enqueue = () => {
+			queue.enqueue({
+				kind: 'progress',
+				chapterId: input.chapterId,
+				workId: input.workId,
+				revision: input.revision ?? hosted.knownRevision?.(input.workId) ?? null,
+				lastPageRead: input.lastPageRead,
+				read: input.read,
+				userId: owner,
+				numericEpoch: epoch,
+			});
+		};
+		const send = async (): Promise<ProgressResult | null> => {
+			if (!this.writeIsCurrent(owner, generation)) return null;
+			if (queue.hasPendingProgress(owner, input.workId)) {
+				enqueue();
+				void this.flushQueue();
+				return null;
+			}
+			try {
+				const result = await hosted.saveProgress!(input);
+				if (this.writeIsCurrent(owner, generation)) void this.flushQueue();
+				return result;
+			} catch (e) {
+				if (isStaleNumericEpoch(e)) {
+					dropStaleProgress(input.chapterId);
+					return null;
+				}
+				if (this.writeIsCurrent(owner, generation)) enqueue();
+				return null;
+			}
+		};
+		return this.inWorkOrder(owner, generation, input.workId, send);
+	}
+
+	/**
+	 * One live revisioned write per sign-in and work at a time: a later write must see
+	 * the backlog an earlier failed save leaves, or it would move the revision past the
+	 * queued one. Keyed by the write generation too, so a request of an earlier sign-in
+	 * that never answers cannot hold up the next one.
+	 */
+	private inWorkOrder<T>(
+		owner: Id | null,
+		generation: number,
+		workId: Id,
+		write: () => Promise<T>,
+	): Promise<T> {
+		const key = `${generation}\u0000${owner ?? ''}\u0000${workId}`;
+		const previous = this.liveProgress.get(key) ?? Promise.resolve();
+		const next = previous.then(write, write);
+		this.liveProgress.set(key, next);
+		const clear = () => {
+			if (this.liveProgress.get(key) === next) this.liveProgress.delete(key);
+		};
+		next.then(clear, clear);
+		return next;
+	}
+
+	async saveChapterRead(input: SaveChapterReadInput): Promise<ProgressResult | null> {
+		const hosted = this.opts.hosted;
+		if (hosted.saveChapterRead) {
+			const queue = this.opts.queue;
+			if (!queue) return hosted.saveChapterRead(input);
+			const owner = this.currentUserId;
+			const generation = this.writeGeneration;
+			return this.inWorkOrder(owner, generation, input.workId, async () => {
+				// A toggle cannot be queued, and sent first it would make the queued saves
+				// of this work stale. Send them first; the reader undoes the toggle on a throw.
+				if (queue.hasPendingProgress(owner, input.workId)) await this.flushQueue();
+				if (!this.writeIsCurrent(owner, generation)) {
+					throw new Error('Offline write identity changed');
+				}
+				if (queue.hasPendingProgress(owner, input.workId)) {
+					throw new Error('Saved reading progress is still waiting to sync.');
+				}
+				return hosted.saveChapterRead!(input);
+			});
+		}
+		if (!(await this.setChapterRead(input.chapterId, input.read))) {
+			throw new Error('Chapter read state is unavailable on this server.');
+		}
+		return null;
+	}
+
+	async viewerProgress(workId: Id): Promise<ViewerProgress | null | undefined> {
+		return this.opts.hosted.viewerProgress?.(workId);
+	}
+
+	knownRevision(workId: Id): number | undefined {
+		return this.opts.hosted.knownRevision?.(workId);
+	}
+
+	async chapterWork(chapterId: Id): Promise<ChapterWork | null | undefined> {
+		return this.opts.hosted.chapterWork?.(chapterId);
+	}
+
 	// --- viewer preferences ---
 	setShowNsfw(value: boolean): Promise<boolean> {
 		return this.opts.hosted.setShowNsfw!(value);
@@ -734,6 +875,24 @@ export class CompositeBackend implements Backend {
 	}
 	setChapterOverride(input: ChapterOverrideInput): Promise<boolean> {
 		return this.opts.hosted.setChapterOverride!(input);
+	}
+	async workChapterList(workId: Id): Promise<WorkChapterList | undefined> {
+		return this.opts.hosted.workChapterList?.(workId);
+	}
+	async setWorkChapter(entryId: Id, edit: WorkChapterEdit): Promise<WorkChapterEntry> {
+		const entry = await this.opts.hosted.setWorkChapter?.(entryId, edit);
+		if (!entry) throw new Error('Chapter editing is unavailable on this backend.');
+		return entry;
+	}
+	async linkChapterCopy(chapterId: Id, entryId: Id | null): Promise<boolean> {
+		if (!this.opts.hosted.linkChapterCopy)
+			throw new Error('Chapter editing is unavailable on this backend.');
+		return this.opts.hosted.linkChapterCopy(chapterId, entryId);
+	}
+	async mergeWorkChapters(keepId: Id, dropId: Id): Promise<boolean> {
+		if (!this.opts.hosted.mergeWorkChapters)
+			throw new Error('Chapter editing is unavailable on this backend.');
+		return this.opts.hosted.mergeWorkChapters(keepId, dropId);
 	}
 	rescanWork(workId: Id): Promise<number> {
 		return this.opts.hosted.rescanWork!(workId);

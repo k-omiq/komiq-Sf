@@ -141,3 +141,94 @@ test('upload labels retain the source alongside the group or uploader', () => {
 	assert.equal(chapterAttribution('MangaDex', null), 'MangaDex');
 	assert.equal(chapterAttribution('Other source', 'Team'), 'Other source · Team');
 });
+
+test('entry slots separate equal numbers and join copies with different labels or numbers', () => {
+	const list: VersionedChapter[] = [
+		{ ...ch('zero', 0), entryId: 'zero', entryOrder: 1 },
+		{ ...ch('special', 0, null, 'Extra'), entryId: 'extra', entryOrder: 2 },
+		{ ...ch('special-copy', 8), entryId: 'extra', entryOrder: 2 },
+	];
+	assert.deepEqual(
+		copiesOf(list, list[0]).map((c) => c.id),
+		['zero'],
+	);
+	assert.deepEqual(
+		copiesOf(list, list[1]).map((c) => c.id),
+		['special', 'special-copy'],
+	);
+	const { prev, next, order } = adjacentChapters(list, list[1]);
+	assert.equal(prev?.id, 'zero');
+	assert.equal(next, undefined);
+	assert.deepEqual(
+		order.map((c) => c.id),
+		['zero', 'special'],
+	);
+});
+
+test('a complete entry pool follows entry order and keeps equal ranks stable', () => {
+	const list: VersionedChapter[] = [
+		{ ...ch('last', 1), entryId: 'last', entryOrder: 3 },
+		{ ...ch('extra', 0, null, 'Extra'), entryId: 'extra', entryOrder: 2 },
+		{ ...ch('first', 99), entryId: 'first', entryOrder: 1 },
+		{ ...ch('extra-copy', 7), entryId: 'extra', entryOrder: 2 },
+	];
+	assert.deepEqual(
+		sortChaptersAsc(list).map((c) => c.id),
+		['first', 'extra', 'extra-copy', 'last'],
+	);
+	const { prev, next } = adjacentChapters(list, list[1]);
+	assert.equal(prev?.id, 'first');
+	assert.equal(next?.id, 'last');
+});
+
+test('a mixed entry pool keeps the legacy order for the whole list', () => {
+	const list: VersionedChapter[] = [
+		{ ...ch('three', 3), entryId: 'three', entryOrder: 1 },
+		{ ...ch('extra', 0, null, 'Extra'), entryId: 'extra', entryOrder: 2 },
+		{ ...ch('one', 1), entryId: 'one', entryOrder: 3 },
+		ch('two', 2),
+		{ ...ch('two-copy', 2), entryId: null, entryOrder: null },
+	];
+	const legacy = list.map(({ entryId, entryOrder, ...c }) => c);
+	assert.deepEqual(
+		sortChaptersAsc(list).map((c) => c.id),
+		['one', 'two', 'two-copy', 'three', 'extra'],
+	);
+	assert.deepEqual(
+		sortChaptersAsc(list).map((c) => c.id),
+		sortChaptersAsc(legacy).map((c) => c.id),
+	);
+});
+
+test('absent and null entry fields preserve legacy slots and navigation', () => {
+	const legacy = [ch('extra', 0, null, 'Extra'), ch('b', 2), ch('a', 1), ch('b-copy', 2)];
+	const nullable = legacy.map((c) => ({ ...c, entryId: null, entryOrder: null }));
+	assert.deepEqual(
+		sortChaptersAsc(nullable).map((c) => c.id),
+		sortChaptersAsc(legacy).map((c) => c.id),
+	);
+	assert.deepEqual(
+		copiesOf(nullable, nullable[1]).map((c) => c.id),
+		['b', 'b-copy'],
+	);
+	const { prev, next } = adjacentChapters(nullable, nullable[1]);
+	assert.equal(prev?.id, 'a');
+	assert.equal(next?.id, 'extra');
+});
+
+test('a work whose list is not ready keeps one number slot for linked and unlinked copies', () => {
+	// The server links copies before the list is ready, so one number can arrive as a
+	// linked copy (entry fields set) and an unlinked one. They are still one chapter.
+	const list: VersionedChapter[] = [
+		{ ...ch('linked-5', 5), entryId: 'e5', entryOrder: 5 },
+		ch('unlinked-5', 5),
+		{ ...ch('linked-6', 6), entryId: 'e6', entryOrder: 6 },
+	];
+	assert.deepEqual(
+		copiesOf(list, list[0]).map((c) => c.id),
+		['linked-5', 'unlinked-5'],
+	);
+	const { next, order } = adjacentChapters(list, list[1]);
+	assert.equal(next?.id, 'linked-6');
+	assert.equal(order.length, 2);
+});

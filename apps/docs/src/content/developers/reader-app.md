@@ -76,6 +76,28 @@ When [the on-device engine](/developers/native-engine) is in use, on desktop or 
 
 During server-side rendering, `apps/reader/src/lib/data/load-fetch.ts` passes SvelteKit's scoped `fetch` function into GraphQL requests. SvelteKit serializes responses into `<script data-sveltekit-fetched>` tags inside the generated HTML document. When the browser hydrates the page, it reuses the serialized responses rather than issuing duplicate network requests for the same data.
 
+### Progress saves and offline replay
+
+The reader sends `saveProgress` and `saveChapterRead` with the work ID. A base revision identifies the progress version it last saw in the series bundle's `viewerProgress` or the separate query. `GraphQLBackend` sends one save at a time per work. Only `APPLIED` raises its known revision. See [GraphQL API](/developers/graphql) for results and older-server fallbacks.
+
+The root layout listens to `onProgressConflict` for live saves and queued replays. It calls `dropWorkProgressState(workId)` to clear that work's optimistic checkmarks, the marks shown before a save finishes. It also clears the reader cache and refetches the current page.
+
+Each queued progress save stores a stable `opId`, its `workId`, its base `revision` and `chainedTo`, the ID of the preceding save for that work and account:
+
+- A save adopts its predecessor's revision only after `APPLIED`. Other results release the next save with its original base revision.
+- Collapsing duplicate chapter saves passes the removed save's predecessor and the greater known base revision to its successor. The replacement joins the end of the work's chain.
+- The save being sent is never replaced. New progress for that chapter waits behind it. Live progress joins an existing queue for the same work and account. A live save also waits for an earlier live save of that work, so it joins the queue that a failed save leaves.
+- A chapter checkmark cannot be queued. It first sends the queued saves of its work. If they cannot be sent, the checkmark fails and the reader undoes it.
+- Removing an acknowledged save and updating its successor happen in one storage write. Account ownership checks and the captured numeric epoch still apply. The epoch identifies the source engine's generation.
+
+Two limits remain. A crash after the server applies a queued save but before the app records its answer leaves the remaining saves for that work stale. Only forward page steps with `read: false` can apply. A queued save whose base revision was never known, for example because the app started offline, uses the revision known or fetched at replay. This cannot check whether its original view was stale, as with older apps.
+
+### Chapter entries and moved links
+
+A chapter-list entry represents one chapter of the work and links its source copies. The series list joins copies by `entryId` and sorts by `entryOrder` when the work's list is ready. Aggregate rows carry the `special` flag for badges. Reader navigation groups and orders by entry only when every copy in its pool has both entry fields. Otherwise, the whole pool keeps the older chapter-number rules.
+
+If a requested chapter is missing from the resolved work, or a link's `src` names a source outside the work, the reader asks `chapterWork(chapterId)` for its current owner. A different work produces `movedTo`; the route redirects with HTTP 307 to `/read/{workId}?ch={chapterId}`. An unsupported or failed lookup leaves the empty reader.
+
 ## The long-strip reader
 
 `apps/reader/src/routes/read/[slug]/+page.svelte` supports single-page, double-page and long-strip reading. Long-strip mode keeps every page mounted:
@@ -114,6 +136,9 @@ The rating row is one touch target, allowing a slide to correct a selection. Pag
 - `apps/reader/src/lib/stream.ts`: Logic distinguishing edge rendering and hydration from subsequent client navigations.
 - `apps/reader/src/lib/context.ts`: Application singletons for the API backend, image provider, and offline write queue.
 - `apps/reader/src/lib/data/load-fetch.ts`: SvelteKit fetch integration and serialized response hydration.
+- `apps/reader/src/lib/data/source.ts` and `apps/reader/src/lib/data/chapter-versions.ts`: Entry joins, reading order, progress conflicts and moved-chapter lookup.
+- `packages/api/src/graphql-backend.ts` and `packages/api/src/progress-conflict.ts`: Revisioned saves and conflict listeners.
+- `packages/api/src/offline-queue.ts` and `packages/api/src/composite-backend.ts`: Offline save chains, revision handover and account checks.
 - `apps/reader/src/routes/read/[slug]/+page.svelte`: Reader layout, image queuing, aspect ratio stabilization, and prefetch logic.
 - `apps/reader/src/lib/app.css`: Safe-area tokens, the phone shell token, `k-hit` and the native-app rules.
 - `apps/reader/src/lib/native.ts` and `apps/reader/static/theme-init.js`: Zoom lock and status bar calls for the native app.

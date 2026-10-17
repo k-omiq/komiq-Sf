@@ -1,5 +1,8 @@
 import type {
 	ChapterOrigin,
+	ChapterWork,
+	ProgressResult,
+	ViewerProgress,
 	MediaRoute,
 	AdminUser,
 	CoverIssue,
@@ -79,6 +82,8 @@ import type {
 	PostReviewInput,
 	RegisterInput,
 	SearchFilters,
+	SaveProgressInput,
+	SaveChapterReadInput,
 	SeriesAdminInput,
 	SeriesAdminMeta,
 	SeriesMetadataInput,
@@ -91,9 +96,13 @@ import type {
 	CloudflareConnection,
 	CloudflareSetupInput,
 	CloudflareTokenCheck,
+	WorkChapterEdit,
+	WorkChapterEntry,
+	WorkChapterList,
 } from './backend.js';
 import * as ops from './operations.js';
 import { isNumericChapterId, isStaleNumericEpoch, notifyStaleNumericEpoch } from './numeric-epoch.js';
+import { notifyProgressConflict } from './progress-conflict.js';
 import { failedOnlyAt, GraphQLRequestError, tolerablePartialErrors } from './partial-errors.js';
 import type { GraphQLErrorLike, PathSegment } from './partial-errors.js';
 
@@ -193,10 +202,13 @@ function canonicalUrl(url: string): string {
 /** Negative schema discovery is shared by fetch views, bounded and retried after upgrades. */
 const CAPABILITY_NEGATIVE_TTL_MS = 5 * 60_000;
 
-/** The bearer token and the numeric epoch, shared by a backend and its {@link GraphQLBackend.withFetch} views. */
+/** Auth and progress state shared by a backend and its {@link GraphQLBackend.withFetch} views. */
 interface AuthCell {
 	token: string | null;
 	revision: number;
+	progressRevisions: Map<Id, number>;
+	/** The last revisioned save per work, so the next one starts after it answered. */
+	progressSaves?: Map<Id, Promise<unknown>>;
 	numericEpoch?: Promise<number | null>;
 	staleNumericEpochNotified?: boolean;
 }
@@ -214,6 +226,10 @@ interface EndpointCapabilities {
 	tagsUnsupported: boolean;
 	libraryEpochUnsupported: Set<string>;
 	setChapterReadUnsupported: boolean;
+	saveProgressUnsupported: boolean;
+	viewerProgressUnsupported: boolean;
+	chapterWorkUnsupported: boolean;
+	workChapterListUnsupported: boolean;
 	chapterOriginUnsupported: boolean;
 	mediaRoutesUnsupported: boolean;
 	seriesPageUnsupported: boolean;
@@ -236,6 +252,10 @@ function endpointCapabilities(config: BackendConfig): EndpointCapabilities {
 			tagsUnsupported: false,
 			libraryEpochUnsupported: new Set(),
 			setChapterReadUnsupported: false,
+			saveProgressUnsupported: false,
+			viewerProgressUnsupported: false,
+			chapterWorkUnsupported: false,
+			workChapterListUnsupported: false,
 			chapterOriginUnsupported: false,
 			mediaRoutesUnsupported: false,
 			seriesPageUnsupported: false,
@@ -276,7 +296,7 @@ export class GraphQLBackend implements Backend {
 		private config: BackendConfig,
 		auth?: AuthCell,
 	) {
-		this.auth = auth ?? { token: config.token ?? null, revision: 0 };
+		this.auth = auth ?? { token: config.token ?? null, revision: 0, progressRevisions: new Map() };
 	}
 
 	withFetch(fetch: typeof globalThis.fetch): Backend {
@@ -287,6 +307,9 @@ export class GraphQLBackend implements Backend {
 		if (this.auth.token === token) return;
 		this.auth.token = token;
 		this.auth.revision += 1;
+		this.auth.progressRevisions.clear();
+		// Saves still waiting fail their auth check; the new account must not wait on them.
+		this.auth.progressSaves = undefined;
 	}
 
 	/**
@@ -375,11 +398,14 @@ export class GraphQLBackend implements Backend {
 			return query;
 		let out = query;
 		for (const field of this.capabilities.unsupportedFields) {
-			// Metadata has only field selections with two levels of child objects.
+			// Nested optional fields have at most two levels of child objects.
 			// Remove the balanced complete selection, including formatted multiline
 			// children, so a newer reader still works against an older server.
-			if (field === 'metadata') {
-				out = out.replace(/^[\t ]*metadata[\t ]*\{(?:[^{}]|\{[^{}]*\})*\}[\t ]*\r?\n/gm, '');
+			if (ops.OPTIONAL_NESTED_SERIES_FIELDS.includes(field)) {
+				out = out.replace(
+					new RegExp(`^[\\t ]*${field}[\\t ]*\\{(?:[^{}]|\\{[^{}]*\\})*\\}[\\t ]*\\r?\\n`, 'gm'),
+					'',
+				);
 				continue;
 			}
 			out = out.replace(new RegExp(`^[\\t ]*${field}[\\t ]*\\r?\\n`, 'gm'), '');
@@ -508,10 +534,14 @@ export class GraphQLBackend implements Backend {
 			// An unknown ARGUMENT (`includeNsfw`) is a different validation error but the
 			// same failure mode, so it gets the same treatment. Both are collected in one
 			// pass: validation reports every error at once, and there is only one retry.
+			// Argument-bearing queries need their own fallback because only plain nested
+			// selections can be removed without emptying the document.
 			if (!retried) {
 				const dropped = ops.OPTIONAL_SERIES_FIELDS.filter(
 					(f) =>
 						!this.capabilities.unsupportedFields.has(f) &&
+						(!ops.OPTIONAL_NESTED_SERIES_FIELDS.includes(f) ||
+							new RegExp(`^[\\t ]*${f}[\\t ]*\\{`, 'm').test(query)) &&
 						messages.some((m) => m.includes(`Unknown field "${f}"`)),
 				);
 				const droppedArgs = ops.OPTIONAL_ARGUMENTS.filter(
@@ -822,6 +852,133 @@ export class GraphQLBackend implements Backend {
 		}
 	}
 
+	knownRevision(workId: Id): number | undefined {
+		return this.auth.progressRevisions.get(workId);
+	}
+
+	private recordRevision(workId: Id, revision: number): void {
+		this.auth.progressRevisions.set(workId, Math.max(this.knownRevision(workId) ?? 0, revision));
+	}
+
+	async viewerProgress(workId: Id): Promise<ViewerProgress | null | undefined> {
+		const authRevision = this.auth.revision;
+		if (this.capabilities.viewerProgressUnsupported) return undefined;
+		try {
+			const d = await this.gql<{ viewerProgress: ViewerProgress | null }>(ops.VIEWER_PROGRESS, {
+				workId,
+			});
+			this.assertAuthRevision(authRevision);
+			if (d.viewerProgress) this.recordRevision(workId, d.viewerProgress.revision);
+			return d.viewerProgress;
+		} catch (e) {
+			this.assertAuthRevision(authRevision);
+			if (e instanceof Error && e.message.includes('Unknown field "viewerProgress"')) {
+				this.capabilities.viewerProgressUnsupported = true;
+				return undefined;
+			}
+			throw e;
+		}
+	}
+
+	saveProgress(input: SaveProgressInput): Promise<ProgressResult | null> {
+		return this.saveRevisionedProgress('saveProgress', input);
+	}
+
+	saveChapterRead(input: SaveChapterReadInput): Promise<ProgressResult | null> {
+		return this.saveRevisionedProgress('saveChapterRead', input);
+	}
+
+	private async saveLegacyProgress(
+		field: 'saveProgress' | 'saveChapterRead',
+		input: SaveProgressInput | SaveChapterReadInput,
+	): Promise<null> {
+		if (field === 'saveProgress' && 'lastPageRead' in input) {
+			await this.setProgress(input.chapterId, input.lastPageRead, input.read, input.numericEpoch);
+		} else if (!(await this.setChapterRead(input.chapterId, input.read))) {
+			throw new Error('Chapter read state is unavailable on this server.');
+		}
+		return null;
+	}
+
+	/**
+	 * Saves of one work go out one at a time. The reader fires overlapping saves (the
+	 * end-of-chapter finish and the save on leaving the chapter), and both would carry the
+	 * same base revision: the first is applied and moves the revision, so the second would
+	 * be refused as stale and the page refreshed for nothing. Waiting lets the second one
+	 * send the revision the first answer returned.
+	 */
+	private saveRevisionedProgress(
+		field: 'saveProgress' | 'saveChapterRead',
+		input: SaveProgressInput | SaveChapterReadInput,
+	): Promise<ProgressResult | null> {
+		// Taken now: a save waiting behind another must never go out under a later sign-in.
+		const authRevision = this.auth.revision;
+		const saves = (this.auth.progressSaves ??= new Map());
+		const previous = saves.get(input.workId) ?? Promise.resolve();
+		const next = previous
+			.catch(() => {})
+			.then(() => this.sendRevisionedProgress(field, input, authRevision));
+		saves.set(input.workId, next);
+		const clear = () => {
+			if (saves.get(input.workId) === next) saves.delete(input.workId);
+		};
+		next.then(clear, clear);
+		return next;
+	}
+
+	private async sendRevisionedProgress(
+		field: 'saveProgress' | 'saveChapterRead',
+		input: SaveProgressInput | SaveChapterReadInput,
+		authRevision: number,
+	): Promise<ProgressResult | null> {
+		this.assertAuthRevision(authRevision);
+		if (this.capabilities.saveProgressUnsupported) return this.saveLegacyProgress(field, input);
+		const revision =
+			input.revision ??
+			this.knownRevision(input.workId) ??
+			(await this.viewerProgress(input.workId))?.revision ??
+			0;
+		this.assertAuthRevision(authRevision);
+		const numericEpoch = await this.epochFor(input.chapterId, input.numericEpoch);
+		try {
+			const d = await this.gql<Record<string, ProgressResult>>(
+				field === 'saveProgress' ? ops.SAVE_PROGRESS : ops.SAVE_CHAPTER_READ,
+				{ ...input, numericEpoch, revision },
+				false,
+				undefined,
+				authRevision,
+			);
+			this.assertAuthRevision(authRevision);
+			const result = d[field];
+			if (result.status === 'APPLIED') {
+				this.recordRevision(input.workId, result.revision);
+				if (result.workId != null) this.recordRevision(result.workId, result.revision);
+			} else if (result.status === 'REFUSED' || result.status === 'MOVED') {
+				// The next save reads the revision again, after the refresh the conflict starts.
+				this.auth.progressRevisions.delete(input.workId);
+				notifyProgressConflict({
+					status: result.status,
+					workId: input.workId,
+					movedTo: result.workId,
+					chapterId: input.chapterId,
+				});
+			}
+			return result;
+		} catch (e) {
+			this.assertAuthRevision(authRevision);
+			this.staleProgress(input.chapterId, input.numericEpoch === undefined, e);
+			if (
+				e instanceof Error &&
+				(e.message.includes('Unknown field "saveProgress"') ||
+					e.message.includes('Unknown field "saveChapterRead"'))
+			) {
+				this.capabilities.saveProgressUnsupported = true;
+				return this.saveLegacyProgress(field, input);
+			}
+			throw e;
+		}
+	}
+
 	async recordView(seriesId: Id): Promise<void> {
 		await this.gql<{ recordView: boolean }>(ops.RECORD_VIEW, { seriesId });
 	}
@@ -976,6 +1133,51 @@ export class GraphQLBackend implements Backend {
 	async setChapterOverride(input: ChapterOverrideInput): Promise<boolean> {
 		const d = await this.gql<{ setChapterOverride: boolean }>(ops.SET_CHAPTER_OVERRIDE, { input });
 		return d.setChapterOverride;
+	}
+
+	async workChapterList(workId: Id): Promise<WorkChapterList | undefined> {
+		const authRevision = this.auth.revision;
+		if (this.capabilities.workChapterListUnsupported) return undefined;
+		try {
+			const d = await this.gql<{ workChapterList: WorkChapterList }>(ops.WORK_CHAPTER_LIST, {
+				workId,
+			});
+			return d.workChapterList;
+		} catch (e) {
+			this.assertAuthRevision(authRevision);
+			const msg = e instanceof Error ? e.message : String(e);
+			// The server predates chapter lists, so the editor can use the old aggregates.
+			if (msg.includes('Unknown field "workChapterList"')) {
+				this.capabilities.workChapterListUnsupported = true;
+				return undefined;
+			}
+			throw e;
+		}
+	}
+
+	async setWorkChapter(entryId: Id, edit: WorkChapterEdit): Promise<WorkChapterEntry> {
+		const variables: Record<string, unknown> = { entryId };
+		for (const field of ['hidden', 'titleOverride', 'clearTitle', 'special', 'sortKey'] as const) {
+			if (edit[field] !== undefined) variables[field] = edit[field];
+		}
+		const d = await this.gql<{ setWorkChapter: WorkChapterEntry }>(ops.SET_WORK_CHAPTER, variables);
+		return d.setWorkChapter;
+	}
+
+	async linkChapterCopy(chapterId: Id, entryId: Id | null): Promise<boolean> {
+		const d = await this.gql<{ linkChapterCopy: boolean }>(ops.LINK_CHAPTER_COPY, {
+			chapterId,
+			entryId,
+		});
+		return d.linkChapterCopy;
+	}
+
+	async mergeWorkChapters(keepId: Id, dropId: Id): Promise<boolean> {
+		const d = await this.gql<{ mergeWorkChapters: boolean }>(ops.MERGE_WORK_CHAPTERS, {
+			keepId,
+			dropId,
+		});
+		return d.mergeWorkChapters;
 	}
 
 	async rescanWork(workId: Id): Promise<number> {
@@ -1677,6 +1879,24 @@ export class GraphQLBackend implements Backend {
 		}
 	}
 
+	async chapterWork(chapterId: Id): Promise<ChapterWork | null | undefined> {
+		const authRevision = this.auth.revision;
+		if (this.capabilities.chapterWorkUnsupported) return undefined;
+		try {
+			const d = await this.gql<{ chapterWork: ChapterWork | null }>(ops.CHAPTER_WORK, {
+				chapterId,
+			});
+			return d.chapterWork;
+		} catch (e) {
+			this.assertAuthRevision(authRevision);
+			if (e instanceof Error && e.message.includes('Unknown field "chapterWork"')) {
+				this.capabilities.chapterWorkUnsupported = true;
+				return undefined;
+			}
+			throw e;
+		}
+	}
+
 	async workSources(workId: Id): Promise<WorkSource[]> {
 		const d = await this.gql<{ workSources: WorkSource[] }>(ops.WORK_SOURCES, { workId });
 		return d.workSources;
@@ -1708,6 +1928,12 @@ export class GraphQLBackend implements Backend {
 				false,
 				[SERIES_PAGE_AGGREGATED],
 			);
+			// A bundle fetched under a previous sign-in must not seed this account's base
+			// revision; the page itself is handled as before.
+			if (this.auth.revision === authRevision && d.seriesPage?.viewerProgress) {
+				this.recordRevision(workId, d.seriesPage.viewerProgress.revision);
+				this.recordRevision(d.seriesPage.workId, d.seriesPage.viewerProgress.revision);
+			}
 			if (withAggregated && d.seriesPage && d.seriesPage.aggregated == null) {
 				return { ...d.seriesPage, aggregated: [] };
 			}

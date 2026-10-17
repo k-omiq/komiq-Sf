@@ -58,6 +58,9 @@ import type {
 	SeriesAdminInput,
 	SeriesAdminMeta,
 	SeriesMetadataInput,
+	WorkChapterEdit,
+	WorkChapterEntry,
+	WorkChapterList,
 } from '@komika/api';
 import { backend } from './context';
 import { assetSrc } from './config';
@@ -703,6 +706,36 @@ export async function setChapterOverride(input: ChapterOverrideInput): Promise<b
 	if (!backend.setChapterOverride)
 		throw new Error('Chapter editing is unavailable on this backend.');
 	return backend.setChapterOverride(input);
+}
+
+/** Older backends leave the editor on the existing aggregate chapter list. */
+export async function loadWorkChapterList(workId: string): Promise<WorkChapterList | undefined> {
+	return backend.workChapterList?.(workId);
+}
+
+/** Edit the work's entry so its linked source copies keep the same list identity. */
+export async function editWorkChapter(
+	entryId: string,
+	edit: WorkChapterEdit,
+): Promise<WorkChapterEntry> {
+	if (!backend.setWorkChapter) throw new Error('Chapter editing is unavailable on this backend.');
+	return backend.setWorkChapter(entryId, edit);
+}
+
+/** Relink one source copy, or give it its own entry when entryId is null. */
+export async function relinkChapterCopy(
+	chapterId: string,
+	entryId: string | null,
+): Promise<boolean> {
+	if (!backend.linkChapterCopy) throw new Error('Chapter editing is unavailable on this backend.');
+	return backend.linkChapterCopy(chapterId, entryId);
+}
+
+/** Keep one entry's identity while moving the dropped entry's copies into it. */
+export async function mergeChapterEntries(keepId: string, dropId: string): Promise<boolean> {
+	if (!backend.mergeWorkChapters)
+		throw new Error('Chapter editing is unavailable on this backend.');
+	return backend.mergeWorkChapters(keepId, dropId);
 }
 
 /** Force an immediate re-scan of every Suwayomi source of a work; returns count. */

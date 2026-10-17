@@ -115,10 +115,22 @@ The **Sources** section lists visible external sources attached to the work, sub
 
 ### Chapter management
 
-The **Chapters** table groups chapters across linked sources by chapter number, including hidden chapters:
+The **Chapters** list shows one chapter of the work's own list per row, called an entry. Copies from sources link to that entry. The list includes hidden entries and entries with no copies:
 
 - **Rename**: Assigns a custom title override to the chapter. Saving an empty title restores the source title.
 - **Hide** / **Unhide**: Soft-hides a chapter from readers without deleting it. You can unhide it at any time.
+- **Special on** / **Special off**: Marks or unmarks an entry as special. Finishing a later chapter does not mark a special read.
+- **Move up** / **Move down**: Changes the entry's position in the chapter list.
+- **Copies**: Click the copy count to see the linked copies and their source details.
+- **Move**: Under a copy, choose another entry in the same work from **Move to…**, or choose **A new entry of its own**. Click **Move** and confirm.
+- **Merge**: Choose the entry to keep from **Merge into…**, click **Merge** and confirm. The dropped entry's copies move to the kept entry.
+
+Readers keep what they have read when you move copies or merge entries.
+
+> [!NOTE]
+> If the chapter list is still being built, the editor shows a note. Readers see the old list until it is ready.
+
+On an older server, you see the old table grouped by chapter number. It offers only rename and hide controls.
 
 ## Latest updates
 

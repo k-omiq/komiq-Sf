@@ -25,15 +25,23 @@
  * Violating any of these is not corrupting (`stripUnsupported` returns the document
  * unchanged rather than emit invalid GraphQL) but it silently disables the fallback,
  * so the query just fails against an older server.
+ * Nested selections in {@link OPTIONAL_NESTED_SERIES_FIELDS} are the exception:
+ * their complete balanced selection is removed, including child objects.
  */
+export const OPTIONAL_NESTED_SERIES_FIELDS: readonly string[] = ['metadata', 'viewerProgress'];
+
 export const OPTIONAL_SERIES_FIELDS = [
-	// Metadata is the sole nested optional selection (balanced child stripping).
 	'metadata',
+	'viewerProgress',
 	'averageRating',
 	'ratingCount',
 	'detectedAt',
 	'workId',
 	'latestChapter',
+	// Work-list identity and order fall back to the existing number-based lists on older servers.
+	'entryId',
+	'entryOrder',
+	'special',
 	// F12's per-chapter date on `AggregatedChapter`. Optional for the usual reason: the
 	// reader and the API deploy separately, and a reader that shipped first would
 	// otherwise fail the WHOLE series page rather than lose one date line. Its caller-side
@@ -220,6 +228,8 @@ const CHAPTER_FIELDS = /* GraphQL */ `
 	fragment ChapterFields on Chapter {
 		id
 		seriesId
+		entryId
+		entryOrder
 		number
 		label
 		externalUrl
@@ -404,6 +414,9 @@ export const GENRE_FACETS = /* GraphQL */ `
 export const AGGREGATED_CHAPTERS = /* GraphQL */ `
 	query AggregatedChapters($workId: ID!) {
 		aggregatedChapters(workId: $workId) {
+			entryId
+			entryOrder
+			special
 			number
 			label
 			title
@@ -610,6 +623,70 @@ export const SET_PROGRESS = /* GraphQL */ `
 export const SET_CHAPTER_READ = /* GraphQL */ `
 	mutation SetChapterRead($chapterId: ID!, $read: Boolean!, $numericEpoch: Int) {
 		setChapterRead(chapterId: $chapterId, read: $read, numericEpoch: $numericEpoch)
+	}
+`;
+
+export const SAVE_PROGRESS = /* GraphQL */ `
+	mutation SaveProgress(
+		$chapterId: ID!
+		$workId: ID
+		$lastPageRead: Int!
+		$read: Boolean!
+		$numericEpoch: Int
+		$revision: Int!
+	) {
+		saveProgress(
+			chapterId: $chapterId
+			workId: $workId
+			lastPageRead: $lastPageRead
+			read: $read
+			numericEpoch: $numericEpoch
+			revision: $revision
+		) {
+			status
+			revision
+			workId
+		}
+	}
+`;
+
+export const SAVE_CHAPTER_READ = /* GraphQL */ `
+	mutation SaveChapterRead(
+		$chapterId: ID!
+		$workId: ID
+		$read: Boolean!
+		$numericEpoch: Int
+		$revision: Int!
+	) {
+		saveChapterRead(
+			chapterId: $chapterId
+			workId: $workId
+			read: $read
+			numericEpoch: $numericEpoch
+			revision: $revision
+		) {
+			status
+			revision
+			workId
+		}
+	}
+`;
+
+export const VIEWER_PROGRESS = /* GraphQL */ `
+	query ViewerProgress($workId: ID!) {
+		viewerProgress(workId: $workId) {
+			revision
+			throughEntryId
+		}
+	}
+`;
+
+export const CHAPTER_WORK = /* GraphQL */ `
+	query ChapterWork($chapterId: ID!) {
+		chapterWork(chapterId: $chapterId) {
+			workId
+			entryId
+		}
 	}
 `;
 
@@ -2019,6 +2096,10 @@ export const SERIES_PAGE = /* GraphQL */ `
 	) {
 		seriesPage(workId: $workId, includeFederated: $includeFederated) {
 			workId
+			viewerProgress {
+				revision
+				throughEntryId
+			}
 			series {
 				...SeriesFields
 				metadata {
@@ -2083,11 +2164,15 @@ export const SERIES_PAGE = /* GraphQL */ `
 				}
 			}
 			aggregated @include(if: $withAggregated) {
+				entryId
+				entryOrder
+				special
 				number
 				label
 				title
 				# Own line, no alias — the unknown-field fallback strips it by line.
 				firstReleasedAt
+				readAnywhere
 				chapterVolume
 				# One entry per COPY: every (source, scanlation group) upload of the number.
 				# The two copy… fields are opportunistic (OPTIONAL_SERIES_FIELDS).
@@ -2386,6 +2471,81 @@ export const WORK_CHAPTERS_ADMIN = /* GraphQL */ `
 export const SET_CHAPTER_OVERRIDE = /* GraphQL */ `
 	mutation SetChapterOverride($input: ChapterOverrideInput!) {
 		setChapterOverride(input: $input)
+	}
+`;
+
+const WORK_CHAPTER_ENTRY_FIELDS = /* GraphQL */ `
+	fragment WorkChapterEntryFields on WorkChapterEntry {
+		id
+		matchKey
+		sortKey
+		sortKeyText
+		number
+		label
+		special
+		specialBy
+		hidden
+		titleOverride
+		copies {
+			chapterId
+			sourceSeriesId
+			sourceType
+			sourceId
+			number
+			title
+			lang
+			scanlator
+			releasedAt
+			linkedBy
+		}
+	}
+`;
+
+export const WORK_CHAPTER_LIST = /* GraphQL */ `
+	${WORK_CHAPTER_ENTRY_FIELDS}
+	query WorkChapterList($workId: ID!) {
+		workChapterList(workId: $workId) {
+			workId
+			ready
+			entries {
+				...WorkChapterEntryFields
+			}
+		}
+	}
+`;
+
+export const SET_WORK_CHAPTER = /* GraphQL */ `
+	${WORK_CHAPTER_ENTRY_FIELDS}
+	mutation SetWorkChapter(
+		$entryId: ID!
+		$hidden: Boolean
+		$titleOverride: String
+		$clearTitle: Boolean
+		$special: Boolean
+		$sortKey: Float
+	) {
+		setWorkChapter(
+			entryId: $entryId
+			hidden: $hidden
+			titleOverride: $titleOverride
+			clearTitle: $clearTitle
+			special: $special
+			sortKey: $sortKey
+		) {
+			...WorkChapterEntryFields
+		}
+	}
+`;
+
+export const LINK_CHAPTER_COPY = /* GraphQL */ `
+	mutation LinkChapterCopy($chapterId: ID!, $entryId: ID) {
+		linkChapterCopy(chapterId: $chapterId, entryId: $entryId)
+	}
+`;
+
+export const MERGE_WORK_CHAPTERS = /* GraphQL */ `
+	mutation MergeWorkChapters($keepId: ID!, $dropId: ID!) {
+		mergeWorkChapters(keepId: $keepId, dropId: $dropId)
 	}
 `;
 

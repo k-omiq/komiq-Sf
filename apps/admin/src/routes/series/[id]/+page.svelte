@@ -6,6 +6,9 @@
 		PinnableField,
 		SeriesAdminMeta,
 		SeriesMetadataInput,
+		WorkChapterEdit,
+		WorkChapterEntry,
+		WorkChapterList,
 	} from '@komika/api';
 	import { page } from '$app/state';
 	import { afterNavigate, beforeNavigate } from '$app/navigation';
@@ -15,10 +18,14 @@
 		COMIC_TYPE_OPTIONS,
 		STATUS_OPTIONS,
 		addSeriesAltTitle,
+		editWorkChapter,
 		loadSeriesAdminMeta,
 		loadSeriesDetail,
 		loadWorkChaptersAdmin,
+		loadWorkChapterList,
 		loadWorkSources,
+		mergeChapterEntries,
+		relinkChapterCopy,
 		removeSeriesAltTitle,
 		rescanWork,
 		saveSeriesMetadata,
@@ -26,6 +33,7 @@
 		triggerScan,
 	} from '$lib/data';
 	import { toast } from '$lib/toast.svelte';
+	import { entryLabel, entryTargetLabel, moveSortKey, otherEntries } from '$lib/work-chapters';
 	import Button from '$lib/components/Button.svelte';
 	import Cover from '$lib/components/Cover.svelte';
 	import Icon from '$lib/components/Icon.svelte';
@@ -124,6 +132,7 @@
 	}
 	let sources = $state<WorkSource[]>([]);
 	let chapters = $state<AdminChapter[]>([]);
+	let chapterList = $state<WorkChapterList | undefined>(undefined);
 	let loading = $state(true);
 	let loadError = $state<string | null>(null);
 
@@ -229,15 +238,20 @@
 		try {
 			const s = await loadSeriesDetail(seriesId);
 			const m = await loadSeriesAdminMeta(seriesId);
-			const [srcs, chs] = m.workId
-				? await Promise.all([loadWorkSources(m.workId), loadWorkChaptersAdmin(m.workId)])
-				: [[], []];
+			const [srcs, chs, list] = m.workId
+				? await Promise.all([
+						loadWorkSources(m.workId),
+						loadWorkChaptersAdmin(m.workId),
+						loadWorkChapterList(m.workId),
+					])
+				: [[], [], undefined];
 			if (seq !== loadSeq) return; // a newer load superseded this one
 			series = s;
 			meta = m;
 			seedForm(m);
 			sources = srcs;
 			chapters = chs;
+			chapterList = list;
 		} catch (err) {
 			if (seq !== loadSeq) return;
 			loadError = err instanceof Error ? err.message : 'Failed to load series.';
@@ -252,6 +266,9 @@
 		// for the previous series must not show up (and save) under the new one.
 		editingKey = null;
 		editTitle = '';
+		expandedEntries = [];
+		copyTargets = {};
+		mergeTargets = {};
 		newAltTitle = '';
 		newTag = '';
 		load(id);
@@ -425,8 +442,14 @@
 			await triggerScan(src.sourceKey);
 			toast.success(`Scanned ${extLabel(src)}.`);
 			if (!workId) return;
-			const fresh = await loadWorkChaptersAdmin(workId);
-			if (id === here) chapters = fresh;
+			const [fresh, list] = await Promise.all([
+				loadWorkChaptersAdmin(workId),
+				loadWorkChapterList(workId),
+			]);
+			if (id === here) {
+				chapters = fresh;
+				chapterList = list;
+			}
 		} catch (err) {
 			toast.fromError(err, 'Scan failed.');
 		} finally {
@@ -443,8 +466,14 @@
 		try {
 			const n = await rescanWork(workId);
 			toast.success(`Re-scanned ${n} source${n === 1 ? '' : 's'}.`);
-			const fresh = await loadWorkChaptersAdmin(workId);
-			if (id === here) chapters = fresh;
+			const [fresh, list] = await Promise.all([
+				loadWorkChaptersAdmin(workId),
+				loadWorkChapterList(workId),
+			]);
+			if (id === here) {
+				chapters = fresh;
+				chapterList = list;
+			}
 		} catch (err) {
 			toast.fromError(err, 'Rescan failed.');
 		} finally {
@@ -508,6 +537,148 @@
 			if (chapBusyKey !== c.key) saveRename(c);
 		} else if (e.key === 'Escape') {
 			editingKey = null;
+		}
+	}
+
+	// ---- work chapter entries ----
+	let entryBusyKey = $state<string | null>(null);
+	let expandedEntries = $state<string[]>([]);
+	let copyTargets = $state<Record<string, string>>({});
+	let mergeTargets = $state<Record<string, string>>({});
+
+	function toggleCopies(entryId: string): void {
+		expandedEntries = expandedEntries.includes(entryId)
+			? expandedEntries.filter((key) => key !== entryId)
+			: [...expandedEntries, entryId];
+	}
+
+	function startEntryRename(entry: WorkChapterEntry): void {
+		editingKey = entry.id;
+		editTitle = entry.titleOverride ?? entry.copies[0]?.title ?? '';
+	}
+
+	async function commitEntry(entry: WorkChapterEntry, edit: WorkChapterEdit): Promise<void> {
+		const workId = meta?.workId;
+		if (!workId || entryBusyKey !== null) return;
+		const here = id;
+		entryBusyKey = entry.id;
+		try {
+			await editWorkChapter(entry.id, edit);
+			const fresh = await loadWorkChapterList(workId);
+			if (id === here) {
+				chapterList = fresh;
+				if (editingKey === entry.id) editingKey = null;
+			}
+			const label = entryLabel(entry);
+			toast.success(
+				'hidden' in edit
+					? edit.hidden
+						? `${label} is hidden from readers.`
+						: `${label} is visible again.`
+					: 'special' in edit
+						? edit.special
+							? `${label} marked as special.`
+							: `${label} is no longer special.`
+						: 'sortKey' in edit
+							? `${label} moved.`
+							: edit.clearTitle
+								? `${label} uses the source title again.`
+								: `${label} renamed.`,
+			);
+		} catch (err) {
+			toast.fromError(err, 'Failed to update chapter.');
+		} finally {
+			entryBusyKey = null;
+		}
+	}
+
+	function saveEntryRename(entry: WorkChapterEntry): void {
+		const title = editTitle.trim();
+		void commitEntry(entry, title ? { titleOverride: title } : { clearTitle: true });
+	}
+
+	function onEntryRenameKey(e: KeyboardEvent, entry: WorkChapterEntry): void {
+		if (e.key === 'Enter') {
+			e.preventDefault();
+			saveEntryRename(entry);
+		} else if (e.key === 'Escape') {
+			editingKey = null;
+		}
+	}
+
+	function moveEntry(entry: WorkChapterEntry, index: number, dir: -1 | 1): void {
+		if (!chapterList) return;
+		const sortKey = moveSortKey(chapterList.entries, index, dir);
+		if (sortKey !== null) void commitEntry(entry, { sortKey });
+	}
+
+	async function moveCopy(entry: WorkChapterEntry, chapterId: string): Promise<void> {
+		const workId = meta?.workId;
+		const selected = copyTargets[chapterId];
+		if (!workId || !chapterList || !selected || entryBusyKey !== null) return;
+		const target = otherEntries(chapterList.entries, entry.id).find((row) => row.id === selected);
+		if (selected !== 'new' && !target) return;
+		const targetLabel = target ? entryTargetLabel(target) : 'a new entry of its own';
+		const here = id;
+		const seq = loadSeq;
+		const ok = await confirm({
+			title: 'Move this copy?',
+			message: `Move this copy to ${targetLabel}? Readers keep what they have read.`,
+			confirmLabel: 'Move copy',
+			danger: true,
+		});
+		if (!ok || id !== here || seq !== loadSeq || entryBusyKey !== null) return;
+		entryBusyKey = entry.id;
+		try {
+			if (!(await relinkChapterCopy(chapterId, target?.id ?? null)))
+				throw new Error('The copy could not be moved. Reload the chapter list and try again.');
+			const fresh = await loadWorkChapterList(workId);
+			if (id === here && seq === loadSeq) {
+				chapterList = fresh;
+				copyTargets = {};
+				mergeTargets = {};
+			}
+			toast.success(`Copy moved to ${targetLabel}.`);
+		} catch (err) {
+			toast.fromError(err, 'Failed to move the copy.');
+		} finally {
+			entryBusyKey = null;
+		}
+	}
+
+	async function mergeEntry(entry: WorkChapterEntry): Promise<void> {
+		const workId = meta?.workId;
+		const selected = mergeTargets[entry.id];
+		if (!workId || !chapterList || !selected || entryBusyKey !== null) return;
+		const target = otherEntries(chapterList.entries, entry.id).find((row) => row.id === selected);
+		if (!target) return;
+		const dropped = entryTargetLabel(entry);
+		const kept = entryTargetLabel(target);
+		const here = id;
+		const seq = loadSeq;
+		const ok = await confirm({
+			title: 'Merge these entries?',
+			message: `Merge ${dropped} into ${kept}? The dropped entry's copies move to the kept entry. Readers keep what they have read.`,
+			confirmLabel: 'Merge entries',
+			danger: true,
+		});
+		if (!ok || id !== here || seq !== loadSeq || entryBusyKey !== null) return;
+		entryBusyKey = entry.id;
+		try {
+			if (!(await mergeChapterEntries(target.id, entry.id)))
+				throw new Error('The entries could not be merged. Reload the chapter list and try again.');
+			const fresh = await loadWorkChapterList(workId);
+			if (id === here && seq === loadSeq) {
+				chapterList = fresh;
+				copyTargets = {};
+				mergeTargets = {};
+				if (editingKey === entry.id) editingKey = null;
+			}
+			toast.success(`${dropped} merged into ${kept}.`);
+		} catch (err) {
+			toast.fromError(err, 'Failed to merge entries.');
+		} finally {
+			entryBusyKey = null;
 		}
 	}
 </script>
@@ -1008,7 +1179,9 @@
 							<div class="group-head">
 								<div>
 									<h2 id="chapters-title" class="group-title">
-										Chapters <span class="count k-num">{chapters.length}</span>
+										Chapters <span class="count k-num"
+											>{chapterList ? chapterList.entries.length : chapters.length}</span
+										>
 									</h2>
 									<p class="group-desc">
 										Rename a chapter or hide it from readers. A hidden chapter is not deleted and
@@ -1017,84 +1190,315 @@
 								</div>
 							</div>
 							<div class="group-body">
-								<LoadState
-									empty={chapters.length === 0}
-									emptyTitle="No chapters yet"
-									emptyHint="Chapters appear here after a source has been scanned."
-									emptyIcon="book"
-								>
-									<div class="k-table" role="table" aria-label="Chapters">
-										<div class="k-tr k-tr--head" role="row">
-											<span role="columnheader">Chapter</span>
-											<span role="columnheader">Title</span>
-											<span role="columnheader">Sources</span>
-											<span role="columnheader" class="k-td--end">Actions</span>
-										</div>
-										{#each chapters as c (c.key)}
-											<div class="k-tr" class:is-hidden={c.hidden} role="row">
-												<span class="ch-num k-num" role="cell" data-label="Chapter">{c.number}</span
-												>
-												{#if editingKey === c.key}
-													<span class="ch-title" role="cell">
-														<input
-															class="k-input k-input--sm"
-															aria-label="Chapter title"
-															name="chapter-title"
-															autocomplete="off"
-															type="text"
-															placeholder={c.sourceTitle ?? ''}
-															bind:value={editTitle}
-															onkeydown={(e) => onRenameKey(e, c)}
-														/>
-													</span>
-													<span class="ch-src k-muted k-num" role="cell" data-label="Sources"
-														>{c.sourceCount}</span
-													>
-													<span class="k-td--end" role="cell">
-														<Button
-															size="sm"
-															variant="primary"
-															busy={chapBusyKey === c.key}
-															onclick={() => saveRename(c)}>Save</Button
-														>
-														<Button size="sm" variant="ghost" onclick={() => (editingKey = null)}
-															>Cancel</Button
-														>
-													</span>
-												{:else}
-													<span class="ch-title" role="cell">
-														<span class="ch-name" class:k-muted={!c.effectiveTitle}
-															>{c.effectiveTitle ?? 'Untitled'}</span
-														>
-														{#if c.hidden}<span class="k-badge" data-tone="warning">Hidden</span
-															>{/if}
-														{#if c.titleOverride}<span class="k-badge">Renamed</span>{/if}
-													</span>
-													<span class="ch-src k-muted k-num" role="cell" data-label="Sources"
-														>{c.sourceCount}</span
-													>
-													<span class="k-td--end ch-actions" role="cell">
-														<Button
-															size="sm"
-															variant="ghost"
-															icon="edit"
-															onclick={() => startRename(c)}>Rename</Button
-														>
-														<Button
-															size="sm"
-															variant="ghost"
-															icon={c.hidden ? 'eye' : 'eye-off'}
-															busy={chapBusyKey === c.key}
-															onclick={() => commitChapter(c, { hidden: !c.hidden })}
-														>
-															{c.hidden ? 'Unhide' : 'Hide'}
-														</Button>
-													</span>
-												{/if}
+								{#if chapterList}
+									{#if !chapterList.ready}
+										<p class="k-hint chapter-note">
+											The chapter list is still being built. Readers see the old list until it is
+											ready.
+										</p>
+									{/if}
+									<LoadState
+										empty={chapterList.entries.length === 0}
+										emptyTitle="No chapters yet"
+										emptyHint="Chapters appear here after a source has been scanned."
+										emptyIcon="book"
+									>
+										<div class="k-table entry-table" role="table" aria-label="Chapters">
+											<div class="k-tr k-tr--head" role="row">
+												<span role="columnheader">Chapter</span>
+												<span role="columnheader">Title</span>
+												<span role="columnheader">Copies</span>
+												<span role="columnheader" class="k-td--end">Actions</span>
 											</div>
-										{/each}
-									</div>
-								</LoadState>
+											{#each chapterList.entries as entry, index (entry.id)}
+												{@const label = entryLabel(entry)}
+												{@const title = entry.titleOverride ?? entry.copies[0]?.title}
+												{@const targets = otherEntries(chapterList.entries, entry.id)}
+												{@const expanded = expandedEntries.includes(entry.id)}
+												{@const upKey = moveSortKey(chapterList.entries, index, -1)}
+												{@const downKey = moveSortKey(chapterList.entries, index, 1)}
+												<div
+													class="k-tr"
+													class:is-hidden={entry.hidden}
+													role="row"
+													aria-busy={entryBusyKey === entry.id || undefined}
+												>
+													<span class="ch-num k-num" role="cell" data-label="Chapter">{label}</span>
+													<span class="ch-title" role="cell">
+														{#if editingKey === entry.id}
+															<input
+																class="k-input k-input--sm"
+																aria-label={`${label} title`}
+																name="chapter-title"
+																autocomplete="off"
+																type="text"
+																placeholder={entry.copies[0]?.title ?? ''}
+																bind:value={editTitle}
+																disabled={entryBusyKey !== null}
+																onkeydown={(e) => onEntryRenameKey(e, entry)}
+															/>
+														{:else}
+															<span class="ch-name" class:k-muted={!title}
+																>{title ?? 'Untitled'}</span
+															>
+														{/if}
+														{#if entry.hidden}<span class="k-badge" data-tone="warning">Hidden</span
+															>{/if}
+														{#if entry.titleOverride !== null}<span class="k-badge">Renamed</span
+															>{/if}
+														{#if entry.special}<span class="k-badge entry-special" data-tone="info"
+																>Special</span
+															>{/if}
+													</span>
+													<span class="ch-src k-num" role="cell" data-label="Copies">
+														<Button
+															size="sm"
+															variant="ghost"
+															icon={expanded ? 'chevron-down' : 'chevron-right'}
+															aria-label={`${expanded ? 'Hide' : 'Show'} copies for ${label} (${entry.copies.length})`}
+															aria-expanded={expanded}
+															aria-controls={`entry-copies-${entry.id}`}
+															onclick={() => toggleCopies(entry.id)}>{entry.copies.length}</Button
+														>
+													</span>
+													<span class="k-td--end" role="cell">
+														{#if editingKey === entry.id}
+															<Button
+																size="sm"
+																variant="primary"
+																busy={entryBusyKey === entry.id}
+																disabled={entryBusyKey !== null}
+																onclick={() => saveEntryRename(entry)}>Save</Button
+															>
+															<Button
+																size="sm"
+																variant="ghost"
+																disabled={entryBusyKey !== null}
+																onclick={() => (editingKey = null)}>Cancel</Button
+															>
+														{:else}
+															<Button
+																size="sm"
+																variant="ghost"
+																icon="edit"
+																disabled={entryBusyKey !== null}
+																onclick={() => startEntryRename(entry)}>Rename</Button
+															>
+															<Button
+																size="sm"
+																variant="ghost"
+																icon={entry.hidden ? 'eye' : 'eye-off'}
+																busy={entryBusyKey === entry.id}
+																disabled={entryBusyKey !== null}
+																onclick={() => commitEntry(entry, { hidden: !entry.hidden })}
+															>
+																{entry.hidden ? 'Unhide' : 'Hide'}
+															</Button>
+															<Button
+																size="sm"
+																variant="ghost"
+																aria-label={`Turn Special ${entry.special ? 'off' : 'on'} for ${label}`}
+																disabled={entryBusyKey !== null}
+																onclick={() => commitEntry(entry, { special: !entry.special })}
+															>
+																Special {entry.special ? 'off' : 'on'}
+															</Button>
+															<Button
+																size="sm"
+																variant="ghost"
+																aria-label={`Move ${label} up`}
+																disabled={entryBusyKey !== null || upKey === null}
+																onclick={() => moveEntry(entry, index, -1)}>Move up</Button
+															>
+															<Button
+																size="sm"
+																variant="ghost"
+																aria-label={`Move ${label} down`}
+																disabled={entryBusyKey !== null || downKey === null}
+																onclick={() => moveEntry(entry, index, 1)}>Move down</Button
+															>
+														{/if}
+														{#if targets.length > 0 && editingKey !== entry.id}
+															<span class="entry-transfer">
+																<label class="k-field">
+																	<span class="k-label">Merge into…</span>
+																	<select
+																		class="k-select"
+																		aria-label={`Merge into… for ${label}`}
+																		value={mergeTargets[entry.id] ?? ''}
+																		disabled={entryBusyKey !== null}
+																		onchange={(e) =>
+																			(mergeTargets[entry.id] = e.currentTarget.value)}
+																	>
+																		<option value="" disabled>Choose an entry</option>
+																		{#each targets as target (target.id)}
+																			<option value={target.id}>{entryTargetLabel(target)}</option>
+																		{/each}
+																	</select>
+																</label>
+																<Button
+																	size="sm"
+																	busy={entryBusyKey === entry.id}
+																	disabled={entryBusyKey !== null || !mergeTargets[entry.id]}
+																	onclick={() => mergeEntry(entry)}>Merge</Button
+																>
+															</span>
+														{/if}
+													</span>
+												</div>
+												{#if expanded}
+													<div class="k-tr" role="row">
+														<div
+															id={`entry-copies-${entry.id}`}
+															class="entry-copies"
+															role="cell"
+															aria-colspan="4"
+														>
+															{#if entry.copies.length === 0}
+																<p class="k-hint">No copies</p>
+															{:else}
+																<ul class="copy-list" aria-label={`Copies of ${label}`}>
+																	{#each entry.copies as copy (copy.chapterId)}
+																		<li>
+																			<dl class="facts copy-facts">
+																				<dt>Source</dt>
+																				<dd>{copy.sourceType} / {copy.sourceId ?? 'Unknown'}</dd>
+																				<dt>Scanlator</dt>
+																				<dd>{copy.scanlator ?? 'Unknown'}</dd>
+																				<dt>Number</dt>
+																				<dd>{copy.number ?? 'Unnumbered'}</dd>
+																				<dt>Title</dt>
+																				<dd>{copy.title ?? 'Untitled'}</dd>
+																				<dt>Language</dt>
+																				<dd>{copy.lang ?? 'Unknown'}</dd>
+																				<dt>Chapter ID</dt>
+																				<dd class="k-mono">{copy.chapterId}</dd>
+																				<dt>Linked by</dt>
+																				<dd>{copy.linkedBy}</dd>
+																			</dl>
+																			<div class="entry-transfer copy-move">
+																				<label class="k-field">
+																					<span class="k-label">Move to…</span>
+																					<select
+																						class="k-select"
+																						aria-label={`Move to… for copy ${copy.chapterId} of ${label}`}
+																						value={copyTargets[copy.chapterId] ?? ''}
+																						disabled={entryBusyKey !== null}
+																						onchange={(e) =>
+																							(copyTargets[copy.chapterId] = e.currentTarget.value)}
+																					>
+																						<option value="" disabled>Choose an entry</option>
+																						{#each targets as target (target.id)}
+																							<option value={target.id}
+																								>{entryTargetLabel(target)}</option
+																							>
+																						{/each}
+																						<option value="new">A new entry of its own</option>
+																					</select>
+																				</label>
+																				<Button
+																					size="sm"
+																					busy={entryBusyKey === entry.id}
+																					disabled={entryBusyKey !== null ||
+																						!copyTargets[copy.chapterId]}
+																					onclick={() => moveCopy(entry, copy.chapterId)}
+																					>Move</Button
+																				>
+																			</div>
+																		</li>
+																	{/each}
+																</ul>
+															{/if}
+														</div>
+													</div>
+												{/if}
+											{/each}
+										</div>
+									</LoadState>
+								{:else}
+									<p class="k-hint chapter-note">
+										This server is older: only rename and hide are available.
+									</p>
+									<LoadState
+										empty={chapters.length === 0}
+										emptyTitle="No chapters yet"
+										emptyHint="Chapters appear here after a source has been scanned."
+										emptyIcon="book"
+									>
+										<div class="k-table" role="table" aria-label="Chapters">
+											<div class="k-tr k-tr--head" role="row">
+												<span role="columnheader">Chapter</span>
+												<span role="columnheader">Title</span>
+												<span role="columnheader">Sources</span>
+												<span role="columnheader" class="k-td--end">Actions</span>
+											</div>
+											{#each chapters as c (c.key)}
+												<div class="k-tr" class:is-hidden={c.hidden} role="row">
+													<span class="ch-num k-num" role="cell" data-label="Chapter"
+														>{c.number}</span
+													>
+													{#if editingKey === c.key}
+														<span class="ch-title" role="cell">
+															<input
+																class="k-input k-input--sm"
+																aria-label="Chapter title"
+																name="chapter-title"
+																autocomplete="off"
+																type="text"
+																placeholder={c.sourceTitle ?? ''}
+																bind:value={editTitle}
+																onkeydown={(e) => onRenameKey(e, c)}
+															/>
+														</span>
+														<span class="ch-src k-muted k-num" role="cell" data-label="Sources"
+															>{c.sourceCount}</span
+														>
+														<span class="k-td--end" role="cell">
+															<Button
+																size="sm"
+																variant="primary"
+																busy={chapBusyKey === c.key}
+																onclick={() => saveRename(c)}>Save</Button
+															>
+															<Button size="sm" variant="ghost" onclick={() => (editingKey = null)}
+																>Cancel</Button
+															>
+														</span>
+													{:else}
+														<span class="ch-title" role="cell">
+															<span class="ch-name" class:k-muted={!c.effectiveTitle}
+																>{c.effectiveTitle ?? 'Untitled'}</span
+															>
+															{#if c.hidden}<span class="k-badge" data-tone="warning">Hidden</span
+																>{/if}
+															{#if c.titleOverride}<span class="k-badge">Renamed</span>{/if}
+														</span>
+														<span class="ch-src k-muted k-num" role="cell" data-label="Sources"
+															>{c.sourceCount}</span
+														>
+														<span class="k-td--end ch-actions" role="cell">
+															<Button
+																size="sm"
+																variant="ghost"
+																icon="edit"
+																onclick={() => startRename(c)}>Rename</Button
+															>
+															<Button
+																size="sm"
+																variant="ghost"
+																icon={c.hidden ? 'eye' : 'eye-off'}
+																busy={chapBusyKey === c.key}
+																onclick={() => commitChapter(c, { hidden: !c.hidden })}
+															>
+																{c.hidden ? 'Unhide' : 'Hide'}
+															</Button>
+														</span>
+													{/if}
+												</div>
+											{/each}
+										</div>
+									</LoadState>
+								{/if}
 							</div>
 						</section>
 					{/if}
@@ -1385,6 +1789,53 @@
 	/* ---- chapters ---- */
 	.k-table {
 		--cols: 64px minmax(0, 1fr) 64px 196px;
+	}
+	.entry-table {
+		--cols: 96px minmax(0, 1fr) 72px 224px;
+	}
+	.entry-table .ch-num {
+		overflow-wrap: anywhere;
+	}
+	.chapter-note {
+		margin-bottom: var(--k-space-3);
+	}
+	.k-badge.entry-special {
+		border-color: transparent;
+	}
+	.entry-copies {
+		grid-column: 1 / -1;
+	}
+	.copy-list {
+		display: grid;
+		gap: var(--k-space-4);
+		padding: 0;
+		list-style: none;
+	}
+	.copy-list > li + li {
+		padding-top: var(--k-space-4);
+		border-top: 1px solid var(--k-border);
+	}
+	.copy-facts {
+		font-size: var(--k-text-xs);
+	}
+	.entry-transfer {
+		display: flex;
+		align-items: flex-end;
+		flex-wrap: wrap;
+		flex-basis: 100%;
+		gap: var(--k-space-2);
+		min-width: 0;
+	}
+	.entry-transfer .k-field {
+		flex: 1 1 160px;
+		min-width: 0;
+	}
+	.entry-transfer .k-select {
+		width: 100%;
+	}
+	.copy-move {
+		margin-top: var(--k-space-3);
+		max-width: 480px;
 	}
 	.ch-num {
 		color: var(--k-text-1);

@@ -46,7 +46,7 @@ The library interface provides several tools to help you track your reading.
 
 ### Continue reading rail
 
-When you have library series with some but not all chapters read, the top of your library displays a Continue Reading section. Each card shows the series cover and a progress bar showing the percentage of chapters you have read. Click Resume to open the series page, then use Continue Ch. to open the first unread chapter.
+When you have library series with some but not all chapters read, the top of your library displays a Continue Reading section. Each card shows the series cover and a progress bar showing the percentage of chapters you have read. Click Resume to open the series page, then use Continue Ch. to open the first unread chapter after the one you have read through. If none remains after that point, it opens the first unread chapter in the list.
 
 ### Chapter checkmarks
 
@@ -54,9 +54,11 @@ On each series page, every chapter row displays a read mark indicator. When you 
 
 When you finish a chapter, komiq also marks the chapters before it in the series' chapter list as read, on every source. Special chapters, such as extras, stay as they are. While the server is still building the chapter list of a series, only the earlier chapters on the same source are marked.
 
-If you mark a chapter unread, it stays unread. Finishing a later chapter does not mark it read again. Neither does a late save of a later chapter, for example an offline save from another device that syncs afterwards. The chapter becomes read again only when you read it to the end or click its checkmark again. A late save that finished this same chapter also counts as reading it. Reading or ticking the same chapter on another source of the same series counts too. Marking a chapter unread also clears it on the other sources of that series.
+If you mark a chapter unread, it stays unread. Finishing a later chapter does not mark it read again. Neither does a late save of a later chapter, for example an offline save from another device that syncs afterwards. The chapter becomes read again only when you read it to the end or click its checkmark again. A late save that finished this same chapter also counts as reading it unless the server refuses it as out of date. Reading or ticking the same chapter on another source of the same series counts too. Marking a chapter unread also clears it on the other sources of that series.
 
 The read count and the last-read time of a series use the same rule, so they match the checkmarks you see.
+
+Continue Reading and checkmarks use the same chapter order and progress rules. See [Read a chapter](/guide/reading) for specials and saves from an older view.
 
 ### Filter and sort your library
 

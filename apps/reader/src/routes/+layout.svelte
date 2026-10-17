@@ -7,7 +7,8 @@
 	import '$lib/app.css';
 	import { page } from '$app/state';
 	import { onMount } from 'svelte';
-	import { isTauri, onStaleNumericEpoch } from '@komika/api';
+	import { isTauri, onStaleNumericEpoch, onProgressConflict } from '@komika/api';
+	import { dropWorkProgressState } from '$lib/data/source';
 	import { auth, initAuth } from '$lib/auth.svelte';
 	import { initTheme } from '$lib/theme.svelte';
 	import { markHydrated } from '$lib/stream';
@@ -26,6 +27,7 @@
 			staleNumericEpoch = true;
 		}),
 	);
+	onMount(() => onProgressConflict(({ workId }) => dropWorkProgressState(workId)));
 
 	// Entry imports and the initial route have loaded before the root mounts.
 	// End bootstrap recovery and let a later deployment reload once again.

@@ -403,17 +403,17 @@
 		const atEnd = isStrip ? atStripEnd() : currentEnd >= total - 1;
 		if (atEnd) {
 			readMarked = true;
-			void saveProgress(data.chapterId, Math.max(0, total - 1), true);
+			void saveProgress(data.chapterId, Math.max(0, total - 1), true, data.seriesId);
 		}
 	}
 
 	// Persist the current reading position. Reading otherwise only saves on in-app
 	// chapter changes and at the end, so a browser-back or header-link exit would drop
 	// a mid-chapter position. Save on navigation away, on tab-hide, and on unmount.
-	// saveProgress is idempotent latest-wins, so overlapping triggers are harmless.
+	// The backend reconciles overlapping saves against the work's known revision.
 	function saveCurrentProgress(): void {
 		if (!data.chapterId) return;
-		void saveProgress(data.chapterId, currentPageIndex(), readMarked);
+		void saveProgress(data.chapterId, currentPageIndex(), readMarked, data.seriesId);
 	}
 	beforeNavigate(() => saveCurrentProgress());
 	$effect(() => {
@@ -1271,7 +1271,9 @@
 					>
 						{#each data.chapters as c (c.id ?? c.n)}
 							<option value={c.id ?? ''} disabled={!c.id}
-								>{chapterLabel(c)}{c.externalUrl ? ' (off-site)' : ''}</option
+								>{chapterLabel(c)}{c.externalUrl ? ' (off-site)' : ''}{c.special
+									? ' (special)'
+									: ''}</option
 							>
 						{/each}
 					</select>
