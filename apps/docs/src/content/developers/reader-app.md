@@ -92,8 +92,7 @@ Each queued progress save stores a stable `opId`, its `workId`, its base `revisi
 
 - A save is never sent twice at once. When a new sign-in token cancels a replay while a save is out, the next replay waits for that request. If the server answers, the queue removes the save and passes its revision on as usual.
 - The queue's storage also keeps the last base revision the app saw for each work of the signed-in account. After an offline restart, a new save uses it, so the server can still refuse it as stale. Loading the work's chapter list from the server replaces it, or forgets it when that load brings no revision. Another account's sign-in or a sign-out clears it.
-
-One limit remains. A save the server applied whose answer never arrived, for example after a timeout or a crash, is sent again with its old base revision. The server refuses it, and the remaining saves for that work are stale: only forward page steps with `read: false` can apply. The server cannot tell such a retry from a stale save, because a save carries no ID of its own.
+- A save carries its `opId`. A live save that fails is queued with the same id. When the server applied a save but its answer never arrived, for example after a timeout or a crash, the resend has its old base revision. The server finds that this id made the reader's last change in the work and answers `APPLIED` with the current revision, so the next save of the chain goes out with that revision. A server that predates `opId` judges the resend by its revision alone and refuses it.
 
 ### Chapter entries and moved links
 

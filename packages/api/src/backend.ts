@@ -1478,6 +1478,11 @@ export interface SaveProgressInput {
 	numericEpoch?: number | null;
 	/** Base revision; omitted = the known one (fetched with `viewerProgress` if none). */
 	revision?: number;
+	/**
+	 * This save's own id (at most 64 characters). Sending the same id again after a lost
+	 * answer is answered APPLIED with the current revision when it was the last change.
+	 */
+	opId?: string;
 }
 
 /** {@link Backend.saveChapterRead} input. */
@@ -1487,6 +1492,8 @@ export interface SaveChapterReadInput {
 	read: boolean;
 	numericEpoch?: number | null;
 	revision?: number;
+	/** See {@link SaveProgressInput.opId}. */
+	opId?: string;
 }
 
 /** One copy (a source's chapter) linked to a {@link WorkChapterEntry}. */

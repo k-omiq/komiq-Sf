@@ -11,6 +11,7 @@
  * success signals + the browser `online` event, and the queue only reorders and
  * flushes an ordered list of ops.
  */
+import { createOpId } from './op-id.js';
 
 /**
  * Storage seam so persistence is injectable. The default binds to
@@ -28,7 +29,10 @@ export interface StorageAdapter {
 /** A pending on-device reading-progress write, reconciled by canonical `chapterId`. */
 export interface ProgressOp {
 	kind: 'progress';
-	/** Stable identity lets queued successors survive collapse and reload. */
+	/**
+	 * Stable identity lets queued successors survive collapse and reload. It is also sent
+	 * with the save, so a resend after a lost answer is recognised as already applied.
+	 */
 	opId?: string;
 	chapterId: string;
 	/** Writes without a known work cannot participate in a revision chain. */
@@ -93,6 +97,8 @@ export type EnqueueOp =
 			workId?: string | null;
 			/** See {@link ProgressOp.revision}. */
 			revision?: number | null;
+			/** The id a live attempt of this same save already went out with, if any. */
+			opId?: string;
 			lastPageRead: number;
 			read: boolean;
 			ts?: number;
@@ -300,7 +306,7 @@ export class OfflineWriteQueue {
 			op.kind === 'progress'
 				? {
 						kind: 'progress',
-						opId: createOpId(),
+						opId: op.opId ?? createOpId(),
 						chapterId: op.chapterId,
 						workId: op.workId ?? null,
 						revision: op.revision ?? null,
@@ -508,14 +514,6 @@ export class OfflineWriteQueue {
 			}
 		}
 	}
-}
-
-let opIdCounter = 0;
-
-/** Older webviews still need unique identities when randomUUID is unavailable. */
-function createOpId(): string {
-	if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
-	return `${Date.now().toString(36)}-${++opIdCounter}-${Math.random().toString(36).slice(2)}`;
 }
 
 /** Whether two ops address the same reconciliation target (so `b` supersedes `a`). */

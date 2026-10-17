@@ -769,3 +769,131 @@ async fn an_untick_keeps_the_last_read_time_and_a_finish_moves_it() {
     .await;
     assert_eq!(last_read().await, (false, 3), "a finish is a read");
 }
+
+async fn save_op(
+    schema: &ApiSchema,
+    work: &str,
+    id: &str,
+    page: i32,
+    read: bool,
+    revision: i64,
+    op: &str,
+) -> Value {
+    bob(schema, &format!(
+        r#"mutation {{ saveProgress(chapterId:"{id}",workId:"{work}",lastPageRead:{page},read:{read},revision:{revision},opId:"{op}") {{ status revision workId }} }}"#,
+    )).await["saveProgress"].clone()
+}
+
+async fn tick_op(
+    schema: &ApiSchema,
+    work: &str,
+    id: &str,
+    read: bool,
+    revision: i64,
+    op: &str,
+) -> Value {
+    bob(schema, &format!(
+        r#"mutation {{ saveChapterRead(chapterId:"{id}",workId:"{work}",read:{read},revision:{revision},opId:"{op}") {{ status revision workId }} }}"#,
+    )).await["saveChapterRead"].clone()
+}
+
+async fn last_op_id(pool: &Database, work: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT last_op_id FROM work_progress WHERE user_id = $1 AND work_id = $2")
+        .bind(crate::db_types::uuid(BOB).unwrap())
+        .bind(work)
+        .fetch_one(pool.read())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_resent_save_with_its_op_id_is_applied_once_and_other_stale_saves_stay_refused() {
+    let (schema, pool, work) = fixture(true).await;
+    let applied = |revision: i64| json!({"status":"APPLIED","revision":revision,"workId":work});
+    // A finish whose answer is lost is resent with the same base revision and id.
+    assert_eq!(
+        save_op(&schema, &work, "entry-one", 20, true, 0, "op-a").await,
+        applied(1)
+    );
+    assert_eq!(last_op_id(&pool, &work).await.as_deref(), Some("op-a"));
+    let row = bob_progress_row(&pool, "entry-one").await;
+    let progress = viewer(&schema, &work).await;
+    assert_eq!(
+        save_op(&schema, &work, "entry-one", 20, true, 0, "op-a").await,
+        applied(1)
+    );
+    assert_eq!(
+        viewer(&schema, &work).await,
+        progress,
+        "no second revision bump"
+    );
+    assert_eq!(bob_progress_row(&pool, "entry-one").await, row);
+    // The same for a tick.
+    assert_eq!(
+        tick_op(&schema, &work, "entry-two", true, 1, "op-b").await,
+        applied(2)
+    );
+    assert_eq!(
+        tick_op(&schema, &work, "entry-two", true, 1, "op-b").await,
+        applied(2)
+    );
+    // Another id with a stale base is still refused, and so is a stale save with none.
+    assert_eq!(
+        save_op(&schema, &work, "entry-three", 20, true, 0, "op-c").await["status"],
+        "REFUSED"
+    );
+    assert_eq!(
+        save(&schema, &work, "entry-three", 20, true, 0).await["status"],
+        "REFUSED"
+    );
+    assert!(bob_progress_row(&pool, "entry-three").await.is_none());
+    // A save with no id behaves as before and stores none, so op-b is no longer the last
+    // change: its resend is judged by its revision again.
+    assert_eq!(
+        save(&schema, &work, "entry-three", 20, true, 2).await,
+        applied(3)
+    );
+    assert_eq!(last_op_id(&pool, &work).await, None);
+    assert_eq!(
+        tick_op(&schema, &work, "entry-two", true, 1, "op-b").await["status"],
+        "REFUSED"
+    );
+    // An old mutation's change clears the id too.
+    assert_eq!(
+        tick_op(&schema, &work, "entry-one", false, 3, "op-d").await,
+        applied(4)
+    );
+    let data = bob(
+        &schema,
+        r#"mutation { setChapterRead(chapterId:"entry-one",read:true) }"#,
+    )
+    .await;
+    assert_eq!(data["setChapterRead"], true);
+    assert_eq!(viewer(&schema, &work).await["revision"], 5);
+    assert_eq!(last_op_id(&pool, &work).await, None);
+    assert_eq!(
+        tick_op(&schema, &work, "entry-one", false, 3, "op-d").await["status"],
+        "REFUSED"
+    );
+    // The id is bounded.
+    let long = "x".repeat(65);
+    for op in ["", long.as_str()] {
+        for text in [
+            format!(
+                r#"mutation {{ saveProgress(chapterId:"entry-one",workId:"{work}",lastPageRead:1,read:false,revision:5,opId:"{op}") {{ status }} }}"#
+            ),
+            format!(
+                r#"mutation {{ saveChapterRead(chapterId:"entry-one",workId:"{work}",read:true,revision:5,opId:"{op}") {{ status }} }}"#
+            ),
+        ] {
+            assert!(!exec(&schema, &text, Some("bobtok"), "w3b-op-id")
+                .await
+                .errors
+                .is_empty());
+        }
+    }
+    assert_eq!(
+        save_op(&schema, &work, "entry-one", 1, false, 5, &"y".repeat(64)).await["status"],
+        "APPLIED"
+    );
+}

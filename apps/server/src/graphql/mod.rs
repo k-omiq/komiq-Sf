@@ -11403,6 +11403,21 @@ async fn mark_notifications_read_once(
 struct ProgressCheck<'a> {
     work_id: Option<&'a str>,
     revision: i64,
+    /// The client's id for this save. A retry of the save last applied for this reader
+    /// and work (its answer was lost) is answered as applied, without a second change.
+    op_id: Option<&'a str>,
+}
+
+/// Longest client save id `saveProgress` / `saveChapterRead` accept (a UUID is 36).
+const MAX_PROGRESS_OP_ID: usize = 64;
+
+fn progress_op_id(op_id: Option<&str>) -> Result<Option<&str>> {
+    match op_id {
+        Some(op) if op.is_empty() || op.len() > MAX_PROGRESS_OP_ID => {
+            Err(Error::new("Invalid opId"))
+        }
+        op => Ok(op),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -11521,14 +11536,16 @@ async fn write_progress_once(
         return Err(crate::locks::RestartTransaction.into());
     }
     let user = crate::db_types::uuid(user_id)?;
-    let stored: Option<(Option<String>, i64)> = if copy.work_id.is_empty() {
+    let stored: Option<(Option<String>, i64, Option<String>)> = if copy.work_id.is_empty() {
         None
     } else {
         sqlx::query_as(
-            "SELECT through_entry_id, revision FROM work_progress WHERE user_id = $1 AND work_id = $2 FOR UPDATE",
+            "SELECT through_entry_id, revision, last_op_id FROM work_progress \
+             WHERE user_id = $1 AND work_id = $2 FOR UPDATE",
         ).bind(user).bind(&copy.work_id).fetch_optional(&mut *tx).await?
     };
-    let (mut through, revision) = stored.unwrap_or((None, 0));
+    let (mut through, revision, last_op_id) = stored.unwrap_or((None, 0, None));
+    let op_id = check.as_ref().and_then(|check| check.op_id);
     let outcome = |status, revision| ProgressResult {
         status,
         revision,
@@ -11542,6 +11559,12 @@ async fn write_progress_once(
         if client_work.as_deref() != Some(copy.work_id.as_str()) {
             tx.commit().await?;
             return Ok(outcome(ProgressStatus::Moved, revision));
+        }
+        // A resend of the save this reader's last change came from: it is applied, and
+        // the current revision is exactly what it produced.
+        if op_id.is_some() && op_id == last_op_id.as_deref() {
+            tx.commit().await?;
+            return Ok(outcome(ProgressStatus::Applied, revision));
         }
         if check.revision != revision {
             if let ProgressWrite::Save { page, read: false } = write {
@@ -11809,13 +11832,15 @@ async fn write_progress_once(
     let new_revision =
         if changed && !copy.work_id.is_empty() {
             sqlx::query_scalar(
-            "INSERT INTO work_progress (user_id, work_id, through_entry_id, revision, updated_at) \
-             VALUES ($1, $2, $3, 1, now()) ON CONFLICT (user_id, work_id) DO UPDATE SET \
+            "INSERT INTO work_progress (user_id, work_id, through_entry_id, revision, updated_at, last_op_id) \
+             VALUES ($1, $2, $3, 1, now(), $5) ON CONFLICT (user_id, work_id) DO UPDATE SET \
              through_entry_id = excluded.through_entry_id, revision = work_progress.revision + 1, \
-             updated_at = CASE WHEN $4 THEN work_progress.updated_at ELSE excluded.updated_at END \
+             updated_at = CASE WHEN $4 THEN work_progress.updated_at ELSE excluded.updated_at END, \
+             last_op_id = excluded.last_op_id \
              RETURNING revision",
         ).bind(user).bind(&copy.work_id).bind(&through)
             .bind(matches!(write, ProgressWrite::Toggle { read: false }))
+            .bind(op_id)
             .fetch_one(&mut *tx).await?
         } else {
             revision
@@ -12933,10 +12958,12 @@ impl MutationRoot {
         read: bool,
         numeric_epoch: Option<i64>,
         revision: i64,
+        op_id: Option<String>,
     ) -> Result<ProgressResult> {
         if last_page_read < 0 {
             return Err(Error::new("lastPageRead must be non-negative"));
         }
+        let op_id = progress_op_id(op_id.as_deref())?;
         let user = require_user(ctx).await?;
         let id = chapter_id.0.trim();
         if id.is_empty() || id.len() > 128 {
@@ -12955,6 +12982,7 @@ impl MutationRoot {
                 Some(ProgressCheck {
                     work_id: work_id.as_ref().map(|id| id.0.as_str()),
                     revision,
+                    op_id,
                 }),
             )
         })
@@ -12970,7 +12998,9 @@ impl MutationRoot {
         read: bool,
         numeric_epoch: Option<i64>,
         revision: i64,
+        op_id: Option<String>,
     ) -> Result<ProgressResult> {
+        let op_id = progress_op_id(op_id.as_deref())?;
         let user = require_user(ctx).await?;
         let id = chapter_id.0.trim();
         if id.is_empty() || id.len() > 128 {
@@ -12986,6 +13016,7 @@ impl MutationRoot {
                 Some(ProgressCheck {
                     work_id: work_id.as_ref().map(|id| id.0.as_str()),
                     revision,
+                    op_id,
                 }),
             )
         })

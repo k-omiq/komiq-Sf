@@ -91,8 +91,12 @@ async function fixture() {
 test('an offline live save queues its work, known revision, owner and captured epoch', async () => {
 	const { composite, server, writes, queued, adapter } = await fixture();
 	assert.equal(await composite.saveProgress(input), null);
-	assert.deepEqual(server.sent, [input], 'the live request keeps its epoch implicit');
 	const [op] = queued();
+	assert.deepEqual(
+		server.sent,
+		[{ ...input, opId: op.opId }],
+		'the live request keeps its epoch implicit and shares its id with the queued retry',
+	);
 	assert.equal(op.workId, workId);
 	assert.equal(op.revision, 4);
 	assert.equal(op.numericEpoch, 3);
@@ -129,8 +133,8 @@ test('two saves of one work replay in order with the first APPLIED revision', as
 	assert.deepEqual(
 		server.sent.filter((save) => save.workId === workId),
 		[
-			{ ...input, numericEpoch: 3, revision: 4 },
-			{ ...input, chapterId: '43', read: true, numericEpoch: 3, revision: 17 },
+			{ ...input, numericEpoch: 3, revision: 4, opId: first.opId },
+			{ ...input, chapterId: '43', read: true, numericEpoch: 3, revision: 17, opId: second.opId },
 		],
 	);
 	assert.equal(writes.size(), 0);

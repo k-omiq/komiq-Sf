@@ -171,6 +171,10 @@ export const OPTIONAL_ARGUMENTS = [
 	// an engine change is refused instead of filed on a chapter that reused the id. A server
 	// that predates engine generations has no fence and needs no epoch.
 	'numericEpoch',
+	// M9: `saveProgress` / `saveChapterRead` carry the save's own id, so a resend of a save
+	// whose answer was lost is answered APPLIED instead of being refused as stale. A server
+	// that predates it judges the resend by its revision alone, as before.
+	'opId',
 ] as const;
 
 const SERIES_FIELDS = /* GraphQL */ `
@@ -659,6 +663,7 @@ export const SAVE_PROGRESS = /* GraphQL */ `
 		$read: Boolean!
 		$numericEpoch: Int
 		$revision: Int!
+		$opId: String
 	) {
 		saveProgress(
 			chapterId: $chapterId
@@ -667,6 +672,7 @@ export const SAVE_PROGRESS = /* GraphQL */ `
 			read: $read
 			numericEpoch: $numericEpoch
 			revision: $revision
+			opId: $opId
 		) {
 			status
 			revision
@@ -682,6 +688,7 @@ export const SAVE_CHAPTER_READ = /* GraphQL */ `
 		$read: Boolean!
 		$numericEpoch: Int
 		$revision: Int!
+		$opId: String
 	) {
 		saveChapterRead(
 			chapterId: $chapterId
@@ -689,6 +696,7 @@ export const SAVE_CHAPTER_READ = /* GraphQL */ `
 			read: $read
 			numericEpoch: $numericEpoch
 			revision: $revision
+			opId: $opId
 		) {
 			status
 			revision

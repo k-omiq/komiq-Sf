@@ -131,7 +131,7 @@ The **Chapters** list shows one chapter of the work's own list per row, called a
 - **Move up** / **Move down**: Changes the entry's position in the chapter list.
 - **Copies**: Click the copy count to see the linked copies and their source details.
 - **Move**: Under a copy, choose another entry in the same work from **Move to…**, or choose **A new entry of its own**. Click **Move** and confirm.
-- **Merge**: Choose the entry to keep from **Merge into…**, click **Merge** and confirm. The dropped entry's copies move to the kept entry. A new copy with the dropped entry's chapter number joins the kept entry too, as long as one of the moved copies is still there.
+- **Merge**: Choose the entry to keep from **Merge into…**, click **Merge** and confirm. The dropped entry's copies move to the kept entry. The kept entry also keeps the dropped entry's chapter number, or its identity for a chapter without a number. A copy that comes back later, or a new copy with that number, joins the kept entry, so the merge is not undone.
 
 Readers keep what they have read when you move copies or merge entries.
 

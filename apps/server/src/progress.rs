@@ -688,7 +688,8 @@ pub async fn keep_state_after(
         .await?;
     }
     if !progress_users.is_empty() {
-        // Only the revision moves. `updated_at` is the reader's last read, which orders
+        // Only the revision moves (and no client save produced it, so a resend of the
+        // last one is judged by its revision again). `updated_at` is the reader's last read, which orders
         // Continue reading: keep the row's own; a new row takes its origin's (the loser's
         // or the split source's), and a merge keeps the later of the two. A row with
         // neither has no pointer, so its time is never shown.
@@ -702,7 +703,8 @@ pub async fn keep_state_after(
                LEFT JOIN work_progress own ON own.user_id = u.user_id AND own.work_id = u.work_id \
                LEFT JOIN work_progress origin ON origin.user_id = u.user_id AND origin.work_id = u.origin \
              ON CONFLICT (user_id, work_id) DO UPDATE SET through_entry_id = EXCLUDED.through_entry_id, \
-                 revision = work_progress.revision + 1, updated_at = EXCLUDED.updated_at",
+                 revision = work_progress.revision + 1, updated_at = EXCLUDED.updated_at, \
+                 last_op_id = NULL",
         )
         .bind(&progress_users)
         .bind(&progress_works)

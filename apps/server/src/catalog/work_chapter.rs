@@ -141,10 +141,10 @@ async fn link_copies_on(
         let mut numbers = Vec::new();
         let mut labels = Vec::new();
         let mut specials = Vec::new();
-        // A key an admin merged away has no entry of its own, but the entry that took
-        // its copies still claims it (see `merged_key_owners_on`).
+        // A key an admin merged away has no entry of its own: its alias names the entry
+        // that took its copies.
         let all_keys: Vec<String> = numbered.iter().map(|(_, key, _)| key.clone()).collect();
-        let merged = merged_key_owners_on(conn, work_id, &all_keys).await?;
+        let merged = aliased_entries_on(conn, work_id, &all_keys).await?;
         let mut seen: std::collections::HashSet<String> = merged.keys().cloned().collect();
         for (c, key, n) in &numbered {
             if seen.insert(key.clone()) {
@@ -266,7 +266,10 @@ async fn link_copies_on(
             }
             let key = special_match_key(c, &native);
             let existing: Option<String> = sqlx::query_scalar(
-                "SELECT id FROM work_chapter WHERE work_id = $1 AND match_key = $2",
+                "SELECT id FROM work_chapter WHERE work_id = $1 AND match_key = $2 \
+                 UNION ALL \
+                 SELECT work_chapter_id FROM work_chapter_alias WHERE work_id = $1 AND match_key = $2 \
+                 LIMIT 1",
             )
             .bind(work_id)
             .bind(&key)
@@ -326,28 +329,17 @@ async fn link_copies_on(
     Ok(linked)
 }
 
-/// Numbered keys with no entry of their own whose copies an admin entry merge moved onto
-/// another entry: key -> that entry. `merge_entries_within_on` deletes the dropped entry
-/// and marks the links it moves `admin`, so the survivor keeps claiming the dropped key
-/// as long as one of those copies is linked; a new copy with that key (a re-listed
-/// chapter, another group's upload) joins the survivor instead of recreating the
-/// duplicate. Matcher links are never read here: link once can leave a renumbered copy
-/// on an entry whose key is not its own.
-async fn merged_key_owners_on(
+/// Keys an admin entry merge took away (`work_chapter_alias`): key -> the entry that took
+/// the dropped entry's copies. A new or returning copy with such a key (a re-listed
+/// chapter, another group's upload) joins that entry instead of recreating the duplicate.
+async fn aliased_entries_on(
     conn: &mut PgConnection,
     work_id: &str,
     keys: &[String],
 ) -> Result<HashMap<String, String>> {
     Ok(sqlx::query_as::<_, (String, String)>(
-        "SELECT DISTINCT ON (c.chapter_key) c.chapter_key, wc.id \
-           FROM work_chapter wc \
-           JOIN work_chapter_link l ON l.work_chapter_id = wc.id AND l.linked_by = 'admin' \
-           JOIN chapter c ON c.id = l.chapter_id \
-          WHERE wc.work_id = $1 AND c.chapter_key = ANY($2) \
-            AND wc.match_key IS DISTINCT FROM c.chapter_key \
-            AND NOT EXISTS (SELECT 1 FROM work_chapter k \
-                             WHERE k.work_id = $1 AND k.match_key = c.chapter_key) \
-          ORDER BY c.chapter_key, l.linked_at DESC, wc.id",
+        "SELECT match_key, work_chapter_id FROM work_chapter_alias \
+          WHERE work_id = $1 AND match_key = ANY($2)",
     )
     .bind(work_id)
     .bind(keys)
@@ -355,6 +347,18 @@ async fn merged_key_owners_on(
     .await?
     .into_iter()
     .collect())
+}
+
+/// An alias is only for a key the work has no entry of its own for: a real entry wins.
+async fn drop_shadowed_aliases_on(conn: &mut PgConnection, work_id: &str) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM work_chapter_alias a USING work_chapter wc \
+          WHERE a.work_id = $1 AND wc.work_id = $1 AND wc.match_key = a.match_key",
+    )
+    .bind(work_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 /// Where a new special goes, as one SQL expression over `$2` (work) and `$4` (release):
@@ -708,9 +712,11 @@ pub async fn run_cli(pool: &Database, args: &[String]) -> Result<()> {
 
 /// Fold `source_work`'s entries into `target_work`, inside the merge's transaction and
 /// before the source work is deleted. An entry whose `match_key` the target already has
-/// maps onto that entry (its links move; the target's overrides win, a loser override
-/// fills a target entry that has none); every other entry moves as it is. Returns the
-/// entry map. The target stays ready if it was and every copy it now has is linked.
+/// (as an entry, or as an alias an admin entry merge left) maps onto that entry (its
+/// links move; the target's overrides win, a loser override fills a target entry that
+/// has none); every other entry moves as it is. The loser's aliases follow their entries;
+/// one whose key the target has as an entry or alias is dropped. Returns the entry map.
+/// The target stays ready if it was and every copy it now has is linked.
 pub(crate) async fn merge_entries_on(
     conn: &mut PgConnection,
     source_work: &str,
@@ -718,16 +724,37 @@ pub(crate) async fn merge_entries_on(
 ) -> Result<Vec<EntryMove>> {
     crate::catalog::guards::assert_in_transaction(conn, "work_chapter::merge_entries_on");
     let pairs: Vec<(String, String)> = sqlx::query_as(
-        "SELECT l.id, s.id FROM work_chapter l \
-           JOIN work_chapter s ON s.work_id = $2 AND s.match_key = l.match_key \
-          WHERE l.work_id = $1 ORDER BY l.id",
+        "SELECT l.id, COALESCE(s.id, a.work_chapter_id) FROM work_chapter l \
+           LEFT JOIN work_chapter s ON s.work_id = $2 AND s.match_key = l.match_key \
+           LEFT JOIN work_chapter_alias a ON a.work_id = $2 AND a.match_key = l.match_key \
+          WHERE l.work_id = $1 AND (s.id IS NOT NULL OR a.work_chapter_id IS NOT NULL) \
+          ORDER BY l.id",
     )
     .bind(source_work)
     .bind(target_work)
     .fetch_all(&mut *conn)
     .await?;
+    // Before the paired loser entries go: their aliases cascade with them.
+    let (from, to): (Vec<String>, Vec<String>) = pairs.iter().cloned().unzip();
+    sqlx::query(
+        "INSERT INTO work_chapter_alias (work_id, match_key, work_chapter_id, created_at) \
+         SELECT $2, a.match_key, COALESCE(m.t, a.work_chapter_id), a.created_at \
+           FROM work_chapter_alias a \
+           LEFT JOIN UNNEST($3::text[], $4::text[]) AS m(f, t) ON m.f = a.work_chapter_id \
+          WHERE a.work_id = $1 \
+         ON CONFLICT (work_id, match_key) DO NOTHING",
+    )
+    .bind(source_work)
+    .bind(target_work)
+    .bind(&from)
+    .bind(&to)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query("DELETE FROM work_chapter_alias WHERE work_id = $1")
+        .bind(source_work)
+        .execute(&mut *conn)
+        .await?;
     if !pairs.is_empty() {
-        let (from, to): (Vec<String>, Vec<String>) = pairs.iter().cloned().unzip();
         sqlx::query(
             "UPDATE work_chapter s SET hidden = l.hidden, title_override = l.title_override \
                FROM UNNEST($1::text[], $2::text[]) AS m(f, t) \
@@ -758,6 +785,8 @@ pub(crate) async fn merge_entries_on(
             .bind(target_work)
             .fetch_all(&mut *conn)
             .await?;
+    // A loser alias whose key a moved loser entry holds as its own.
+    drop_shadowed_aliases_on(conn, target_work).await?;
     // The merge already folded legacy overrides with survivor precedence.
     sync_numbered_entries_from_overrides_on(conn, target_work).await?;
     // A ready target stays ready when every copy it now has is linked; the loser's own
@@ -805,12 +834,16 @@ pub(crate) async fn merge_entries_on(
 /// Entries follow the copies of `moving` source mappings from `from_work` to `to_work`,
 /// inside the split's transaction (call it before or after the mappings move; it reads
 /// copies by mapping id). Per entry with a moving copy:
-///   * the destination already has its `match_key`: the moving links join that entry;
+///   * the destination already has its `match_key` (as an entry or an alias): the moving
+///     links join that entry;
 ///   * every copy moves: the entry moves;
 ///   * copies on both sides: the entry stays, and the destination gets a new entry with
 ///     the same key, order and flags for the moving copies.
-/// Entries with no copies stay. `to_is_new`: the destination was created by this split,
-/// so only the drain may mark it ready.
+/// Entries with no copies stay. Aliases follow their entry: a moved entry takes them, and
+/// the destination entry of a joined or cloned one gets a copy, while the staying entry
+/// keeps its own (unless the destination has the key as an entry or alias already).
+/// `to_is_new`: the destination was created by this split, so only the drain may mark
+/// it ready.
 pub(crate) async fn split_entries_on(
     conn: &mut PgConnection,
     from_work: &str,
@@ -821,7 +854,10 @@ pub(crate) async fn split_entries_on(
     crate::catalog::guards::assert_in_transaction(conn, "work_chapter::split_entries_on");
     let affected: Vec<(String, Option<String>, bool, Option<String>)> = sqlx::query_as(
         "SELECT wc.id, wc.match_key, bool_and(c.source_series_id = ANY($2)), \
-                (SELECT d.id FROM work_chapter d WHERE d.work_id = $3 AND d.match_key = wc.match_key) \
+                COALESCE((SELECT d.id FROM work_chapter d \
+                           WHERE d.work_id = $3 AND d.match_key = wc.match_key), \
+                         (SELECT a.work_chapter_id FROM work_chapter_alias a \
+                           WHERE a.work_id = $3 AND a.match_key = wc.match_key)) \
            FROM work_chapter wc \
            JOIN work_chapter_link l ON l.work_chapter_id = wc.id \
            JOIN chapter c ON c.id = l.chapter_id \
@@ -881,6 +917,33 @@ pub(crate) async fn split_entries_on(
         .execute(&mut *conn)
         .await?;
         map.push(EntryMove { from: entry, to });
+    }
+    if !map.is_empty() {
+        let (from, to): (Vec<String>, Vec<String>) =
+            map.iter().map(|m| (m.from.clone(), m.to.clone())).unzip();
+        sqlx::query(
+            "INSERT INTO work_chapter_alias (work_id, match_key, work_chapter_id, created_at) \
+             SELECT $2, a.match_key, m.t, a.created_at \
+               FROM work_chapter_alias a JOIN UNNEST($3::text[], $4::text[]) AS m(f, t) \
+                 ON m.f = a.work_chapter_id \
+              WHERE a.work_id = $1 \
+             ON CONFLICT (work_id, match_key) DO NOTHING",
+        )
+        .bind(from_work)
+        .bind(to_work)
+        .bind(&from)
+        .bind(&to)
+        .execute(&mut *conn)
+        .await?;
+        // A moved entry's aliases left with it.
+        sqlx::query(
+            "DELETE FROM work_chapter_alias a USING work_chapter wc \
+              WHERE a.work_id = $1 AND wc.id = a.work_chapter_id AND wc.work_id <> $1",
+        )
+        .bind(from_work)
+        .execute(&mut *conn)
+        .await?;
+        drop_shadowed_aliases_on(conn, to_work).await?;
     }
     // Numbered overrides are dual-written to `chapter_override`, the fallback for copies
     // not linked yet. The destination's own rows win.
@@ -1044,14 +1107,27 @@ pub(crate) async fn merge_entries_within_on(
     let Some((key, hidden, title)) = row else {
         anyhow::bail!("entries are not in work: {work_id}");
     };
-    // `admin` links are what lets the kept entry go on claiming the dropped key
-    // (`merged_key_owners_on`).
+    sqlx::query("UPDATE work_chapter_link SET work_chapter_id = $1 WHERE work_chapter_id = $2")
+        .bind(keep)
+        .bind(drop)
+        .execute(&mut *conn)
+        .await?;
+    // The kept entry goes on claiming the dropped key, and every key that already pointed
+    // at the dropped entry, so the matcher never recreates the duplicate.
+    sqlx::query("UPDATE work_chapter_alias SET work_chapter_id = $1 WHERE work_chapter_id = $2")
+        .bind(keep)
+        .bind(drop)
+        .execute(&mut *conn)
+        .await?;
     sqlx::query(
-        "UPDATE work_chapter_link SET work_chapter_id = $1, linked_by = 'admin', linked_at = now() \
-         WHERE work_chapter_id = $2",
+        "INSERT INTO work_chapter_alias (work_id, match_key, work_chapter_id, created_at) \
+         SELECT $3, d.match_key, $1, now() FROM work_chapter d \
+          WHERE d.id = $2 AND d.match_key IS NOT NULL \
+         ON CONFLICT (work_id, match_key) DO UPDATE SET work_chapter_id = excluded.work_chapter_id",
     )
     .bind(keep)
     .bind(drop)
+    .bind(work_id)
     .execute(&mut *conn)
     .await?;
     sqlx::query("DELETE FROM work_chapter WHERE id = $1")

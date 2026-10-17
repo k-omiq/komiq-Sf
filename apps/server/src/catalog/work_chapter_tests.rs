@@ -1664,3 +1664,299 @@ async fn admin_entry_merge_keeps_claiming_the_dropped_key_for_new_copies() {
     assert_ne!(twelve, keep);
     assert_eq!(linked_entry(&pool, &md.source, "md-twelve").await, twelve);
 }
+
+async fn merge_entries(pool: &Database, work: &str, keep: &str, drop: &str) {
+    let mut tx = pool.begin().await.unwrap();
+    crate::locks::lock_works(&mut tx, &[work]).await.unwrap();
+    merge_entries_within_on(&mut tx, work, keep, drop)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+async fn aliases(pool: &Database, work: &str) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT match_key, work_chapter_id FROM work_chapter_alias \
+          WHERE work_id = $1 ORDER BY match_key",
+    )
+    .bind(work)
+    .fetch_all(pool.read())
+    .await
+    .unwrap()
+}
+
+async fn entry_ids(pool: &Database, work: &str) -> Vec<String> {
+    let mut ids: Vec<String> = admin_entry_list(pool, work)
+        .await
+        .unwrap()
+        .1
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn admin_entry_merge_claim_survives_a_copy_that_vanishes_and_returns_later() {
+    let pool = pool().await;
+    let md = md_work(&pool, "Merged key returns").await;
+    let ten = chapter("md-ten", Some("10"), "Ten");
+    catalog::replace_source_chapters(
+        &pool,
+        &md.source,
+        &[ten.clone(), chapter("md-typo", Some("10.05"), "Ten")],
+    )
+    .await
+    .unwrap();
+    let keep = entry(&pool, &md.work, "1000").await.id;
+    let drop = entry(&pool, &md.work, "1005").await.id;
+    merge_entries(&pool, &md.work, &keep, &drop).await;
+    assert_eq!(
+        aliases(&pool, &md.work).await,
+        [("1005".into(), keep.clone())]
+    );
+
+    // One scan drops the moved copy: no copy of the work has 10.05 any more.
+    catalog::replace_source_chapters(&pool, &md.source, &[ten.clone()])
+        .await
+        .unwrap();
+    // A later scan brings it back, and another group's upload with it.
+    catalog::replace_source_chapters(
+        &pool,
+        &md.source,
+        &[
+            ten,
+            chapter("md-typo", Some("10.05"), "Ten"),
+            chapter("md-typo-b", Some("10.05"), "Ten (group B)"),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(linked_entry(&pool, &md.source, "md-typo").await, keep);
+    assert_eq!(linked_entry(&pool, &md.source, "md-typo-b").await, keep);
+    assert_eq!(entry_ids(&pool, &md.work).await, [keep.clone()]);
+    // The drain takes the same path.
+    make_ready(&pool, &md.work).await;
+    assert_eq!(entry_ids(&pool, &md.work).await, [keep]);
+}
+
+#[tokio::test]
+async fn admin_entry_merge_keeps_claiming_a_merged_away_special() {
+    let pool = pool().await;
+    let md = md_work(&pool, "Merged special").await;
+    let ten = chapter("md-ten", Some("10"), "Ten");
+    let oneshot = chapter("md-oneshot", None, "Oneshot");
+    catalog::replace_source_chapters(&pool, &md.source, &[ten.clone(), oneshot.clone()])
+        .await
+        .unwrap();
+    let keep = entry(&pool, &md.work, "1000").await.id;
+    let drop = entry(&pool, &md.work, "x:md-oneshot").await.id;
+    merge_entries(&pool, &md.work, &keep, &drop).await;
+
+    catalog::replace_source_chapters(&pool, &md.source, &[ten.clone()])
+        .await
+        .unwrap();
+    catalog::replace_source_chapters(&pool, &md.source, &[ten, oneshot])
+        .await
+        .unwrap();
+    assert_eq!(linked_entry(&pool, &md.source, "md-oneshot").await, keep);
+    assert_eq!(entry_ids(&pool, &md.work).await, [keep]);
+}
+
+#[tokio::test]
+async fn entry_aliases_follow_work_merge_and_split() {
+    let pool = pool().await;
+    let survivor = md_work(&pool, "Alias survivor").await;
+    catalog::replace_source_chapters(
+        &pool,
+        &survivor.source,
+        &[
+            chapter("s-ten", Some("10"), "Ten"),
+            chapter("s-thirty-typo", Some("30.05"), "Thirty"),
+            chapter("s-forty", Some("40"), "Forty"),
+            chapter("s-forty-typo", Some("40.05"), "Forty"),
+        ],
+    )
+    .await
+    .unwrap();
+    let s10 = entry(&pool, &survivor.work, "1000").await.id;
+    let s3005 = entry(&pool, &survivor.work, "3005").await.id;
+    let s40 = entry(&pool, &survivor.work, "4000").await.id;
+    let s4005 = entry(&pool, &survivor.work, "4005").await.id;
+    merge_entries(&pool, &survivor.work, &s40, &s4005).await;
+
+    let loser = catalog::create_work(
+        &pool,
+        &WorkInput {
+            primary_title: Some("Alias loser".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let loser_source = source(&pool, &loser, "77").await;
+    catalog::replace_source_chapters(
+        &pool,
+        &loser_source,
+        &[
+            chapter("l-ten", Some("10"), "Ten"),
+            chapter("l-ten-typo", Some("10.05"), "Ten"),
+            chapter("l-thirty", Some("30"), "Thirty"),
+            chapter("l-thirty-typo", Some("30.05"), "Thirty"),
+            chapter("l-forty-typo", Some("40.05"), "Forty"),
+        ],
+    )
+    .await
+    .unwrap();
+    let l10 = entry(&pool, &loser, "1000").await.id;
+    let l1005 = entry(&pool, &loser, "1005").await.id;
+    let l30 = entry(&pool, &loser, "3000").await.id;
+    let l3005 = entry(&pool, &loser, "3005").await.id;
+    let l4005 = entry(&pool, &loser, "4005").await.id;
+    merge_entries(&pool, &loser, &l10, &l1005).await;
+    merge_entries(&pool, &loser, &l30, &l3005).await;
+
+    let outcome = catalog::merge_works(&pool, &loser, &survivor.work)
+        .await
+        .unwrap();
+    // The survivor's alias claims the loser's own 40.05 entry.
+    assert!(outcome.entry_map.contains(&EntryMove {
+        from: l4005.clone(),
+        to: s40.clone(),
+    }));
+    assert_eq!(
+        linked_entry(&pool, &loser_source, "l-forty-typo").await,
+        s40
+    );
+    // The loser's 10.05 alias follows its entry onto the survivor's 10. Its 30.05 alias
+    // gives way to the survivor's own 30.05 entry.
+    assert_eq!(
+        aliases(&pool, &survivor.work).await,
+        [("1005".into(), s10.clone()), ("4005".into(), s40.clone())]
+    );
+    assert_eq!(entry(&pool, &survivor.work, "3005").await.id, s3005);
+    assert_eq!(entry(&pool, &survivor.work, "3000").await.id, l30);
+    assert!(aliases(&pool, &loser).await.is_empty());
+    catalog::upsert_chapter(
+        &pool,
+        &survivor.source,
+        &chapter("s-ten-typo", Some("10.05"), "Ten"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        linked_entry(&pool, &survivor.source, "s-ten-typo").await,
+        s10
+    );
+
+    // Split the old loser's source off again. 10 and 40 keep copies on both sides: each
+    // destination clone takes the aliases too, and the staying entries keep theirs.
+    let out = catalog::split_source_series(&pool, &survivor.work, &[loser_source.clone()], None)
+        .await
+        .unwrap();
+    let d10 = entry(&pool, &out.new_work_id, "1000").await.id;
+    let d40 = entry(&pool, &out.new_work_id, "4000").await.id;
+    assert_eq!(entry(&pool, &out.new_work_id, "3000").await.id, l30);
+    assert_eq!(
+        aliases(&pool, &out.new_work_id).await,
+        [("1005".into(), d10.clone()), ("4005".into(), d40.clone())]
+    );
+    assert_eq!(
+        aliases(&pool, &survivor.work).await,
+        [("1005".into(), s10), ("4005".into(), s40)]
+    );
+    catalog::upsert_chapter(
+        &pool,
+        &loser_source,
+        &chapter("l-forty-typo-b", Some("40.05"), "Forty"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        linked_entry(&pool, &loser_source, "l-forty-typo-b").await,
+        d40
+    );
+}
+
+#[tokio::test]
+async fn admin_entry_merge_keeps_a_merged_special_through_an_engine_reset() {
+    use crate::engine_generation::{
+        tests::{chapter_json, manga_json, MockEngine},
+        Fence, Replace,
+    };
+    use crate::suwayomi::SuwayomiClient;
+
+    let pool = pool().await;
+    let cover_dir = crate::cover_store::test_support::TestDir::new();
+    let covers = crate::cover_store::test_support::store(&cover_dir);
+    let engine = MockEngine::spawn().await;
+    let engine_rows = |manga_id, numbered_id, special_id| {
+        let mut manga = manga_json(manga_id);
+        manga["url"] = serde_json::json!("/manga/merged-special");
+        let mut numbered = chapter_json(numbered_id, manga_id);
+        numbered["url"] = serde_json::json!("/chapter/one");
+        numbered["sourceOrder"] = serde_json::json!(1);
+        numbered["manga"]["url"] = manga["url"].clone();
+        let mut special = chapter_json(special_id, manga_id);
+        special["url"] = serde_json::json!("/chapter/appendix");
+        special["sourceOrder"] = serde_json::json!(2);
+        special["name"] = serde_json::json!("Appendix");
+        special["chapterNumber"] = serde_json::json!(-1.0);
+        special["manga"]["url"] = manga["url"].clone();
+        (manga, vec![numbered, special])
+    };
+    {
+        let mut data = engine.data.lock().await;
+        let (manga, chapters) = engine_rows(7, 8, 9);
+        data.mangas = vec![manga];
+        data.chapters = chapters;
+    }
+    let mut client = SuwayomiClient::new(engine.url.clone(), None, None);
+    let fence = Fence::attach(&pool, &covers, &mut client).await.unwrap();
+    let work = catalog::create_work(
+        &pool,
+        &WorkInput {
+            primary_title: Some("Merged special reset".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    source(&pool, &work, "7").await;
+    let (manga, chapters) = client.series_and_chapters(7).await.unwrap();
+    assert!(crate::series_cache::put_series(&pool, &manga)
+        .await
+        .unwrap());
+    crate::series_cache::put_chapters(&pool, 7, &chapters)
+        .await
+        .unwrap();
+    let keep = entry(&pool, &work, "100").await.id;
+    let drop = entry(&pool, &work, "x:source:/chapter/appendix").await.id;
+    merge_entries(&pool, &work, &keep, &drop).await;
+
+    {
+        let mut data = engine.data.lock().await;
+        let (manga, chapters) = engine_rows(70, 80, 90);
+        data.mangas = vec![manga];
+        data.chapters = chapters;
+    }
+    fence.start_new_generation(Replace::Force).await.unwrap();
+    assert!(fence.wait().await.is_ok());
+    assert_eq!(
+        aliases(&pool, &work).await,
+        [("x:source:/chapter/appendix".into(), keep.clone())]
+    );
+
+    let new_mapping = source(&pool, &work, "70").await;
+    let (manga, chapters) = client.series_and_chapters(70).await.unwrap();
+    assert!(crate::series_cache::put_series(&pool, &manga)
+        .await
+        .unwrap());
+    crate::series_cache::put_chapters(&pool, 70, &chapters)
+        .await
+        .unwrap();
+    assert_eq!(linked_entry(&pool, &new_mapping, "80").await, keep);
+    assert_eq!(linked_entry(&pool, &new_mapping, "90").await, keep);
+    assert_eq!(entry_ids(&pool, &work).await, [keep]);
+}

@@ -98,6 +98,7 @@ import type {
 import type { ContentBackend, SourceRef } from './content-backend.js';
 import type { WorkSourceLike } from './local-suwayomi-backend.js';
 import type { OfflineWriteQueue, WriteOp } from './offline-queue.js';
+import { createOpId } from './op-id.js';
 import { isNumericChapterId, isStaleNumericEpoch } from './numeric-epoch.js';
 
 /** A progress write the server refused as from an earlier engine generation: dropped
@@ -184,6 +185,7 @@ export class CompositeBackend implements Backend {
 								read: op.read,
 								numericEpoch: op.numericEpoch ?? null,
 								revision: op.revision ?? undefined,
+								opId: op.opId,
 							})
 							.then((result) => {
 								this.syncRevision(owner, generation, op.workId!);
@@ -581,11 +583,15 @@ export class CompositeBackend implements Backend {
 				? (input.numericEpoch ?? null)
 				: await (hosted.numericEpoch?.() ?? Promise.resolve(null)).catch(() => null);
 		if (!this.writeIsCurrent(owner, generation)) return null;
+		// One id for the live attempt and its queued retry: when the live answer is lost
+		// after the server applied it, the replay is recognised instead of refused.
+		const opId = input.opId ?? createOpId();
 		const enqueue = () => {
 			queue.enqueue({
 				kind: 'progress',
 				chapterId: input.chapterId,
 				workId: input.workId,
+				opId,
 				revision:
 					input.revision ??
 					hosted.knownRevision?.(input.workId) ??
@@ -605,7 +611,7 @@ export class CompositeBackend implements Backend {
 				return null;
 			}
 			try {
-				const result = await hosted.saveProgress!(input);
+				const result = await hosted.saveProgress!({ ...input, opId });
 				this.syncRevision(owner, generation, input.workId);
 				if (this.writeIsCurrent(owner, generation)) void this.flushQueue();
 				return result;

@@ -152,3 +152,63 @@ test('remembered revisions survive a reload and older builds can drop their reco
 	reloaded.forgetRevision('A', 'work');
 	assert.equal(new OfflineWriteQueue(adapter).knownRevision('A', 'work'), undefined);
 });
+
+test('a resent save whose first answers were lost releases its successors with the returned revision', async () => {
+	// The server's rule: a resend of the save that made the last change is APPLIED with the
+	// current revision; any other save with an old base revision is REFUSED.
+	const server = { revision: 5, lastOpId: null as string | null, lose: 2 };
+	const sent: SaveProgressInput[] = [];
+	const answers: string[] = [];
+	const hosted = {
+		setToken: () => {},
+		numericEpoch: async () => null,
+		knownRevision: () => undefined,
+		saveProgress: async (save: SaveProgressInput) => {
+			sent.push({ ...save });
+			let status: 'APPLIED' | 'REFUSED' = 'APPLIED';
+			if (save.opId == null || save.opId !== server.lastOpId) {
+				if (save.revision !== server.revision) status = 'REFUSED';
+				else {
+					server.revision += 1;
+					server.lastOpId = save.opId ?? null;
+				}
+			}
+			if (server.lose > 0) {
+				server.lose -= 1;
+				throw new Error('the answer was lost');
+			}
+			answers.push(status);
+			return { status, revision: server.revision, workId: save.workId };
+		},
+	} as unknown as Backend;
+	const writes = new OfflineWriteQueue(storage());
+	const backend = new CompositeBackend({ hosted, queue: writes });
+	backend.setToken('token');
+	backend.setCurrentUser('A');
+	const save = (chapterId: string) =>
+		backend.saveProgress({ chapterId, workId: 'work', lastPageRead: 20, read: true, revision: 5 });
+
+	// Live: applied on the server, but the answer is lost, so the save is queued.
+	await save('10');
+	// The next save waits behind it; the resend's answer is lost again.
+	await save('11');
+	await settle();
+	// The third save's drain gets the resend through.
+	await save('12');
+	for (let i = 0; i < 20 && writes.size() > 0; i++) await settle();
+
+	assert.equal(writes.size(), 0);
+	assert.deepEqual(answers, ['APPLIED', 'APPLIED', 'APPLIED']);
+	assert.equal(server.revision, 8, 'each save applied exactly once');
+	const tens = sent.filter((s) => s.chapterId === '10');
+	assert.equal(tens.length, 3);
+	assert.ok(tens[0].opId, 'the live attempt carries an id');
+	assert.ok(tens.every((s) => s.opId === tens[0].opId && s.revision === 5));
+	assert.deepEqual(
+		sent.filter((s) => s.chapterId !== '10').map((s) => [s.chapterId, s.revision]),
+		[
+			['11', 6],
+			['12', 7],
+		],
+	);
+});
