@@ -3560,6 +3560,12 @@ async fn main() -> anyhow::Result<()> {
     catalog::work_chapter::spawn(pool.clone(), shutdown_tx.subscribe());
     // M9 W2: record which source gave each work its metadata (insert-only, paced).
     catalog::work_metadata_backfill::spawn(pool.clone(), shutdown_tx.subscribe());
+    // M9 W2: finish metadata bar re-projections a dropped request or restart left.
+    catalog::work_metadata::spawn_pending_bars(
+        pool.clone(),
+        shutdown_tx.subscribe(),
+        graphql::clear_feed_caches,
+    );
 
     // Direct-MangaDex catalogue sync — opt-in (CATALOGUE.md §5). Off unless
     // CATALOGUE_SYNC is set, so the default deployment never hits MangaDex. Recurring:

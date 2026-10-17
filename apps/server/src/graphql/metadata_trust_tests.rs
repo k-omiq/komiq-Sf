@@ -289,3 +289,85 @@ async fn metadata_sources_follow_redirects_distinguish_no_source_and_refuse_unkn
     let q = r#"{ workMetadataSources(workId: "w_missing") { fieldGroup state } }"#;
     assert_eq!(err(&run(&s, q, Some("admintok")).await), "No such work");
 }
+
+#[tokio::test]
+async fn a_bar_returns_once_stored_and_reprojects_in_the_background() {
+    let (engine, _) = mock_engine().await;
+    let (s, st) = fixture(&engine).await;
+    seed_work(&st.pool, "w_detached").await;
+    sqlx::query(
+        "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) VALUES \
+           ('ss_detached', 'w_detached', 'suwayomi', '77', '903', '2025-01-01T00:00:00Z')",
+    )
+    .execute(&st.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO work_metadata_contribution \
+           (source_series_id, field_group, slot, value, attribution, observed_at) \
+         VALUES ('ss_detached', 'title', 'primary', 'Allowed title', 'observed', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&st.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        set_bar(&s, "mangadex", "TITLE", true).await,
+        json!({ "sourceId": "mangadex", "fieldGroup": "TITLE", "barred": true, "works": 1 })
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (title, pending): (Option<String>, bool) = sqlx::query_as(
+            "SELECT (SELECT primary_title FROM work WHERE id = 'w_detached'), \
+                    EXISTS (SELECT 1 FROM instance_setting WHERE key = 'metadata_bar_reproject:mangadex:title')",
+        )
+        .fetch_one(&st.pool)
+        .await
+        .unwrap();
+        if title.as_deref() == Some("Allowed title") && !pending {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background re-projection did not finish: {title:?}, pending {pending}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn metadata_sources_do_not_wait_long_for_a_hung_engine() {
+    let router = axum::Router::new().route(
+        "/api/graphql",
+        axum::routing::post(|| async {
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            axum::Json(json!({ "data": null }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let engine = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (s, st) = fixture(&engine).await;
+    sqlx::query(
+        "INSERT INTO work (id, primary_title, created_at, updated_at) \
+         VALUES ('w_hung', 'Title', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&st.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) VALUES \
+           ('ss_hung', 'w_hung', 'suwayomi', '77', '904', '2025-01-01T00:00:00Z')",
+    )
+    .execute(&st.pool)
+    .await
+    .unwrap();
+    let started = std::time::Instant::now();
+    let rows = sources(&s, "w_hung").await;
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(group(&rows, "TITLE")["sourceId"], "77");
+    assert_eq!(group(&rows, "TITLE")["sourceName"], Value::Null);
+}

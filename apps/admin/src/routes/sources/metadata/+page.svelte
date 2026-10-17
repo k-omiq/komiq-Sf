@@ -81,7 +81,7 @@
 			const savedKey = key(saved.sourceId, saved.fieldGroup);
 			bars = bars.filter((bar) => bar !== savedKey);
 			if (saved.barred) bars = [...bars, savedKey];
-			result = `Re-checked ${saved.works} works`;
+			result = `Saved. Re-checking ${saved.works} works`;
 		} catch (err) {
 			supported = metadataBarsSupported();
 			if (supported) toast.fromError(err, 'Failed to save metadata bar.');

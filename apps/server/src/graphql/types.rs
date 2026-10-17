@@ -422,7 +422,8 @@ pub struct SetSourceMetadataBarResult {
     pub source_id: String,
     pub field_group: MetadataFieldGroup,
     pub barred: bool,
-    /// Works re-projected, including when the bar was already in this state.
+    /// Works with a mapping of the source. The bar is stored when this returns; these
+    /// works are re-checked in the background, also when the bar was already in this state.
     pub works: i32,
 }
 

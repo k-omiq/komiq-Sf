@@ -740,6 +740,28 @@ async fn unpin_projects_allowed_credits_instead_of_the_stale_saved_source_value(
     Ok(())
 }
 
+#[tokio::test]
+async fn unpin_before_the_backfill_keeps_the_saved_source_value() -> Result<()> {
+    let pool = pool().await?;
+    let work = upsert_work_from_mangadex(&pool, "md-unpin-early", &mangadex_input()).await?;
+    let mapping = mapping(&pool, "md-unpin-early").await?;
+    // A work the backfill has not reached yet: its mapping has no recorded rows.
+    sqlx::query("DELETE FROM work_metadata_contribution WHERE source_series_id = $1")
+        .bind(&mapping)
+        .execute(&pool)
+        .await?;
+    let mut conn = pool.write().acquire().await?;
+    pin_work_field(&mut conn, &work, PinnedField::Author, Some("Pinned Author")).await?;
+    unpin_work_field(&mut conn, &work, PinnedField::Author).await?;
+    drop(conn);
+    let author: Option<String> = sqlx::query_scalar("SELECT author FROM work WHERE id = $1")
+        .bind(&work)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(author.as_deref(), Some("MangaDex Author"));
+    Ok(())
+}
+
 fn enrolment<'a>(
     m: &'a crate::suwayomi::SuwayomiManga,
     key: &'a str,

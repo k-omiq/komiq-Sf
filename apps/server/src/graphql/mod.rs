@@ -256,6 +256,9 @@ fn store_feed<T>(cache: &FeedCache<T>, key: bool, value: T) {
 /// URL, which the browser and the edge already hold under a one-year `immutable` entry, so
 /// until it expires the viewer keeps downloading the fat pre-recompress bytes we just
 /// replaced. Busting per BATCH (not per cover) keeps that to one clear every tick.
+/// How long `workMetadataSources` waits for the engine's source names.
+const WORK_METADATA_SOURCE_NAMES_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub(crate) fn clear_feed_caches() {
     FEED_CACHE_EPOCH.advance();
     DISCOVERY_CACHE.clear();
@@ -7345,12 +7348,20 @@ impl QueryRoot {
             .iter()
             .any(|g| g.source_id.as_deref().is_some_and(|id| id != "mangadex"))
         {
-            // Display names live in the engine; unavailable names stay null.
-            match st.suwayomi.list_sources().await {
-                Ok(sources) => names.extend(sources.into_iter().map(|s| (s.id, s.name))),
-                Err(e) => {
+            // Display names live in the engine; unavailable names stay null. The series
+            // editor waits for this query, so a down or hung engine gets a short bound
+            // instead of the client's 10-30 s timeouts.
+            match tokio::time::timeout(
+                WORK_METADATA_SOURCE_NAMES_TIMEOUT,
+                st.suwayomi.list_sources(),
+            )
+            .await
+            {
+                Ok(Ok(sources)) => names.extend(sources.into_iter().map(|s| (s.id, s.name))),
+                Ok(Err(e)) => {
                     tracing::warn!(error = %e, "workMetadataSources: source list unavailable")
                 }
+                Err(_) => tracing::warn!("workMetadataSources: source list timed out"),
             }
         }
         Ok(groups
@@ -14641,16 +14652,29 @@ impl MutationRoot {
                 "Invalid source id: use 1-32 ASCII letters, digits, or hyphens.",
             ));
         }
-        let works = catalog::work_metadata::set_bar(
-            &state(ctx).pool,
-            source_id,
-            field_group.into(),
-            barred,
-        )
-        .await
-        .map_err(gql_err)?;
+        let group: catalog::work_metadata::FieldGroup = field_group.into();
+        let (run, works) =
+            catalog::work_metadata::record_bar(&state(ctx).pool, source_id, group, barred)
+                .await
+                .map_err(gql_err)?;
         clear_feed_caches();
         tracing::info!(source_id, ?field_group, barred, works, by = %admin.username, "source metadata bar set by an admin");
+        // The re-projection can take minutes on a large source. It runs detached, so a
+        // dropped request does not cut it off; a failed run resumes from its stored
+        // cursor (`spawn_pending_bars`).
+        let pool = state(ctx).pool.background();
+        let source = source_id.to_string();
+        tokio::spawn(async move {
+            match catalog::work_metadata::reproject_bar(&pool, &source, group, &run).await {
+                Ok(changed) => {
+                    clear_feed_caches();
+                    tracing::info!(source_id = %source, ?group, changed, "source metadata bar re-projection finished");
+                }
+                Err(error) => {
+                    tracing::warn!(source_id = %source, ?group, error = %error, "source metadata bar re-projection failed; it resumes later");
+                }
+            }
+        });
         Ok(SetSourceMetadataBarResult {
             source_id: source_id.to_string(),
             field_group,
@@ -24975,19 +24999,25 @@ mod tests {
     async fn an_admin_can_pin_and_release_every_source_owned_field() {
         let (s, pool) = setup_full(100).await;
         seed_canonical(&pool, "md-edit", "Editable Work", false, "1").await;
+        // The source itself reports the author: since W2 an unpin restores what the
+        // chosen source said (its recorded contribution), not a column written by hand.
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-edit",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Editable Work".into()),
+                author: Some("Source Author".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let wid = work_id_of(&pool, "md-edit").await;
-        sqlx::query("UPDATE work SET author = 'Source Author', year = 2001 WHERE id = $1")
+        sqlx::query("UPDATE work SET year = 2001 WHERE id = $1")
             .bind(&wid)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query(
-            "INSERT INTO work_credit (work_id, role, name) VALUES ($1, 'author', 'Source Author')",
-        )
-        .bind(&wid)
-        .execute(&pool)
-        .await
-        .unwrap();
         let run = |query: String, token: Option<&'static str>| {
             let s = &s;
             async move { exec(s, &query, token, "1.1.1.1").await }

@@ -1131,35 +1131,167 @@ pub fn valid_source_id(id: &str) -> bool {
             && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
 }
 
+/// A bar's pending re-projection lives in `instance_setting` under this prefix plus
+/// `{source_id}:{group}`, so a run cut off by a dropped request, an error or a restart
+/// is finished by [`resume_pending_bars`].
+const PENDING_PREFIX: &str = "metadata_bar_reproject:";
+const BAR_CHUNK: usize = 100;
+const PENDING_BOOT_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+const PENDING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// One toggle's re-projection: `run` names the toggle (a newer toggle of the same
+/// source and group replaces it), `after` is the last work id whose chunk finished.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingBar {
+    run: String,
+    after: String,
+}
+
+fn pending_key(source_id: &str, group: FieldGroup) -> String {
+    format!("{PENDING_PREFIX}{source_id}:{}", group.as_str())
+}
+
+/// The runs this process is executing, so the periodic resume does not run a toggle's
+/// chunks a second time beside the task the mutation started.
+static RUNNING_BARS: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+struct RunningBar(String);
+
+impl RunningBar {
+    fn claim(run: &str) -> Option<Self> {
+        let mut running = RUNNING_BARS.lock().unwrap_or_else(|e| e.into_inner());
+        running.insert(run.to_owned()).then(|| Self(run.to_owned()))
+    }
+}
+
+impl Drop for RunningBar {
+    fn drop(&mut self) {
+        RUNNING_BARS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
 /// Bar (`barred = true`) or allow `source_id` for `group`, then re-project every work
-/// with a mapping of that source, in chunks of 100 works by id, each chunk one retried
-/// transaction: exclusive `SourcePolicy(source_id)` advisory key, then the chunk's works
-/// locked in sorted order (rediscovered under the lock; a changed set restarts), the bar
-/// row written with the first chunk, then [`project_on`] for every work. A later chunk
-/// that finds the bar state reversed stops. For the tags group, each committed chunk's
-/// works then get `tags::sync_work_suwayomi_tags(pool, work, None, &[])` and their
-/// materialized comic types refreshed under the work lock. For the cover group no
-/// projector runs: each chunk instead refreshes its works' stored feed and Browse
-/// thumbnail fallbacks on the same transaction, writing only changed rows.
+/// with a mapping of that source: [`record_bar`] followed by [`reproject_bar`].
 /// Returns how many works were re-projected, plus source covers removed after a
-/// cover bar commits (a work may count in both).
+/// cover bar (a work may count in both).
 pub async fn set_bar(
     pool: &Database,
     source_id: &str,
     group: FieldGroup,
     barred: bool,
 ) -> Result<u64> {
+    let (run, _) = record_bar(pool, source_id, group, barred).await?;
+    reproject_bar(pool, source_id, group, &run).await
+}
+
+/// Store the bar state and a fresh pending re-projection for `source_id` and `group`
+/// in one transaction under the exclusive `SourcePolicy(source_id)` advisory key.
+/// Returns the run for [`reproject_bar`] and how many works have a mapping of the
+/// source. Storing the same state again is harmless and restarts the re-projection.
+pub async fn record_bar(
+    pool: &Database,
+    source_id: &str,
+    group: FieldGroup,
+    barred: bool,
+) -> Result<(String, u64)> {
     anyhow::ensure!(valid_source_id(source_id), "invalid source id");
-    let mut after: Option<String> = None;
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin_with("BEGIN").await?;
+        crate::locks::advisory(
+            &mut tx,
+            &[crate::locks::AdvisoryKey::new(
+                crate::locks::KeyClass::SourcePolicy,
+                &[source_id],
+            )],
+        )
+        .await?;
+        if barred {
+            sqlx::query("INSERT INTO source_metadata_bar (source_id, field_group, created_at) VALUES ($1, $2, now()) ON CONFLICT DO NOTHING")
+                .bind(source_id).bind(group.as_str()).execute(&mut *tx).await?;
+        } else {
+            sqlx::query(
+                "DELETE FROM source_metadata_bar WHERE source_id = $1 AND field_group = $2",
+            )
+            .bind(source_id)
+            .bind(group.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let pending = serde_json::to_string(&PendingBar {
+            run: run.clone(),
+            after: String::new(),
+        })?;
+        sqlx::query(
+            "INSERT INTO instance_setting (key, value, updated_at) VALUES ($1, $2, now()) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        )
+        .bind(pending_key(source_id, group))
+        .bind(&pending)
+        .execute(&mut *tx)
+        .await?;
+        let works: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT work_id) FROM source_series WHERE COALESCE(source_id, source_type) = $1",
+        )
+        .bind(source_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok((run, works as u64))
+    })
+    .await
+}
+
+/// Re-project the works of `source_id` for `group` for the pending `run`, from its
+/// cursor on, in chunks of 100 works by id. Each chunk is one retried transaction:
+/// exclusive `SourcePolicy(source_id)` advisory key, the pending row re-read (a newer
+/// toggle or a finished run stops this one), then the chunk's works locked in sorted
+/// order (rediscovered under the lock; a changed set restarts) and [`project_on`] for
+/// `group` only. For the tags group, each committed chunk's works that have a Suwayomi
+/// mapping or Suwayomi-tier tags then get `tags::sync_work_suwayomi_tags(pool, work,
+/// None, &[])` and their materialized comic types refreshed under the work lock. For
+/// the cover group no projector runs: each chunk instead refreshes its works' stored
+/// feed and Browse thumbnail fallbacks on the same transaction, writing only changed
+/// rows. The cursor moves after a chunk's follow-up work, so an interrupted chunk runs
+/// again; every step is idempotent. A cover bar then removes the source's published
+/// covers, and the pending row is deleted last. Returns how many works were
+/// re-projected, plus source covers removed (a work may count in both); 0 when this
+/// process already runs `run`.
+pub async fn reproject_bar(
+    pool: &Database,
+    source_id: &str,
+    group: FieldGroup,
+    run: &str,
+) -> Result<u64> {
+    let Some(_running) = RunningBar::claim(run) else {
+        return Ok(0);
+    };
+    let key = pending_key(source_id, group);
     let mut projected = 0;
     loop {
-        let works = crate::db::retry_transaction(|| {
-            set_bar_chunk(pool, source_id, group, barred, after.as_deref())
-        })
-        .await?;
+        let Some((works, pending)) =
+            crate::db::retry_transaction(|| set_bar_chunk(pool, source_id, group, &key, run))
+                .await?
+        else {
+            return Ok(projected);
+        };
         projected += works.len() as u64;
-        if group == FieldGroup::Tags {
-            for work in &works {
+        if group == FieldGroup::Tags && !works.is_empty() {
+            // Only the Suwayomi tier is rebuilt here; works without it have nothing to
+            // resync, and project_on already refreshed their comic types.
+            let tiered: Vec<String> = sqlx::query_scalar(
+                "SELECT work_id FROM source_series WHERE work_id = ANY($1) AND source_type = 'suwayomi' \
+                 UNION SELECT work_id FROM work_tag WHERE work_id = ANY($1) AND source = 'suwayomi' \
+                 ORDER BY 1",
+            )
+            .bind(&works)
+            .fetch_all(pool)
+            .await?;
+            for work in &tiered {
                 if let Err(error) =
                     crate::tags::sync_work_suwayomi_tags(pool, work, None, &[]).await
                 {
@@ -1177,11 +1309,33 @@ pub async fn set_bar(
                 .await?;
             }
         }
-        if works.len() < 100 {
+        let Some(last) = works.last() else {
+            break;
+        };
+        let next = serde_json::to_string(&PendingBar {
+            run: run.to_owned(),
+            after: last.clone(),
+        })?;
+        // Compare-and-set: a newer toggle's row is left alone (the next chunk stops).
+        sqlx::query(
+            "UPDATE instance_setting SET value = $3, updated_at = now() WHERE key = $1 AND value = $2",
+        )
+        .bind(&key)
+        .bind(&pending)
+        .bind(&next)
+        .execute(pool)
+        .await?;
+        if works.len() < BAR_CHUNK {
             break;
         }
-        after = works.last().cloned();
     }
+    let barred: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM source_metadata_bar WHERE source_id = $1 AND field_group = $2)",
+    )
+    .bind(source_id)
+    .bind(group.as_str())
+    .fetch_one(pool)
+    .await?;
     if group == FieldGroup::Cover && barred {
         let mut after = String::new();
         loop {
@@ -1205,16 +1359,98 @@ pub async fn set_bar(
             }
         }
     }
+    sqlx::query("DELETE FROM instance_setting WHERE key = $1 AND value::jsonb ->> 'run' = $2")
+        .bind(&key)
+        .bind(run)
+        .execute(pool)
+        .await?;
     Ok(projected)
+}
+
+/// Finish every pending bar re-projection (a dropped admin request, an error or a
+/// restart left it). Returns how many works were re-projected.
+pub async fn resume_pending_bars(pool: &Database) -> Result<u64> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT key, value FROM instance_setting WHERE starts_with(key, $1) ORDER BY key",
+    )
+    .bind(PENDING_PREFIX)
+    .fetch_all(pool)
+    .await?;
+    let mut projected = 0;
+    for (key, value) in rows {
+        let parsed = key[PENDING_PREFIX.len()..]
+            .rsplit_once(':')
+            .and_then(|(source, group)| Some((source, FieldGroup::parse(group)?)))
+            .filter(|(source, _)| valid_source_id(source));
+        let (Some((source_id, group)), Ok(pending)) =
+            (parsed, serde_json::from_str::<PendingBar>(&value))
+        else {
+            tracing::warn!(%key, "skipping a malformed pending metadata bar re-projection");
+            continue;
+        };
+        projected += reproject_bar(pool, source_id, group, &pending.run).await?;
+    }
+    Ok(projected)
+}
+
+/// Resume pending bar re-projections shortly after start and then every ten minutes,
+/// calling `done` (the read caches' clear) after a pass that re-projected anything.
+pub fn spawn_pending_bars(
+    pool: Database,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    done: fn(),
+) {
+    let pool = pool.background();
+    tokio::spawn(crate::task::supervise(
+        "metadata-bar-resume",
+        PENDING_INTERVAL,
+        shutdown.clone(),
+        move || pending_bars_loop(pool.clone(), shutdown.clone(), done),
+    ));
+}
+
+async fn pending_bars_loop(
+    pool: Database,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    done: fn(),
+) {
+    let mut delay = PENDING_BOOT_DELAY;
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep(delay) => {}
+        }
+        if *shutdown.borrow() {
+            return;
+        }
+        delay = PENDING_INTERVAL;
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.changed() => return,
+            result = resume_pending_bars(&pool) => result,
+        };
+        match result {
+            Ok(0) => {}
+            Ok(works) => {
+                done();
+                tracing::info!(works, "pending metadata bar re-projection finished");
+            }
+            Err(error) => {
+                let error = crate::db::observed_database_error(error);
+                tracing::warn!(error = %error, "pending metadata bar re-projection failed; will retry");
+            }
+        }
+    }
 }
 
 async fn set_bar_chunk(
     pool: &Database,
     source_id: &str,
     group: FieldGroup,
-    barred: bool,
-    after: Option<&str>,
-) -> Result<Vec<String>> {
+    key: &str,
+    run: &str,
+) -> Result<Option<(Vec<String>, String)>> {
     const WORKS: &str =
         "SELECT DISTINCT work_id FROM source_series WHERE COALESCE(source_id, source_type) = $1 \
         AND work_id > $2 ORDER BY work_id LIMIT 100";
@@ -1227,41 +1463,35 @@ async fn set_bar_chunk(
         )],
     )
     .await?;
-    if after.is_some() {
-        let current: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM source_metadata_bar WHERE source_id = $1 AND field_group = $2)")
-            .bind(source_id).bind(group.as_str()).fetch_one(&mut *tx).await?;
-        if current != barred {
-            tx.rollback().await?;
-            return Ok(Vec::new());
-        }
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT value FROM instance_setting WHERE key = $1")
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let pending = stored
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<PendingBar>(value).ok());
+    let (Some(stored), Some(pending)) = (stored, pending) else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    if pending.run != run {
+        tx.rollback().await?;
+        return Ok(None);
     }
     let works: Vec<String> = sqlx::query_scalar(WORKS)
         .bind(source_id)
-        .bind(after.unwrap_or(""))
+        .bind(&pending.after)
         .fetch_all(&mut *tx)
         .await?;
     let locked = crate::locks::lock_works(&mut tx, &works).await?;
     let current: Vec<String> = sqlx::query_scalar(WORKS)
         .bind(source_id)
-        .bind(after.unwrap_or(""))
+        .bind(&pending.after)
         .fetch_all(&mut *tx)
         .await?;
     if !locked.missing.is_empty() || works != current {
         return Err(crate::locks::RestartTransaction.into());
-    }
-    if after.is_none() {
-        if barred {
-            sqlx::query("INSERT INTO source_metadata_bar (source_id, field_group, created_at) VALUES ($1, $2, now()) ON CONFLICT DO NOTHING")
-                .bind(source_id).bind(group.as_str()).execute(&mut *tx).await?;
-        } else {
-            sqlx::query(
-                "DELETE FROM source_metadata_bar WHERE source_id = $1 AND field_group = $2",
-            )
-            .bind(source_id)
-            .bind(group.as_str())
-            .execute(&mut *tx)
-            .await?;
-        }
     }
     if group == FieldGroup::Cover {
         // The projector does nothing for cover. What a cover bar changes is the stored
@@ -1279,11 +1509,11 @@ async fn set_bar_chunk(
         }
     } else {
         for work in &works {
-            project_on(&mut tx, work, &PROJECTED_GROUPS).await?;
+            project_on(&mut tx, work, &[group]).await?;
         }
     }
     tx.commit().await?;
-    Ok(works)
+    Ok(Some((works, stored)))
 }
 
 #[cfg(test)]
@@ -1720,6 +1950,101 @@ mod tests {
             "MangaDex title",
             "all barred keeps the scalar"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_bar_reprojection_resumes_from_its_cursor_and_a_newer_toggle_wins() {
+        let pool = pool().await;
+        let mut works = Vec::new();
+        for (n, key) in [(1, "md-1"), (2, "md-2")] {
+            let work = work(&pool, &format!("Legacy {n}")).await;
+            let sw = source(&pool, &work, key).await;
+            let md = mapping(
+                &pool,
+                &work,
+                "mangadex",
+                "mangadex",
+                key,
+                "2030-01-01T00:00:00Z",
+            )
+            .await;
+            let md_title = format!("MangaDex {n}");
+            let sw_title = format!("Suwayomi {n}");
+            for (mapping, value) in [(&md, &md_title), (&sw, &sw_title)] {
+                let observation =
+                    single_group(FieldGroup::Title, vec![row("primary", "", value, 0)]);
+                record(&pool, &work, mapping, &observation, Attribution::Observed).await;
+            }
+            project(&pool, &work, &[FieldGroup::Title]).await;
+            works.push(work);
+        }
+        works.sort();
+        let titles = |pool: Database, works: Vec<String>| async move {
+            let mut out = Vec::new();
+            for work in &works {
+                out.push(title(&pool, work).await);
+            }
+            out
+        };
+        let pending = || async {
+            sqlx::query_scalar::<_, String>(
+                "SELECT value FROM instance_setting WHERE key = 'metadata_bar_reproject:mangadex:title'",
+            )
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+        };
+
+        // The request stored the bar and was cut off before any chunk ran.
+        let (stale, linked) = record_bar(&pool, "mangadex", FieldGroup::Title, true)
+            .await
+            .unwrap();
+        assert_eq!(linked, 2);
+        let before = titles(pool.clone(), works.clone()).await;
+        assert!(
+            before.iter().all(|t| t.starts_with("MangaDex")),
+            "{before:?}"
+        );
+        assert!(pending().await.is_some());
+        // Re-running the same toggle restarts it; the older run then stops untouched.
+        let (run, _) = record_bar(&pool, "mangadex", FieldGroup::Title, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            reproject_bar(&pool, "mangadex", FieldGroup::Title, &stale)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(titles(pool.clone(), works.clone()).await, before);
+        // A chunk that finished the first work before the cut.
+        let cursor = serde_json::to_string(&PendingBar {
+            run,
+            after: works[0].clone(),
+        })
+        .unwrap();
+        sqlx::query("UPDATE instance_setting SET value = $1 WHERE key = 'metadata_bar_reproject:mangadex:title'")
+            .bind(&cursor).execute(&pool).await.unwrap();
+
+        assert_eq!(resume_pending_bars(&pool).await.unwrap(), 1);
+        let after = titles(pool.clone(), works.clone()).await;
+        assert!(
+            after[0].starts_with("MangaDex"),
+            "the cursor skips done works: {after:?}"
+        );
+        assert!(after[1].starts_with("Suwayomi"), "{after:?}");
+        assert!(pending().await.is_none());
+        assert_eq!(resume_pending_bars(&pool).await.unwrap(), 0);
+        // The full toggle again is idempotent and reaches every work.
+        assert_eq!(
+            set_bar(&pool, "mangadex", FieldGroup::Title, true)
+                .await
+                .unwrap(),
+            2
+        );
+        let after = titles(pool.clone(), works.clone()).await;
+        assert!(after.iter().all(|t| t.starts_with("Suwayomi")), "{after:?}");
+        assert!(pending().await.is_none());
     }
 
     #[tokio::test]

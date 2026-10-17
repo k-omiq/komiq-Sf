@@ -77,11 +77,13 @@ When complete, `Result of the last add` shows the outcome for each series: merge
 
 Open Metadata to choose which sources may supply series details. Each source has six switches: Title, Description, Authors, Tags, Cover and Status. Authors covers both authors and artists. The built-in catalogue source appears first, followed by installed sources.
 
-A switch on means allowed. Turn it off to bar that source from the field group. Each change saves at once. Controls stay disabled while the save runs. The result says `Re-checked N works`.
+A switch on means allowed. Turn it off to bar that source from the field group. Each change saves at once. Controls stay disabled while the save runs. The result says `Saved. Re-checking N works`.
 
-A failed save may have applied part of the change. The page reloads the saved switches from the server. You can safely retry the same change.
+The server then checks that field group again on every work linked to the source. It does this in the background, so a large source can take several minutes. Series pages change as each work is checked. If the server stops before it finishes, it continues after it starts again.
 
-The server checks linked works again when you change a bar. For title, description, authors and status, it chooses the first allowed source in its ranking. If every source is barred, it keeps the current value. It also keeps the value when the chosen source has not been read yet. Catalogue tags come from the first allowed catalogue listing that has reported them. An empty report clears those tags. Your title and description overrides and pinned values stay in place.
+A failed save changes nothing. The page reloads the saved switches from the server. You can safely retry the same change, and saving a switch again starts its check again.
+
+For title, description, authors and status, the server chooses the first allowed source in its ranking. If every source is barred, it keeps the current value. It also keeps the value when the chosen source has not been read yet. Catalogue tags come from the first allowed catalogue listing that has reported them. An empty report clears those tags. Your title and description overrides and pinned values stay in place.
 
 Turning off Cover for a source removes the covers that source supplied. The server then fetches a cover from the next allowed source. Covers you uploaded stay. So do covers stored before this setting existed, because the server does not know their source. Readers may keep an old cover image in their browser cache for a while.
 
