@@ -150,6 +150,21 @@ The self-host Compose file runs stock PostgreSQL privately alongside the server 
 
 The desktop admin app bundles PostgreSQL and saves a local dump while running when the newest is at least 20 hours old. It keeps seven completed dumps. The reader app does not run the account database.
 
+### Optional standby
+
+The global packaging can run a second PostgreSQL host as a standby: a copy that streams the primary's WAL and can be promoted by hand. It is opt-in. Without `KOMIKA_NODE_ID` the stack starts as before. The procedure is `deploy/postgres/STANDBY.md`; production has no standby yet.
+
+- **Transport.** Replication runs over TLS. The role `komika_replica` has no password and logs in only with a client certificate from `hosted.py standby-certs`. One physical replication slot keeps WAL for the standby, capped at 2 GB.
+- **Fence.** `fence.json` sits in the backup bucket beside the pgBackRest path and names the one node that may be the primary, with an epoch and a timeline. PostgreSQL checks it before it starts as a primary, and the backup scheduler checks it before each job. A node the fence does not name refuses to start as a primary.
+- **Promotion.** `hosted.py promote` runs only with `--old-primary-stopped` and the old primary's node name, the operator's word that this node is powered off or stopped. It moves the fence with a conditional write, so two promotions cannot both win, then calls `pg_promote()`. Nothing promotes automatically.
+- **Server check.** With `KOMIKA_NODE_ID` set, the server refuses to start on a database in recovery or on one that another node's fence check started.
+- **Lag.** `hosted.py status`, health and `/metrics` show the sent, flushed and replayed positions and the replay lag.
+
+> [!WARNING]
+> Replication is not backup. A standby copies a mistake at once. pgBackRest stays the backup and the only way back to an earlier time.
+
+The engine volume, the cover cache, the media signing key, `deploy/.env` and the fallback certificate files are not in PostgreSQL. `STANDBY.md` lists what to copy to the standby host.
+
 ## Local validation
 
 Build the static target, then web, before running the reader tests. The tests inspect both emitted shells:
@@ -183,3 +198,6 @@ Production cutover, restore rehearsal and desktop installer validation are plann
 - `deploy/server-entrypoint.sh`: Container startup checks and server process execution.
 - `deploy/postgres/`: PostgreSQL initialization, pgBackRest backup scheduling and restore tooling.
 - `deploy/postgres/RESTORE.md`: the hosted backup, restore and rehearsal procedure.
+- `deploy/postgres/STANDBY.md` and `deploy/docker-compose.standby.yml`: the optional standby, its fence and manual promotion.
+- `deploy/postgres/hosted.py`: fence checks, `standby-init`, `promote` and the replication status.
+- `apps/server/src/postgres_metrics.rs` and `apps/server/src/node_fence.rs`: replication gauges and the server's start check.

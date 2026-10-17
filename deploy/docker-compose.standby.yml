@@ -1,0 +1,29 @@
+# Optional fenced standby pair (deploy/postgres/STANDBY.md). Add this file on
+# BOTH hosts, after docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.standby.yml ...
+# Each host's deploy/.env names its own node and the other host's address range.
+services:
+  postgres:
+    environment:
+      KOMIKA_NODE_ID: ${KOMIKA_NODE_ID:?set this node's name in deploy/.env}
+      KOMIKA_PG_REPLICA_CIDRS: ${KOMIKA_PG_REPLICA_CIDRS:?set the address range the standby connects from}
+    volumes:
+      # server.crt, server.key, ca.crt, client.crt, client.key from
+      # `hosted.py standby-certs`; entrypoint.sh makes private copies.
+      - ${KOMIKA_PG_TLS_DIR:?set the directory with this node's certificates}:/etc/komika-postgres-tls:ro
+    ports:
+      # Replication only: HBA lets the standby in with its client certificate
+      # (hostssl ... cert); the application role stays limited to Compose's
+      # private network. Bind a private or VPN address where you have one.
+      - ${KOMIKA_PG_REPLICATION_BIND:?set the host address the standby connects to}:5432:5432
+
+  postgres-backup:
+    environment:
+      KOMIKA_NODE_ID: ${KOMIKA_NODE_ID:?set this node's name in deploy/.env}
+      KOMIKA_PG_REPLICA_CIDRS: ${KOMIKA_PG_REPLICA_CIDRS:?set the address range the standby connects from}
+
+  server:
+    environment:
+      # The server starts only on a database that its node's fence check started
+      # as the primary (komika.node_id), never on a standby.
+      KOMIKA_NODE_ID: ${KOMIKA_NODE_ID:?set this node's name in deploy/.env}

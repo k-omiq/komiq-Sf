@@ -1324,6 +1324,12 @@ and run check afterwards. The restore helper passes keys through Docker stdin
 rather than arguments or a host secret file; its temporary container has the
 same residual Docker-admin exposure and is removed after use.
 
+## Standby and promotion
+
+An optional streaming standby with a fence and manual promotion is in
+`STANDBY.md`. It does not replace anything in this file: replication is not
+backup, and pgBackRest stays the only way back to an earlier time.
+
 ## Recovery health
 
 Read-only checks for the hosted stack (use `hc` from "Hosted commands"). None of

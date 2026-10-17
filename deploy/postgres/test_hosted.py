@@ -2,11 +2,14 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 import hosted as h
+
+PATH = os.environ.get("PATH", "")
 
 
 def epoch(value):
@@ -32,7 +35,10 @@ class HostedTests(unittest.TestCase):
         # Health reads the archiver over the socket and the volume's free space.
         self.facts = {"in_recovery": False, "archived_count": 9, "failed_count": 0, "last_archived_wal": "0000000100000000000000AA",
                       "last_archived_time": 0, "last_failed_wal": None, "last_failed_time": None, "ready": 0}
-        for name, value in (("archiver_facts", lambda timeout=10: self.facts), ("free_bytes", lambda: 100 << 30)):
+        # A primary without a standby, unless a test says otherwise.
+        self.replication = {"in_recovery": False, "timeline": 1, "senders": [], "slots": [], "receiver": None}
+        for name, value in (("archiver_facts", lambda timeout=10: self.facts), ("free_bytes", lambda: 100 << 30),
+                            ("replication_facts", lambda timeout=10: self.replication)):
             p = patch.object(h, name, side_effect=value)
             p.start()
             self.addCleanup(p.stop)
@@ -843,6 +849,500 @@ class HostedTests(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError) as error:
             h.backup_info()
         self.assertEqual(error.exception.returncode, 39)
+
+
+class FakeStore:
+    """An S3 bucket with ETags and conditional PUTs, as R2 and MinIO answer them."""
+
+    def __init__(self, honour=True):
+        # honour: True, False, or "create-only" (If-None-Match only, If-Match ignored).
+        self.objects, self.honour, self.version, self.puts = {}, honour, 0, []
+        self.before_put = None  # A rival writer that acts between a read and a write.
+
+    def __call__(self, method, key="", query=None, body=b"", extra=None, timeout=180):
+        extra = {k.lower(): v for k, v in (extra or {}).items()}
+        if method == "GET":
+            if key not in self.objects:
+                return 404, {}, b"<Error/>"
+            etag, data = self.objects[key]
+            return 200, {"ETag": etag}, data
+        if self.before_put:
+            rival, self.before_put = self.before_put, None
+            rival()
+        current = self.objects.get(key)
+        if self.honour:
+            if extra.get("if-none-match") == "*" and current is not None:
+                return 412, {}, b""
+            if self.honour is True and "if-match" in extra and (current is None or current[0] != extra["if-match"]):
+                return 412, {}, b""
+        self.version += 1
+        self.objects[key] = (f'"v{self.version}"', body)
+        self.puts.append((key, extra))
+        return 200, {"ETag": f'"v{self.version}"'}, b""
+
+    def fence(self):
+        return json.loads(self.objects["rehearsal/test.fence.json"][1])
+
+
+class StandbyTests(unittest.TestCase):
+    """Fence parsing, the refusal matrix, the claim, promote preconditions and a
+    lost conditional write. The bucket is a fake; PostgreSQL is a fake query()."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        for name, value in (("DATA", self.root / "data"), ("STATE", self.root / "state"),
+                            ("CONFIG", self.root / "config"), ("TLS", self.root / "tls")):
+            p = patch.object(h, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = patch.dict(os.environ, dict(zip(h.BACKUP_VARS, (
+            "https://example.r2.cloudflarestorage.com", "komika-backup", "rehearsal/test", "testkey", "testsecret"))),
+            clear=True)
+        p.start()
+        self.addCleanup(p.stop)
+        self.assertTrue(h.configure())
+        self.store = FakeStore()
+        p = patch.object(h, "s3_request", side_effect=self.store)
+        p.start()
+        self.addCleanup(p.stop)
+        self.exec = patch.object(h.os, "execvp")
+        self.execute = self.exec.start()
+        self.addCleanup(self.exec.stop)
+        self.timeline = 1
+        p = patch.object(h, "local_timeline", side_effect=lambda: self.timeline)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def existing(self, standby=False):
+        h.DATA.mkdir()
+        (h.DATA / "PG_VERSION").write_text("18")
+        if standby:
+            (h.DATA / "standby.signal").write_text("")
+
+    def put_fence(self, **fields):
+        fence = dict({"epoch": 4, "primary_node": "node-a", "timeline": 2, "at": "2026-10-16T12:00:00Z"}, **fields)
+        self.store("PUT", "rehearsal/test.fence.json", body=json.dumps(fence).encode())
+        return fence
+
+    def test_fence_parsing_is_strict(self):
+        good = {"epoch": 3, "primary_node": "node-a", "timeline": 2, "at": "2026-10-16T12:00:00Z"}
+        self.assertEqual(h.parse_fence(json.dumps(good)), good)
+        for change in ({"epoch": 0}, {"epoch": "3"}, {"epoch": True}, {"epoch": 1.0}, {"timeline": 0},
+                       {"primary_node": "Node-A"}, {"primary_node": "-a"}, {"primary_node": ""}, {"primary_node": 7},
+                       {"at": "2026-10-16 12:00:00"}, {"at": "2026-13-16T12:00:00Z"}, {"extra": 1}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                h.parse_fence(json.dumps(dict(good, **change)))
+        for text in ("[]", "null", '{"epoch": 3}', "not json"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                h.parse_fence(text)
+        # Beside the pgBackRest path, never inside it.
+        self.assertEqual(h.fence_key(), "rehearsal/test.fence.json")
+
+    def test_refusal_matrix(self):
+        fence = {"epoch": 4, "primary_node": "node-a", "timeline": 3, "at": "2026-10-16T12:00:00Z"}
+        cases = ((None, None, None, True), (fence, None, 1, True),  # Fencing off: no node name.
+                 (None, "node-a", 3, False),                       # No fence: only a claim may start it.
+                 (fence, "node-a", 3, True), (fence, "node-a", 4, True), (fence, "node-a", None, True),
+                 (fence, "node-a", 2, False),                      # An old copy of the fenced node.
+                 (fence, "node-b", 3, False), (fence, "node-b", 9, False))
+        for value, node, timeline, allowed in cases:
+            with self.subTest(node=node, timeline=timeline, fence=value is not None):
+                self.assertEqual(h.fence_decision(value, node, timeline)[0], allowed)
+
+    def test_node_name_is_validated(self):
+        for value in ("Node", "a_b", "-a", "a" * 64, "a b"):
+            with self.subTest(value=value), patch.dict(os.environ, {"KOMIKA_NODE_ID": value}), \
+                    self.assertRaises(ValueError):
+                h.node_id()
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": ""}):
+            self.assertIsNone(h.node_id())
+
+    def test_without_a_node_name_start_never_reads_the_fence(self):
+        self.existing()
+        self.put_fence(primary_node="node-b")
+        with patch.object(h, "read_fence", side_effect=AssertionError("fencing is off")):
+            h.start(True)
+        args = self.execute.call_args.args[1]
+        self.assertFalse(any(a.startswith("komika.") for a in args))
+
+    def test_the_fenced_primary_starts_and_passes_its_epoch_to_the_server(self):
+        self.existing()
+        self.put_fence(primary_node="node-a", timeline=2)
+        self.timeline = 2
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-a"}):
+            h.start(True)
+        args = self.execute.call_args.args[1]
+        self.assertIn("komika.node_id=node-a", args)
+        self.assertIn("komika.fence_epoch=4", args)
+
+    def test_old_primary_and_old_copies_refuse_to_start_as_primary(self):
+        self.existing()
+        for node, timeline in (("node-b", 2), ("node-a", 1)):
+            self.put_fence(primary_node="node-a", timeline=2)
+            self.timeline = timeline
+            with self.subTest(node=node, timeline=timeline), patch.dict(os.environ, {"KOMIKA_NODE_ID": node}), \
+                    self.assertRaises(ValueError) as refused:
+                h.start(True)
+            self.assertIn("refusing to start as primary", str(refused.exception))
+        # Empty data directory: no restore and no initdb for a node the fence does not name.
+        (h.DATA / "PG_VERSION").unlink()
+        h.DATA.rmdir()
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-b"}), patch.object(h, "backup_info") as info, \
+                patch.object(h, "init_cluster") as init, self.assertRaises(ValueError):
+            h.start(True)
+        info.assert_not_called()
+        init.assert_not_called()
+        self.execute.assert_not_called()
+
+    def test_unreadable_fence_or_no_repository_refuses(self):
+        self.existing()
+        self.store.objects["rehearsal/test.fence.json"] = ('"x"', b"{broken")
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-a"}), self.assertRaises(ValueError):
+            h.start(True)
+        with patch.object(h, "s3_request", return_value=(403, {}, b"")), \
+                patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-a"}), self.assertRaises(ValueError):
+            h.start(True)
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-a"}), self.assertRaises(ValueError):
+            h.start(False)  # No repository: nowhere to keep a fence.
+        self.execute.assert_not_called()
+
+    def test_a_standby_starts_without_the_fence(self):
+        self.existing(standby=True)
+        self.put_fence(primary_node="node-a")
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-b"}), \
+                patch.object(h, "read_fence", side_effect=AssertionError("a standby takes no writes")):
+            h.start(True)
+        self.assertFalse(any(a.startswith("komika.") for a in self.execute.call_args.args[1]))
+
+    def test_first_primary_claims_epoch_one_and_a_lost_claim_is_decided_again(self):
+        self.existing()
+        self.timeline = 1
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-a"}):
+            h.start(True)
+        self.assertEqual(self.store.fence()["epoch"], 1)
+        self.assertEqual(self.store.fence()["primary_node"], "node-a")
+        self.assertEqual(self.store.puts[-1][1].get("if-none-match"), "*")
+        # Two first starts at once: node-b reads no fence, node-a claims first.
+        del self.store.objects["rehearsal/test.fence.json"]
+        self.store.before_put = lambda: self.put_fence(epoch=1, primary_node="node-a", timeline=1)
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-b"}), self.assertRaises(ValueError) as refused:
+            h.start(True)
+        self.assertIn("names node-a", str(refused.exception))
+
+    def promote_with(self, replication, node="node-b", argv=("--old-primary-stopped", "node-a"), events=None):
+        sql = []
+
+        def query(text, timeout=10):
+            sql.append(text)
+            if events is not None and "pg_promote" in text:
+                events.append("promote")
+            return "t\n" if "pg_promote" in text else ""
+
+        calls = []
+
+        def facts(timeout=10):
+            calls.append(timeout)
+            # After pg_promote() and the checkpoint: out of recovery on the fence's timeline.
+            if len(calls) > 1 and any("CHECKPOINT" in text for text in sql):
+                current = h.read_fence()[0]
+                return {"in_recovery": False, "timeline": current["timeline"] if current else 1}
+            return replication(timeout)
+
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": node}), patch.object(h, "query", side_effect=query), \
+                patch.object(h, "replication_facts", side_effect=facts):
+            result = h.promote(list(argv))
+        return result, sql
+
+    def standby_facts(self, timeline=2):
+        return lambda timeout=10: {"in_recovery": True, "timeline": timeline, "receiver": None,
+                                   "replay_lsn": "0/3000148", "last_replayed_commit": 1792000000}
+
+    def test_promote_refuses_without_the_operators_word(self):
+        self.put_fence()
+        for argv in ((), ("--force",), ("--old-primary-stopped",), ("--old-primary-stopped", "node-a", "extra"),
+                     ("--old-primary-unreachable", "node-a"), ("--old-primary-stopped", "Node-A"),
+                     ("--old-primary-stopped=node-a",)):
+            with self.subTest(argv=argv), self.assertRaises(ValueError) as refused:
+                self.promote_with(self.standby_facts(), argv=argv)
+            self.assertIn("unreachable port is not proof", str(refused.exception))
+        self.assertEqual(self.store.fence()["epoch"], 4)
+
+    def test_promote_preconditions(self):
+        self.put_fence(primary_node="node-a")
+        primary = lambda timeout=10: {"in_recovery": False, "timeline": 2}
+        with self.assertRaises(ValueError):  # Not a standby, and the fence names another node.
+            self.promote_with(primary)
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": ""}), self.assertRaises(ValueError):
+            h.promote(["--old-primary-stopped", "node-a"])
+        with self.assertRaises(ValueError):  # The operator named this node, not the old primary.
+            self.promote_with(self.standby_facts(), argv=("--old-primary-stopped", "node-b"))
+        h.CONFIG.unlink()
+        with self.assertRaises(ValueError):  # No repository: nowhere to move the fence.
+            self.promote_with(self.standby_facts())
+        self.assertEqual(self.store.fence()["epoch"], 4)
+
+    def test_promote_moves_the_fence_before_pg_promote(self):
+        self.put_fence(primary_node="node-a", timeline=2)
+        order = []
+        real = h.write_fence
+        with patch.object(h, "write_fence", side_effect=lambda *a: order.append("fence") or real(*a)):
+            fence, sql = self.promote_with(self.standby_facts(timeline=2), events=order)
+        self.assertEqual(order, ["fence", "promote"])
+        self.assertEqual(self.store.fence(), fence)
+        self.assertEqual((fence["epoch"], fence["primary_node"], fence["timeline"]), (5, "node-b", 3))
+        self.assertEqual(self.store.puts[-1][1].get("if-match"), '"v1"')
+        joined = "".join(sql)
+        self.assertIn("CHECKPOINT", joined)
+        self.assertIn("ALTER SYSTEM SET komika.node_id = 'node-b'", joined)
+        self.assertIn("ALTER SYSTEM SET komika.fence_epoch = '5'", joined)
+        self.assertIn("ALTER SYSTEM RESET primary_conninfo", joined)
+
+    def test_two_promotions_cannot_both_win(self):
+        self.put_fence(primary_node="node-a")
+        # node-c moves the fence between this node's read and its write.
+        writes = []
+        real = h.write_fence
+
+        def write(fence, etag):
+            self.put_fence(epoch=5, primary_node="node-c", timeline=3)
+            writes.append(fence)
+            return real(fence, etag)
+
+        with patch.object(h, "write_fence", side_effect=write), self.assertRaises(ValueError) as refused:
+            self.promote_with(self.standby_facts())
+        self.assertIn("another promotion won", str(refused.exception))
+        self.assertEqual(self.store.fence()["primary_node"], "node-c")
+        self.assertEqual(len(writes), 1)
+
+    def test_a_later_candidate_never_takes_over_a_fence_already_moved(self):
+        """node-b has moved the fence and not yet run pg_promote(); node-c, told
+        that node-a stopped, reads node-b's fence and is refused."""
+        self.put_fence(primary_node="node-b", epoch=5)
+        with self.assertRaises(ValueError) as refused:
+            self.promote_with(self.standby_facts(), node="node-c")
+        self.assertIn("names node-b, not node-a", str(refused.exception))
+        self.assertEqual(self.store.fence()["primary_node"], "node-b")
+
+    def test_a_store_that_ignores_conditions_refuses_promotion(self):
+        for honour in (False, "create-only"):
+            self.store = FakeStore(honour)
+            self.put_fence(primary_node="node-a")
+            with self.subTest(honour=honour), patch.object(h, "s3_request", side_effect=self.store), \
+                    self.assertRaises(ValueError) as refused:
+                self.promote_with(self.standby_facts())
+            self.assertIn("ignores conditional writes", str(refused.exception))
+            self.assertEqual(self.store.fence()["primary_node"], "node-a")
+
+    def test_an_old_standby_copy_is_never_promoted(self):
+        self.put_fence(primary_node="node-a", timeline=3)
+        with self.assertRaises(ValueError) as refused:  # On timeline 1 while the fence says 3.
+            self.promote_with(self.standby_facts(timeline=1))
+        self.assertIn("old copy", str(refused.exception))
+        self.assertEqual(self.store.fence()["epoch"], 4)
+        # A rerun on a stale copy: the fence already names it, predicted timeline 4.
+        self.put_fence(primary_node="node-b", epoch=5, timeline=4)
+        with self.assertRaises(ValueError):
+            self.promote_with(self.standby_facts(timeline=1))
+        # PostgreSQL ended below the fence's timeline: no server settings.
+        self.put_fence(primary_node="node-a", timeline=2)
+        sql = []
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-b"}), \
+                patch.object(h, "query", side_effect=lambda text, timeout=10: sql.append(text) or "t\n"), \
+                patch.object(h, "replication_facts", side_effect=[self.standby_facts(2)(), {"in_recovery": False, "timeline": 2}]), \
+                self.assertRaises(ValueError):
+            h.promote(["--old-primary-stopped", "node-a"])
+        self.assertFalse(any("ALTER SYSTEM" in text for text in sql))
+
+    def test_first_claim_needs_a_store_that_honours_conditions(self):
+        self.existing()
+        self.store.honour = False
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-a"}), self.assertRaises(ValueError) as refused:
+            h.start(True)
+        self.assertIn("ignores conditional writes", str(refused.exception))
+        self.assertNotIn("rehearsal/test.fence.json", self.store.objects)
+        self.execute.assert_not_called()
+
+    def test_promote_rerun_after_a_crash_does_not_write_again(self):
+        fence = self.put_fence(primary_node="node-b", epoch=5)
+        puts = len(self.store.puts)
+        result, sql = self.promote_with(self.standby_facts())
+        self.assertEqual(result, fence)
+        self.assertEqual(len(self.store.puts), puts)
+        self.assertTrue(any("pg_promote" in text for text in sql))
+        # Promoted, then interrupted before the settings: the rerun finishes them
+        # and does not promote again.
+        result, sql = self.promote_with(lambda timeout=10: {"in_recovery": False, "timeline": 3})
+        self.assertFalse(any("pg_promote" in text for text in sql))
+        self.assertIn("ALTER SYSTEM SET komika.node_id = 'node-b'", "".join(sql))
+        self.assertTrue(any("CHECKPOINT" in text for text in sql))
+
+    def test_backup_jobs_run_only_on_the_fenced_primary(self):
+        self.put_fence(primary_node="node-a")
+        cases = (("", "f", None), ("node-a", "f", None), ("node-b", "f", "names node-a"),
+                 ("node-a", "t", "standby"))
+        for node, recovering, refusal in cases:
+            with self.subTest(node=node, recovering=recovering), patch.dict(os.environ, {"KOMIKA_NODE_ID": node}), \
+                    patch.object(h, "query", return_value=recovering + "\n"):
+                gate = h.backup_gate()
+                if refusal is None:
+                    self.assertIsNone(gate)
+                else:
+                    self.assertIn(refusal, gate)
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-a"}), \
+                patch.object(h, "query", side_effect=subprocess.CalledProcessError(2, "psql")):
+            self.assertIn("unreadable", h.backup_gate())
+
+    def test_fence_check_command(self):
+        self.existing()
+        self.put_fence(primary_node="node-a", timeline=1)
+        for node, standby, allowed in (("node-a", False, True), ("node-b", False, False), ("node-a", True, False)):
+            if standby:
+                (h.DATA / "standby.signal").write_text("")
+            with self.subTest(node=node, standby=standby), patch.dict(os.environ, {"KOMIKA_NODE_ID": node}), \
+                    patch("sys.stdout") as out:
+                self.assertEqual(h.fence_check(), allowed)
+            line = json.loads("".join(c.args[0] for c in out.write.call_args_list))
+            self.assertEqual(line["allowed"], allowed)
+
+    def test_replication_hba_needs_tls_and_explicit_cidrs(self):
+        h.DATA.mkdir()
+        with patch.dict(os.environ, {"KOMIKA_PG_REPLICA_CIDRS": "203.0.113.7/32"}), self.assertRaises(ValueError):
+            h.hba()  # No TLS files.
+        h.TLS.mkdir()
+        for name in ("server.crt", "server.key", "ca.crt"):
+            (h.TLS / name).write_text("x")
+        with patch.dict(os.environ, {"KOMIKA_PG_REPLICA_CIDRS": "203.0.113.7/32, 10.1.0.0/16"}):
+            h.hba()
+        text = (h.DATA / "pg_hba.conf").read_text()
+        self.assertIn("hostssl replication komika_replica 203.0.113.7/32 cert\n", text)
+        self.assertLess(text.index("hostssl replication"), text.index("host all all 0.0.0.0/0 reject"))
+        for value in ("0.0.0.0/0", "::/0", "203.0.113.7", "203.0.113.7/24"):
+            with self.subTest(value=value), patch.dict(os.environ, {"KOMIKA_PG_REPLICA_CIDRS": value}), \
+                    self.assertRaises(ValueError):
+                h.hba()
+        args = h.postgres_args(True)
+        self.assertIn("ssl=on", args)
+        self.assertIn(f"ssl_key_file={h.TLS}/server.key", args)
+        self.assertNotIn("replication", h.GRANT)
+        with patch.dict(os.environ, {"KOMIKA_PG_REPLICA_CIDRS": "203.0.113.7/32"}):
+            self.assertIn("CREATE ROLE komika_replica LOGIN REPLICATION", h.grant_sql())
+            self.assertIn("GRANT pg_read_all_stats TO komika", h.grant_sql())
+
+    def test_standby_init_refusals_and_written_settings(self):
+        with self.assertRaises(ValueError):
+            h.standby_init(["--primary", "db.example"])
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-b"}), self.assertRaises(ValueError):
+            h.standby_init(["--primary", "db.example:5432"])  # No TLS files.
+        h.TLS.mkdir()
+        for name in ("ca.crt", "client.crt", "client.key"):
+            (h.TLS / name).write_text("x")
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-b"}), self.assertRaises(ValueError) as refused:
+            h.standby_init(["--primary", "db.example:5432"])
+        self.assertIn("fence.json is absent", str(refused.exception))
+        self.put_fence(primary_node="node-b")
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-b"}), self.assertRaises(ValueError) as refused:
+            h.standby_init(["--primary", "db.example:5432"])
+        self.assertIn("names this node", str(refused.exception))
+        self.put_fence(primary_node="node-a")
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args)
+            (h.DATA / "PG_VERSION").write_text("18")
+            (h.DATA / "postgresql.auto.conf").write_text(
+                "komika.node_id = 'node-a'\nprimary_conninfo = 'host=old'\nprimary_slot_name = 'old'\n")
+
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-b"}), patch.object(h, "collect", return_value="||\n"), \
+                patch.object(h, "run", side_effect=run):
+            h.standby_init(["--primary", "db.example:5432"])
+        self.assertIn("--create-slot", calls[0])
+        self.assertIn("--slot=komika_standby", calls[0])
+        conninfo = calls[0][calls[0].index("-d") + 1]
+        self.assertIn("sslmode=verify-full", conninfo)
+        self.assertIn("application_name=node-b", conninfo)
+        auto = (h.DATA / "postgresql.auto.conf").read_text()
+        self.assertEqual(auto.count("primary_conninfo"), 1)
+        self.assertIn(f"primary_conninfo = '{conninfo}'", auto)
+        self.assertIn("primary_slot_name = 'komika_standby'", auto)
+        self.assertTrue((h.DATA / "standby.signal").is_file())
+        # A second standby-init needs an empty directory.
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-b"}), self.assertRaises(ValueError):
+            h.standby_init(["--primary", "db.example:5432"])
+        # An existing slot is reused; a lost one (no restart_lsn) is dropped and made again.
+        for answer, dropped, created in (("physical|0/3000148|1\n", False, False), ("physical||\n", True, True)):
+            shutil.rmtree(h.DATA)
+            commands, calls[:] = [], []
+
+            def collect(args, timeout, input=None):
+                commands.append(args[-1])
+                return answer if args[-1].startswith("READ_") else ""
+
+            with self.subTest(answer=answer), patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-b"}), \
+                    patch.object(h, "collect", side_effect=collect), patch.object(h, "run", side_effect=run):
+                h.standby_init(["--primary", "db.example:5432"])
+            self.assertEqual("DROP_REPLICATION_SLOT komika_standby" in commands, dropped)
+            self.assertEqual("--create-slot" in calls[0], created)
+
+    def test_without_a_node_name_status_and_health_ask_nothing_new(self):
+        h.STATE.mkdir(exist_ok=True)
+        with patch.object(h, "read_fence", side_effect=AssertionError("fencing is off")), \
+                patch.object(h, "repository_info", side_effect=ValueError("no repository here")), \
+                patch.object(h, "archiver_facts", return_value={"in_recovery": False, "ready": 0}), \
+                patch.object(h, "free_bytes", return_value=100 << 30), \
+                patch.object(h, "replication_facts", side_effect=subprocess.CalledProcessError(2, "psql")):
+            report = h.report_status(local=False)
+            self.assertIsNone(report["fence"])
+            self.assertFalse(any("replication state" in p for p in h.health_problems()))
+            with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-a"}):
+                self.assertIn("replication state unreadable", h.health_problems())
+
+    def test_health_of_a_standby_and_of_a_primary_with_a_slot(self):
+        self.existing(standby=True)
+        facts = {"in_recovery": True, "receiver": {"status": "streaming"}, "replay_lag_seconds": 0}
+        with patch.object(h, "replication_facts", return_value=facts), patch.object(h, "free_bytes", return_value=100 << 30), \
+                patch.object(h, "read_status", side_effect=AssertionError("a standby runs no backups")):
+            self.assertEqual(h.health_problems(), [])
+            facts.update(receiver=None, replay_lag_seconds=900)
+            self.assertEqual(len(h.health_problems()), 2)
+        self.assertEqual(len(h.replication_problems({"in_recovery": False, "slots": [],
+                                                     "senders": [{"name": "node-b", "replay_lag_seconds": None}]})), 1)
+        primary = {"in_recovery": False, "senders": [{"name": "node-b", "replay_lag_seconds": 400}],
+                   "slots": [{"name": "komika_standby", "wal_status": "extended", "retained_bytes": 2 << 30},
+                             {"name": "other", "wal_status": "lost", "retained_bytes": None}]}
+        problems = h.replication_problems(primary)
+        self.assertEqual(len(problems), 3)
+        self.assertEqual(h.replication_problems({"in_recovery": False, "senders": [], "slots": []}), [])
+
+    def test_standby_certs_verify_against_their_ca(self):
+        if not shutil.which("openssl", path=PATH):
+            self.skipTest("openssl not installed")
+        os.environ["PATH"] = PATH
+        out = self.root / "certs"
+        h.standby_certs([str(out), "node-a=203.0.113.7", "node-b=db-b.example"])
+        for node, san in (("node-a", "IP Address:203.0.113.7"), ("node-b", "DNS:db-b.example")):
+            directory = out / node
+            self.assertEqual(sorted(p.name for p in directory.iterdir()),
+                             ["ca.crt", "client.crt", "client.key", "server.crt", "server.key"])
+            for name in ("server.crt", "client.crt"):
+                verify = subprocess.run(["openssl", "verify", "-CAfile", str(out / "ca.crt"), str(directory / name)],
+                                        capture_output=True, text=True)
+                self.assertEqual(verify.returncode, 0, verify.stdout + verify.stderr)
+            text = subprocess.run(["openssl", "x509", "-noout", "-text", "-in", str(directory / "server.crt")],
+                                  capture_output=True, text=True).stdout
+            self.assertIn(san, text)
+            client = subprocess.run(["openssl", "x509", "-noout", "-subject", "-in", str(directory / "client.crt")],
+                                    capture_output=True, text=True).stdout
+            self.assertIn("komika_replica", client)
+            for key in ("server.key", "client.key"):
+                self.assertEqual((directory / key).stat().st_mode & 0o077, 0)
+        self.assertEqual((out / "ca.key").stat().st_mode & 0o077, 0)
+        with self.assertRaises(ValueError):  # Never overwrites a node's certificates.
+            h.standby_certs([str(out), "node-a=203.0.113.7"])
+        for bad in ("Node=1.2.3.4", "node-c=", "node-c=bad host"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                h.standby_certs([str(out), bad])
 
 
 if __name__ == "__main__":

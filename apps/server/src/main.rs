@@ -40,6 +40,7 @@ mod media_routes;
 // The verifier half is for regional caches (M6); until one ships, only tests call it.
 #[cfg_attr(not(test), allow(dead_code))]
 mod media_verify;
+mod node_fence;
 mod notify;
 mod page_locator;
 #[cfg(test)]
@@ -3114,6 +3115,11 @@ async fn main() -> anyhow::Result<()> {
     // background loops, and Phase 3 does not expand server concurrency.
     let _data_directory_lock = db::DataDirectoryLock::acquire(&cfg.covers_database_url)?;
     legacy_sqlite::refuse_unconverted(&cfg.database_url, &cfg.covers_database_url).await?;
+    // A fenced node (KOMIKA_NODE_ID, deploy/postgres/STANDBY.md) writes nothing
+    // before it knows its database is the primary its own fence check started.
+    if let Some(node_id) = &cfg.node_id {
+        node_fence::check(&cfg.database_url, node_id).await?;
+    }
     let pool = db::init(&cfg.database_url).await?;
     let ready_pool = ReadyDb::connect(&pool).await?;
     // Separate, un-replicated DB for cover blobs — see `db::init_covers`. Kept out

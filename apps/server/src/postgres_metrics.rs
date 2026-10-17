@@ -1,5 +1,5 @@
 //! PostgreSQL recovery-chain readings for the loopback `/metrics` scrape: current
-//! WAL directory size, archiver health, archive backlog and raw WAL generated.
+//! WAL directory size, archiver health, archive backlog, raw WAL generated and replication.
 //!
 //! `pg_ls_waldir()` and `pg_ls_archive_statusdir()` need an EXECUTE grant (or
 //! `pg_monitor`) that an application role may not have. Each scrape asks
@@ -9,7 +9,7 @@
 //! `komika_postgres_metric_available{metric=..} 0` says so; it is never shown as a
 //! number such as -1. `pg_stat_archiver` and `pg_stat_wal` need no grant.
 
-use std::fmt::Write;
+use std::fmt::{Display, Write};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use sqlx::PgConnection;
@@ -22,6 +22,7 @@ pub(crate) struct RecoveryMetrics {
     /// `.ready` files in `pg_wal/archive_status`: segments not yet archived.
     pub archive_ready_files: Option<i64>,
     pub archiver: Option<ArchiverStats>,
+    pub replication: Option<ReplicationStats>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -34,6 +35,41 @@ pub(crate) struct ArchiverStats {
     pub failing: bool,
     /// `pg_stat_wal.wal_bytes`: WAL generated since the statistics reset.
     pub wal_generated_bytes: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ReplicationStats {
+    pub current_wal_lsn_bytes: i64,
+    pub standbys: Vec<StandbyStats>,
+    pub slots: Vec<ReplicationSlotStats>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+pub(crate) struct StandbyStats {
+    pub application_name: String,
+    pub state: String,
+    pub sent_lsn_bytes: Option<i64>,
+    pub flush_lsn_bytes: Option<i64>,
+    pub replay_lsn_bytes: Option<i64>,
+    pub replay_lag_seconds: Option<f64>,
+}
+
+impl StandbyStats {
+    fn replay_lag_seconds(&self) -> Option<f64> {
+        self.replay_lag_seconds.or_else(|| {
+            self.replay_lsn_bytes
+                .filter(|lsn| Some(*lsn) == self.sent_lsn_bytes)
+                .map(|_| 0.0)
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+pub(crate) struct ReplicationSlotStats {
+    pub slot_name: String,
+    pub active: bool,
+    pub wal_status: Option<String>,
+    pub retained_bytes: Option<i64>,
 }
 
 /// Whole seconds since a timestamp, never negative. NULL stays NULL (the sample
@@ -67,10 +103,39 @@ const READY_SQL: &str = "(SELECT COUNT(*) FROM pg_catalog.pg_ls_archive_statusdi
      WHERE name LIKE '%.ready')";
 
 type StatsRow = (i64, i64, Option<i64>, Option<i64>, bool, i64, bool, bool);
+type ReplicationRow = (
+    i64,
+    sqlx::types::Json<Vec<StandbyStats>>,
+    sqlx::types::Json<Vec<ReplicationSlotStats>>,
+);
+
+const REPLICATION_ACCESS_SQL: &str = "SELECT pg_is_in_recovery(), \
+    pg_has_role(current_user, 'pg_read_all_stats', 'USAGE') OR \
+    (SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user)";
+const REPLICATION_SQL: &str = "WITH current_wal AS MATERIALIZED \
+    (SELECT pg_current_wal_lsn() AS lsn), senders AS (\
+     SELECT application_name, state, \
+     pg_wal_lsn_diff(sent_lsn, '0/0')::bigint AS sent_lsn_bytes, \
+     pg_wal_lsn_diff(flush_lsn, '0/0')::bigint AS flush_lsn_bytes, \
+     pg_wal_lsn_diff(replay_lsn, '0/0')::bigint AS replay_lsn_bytes, \
+     EXTRACT(EPOCH FROM replay_lag)::float8 AS replay_lag_seconds \
+     FROM {source} WHERE state <> 'backup') \
+     SELECT pg_wal_lsn_diff(w.lsn, '0/0')::bigint, \
+     COALESCE((SELECT jsonb_agg(to_jsonb(r)) FROM senders r), '[]'::jsonb), \
+     COALESCE((SELECT jsonb_agg(to_jsonb(s)) FROM (\
+       SELECT slot_name, active, wal_status, \
+       pg_wal_lsn_diff(w.lsn, restart_lsn)::bigint AS retained_bytes \
+       FROM pg_catalog.pg_replication_slots WHERE slot_type = 'physical'\
+     ) s), '[]'::jsonb) FROM current_wal w";
+
+fn replication_sql(source: &str) -> String {
+    REPLICATION_SQL.replace("{source}", source)
+}
 
 static WARNED_UNGRANTED: AtomicBool = AtomicBool::new(false);
+static WARNED_REPLICATION_UNGRANTED: AtomicBool = AtomicBool::new(false);
 
-/// Read every recovery value over one read-pool connection (at most two
+/// Read every recovery value over one read-pool connection (at most four
 /// statements). Errors other than a denied permission are recorded as read
 /// database errors, as the other gauges do.
 pub(crate) async fn collect(pool: &crate::db::Database) -> RecoveryMetrics {
@@ -103,6 +168,7 @@ pub(crate) async fn collect_on(conn: &mut PgConnection) -> RecoveryMetrics {
         );
     }
     let (wal_dir_bytes, archive_ready_files) = read_dirs(conn, wal_ok, ready_ok).await;
+    let replication = read_replication(conn).await;
     RecoveryMetrics {
         wal_dir_bytes,
         archive_ready_files,
@@ -114,7 +180,56 @@ pub(crate) async fn collect_on(conn: &mut PgConnection) -> RecoveryMetrics {
             failing,
             wal_generated_bytes: wal_generated,
         }),
+        replication,
     }
+}
+
+async fn read_replication(conn: &mut PgConnection) -> Option<ReplicationStats> {
+    let (in_recovery, granted): (bool, bool) = match sqlx::query_as(REPLICATION_ACCESS_SQL)
+        .fetch_one(&mut *conn)
+        .await
+    {
+        Ok(row) => row,
+        Err(error) => {
+            record_unless_denied(&error);
+            return None;
+        }
+    };
+    if in_recovery {
+        return None;
+    }
+    if !granted {
+        if !WARNED_REPLICATION_UNGRANTED.swap(true, Relaxed) {
+            tracing::warn!(
+                "metrics: the database role cannot read other WAL senders' columns; \
+                 replication /metrics values are left out (grant pg_read_all_stats)"
+            );
+        }
+        return None;
+    }
+    let sql = replication_sql("pg_catalog.pg_stat_replication");
+    match read_replication_stats(conn, &sql).await {
+        Ok(stats) => Some(stats),
+        Err(error) => {
+            record_unless_denied(&error);
+            None
+        }
+    }
+}
+
+async fn read_replication_stats(
+    conn: &mut PgConnection,
+    sql: &str,
+) -> Result<ReplicationStats, sqlx::Error> {
+    let (current_wal_lsn_bytes, sqlx::types::Json(standbys), sqlx::types::Json(slots)) =
+        sqlx::query_as::<_, ReplicationRow>(sql)
+            .fetch_one(conn)
+            .await?;
+    Ok(ReplicationStats {
+        current_wal_lsn_bytes,
+        standbys,
+        slots,
+    })
 }
 
 /// Both directory readings in one statement; a function that is not wanted is
@@ -169,6 +284,7 @@ pub(crate) fn prometheus(metrics: &RecoveryMetrics) -> String {
         ("wal_bytes", metrics.wal_dir_bytes.is_some()),
         ("archive_ready_files", metrics.archive_ready_files.is_some()),
         ("archiver", metrics.archiver.is_some()),
+        ("replication", metrics.replication.is_some()),
     ] {
         let _ = writeln!(
             out,
@@ -226,7 +342,95 @@ pub(crate) fn prometheus(metrics: &RecoveryMetrics) -> String {
         "WAL bytes generated since the statistics reset (pg_stat_wal.wal_bytes)",
         a.map(|a| a.wal_generated_bytes),
     );
+    let r = metrics.replication.as_ref();
+    family(
+        &mut out,
+        "komika_postgres_replication_standbys",
+        "gauge",
+        "WAL senders excluding backups",
+        r.map(|r| r.standbys.len() as i64),
+    );
+    family(
+        &mut out,
+        "komika_postgres_current_wal_lsn_bytes",
+        "gauge",
+        "Current primary WAL position in bytes",
+        r.map(|r| r.current_wal_lsn_bytes),
+    );
+    labelled_gauge(
+        &mut out,
+        "komika_postgres_replication_sent_lsn_bytes",
+        "WAL position sent to the standby in bytes",
+        "standby",
+        r.into_iter()
+            .flat_map(|r| &r.standbys)
+            .map(|s| (s.application_name.as_str(), s.sent_lsn_bytes)),
+    );
+    labelled_gauge(
+        &mut out,
+        "komika_postgres_replication_flush_lsn_bytes",
+        "WAL position flushed by the standby in bytes",
+        "standby",
+        r.into_iter()
+            .flat_map(|r| &r.standbys)
+            .map(|s| (s.application_name.as_str(), s.flush_lsn_bytes)),
+    );
+    labelled_gauge(
+        &mut out,
+        "komika_postgres_replication_replay_lsn_bytes",
+        "WAL position replayed by the standby in bytes",
+        "standby",
+        r.into_iter()
+            .flat_map(|r| &r.standbys)
+            .map(|s| (s.application_name.as_str(), s.replay_lsn_bytes)),
+    );
+    labelled_gauge(
+        &mut out,
+        "komika_postgres_replication_replay_lag_seconds",
+        "Standby replay lag in seconds",
+        "standby",
+        r.into_iter()
+            .flat_map(|r| &r.standbys)
+            .map(|s| (s.application_name.as_str(), s.replay_lag_seconds())),
+    );
+    labelled_gauge(
+        &mut out,
+        "komika_postgres_replication_slot_retained_bytes",
+        "WAL bytes retained by the physical slot",
+        "slot",
+        r.into_iter()
+            .flat_map(|r| &r.slots)
+            .map(|s| (s.slot_name.as_str(), s.retained_bytes)),
+    );
+    labelled_gauge(
+        &mut out,
+        "komika_postgres_replication_slot_active",
+        "1 when the physical slot is active",
+        "slot",
+        r.into_iter()
+            .flat_map(|r| &r.slots)
+            .map(|s| (s.slot_name.as_str(), Some(u8::from(s.active)))),
+    );
     out
+}
+
+fn labelled_gauge<'a, T: Display>(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    label: &str,
+    values: impl Iterator<Item = (&'a str, Option<T>)>,
+) {
+    family(out, name, "gauge", help, None);
+    for (value, reading) in values {
+        if let Some(reading) = reading {
+            let escaped = value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n");
+            let _ = writeln!(out, "{name}{{{label}=\"{escaped}\"}} {reading}");
+        }
+    }
 }
 
 fn family(out: &mut String, name: &str, kind: &str, help: &str, value: Option<i64>) {
@@ -272,6 +476,7 @@ mod tests {
                 failing: false,
                 wal_generated_bytes: 9_000,
             }),
+            ..Default::default()
         });
         assert_eq!(sample(&body, "komika_sqlite_wal_bytes"), Some("1778413942"));
         assert_eq!(
@@ -303,6 +508,277 @@ mod tests {
             ),
             Some("1")
         );
+    }
+
+    #[test]
+    fn unavailable_replication_values_are_absent() {
+        let body = prometheus(&RecoveryMetrics::default());
+        for name in [
+            "komika_postgres_replication_standbys",
+            "komika_postgres_current_wal_lsn_bytes",
+            "komika_postgres_replication_sent_lsn_bytes",
+            "komika_postgres_replication_flush_lsn_bytes",
+            "komika_postgres_replication_replay_lsn_bytes",
+            "komika_postgres_replication_replay_lag_seconds",
+            "komika_postgres_replication_slot_retained_bytes",
+            "komika_postgres_replication_slot_active",
+        ] {
+            assert!(body.contains(&format!("# HELP {name} ")));
+            assert!(body.contains(&format!("# TYPE {name} gauge\n")));
+            assert!(!body.lines().any(|line| line.starts_with(name)), "{name}");
+        }
+        assert_eq!(
+            sample(
+                &body,
+                "komika_postgres_metric_available{metric=\"replication\"}"
+            ),
+            Some("0")
+        );
+        assert!(!body.contains("-1"));
+    }
+
+    #[test]
+    fn replication_readings_render_with_escaped_labels_and_idle_lag() {
+        let mut metrics = RecoveryMetrics {
+            replication: Some(ReplicationStats {
+                current_wal_lsn_bytes: 600,
+                standbys: vec![
+                    StandbyStats {
+                        application_name: "node-\"a\\\n".into(),
+                        state: "streaming".into(),
+                        sent_lsn_bytes: Some(500),
+                        flush_lsn_bytes: Some(500),
+                        replay_lsn_bytes: Some(500),
+                        replay_lag_seconds: None,
+                    },
+                    StandbyStats {
+                        application_name: "node-b".into(),
+                        state: "catchup".into(),
+                        sent_lsn_bytes: Some(500),
+                        flush_lsn_bytes: None,
+                        replay_lsn_bytes: Some(400),
+                        replay_lag_seconds: Some(1.25),
+                    },
+                ],
+                slots: vec![ReplicationSlotStats {
+                    slot_name: "slot-\"a\\\n".into(),
+                    active: true,
+                    wal_status: Some("reserved".into()),
+                    retained_bytes: Some(200),
+                }],
+            }),
+            ..Default::default()
+        };
+        let body = prometheus(&metrics);
+        assert_eq!(
+            sample(&body, "komika_postgres_replication_standbys"),
+            Some("2")
+        );
+        assert_eq!(
+            sample(&body, "komika_postgres_current_wal_lsn_bytes"),
+            Some("600")
+        );
+        assert_eq!(
+            sample(
+                &body,
+                "komika_postgres_metric_available{metric=\"replication\"}"
+            ),
+            Some("1")
+        );
+        for metric in ["sent", "flush", "replay"] {
+            let name = format!(
+                r#"komika_postgres_replication_{metric}_lsn_bytes{{standby="node-\"a\\\n"}}"#
+            );
+            assert_eq!(sample(&body, &name), Some("500"));
+        }
+        assert_eq!(
+            sample(
+                &body,
+                r#"komika_postgres_replication_replay_lag_seconds{standby="node-\"a\\\n"}"#
+            ),
+            Some("0")
+        );
+        assert_eq!(
+            sample(
+                &body,
+                "komika_postgres_replication_sent_lsn_bytes{standby=\"node-b\"}"
+            ),
+            Some("500")
+        );
+        assert_eq!(
+            sample(
+                &body,
+                "komika_postgres_replication_flush_lsn_bytes{standby=\"node-b\"}"
+            ),
+            None
+        );
+        assert_eq!(
+            sample(
+                &body,
+                "komika_postgres_replication_replay_lsn_bytes{standby=\"node-b\"}"
+            ),
+            Some("400")
+        );
+        let lag = "komika_postgres_replication_replay_lag_seconds{standby=\"node-b\"}";
+        assert_eq!(sample(&body, lag), Some("1.25"));
+        assert_eq!(
+            sample(
+                &body,
+                r#"komika_postgres_replication_slot_retained_bytes{slot="slot-\"a\\\n"}"#
+            ),
+            Some("200")
+        );
+        let active = r#"komika_postgres_replication_slot_active{slot="slot-\"a\\\n"}"#;
+        assert_eq!(sample(&body, active), Some("1"));
+
+        metrics.replication.as_mut().unwrap().standbys[1].replay_lag_seconds = None;
+        metrics.replication.as_mut().unwrap().slots[0].active = false;
+        metrics.replication.as_mut().unwrap().slots[0].retained_bytes = None;
+        let body = prometheus(&metrics);
+        assert_eq!(sample(&body, lag), None);
+        assert_eq!(sample(&body, active), Some("0"));
+        assert_eq!(
+            sample(
+                &body,
+                r#"komika_postgres_replication_slot_retained_bytes{slot="slot-\"a\\\n"}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn readable_replication_without_standbys_renders_zero() {
+        let body = prometheus(&RecoveryMetrics {
+            replication: Some(ReplicationStats::default()),
+            ..Default::default()
+        });
+        assert_eq!(
+            sample(&body, "komika_postgres_replication_standbys"),
+            Some("0")
+        );
+        assert_eq!(
+            sample(
+                &body,
+                "komika_postgres_metric_available{metric=\"replication\"}"
+            ),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn null_replay_lag_requires_known_equal_lsns() {
+        for (sent, replay, expected) in [
+            (Some(500), Some(500), Some(0.0)),
+            (Some(500), Some(400), None),
+            (None, Some(500), None),
+            (Some(500), None, None),
+            (None, None, None),
+        ] {
+            assert_eq!(
+                StandbyStats {
+                    sent_lsn_bytes: sent,
+                    replay_lsn_bytes: replay,
+                    ..Default::default()
+                }
+                .replay_lag_seconds(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_sql_parses_lsn_lag_and_excludes_backup() {
+        let pool = crate::db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut conn = pool.read().acquire().await.unwrap();
+        let sql = replication_sql(
+            "(VALUES ('node-a', 'streaming', '0/3000148'::pg_lsn, '0/3000120'::pg_lsn, \
+             '0/3000100'::pg_lsn, '0/3000080'::pg_lsn, interval '1.25 seconds'), \
+             ('node-starting', 'startup', NULL, NULL, NULL, NULL, NULL), \
+             ('basebackup', 'backup', '0/3000148'::pg_lsn, NULL, NULL, NULL, NULL)) \
+             AS r(application_name, state, sent_lsn, write_lsn, flush_lsn, replay_lsn, replay_lag)",
+        );
+        let stats = read_replication_stats(&mut conn, &sql).await.unwrap();
+        drop(conn);
+        pool.close().await;
+        assert!(stats.current_wal_lsn_bytes >= 0);
+        assert_eq!(stats.standbys.len(), 2);
+        assert_eq!(
+            stats
+                .standbys
+                .iter()
+                .find(|s| s.application_name == "node-a"),
+            Some(&StandbyStats {
+                application_name: "node-a".into(),
+                state: "streaming".into(),
+                sent_lsn_bytes: Some(50_331_976),
+                flush_lsn_bytes: Some(50_331_904),
+                replay_lsn_bytes: Some(50_331_776),
+                replay_lag_seconds: Some(1.25),
+            })
+        );
+        assert_eq!(
+            stats
+                .standbys
+                .iter()
+                .find(|s| s.application_name == "node-starting"),
+            Some(&StandbyStats {
+                application_name: "node-starting".into(),
+                state: "startup".into(),
+                ..Default::default()
+            })
+        );
+        assert!(stats.standbys.iter().all(|s| s.state != "backup"));
+    }
+
+    #[tokio::test]
+    async fn replication_requires_stats_role_and_empty_primary_is_readable() {
+        let pool = crate::db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut conn = pool.read().acquire().await.unwrap();
+        let (in_recovery, granted): (bool, bool) = sqlx::query_as(REPLICATION_ACCESS_SQL)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert!(!in_recovery);
+        let initial = collect_on(&mut conn).await;
+        assert_eq!(
+            initial.replication.as_ref().map(|r| r.standbys.len()),
+            granted.then_some(0)
+        );
+
+        let role = format!(
+            "komika_replication_metrics_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        sqlx::query(&format!("CREATE ROLE \"{role}\" NOLOGIN"))
+            .execute(pool.write())
+            .await
+            .unwrap();
+        sqlx::query(&format!("SET ROLE \"{role}\""))
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let (denied, counted) =
+            crate::db::test_counters::scope(async { collect_on(&mut conn).await }).await;
+        sqlx::query(&format!("GRANT pg_read_all_stats TO \"{role}\""))
+            .execute(pool.write())
+            .await
+            .unwrap();
+        let regranted = collect_on(&mut conn).await;
+        sqlx::query("RESET ROLE").execute(&mut *conn).await.unwrap();
+        drop(conn);
+        sqlx::query(&format!("DROP ROLE \"{role}\""))
+            .execute(pool.write())
+            .await
+            .unwrap();
+        pool.close().await;
+
+        assert_eq!(denied.replication, None);
+        assert_eq!(counted, Default::default());
+        assert!(regranted.replication.unwrap().standbys.is_empty());
     }
 
     /// A missing archive time stays absent; a future one (clock skew) reads 0.

@@ -263,6 +263,8 @@ pub struct Config {
     /// Prometheus sidecar convention. Override with `KOMIKA_METRICS_PORT`.
     pub metrics_port: u16,
     pub database_url: String,
+    /// Expected PostgreSQL primary identity (`KOMIKA_NODE_ID`); unset disables the check.
+    pub node_id: Option<String>,
     /// SQLite URL for the SEPARATE cover-cache DB. Kept out of `database_url` on
     /// purpose: cover blobs are large and re-derivable from MangaDex, so this DB is
     /// not stored in PostgreSQL. Defaults to `sqlite://covers.sqlite3`; override
@@ -627,6 +629,12 @@ impl Config {
             .filter(|&v: &i64| v > 0)
             .unwrap_or(200);
         Self {
+            node_id: match env::var("KOMIKA_NODE_ID") {
+                Ok(value) => parse_node_id(Some(value)),
+                Err(env::VarError::NotPresent) => Ok(None),
+                Err(env::VarError::NotUnicode(_)) => Err("KOMIKA_NODE_ID must be ASCII".into()),
+            }
+            .unwrap_or_else(|error| panic!("{error}")),
             fallback: FallbackConfig::parse(|name| env::var(name).ok())
                 .unwrap_or_else(|error| panic!("{error}")),
             media_manifests: env::var("KOMIKA_MEDIA_MANIFESTS").is_ok_and(|v| v == "on"),
@@ -679,6 +687,22 @@ impl Config {
             img_proxy_enabled,
         }
     }
+}
+
+fn parse_node_id(raw: Option<String>) -> Result<Option<String>, String> {
+    let Some(node_id) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let first = node_id.as_bytes()[0];
+    if node_id.len() > 63
+        || !(first.is_ascii_lowercase() || first.is_ascii_digit())
+        || !node_id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err("KOMIKA_NODE_ID must match ^[a-z0-9][a-z0-9-]{0,62}$".into());
+    }
+    Ok(Some(node_id))
 }
 
 /// PostgreSQL endpoints default to the local `covers.sqlite3` cache. Legacy
@@ -843,6 +867,42 @@ mod listener_addr_tests {
         assert_eq!(addr_or(Some("  ".into()), "127.0.0.1"), "127.0.0.1");
         assert_eq!(addr_or(Some(" 0.0.0.0 ".into()), "127.0.0.1"), "0.0.0.0");
         assert_eq!(addr_or(Some("::1".into()), "127.0.0.1"), "::1");
+    }
+}
+
+#[cfg(test)]
+mod node_id_tests {
+    use super::parse_node_id;
+
+    #[test]
+    fn node_id_is_optional_and_accepts_valid_ids() {
+        assert_eq!(parse_node_id(None).unwrap(), None);
+        assert_eq!(parse_node_id(Some(String::new())).unwrap(), None);
+        for value in [
+            "node-a".to_string(),
+            "0".into(),
+            "a-".into(),
+            "a".repeat(63),
+        ] {
+            assert_eq!(parse_node_id(Some(value.clone())).unwrap(), Some(value));
+        }
+    }
+
+    #[test]
+    fn node_id_rejects_invalid_ids() {
+        for value in [
+            "-node".to_string(),
+            "Node-a".into(),
+            "node_a".into(),
+            " ".into(),
+            "node-a\n".into(),
+            "é".into(),
+            "a".repeat(64),
+        ] {
+            let error = parse_node_id(Some(value)).unwrap_err();
+            assert!(error.contains("KOMIKA_NODE_ID"));
+            assert!(error.contains("^[a-z0-9][a-z0-9-]{0,62}$"));
+        }
     }
 }
 
