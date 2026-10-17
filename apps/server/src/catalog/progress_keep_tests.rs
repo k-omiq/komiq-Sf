@@ -612,15 +612,9 @@ async fn engine_reset_keeps_progress_and_serializes_with_canonical_untick() {
 
     for concurrent_untick in [false, true] {
         let pool = pool().await;
-        let covers = crate::database::SqliteTestPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::raw_sql(
-            "CREATE TABLE suwayomi_cover_blob(manga_id INTEGER PRIMARY KEY,webp BLOB,updated_at TEXT); \
-             CREATE TABLE cover_variant(asset_key TEXT,width INTEGER,webp BLOB)",
-        ).execute(&covers).await.unwrap();
+        // No cover fixtures are needed.
+        let cover_dir = crate::cover_store::test_support::TestDir::new();
+        let covers = crate::cover_store::test_support::store(&cover_dir);
         let engine = MockEngine::spawn().await;
         let mut client = SuwayomiClient::new(engine.url.clone(), None, None);
         let fence = Fence::attach(&pool, &covers, &mut client).await.unwrap();
