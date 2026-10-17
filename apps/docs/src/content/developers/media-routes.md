@@ -20,18 +20,21 @@ query MediaRoutes {
 }
 ```
 
-`kind` is `OWNER` or `REGIONAL`. `base` is an origin, `scheme://host[:port]` with no path, or an empty string for the server's own origin. The answer is the same for every viewer, so it rides the cacheable anonymous `GET /graphql` like other public reads.
+`kind` is `OWNER`, `REGIONAL` or `HELPER`. `base` is an origin, `scheme://host[:port]` with no path, or an empty string for the server's own origin. The answer is the same for every viewer, so it rides the cacheable anonymous `GET /graphql` like other public reads.
 
 The list comes from `KOMIKA_MEDIA_ROUTES`, a JSON array:
 
 ```json
 [
 	{ "id": "owner", "kind": "owner" },
-	{ "id": "sg", "kind": "regional", "base": "https://media-sg.example.com", "region": "sg" }
+	{ "id": "sg", "kind": "regional", "base": "https://media-sg.example.com", "region": "sg" },
+	{ "id": "helper", "kind": "helper", "base": "https://media-helper.example.com" }
 ]
 ```
 
-Without the setting, the list is one owner entry with an empty `base`. The server refuses to start when the value is not valid. It needs 1 to 16 entries, exactly one owner, unique ids made of letters, digits, `_` and `-`, and a `base` on every regional entry. A `base` must be an `http` or `https` origin with no user name, password, path, query or fragment. The server stores it in normal form: lower case, no default port, no trailing slash.
+Without the setting, the list is one owner entry with an empty `base`. The server refuses to start when the value is not valid. It needs 1 to 16 entries, exactly one owner, unique ids made of letters, digits, `_` and `-`, and a `base` on every regional or helper entry. A `base` must be an `http` or `https` origin with no user name, password, path, query or fragment. The server stores it in normal form: lower case, no default port, no trailing slash.
+
+A helper runs the server's cache mode. Read [Media cache mode](/developers/media-cache) for its storage, checks and policy lease.
 
 The query has its own capability flag in the GraphQL client, `mediaRoutesUnsupported`. A server that predates the query answers `Unknown field "mediaRoutes"` once, and the client asks it no more. The line-based field stripper cannot remove a field with a sub-selection, so this works the same way as `chapterOrigin`.
 
@@ -41,45 +44,47 @@ Only the web build (`pnpm build` and `KOMIKA_TARGET=static`) uses routes, and on
 
 The reader trusts the intersection of that list and the server's list, plus the API origin as the owner. A server cannot add a host to a web build. The owner is the server's owner `base` when it is the API origin or on the list, and the API origin otherwise.
 
+Regional and helper routes need their origin on `PUBLIC_KOMIKA_MEDIA_HOSTS`. Helpers use the same probes, choice and fallback as regional routes.
+
 Every other build loads each page's `sourceUrl`, as before: the native apps, the static self-host build, a reader pointed at a server from the connect screen, and the `embedded` build. The `embedded` build asks `mediaRoutes` once at start, only to learn the owner's origin. It never routes pages.
 
 ## Choosing a route
 
 A page with an exact object (`mediaPath`) loads from the session's route. The choice holds for the browser tab's session, in `sessionStorage`. Until a probe round picks one, objects load from the owner. Nothing waits for probes.
 
-A probe is `GET {origin}/media/v1/ready`. It sends no credentials (`credentials: 'omit'`) and no headers, and its deadline is 1.5 seconds. The ready route answers `204` with `no-store` and `Access-Control-Allow-Origin: *`. Probes run only when there is more than one route: at start and after a route fails. Each route is probed at most once per 60 seconds, and a session runs at most 3 rounds. A probe never downloads an image.
+A probe is `GET {origin}/media/v1/ready`. It sends no credentials (`credentials: 'omit'`) and no headers, and its deadline is 1.5 seconds. The ready route answers `204` with `no-store` and `Access-Control-Allow-Origin: *`. A helper without a usable policy lease or remaining grace answers `503`. Probes run only when there is more than one route: at start and after a route fails. Each route is probed at most once per 60 seconds, and a session runs at most 3 rounds. A probe never downloads an image.
 
 The first round picks the fastest route that answered. After that, a switch needs another route faster by more than 30 % and by more than 50 ms, in two rounds in a row.
 
 ## Checking objects from other hosts
 
-The reader does not trust the bytes a regional host sends. The owner's `pages` answer gives each exact object its SHA-256 hash (`mediaSha256`), its length in bytes (`mediaLength`) and its MIME type (`mediaMime`). That answer comes from the API, so the browser needs no signature check.
+The reader does not trust the bytes a regional or helper host sends. The owner's `pages` answer gives each exact object its SHA-256 hash (`mediaSha256`), its length in bytes (`mediaLength`) and its MIME type (`mediaMime`). That answer comes from the API, so the browser needs no signature check.
 
-A page on a regional route loads like this:
+A page on a regional or helper route loads like this:
 
-1. The reader fetches the object with `fetch`. It sends no credentials (`credentials: 'omit'`), no referrer and no headers.
+1. The reader fetches the object with `fetch` and follows no redirects. It sends no credentials (`credentials: 'omit'`), no referrer and no headers.
 2. It checks the answer: status `200`, the MIME type without parameters, and the length. It stops reading when the body grows past the expected length.
 3. It hashes the bytes with the browser's WebCrypto (`crypto.subtle`) and compares the hash.
 4. Only then does it show the bytes, from a `blob:` URL.
 
-A page that fails any check, or whose fetch takes longer than 30 seconds, counts as a failed load (read the next section). A page without all three fields, or whose hash does not match the hash in `mediaPath`, never loads from a regional host: it loads from the owner.
+A page that fails any check, or whose fetch takes longer than 30 seconds, counts as a failed load (read the next section). A page without all three fields, or whose hash does not match the hash in `mediaPath`, never loads from a regional or helper host: it loads from the owner.
 
 Pages on the owner route stay a plain `<img>` with no check.
 
 The reader keeps a `blob:` URL alive only for pages near the one you read: 2 pages behind and 6 ahead, plus the pages on screen. A page that leaves that window gives its URL back (`URL.revokeObjectURL`) and shows its placeholder. When you scroll back, the reader fetches and checks it again; the browser cache usually answers. A hard limit of 10 live URLs holds even if the window grows.
 
-The object route answers every request, errors too, with `Access-Control-Allow-Origin: *`, so the browser lets the reader read the bytes. A proxy or cache in front of a regional host must pass that header through. The route sets no cookies.
+The object route answers every request, errors too, with `Access-Control-Allow-Origin: *`, so the browser lets the reader read the bytes. A proxy or cache in front of a regional or helper host must pass that header through. The route sets no cookies.
 
 ## When an object fails
 
 ```flow
-Reader -> Regional route: exact object
-Reader -> Owner: same path, once (region marked down)
+Reader -> Regional or helper route: exact object
+Reader -> Owner: same path, once (route marked down)
 Reader -> Server: pages again by POST, once per chapter
 Reader -> Reader: changed pages load again, or a new page list
 ```
 
-1. A regional object that fails to load or fails its check loads the same path once from the owner. The region is down for the rest of the session, and a probe round starts.
+1. A regional or helper object that fails to load or fails its check loads the same path once from the owner. The route is down for the rest of the session, and a probe round starts.
 2. If the owner fails too, the bytes have likely moved. The reader fetches the chapter's `pages` again, once per chapter, by POST. A POST skips the browser cache and the edge cache that hold anonymous GET answers. Every page whose URL changed loads again, unless it is already on screen.
 3. If the refresh returns a different number of pages, the reader replaces the chapter's page list in place, without leaving the chapter. A page number past the new end moves to the new last page.
 4. After that, a page that still fails shows the usual retry button. Each page, and the page list, is replaced by the refresh at most once, so a page never loops.
@@ -103,7 +108,9 @@ An exact object is a typed value, `MediaUrl` (route id and path), not a string. 
 
 ## The Worker never proxies media
 
-The [image proxy Worker](/developers/image-proxy) refuses any upstream URL whose path is `/media` or starts with `/media/`, on every host. It checks the path after percent-decoding, collapsing repeated slashes and lower-casing, and a path it cannot decode counts as media. It also refuses every host listed in `MEDIA_ROUTE_HOSTS`, matched exactly. The check runs on `src` and on every redirect hop, before any fetch, and answers `403` with `no-store`.
+[The image proxy Worker](/developers/image-proxy) refuses any upstream URL whose path is `/media` or starts with `/media/`, on every host. It checks the path after percent-decoding, collapsing repeated slashes and lower-casing, and a path it cannot decode counts as media. It also refuses every host listed in `MEDIA_ROUTE_HOSTS`, matched exactly. The check runs on `src` and on every redirect hop, before any fetch, and answers `403` with `no-store`.
+
+The server's image proxy also refuses the regional and helper hosts from `MediaRoutes::non_owner_hosts`.
 
 The rule exists because the Worker's host allowlist includes the global server's API host for legacy page paths. Without it, the Worker would cache exact objects outside the server's policy. Read [Deployment](/developers/deployment) for the order this must ship in.
 

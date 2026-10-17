@@ -30,6 +30,9 @@ mod locks;
 mod maintenance;
 mod mangadex;
 mod media;
+mod media_cache;
+#[cfg(test)]
+mod media_cache_tests;
 mod media_manifest;
 mod media_policy;
 #[cfg(test)]
@@ -2901,7 +2904,7 @@ fn public_router(
         let media_hosts = router_state
             .schema
             .data::<media_routes::MediaRoutes>()
-            .map(media_routes::MediaRoutes::regional_hosts)
+            .map(media_routes::MediaRoutes::non_owner_hosts)
             .unwrap_or_default();
         app.route(
             "/img",
@@ -3080,6 +3083,12 @@ async fn main() -> anyhow::Result<()> {
     }
     raise_open_file_limit();
 
+    // `komika-server media-cache …` — a cache of another server's exact media objects
+    // (`media_cache`). It has no database, so it starts none of the server's state.
+    if std::env::args().nth(1).as_deref() == Some("media-cache") {
+        let argv: Vec<String> = std::env::args().skip(2).collect();
+        return media_cache::run_cli(&argv).await;
+    }
     let cfg = Config::from_env();
 
     // `komika-server phase-f <stage> [--apply] …` — the Phase F (`all.mangadex`

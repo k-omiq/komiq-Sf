@@ -268,6 +268,11 @@ impl PolicyGate {
         })
     }
 
+    /// Does the cache hold a lease it may still serve under (valid, or in its grace)?
+    pub fn serving(&self, now: i64) -> bool {
+        self.check(now, None, |_| false).is_ok()
+    }
+
     fn check(
         &self,
         now: i64,

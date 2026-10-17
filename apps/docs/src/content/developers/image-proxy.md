@@ -151,7 +151,7 @@ Your server can serve `/img?src=...` itself. `KOMIKA_IMG_PROXY=on` enables the r
 
 The Rust implementation in `apps/server/src/img_proxy.rs` checks URLs, hosts, redirects, content types and image sizes. It sends the same 7-day immutable cache header. Its host allowlist currently matches the Worker list, including `api.komiq.cc`; it does not substitute your server hostname. The reader loads your server assets directly from the API origin instead of routing them through the Worker.
 
-The server's `/img` refuses media routes like the Worker. It refuses a `/media` path on every host, with the same decoding rules, and the host of every regional `base` in `KOMIKA_MEDIA_ROUTES`. It checks `src` and every redirect hop before it fetches, and answers HTTP 403 with `no-store`.
+The server's `/img` refuses media routes like the Worker. It refuses a `/media` path on every host, with the same decoding rules, and the host of every regional or helper `base` in `KOMIKA_MEDIA_ROUTES`. It checks `src` and every redirect hop before it fetches, and answers HTTP 403 with `no-store`.
 
 ## How to run and deploy
 

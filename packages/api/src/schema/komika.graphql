@@ -1041,6 +1041,7 @@ type MediaRoute {
 enum MediaRouteKind {
 	OWNER
 	REGIONAL
+	HELPER
 }
 
 # [komika] All source mappings resolved for one canonical work (batch grouping).

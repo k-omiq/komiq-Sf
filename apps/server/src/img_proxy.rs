@@ -11,7 +11,7 @@
 //! Worker:
 //!
 //! - **Media routes bypass the proxy** — decoded, slash-collapsed `/media` paths on
-//!   any host, undecodable paths, and regional media route hosts are refused.
+//!   any host, undecodable paths, and regional or helper media route hosts are refused.
 //! - **Host allowlist** ([`ALLOWED_SOURCE_HOSTS`]) — the Worker's `ALLOWED_SOURCE_HOSTS`
 //!   verbatim (a test pins the two together). Exact host or a dot-suffix. Nothing else
 //!   is ever fetched, whatever the URL.
@@ -75,7 +75,7 @@ const IMAGE_CACHE: &str = crate::image_delivery::MUTABLE_CACHE;
 pub struct ImgProxy {
     http: reqwest::Client,
     hosts: Vec<String>,
-    /// Exact hosts from `MediaRoutes::regional_hosts`.
+    /// Exact hosts from `MediaRoutes::non_owner_hosts`.
     media_hosts: Vec<String>,
     /// Production: false (default port only, as the Worker). Tests: true, because a
     /// mock server cannot listen on 80.
@@ -720,7 +720,7 @@ mod tests {
             ]"#,
         ))
         .unwrap();
-        let app = proxy_app(addr, true, MAX_IMAGE_BYTES, routes.regional_hosts());
+        let app = proxy_app(addr, true, MAX_IMAGE_BYTES, routes.non_owner_hosts());
         // The owner's host also serves engine images: only its media paths are refused.
         let (status, ..) = call(&app, &format!("http://allowed.test:{}/ok.jpg", addr.port())).await;
         assert_eq!(status, StatusCode::OK);
@@ -771,7 +771,7 @@ mod tests {
             ]"#,
         ))
         .unwrap();
-        let app = proxy_app(addr, true, MAX_IMAGE_BYTES, routes.regional_hosts());
+        let app = proxy_app(addr, true, MAX_IMAGE_BYTES, routes.non_owner_hosts());
         for host in ["uploads.mangadex.org", "UPLOADS.MANGADEX.ORG."] {
             let before = hits.load(Ordering::SeqCst);
             let to = encode(&format!("http://{host}:{}/ok.jpg", addr.port()));
@@ -925,15 +925,20 @@ mod tests {
         let md = Arc::new(MangaDexClient::new("img-test", 5.0, 40.0));
         md.set_enabled(true);
         let routes = crate::media_routes::MediaRoutes::parse(Some(
-            r#"[{"id":"owner","kind":"owner"},{"id":"sg","kind":"regional","base":"https://Uploads.MangaDex.Org."}]"#,
+            r#"[
+                {"id":"owner","kind":"owner"},
+                {"id":"sg","kind":"regional","base":"https://Uploads.MangaDex.Org."},
+                {"id":"helper","kind":"helper","base":"https://Helper.MangaDex.Network."}
+            ]"#,
         ))
         .unwrap();
-        let proxy = ImgProxy::new(md, routes.regional_hosts());
+        let proxy = ImgProxy::new(md, routes.non_owner_hosts());
         for src in [
             "ftp://blocked.test/media/x",
             "http://user:pw@blocked.test/media/x",
             "https://blocked.test:8443/media/x",
             "https://UPLOADS.MANGADEX.ORG.:8443/ok.jpg",
+            "https://HELPER.MANGADEX.NETWORK.:8443/ok.jpg",
         ] {
             let refusal = proxy.check(&Url::parse(src).unwrap()).unwrap_err();
             assert_eq!(refusal.status, StatusCode::FORBIDDEN, "{src}");

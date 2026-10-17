@@ -7,6 +7,7 @@ use std::collections::HashSet;
 pub enum MediaRouteKind {
     Owner,
     Regional,
+    Helper,
 }
 
 #[derive(async_graphql::SimpleObject, Clone, Debug, PartialEq)]
@@ -42,13 +43,13 @@ impl MediaRoutes {
         }])
     }
 
-    /// Regional media hosts, for the image proxy to refuse as the Worker's
+    /// Regional and helper media hosts, for the image proxy to refuse as the Worker's
     /// `MEDIA_ROUTE_HOSTS`. The owner is left out: its host also serves the API and
     /// engine images, and its media paths are refused by path.
-    pub fn regional_hosts(&self) -> Vec<String> {
+    pub fn non_owner_hosts(&self) -> Vec<String> {
         self.0
             .iter()
-            .filter(|route| route.kind == MediaRouteKind::Regional)
+            .filter(|route| route.kind != MediaRouteKind::Owner)
             .filter_map(|route| reqwest::Url::parse(&route.base).ok())
             .filter_map(|url| {
                 url.host_str()
@@ -89,7 +90,9 @@ impl MediaRoutes {
             if config.kind == MediaRouteKind::Owner {
                 owners += 1;
             } else if config.base.is_empty() {
-                return Err("KOMIKA_MEDIA_ROUTES regional entries need a non-empty base".into());
+                return Err(
+                    "KOMIKA_MEDIA_ROUTES regional and helper entries need a non-empty base".into(),
+                );
             }
             if let Some(region) = &config.region {
                 if !(1..=64).contains(&region.chars().count())
@@ -158,16 +161,33 @@ mod tests {
     }
 
     #[test]
-    fn regional_hosts_leave_out_the_owner_and_drop_trailing_dots_and_ports() {
-        assert!(MediaRoutes::owner_only().regional_hosts().is_empty());
+    fn non_owner_hosts_include_regional_and_helper_but_not_owner() {
+        assert!(MediaRoutes::owner_only().non_owner_hosts().is_empty());
         let routes = MediaRoutes::parse(Some(
             r#"[
                 {"id":"owner","kind":"owner","base":"https://Owner.Example.:8443"},
-                {"id":"regional","kind":"regional","base":"http://Media.Example.:8080"}
+                {"id":"regional","kind":"regional","base":"http://Media.Example.:8080"},
+                {"id":"helper","kind":"helper","base":"https://Helper.Example.:8443"}
             ]"#,
         ))
         .unwrap();
-        assert_eq!(routes.regional_hosts(), vec!["media.example"]);
+        assert_eq!(
+            routes.non_owner_hosts(),
+            vec!["media.example", "helper.example"]
+        );
+    }
+
+    #[test]
+    fn parses_lowercase_helper() {
+        let routes = MediaRoutes::parse(Some(
+            r#"[
+                {"id":"owner","kind":"owner"},
+                {"id":"helper","kind":"helper","base":"https://Helper.Example/"}
+            ]"#,
+        ))
+        .unwrap();
+        assert_eq!(routes.0[1].kind, MediaRouteKind::Helper);
+        assert_eq!(routes.0[1].base, "https://helper.example");
     }
 
     #[test]
@@ -291,7 +311,19 @@ mod tests {
                 regional["base"] = json!(base);
             }
             let raw = json!([{"id":"owner","kind":"owner"}, regional]).to_string();
-            assert_invalid(&raw, "regional entries need a non-empty base");
+            assert_invalid(&raw, "regional and helper entries need a non-empty base");
+        }
+    }
+
+    #[test]
+    fn rejects_helper_without_a_base() {
+        for base in [None, Some("")] {
+            let mut helper = json!({"id":"helper","kind":"helper"});
+            if let Some(base) = base {
+                helper["base"] = json!(base);
+            }
+            let raw = json!([{"id":"owner","kind":"owner"}, helper]).to_string();
+            assert_invalid(&raw, "regional and helper entries need a non-empty base");
         }
     }
 
@@ -387,7 +419,8 @@ mod tests {
         let routes = MediaRoutes::parse(Some(
             r#"[
             {"id":"primary","kind":"owner","base":"https://Owner.Example.com/"},
-            {"id":"sg","kind":"regional","base":"https://Media-SG.Example.com:443/","region":"SG"}
+            {"id":"sg","kind":"regional","base":"https://Media-SG.Example.com:443/","region":"SG"},
+            {"id":"helper","kind":"helper","base":"https://Helper.Example.com/"}
         ]"#,
         ))
         .unwrap();
@@ -402,7 +435,8 @@ mod tests {
             &schema,
             json!({"mediaRoutes":[
                 {"id":"primary","base":"https://owner.example.com","kind":"OWNER","region":null},
-                {"id":"sg","base":"https://media-sg.example.com","kind":"REGIONAL","region":"SG"}
+                {"id":"sg","base":"https://media-sg.example.com","kind":"REGIONAL","region":"SG"},
+                {"id":"helper","base":"https://helper.example.com","kind":"HELPER","region":null}
             ]}),
         )
         .await;

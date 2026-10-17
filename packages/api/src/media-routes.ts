@@ -8,16 +8,16 @@ import type { MediaRoute, Page } from '@komika/types';
  * build-time list (`PUBLIC_KOMIKA_MEDIA_HOSTS`), plus the API origin as the owner. A
  * server cannot add a host to a hosted reader. Every media request goes out with no
  * credentials and no `Authorization`: an `<img>` sends no token, and probes use
- * `credentials: 'omit'` with no headers. Non-owner objects are fetched and checked
- * (length, MIME essence, SHA-256 from the owner's pages answer), then shown as `blob:`
- * URLs. Owner objects stay plain `<img>`.
+ * `credentials: 'omit'` with no headers. Regional or helper objects are fetched and
+ * checked (length, MIME essence, SHA-256 from the owner's pages answer), then shown as
+ * `blob:` URLs. Owner objects stay plain `<img>`.
  */
 
 /** A route the reader trusts: an absolute origin, never a path. */
 export interface TrustedMediaRoute {
 	id: string;
 	origin: string;
-	kind: 'OWNER' | 'REGIONAL';
+	kind: 'OWNER' | 'REGIONAL' | 'HELPER';
 	region: string | null;
 }
 
@@ -128,7 +128,8 @@ export function parseMediaHosts(raw: string | undefined): string[] {
  * The routes this reader may use: the server's list intersected with the build-time
  * allowlist, plus the API origin as the owner. The owner always exists and comes first.
  * Its origin is the server's owner base when that is the API origin or on the allowlist,
- * else the API origin. A regional route is kept only when its origin is on the allowlist.
+ * else the API origin. A regional or helper route is kept only when its origin is on
+ * the allowlist.
  */
 export function trustedMediaRoutes(
 	server: readonly MediaRoute[] | null | undefined,
@@ -149,11 +150,11 @@ export function trustedMediaRoutes(
 	};
 	const out = [owner];
 	for (const route of listed) {
-		if (route.kind !== 'REGIONAL' || !route.id) continue;
+		if ((route.kind !== 'REGIONAL' && route.kind !== 'HELPER') || !route.id) continue;
 		const origin = route.base ? mediaOrigin(route.base) : null;
 		if (!origin || origin === owner.origin || !allowlist.includes(origin)) continue;
 		if (out.some((r) => r.id === route.id || r.origin === origin)) continue;
-		out.push({ id: route.id, origin, kind: 'REGIONAL', region: route.region ?? null });
+		out.push({ id: route.id, origin, kind: route.kind, region: route.region ?? null });
 	}
 	return out;
 }
@@ -186,8 +187,8 @@ export interface MediaRouterOptions {
  * (`GET {origin}/media/v1/ready`, no credentials, 1.5 s deadline) run only when there is
  * more than one route, at most once per route per 60 s and three rounds per session, and
  * never download an image. A switch away from the held choice needs another route faster
- * by more than 30 % and 50 ms in two rounds in a row. A regional object that fails is
- * retried once on the owner and its route is marked down for the session.
+ * by more than 30 % and 50 ms in two rounds in a row. A regional or helper object that
+ * fails is retried once on the owner and its route is marked down for the session.
  */
 export class MediaRouter {
 	readonly routes: readonly TrustedMediaRoute[];
@@ -282,6 +283,7 @@ export class MediaRouter {
 			const res = await this.doFetch(route.origin + MEDIA_READY_PATH, {
 				method: 'GET',
 				credentials: 'omit',
+				redirect: 'error',
 				cache: 'no-store',
 				referrerPolicy: 'no-referrer',
 				signal: controller.signal,
@@ -408,6 +410,7 @@ export async function fetchVerifiedObject(
 		method: 'GET',
 		mode: 'cors',
 		credentials: 'omit',
+		redirect: 'error',
 		referrerPolicy: 'no-referrer',
 		signal: opts.signal,
 	});
@@ -415,7 +418,7 @@ export async function fetchVerifiedObject(
 		void res.body?.cancel().catch(() => {});
 		throw new MediaCheckError(reason);
 	};
-	if (!res.ok) refuse('status');
+	if (res.status !== 200) refuse('status');
 	if (mimeEssence(res.headers.get('content-type') ?? '') !== expect.mime) refuse('mime');
 	// The body decides the length, not `Content-Length`: with a content encoding that
 	// header counts the encoded bytes.

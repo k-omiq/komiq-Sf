@@ -51,6 +51,7 @@ const { GraphQLBackend } = await import(api + 'graphql-backend.ts');
 const API = 'https://api.example';
 const SG = 'https://media-sg.example';
 const EU = 'https://media-eu.example';
+const HELPER = 'https://media-helper.example';
 const WORKER = 'https://img.example';
 const HASH = 'a'.repeat(64);
 const PATH = `/media/v1/o/mc_0123/${HASH}`;
@@ -69,6 +70,7 @@ const serverRoutes = [
 	{ id: 'eu', base: EU, kind: 'REGIONAL', region: 'eu' },
 	{ id: 'evil', base: 'https://evil.example', kind: 'REGIONAL', region: 'x' },
 ];
+const helperRoute = { id: 'helper', base: HELPER, kind: 'HELPER', region: null };
 
 function memoryStorage() {
 	const map = new Map<string, string>();
@@ -150,6 +152,27 @@ test('trusted routes: the server list intersected with the build allowlist, owne
 	assert.deepEqual(parseMediaHosts(` ${SG}/ ,${EU} ${SG}`), [SG, EU]);
 	assert.throws(() => parseMediaHosts('media-sg.example'), /PUBLIC_KOMIKA_MEDIA_HOSTS/);
 	assert.throws(() => parseMediaHosts(`${SG}/path`), /PUBLIC_KOMIKA_MEDIA_HOSTS/);
+});
+
+test('a HELPER on the build allowlist is kept with its kind', () => {
+	assert.deepEqual(trustedMediaRoutes([...serverRoutes, helperRoute], [HELPER], API), [
+		{ id: 'owner', origin: API, kind: 'OWNER', region: null },
+		{ id: 'helper', origin: HELPER, kind: 'HELPER', region: null },
+	]);
+});
+
+test('a HELPER outside the build allowlist is dropped', () => {
+	assert.deepEqual(
+		trustedMediaRoutes([...serverRoutes, helperRoute], [SG], API),
+		trustedMediaRoutes(serverRoutes, [SG], API),
+	);
+});
+
+test('unknown route kinds are skipped even on the build allowlist', () => {
+	assert.deepEqual(
+		trustedMediaRoutes([...serverRoutes, { ...helperRoute, kind: 'EDGE' }], [HELPER], API),
+		trustedMediaRoutes([], [], API),
+	);
 });
 
 test('wildcard media hosts fail the build allowlist and are ignored in server routes', () => {
@@ -254,7 +277,7 @@ test('owner URLs with upper-case or mixed-case HTTP schemes stay absolute in eve
 	}
 });
 
-test('an exact object never reaches the image provider and goes out without credentials', () =>
+test('exact objects skip the image provider; probes omit credentials and reject redirects', () =>
 	withClock(async () => {
 		const net = fakeNet({ [API]: 80, [SG]: 20 });
 		const router = new MediaRouter({
@@ -273,6 +296,7 @@ test('an exact object never reaches the image provider and goes out without cred
 		for (const { url, init } of net.calls) {
 			assert.match(url, /\/media\/v1\/ready$/);
 			assert.equal(init?.credentials, 'omit');
+			assert.equal(init?.redirect, 'error');
 			assert.equal(init?.headers, undefined, 'no Authorization or any other header');
 			assert.equal(init?.method, 'GET');
 		}
@@ -342,6 +366,25 @@ test('only verifiable exact objects use the regional route; owner objects load d
 		const fallback = router.fallback(regional)!;
 		assert.equal(fallback.expect, regional.expect);
 		assert.equal(router.verification(fallback), null);
+	}));
+
+test('a page without mediaSha256 uses the owner even when a HELPER is current', () =>
+	withClock(async () => {
+		const net = fakeNet({ [API]: 80, [HELPER]: 20 });
+		const router = new MediaRouter({
+			routes: trustedMediaRoutes([...serverRoutes, helperRoute], [HELPER], API),
+			fetch: net.fetch,
+		});
+		await settle(router.probe());
+		assert.equal(router.current().kind, 'HELPER');
+		const media = router.pageMedia({ ...page(), mediaSha256: undefined })!;
+		assert.deepEqual(media, { kind: 'media', routeId: 'owner', path: PATH, expect: null });
+		assert.deepEqual(routedMedia(router, media), {
+			url: `${API}${PATH}`,
+			media,
+			verify: null,
+		});
+		assert.equal(router.current().kind, 'HELPER');
 	}));
 
 test('an old server page without exact-object fields keeps its legacy URL', async () => {
@@ -723,7 +766,7 @@ function blobUrls() {
 	};
 }
 
-test('fetchVerifiedObject checks the bytes and MIME essence without credentials or headers', async () => {
+test('fetchVerifiedObject checks bytes and MIME, omits credentials and headers, and rejects redirects', async () => {
 	const expect = await objectExpectation();
 	const controller = new AbortController();
 	let request: { url: string; init?: RequestInit } | undefined;
@@ -745,6 +788,7 @@ test('fetchVerifiedObject checks the bytes and MIME essence without credentials 
 	assert.equal(request!.url, `${SG}${PATH}`);
 	assert.equal(request!.init!.method, 'GET');
 	assert.equal(request!.init!.credentials, 'omit');
+	assert.equal(request!.init!.redirect, 'error');
 	assert.equal(request!.init!.referrerPolicy, 'no-referrer');
 	assert.equal(request!.init!.mode, 'cors');
 	assert.equal(request!.init!.signal, controller.signal);
@@ -779,6 +823,20 @@ test('fetchVerifiedObject rejects mismatched hash, length, MIME and HTTP status'
 			entry.name,
 		);
 	}
+});
+
+test('fetchVerifiedObject rejects HTTP 206 even when the bytes and metadata match', async () => {
+	const expect = await objectExpectation();
+	await assert.rejects(
+		fetchVerifiedObject(`${SG}${PATH}`, expect, {
+			fetch: (async () =>
+				new Response(OBJECT_BYTES, {
+					status: 206,
+					headers: { 'content-type': expect.mime, 'content-length': String(expect.length) },
+				})) as typeof fetch,
+		}),
+		{ name: 'MediaCheckError', reason: 'status' },
+	);
 });
 
 test('fetchVerifiedObject cancels an oversized stream before reading any more chunks', async () => {
@@ -964,43 +1022,49 @@ test('VerifiedObjectUrls clear aborts in-flight fetches and failed fetches can b
 	assert.deepEqual(urls.revoked, [blob]);
 });
 
-test('a failed regional verification recovers to the owner with verify null', () =>
-	withClock(async () => {
-		const net = fakeNet({ [API]: 80, [SG]: 20 });
-		const router = new MediaRouter({
-			routes: trustedMediaRoutes(serverRoutes, [SG], API),
-			fetch: net.fetch,
-		});
-		await settle(router.probe());
-		const expect = await objectExpectation();
-		const mediaPath = `/media/v1/o/mc_0123/${expect.sha256}`;
-		const media = router.pageMedia({
-			...page(mediaPath),
-			mediaSha256: expect.sha256,
-			mediaLength: expect.length,
-		})!;
-		const regional = routedMedia(router, media);
-		assert.deepEqual(regional.verify, expect);
-		await assert.rejects(
-			fetchVerifiedObject(regional.url, regional.verify!, {
-				fetch: (async () => objectResponse(new Uint8Array(OBJECT_BYTES.length))) as typeof fetch,
-			}),
-			(error: unknown) => error instanceof MediaCheckError && (error as { reason: string }).reason === 'hash',
-		);
-		let refreshes = 0;
-		const recovery = new ChapterMediaRecovery(router, [regional], async () => {
-			refreshes++;
-			return [];
-		});
-		const result = await recovery.recover(0, regional.url);
-		assert.deepEqual(result.get(0), {
-			url: `${API}${mediaPath}`,
-			media: { ...media, routeId: 'owner' },
-			verify: null,
-		});
-		assert.equal(refreshes, 0);
-		assert.equal(router.current().id, 'owner');
-	}));
+for (const route of [serverRoutes[1], helperRoute]) {
+	test(`a failed ${route.kind.toLowerCase()} verification recovers to the owner with verify null`, () =>
+		withClock(async () => {
+			const net = fakeNet({ [API]: 80, [route.base]: 20 });
+			const router = new MediaRouter({
+				routes: trustedMediaRoutes([serverRoutes[0], route], [route.base], API),
+				fetch: net.fetch,
+			});
+			await settle(router.probe());
+			assert.equal(router.current().kind, route.kind);
+			const expect = await objectExpectation();
+			const mediaPath = `/media/v1/o/mc_0123/${expect.sha256}`;
+			const media = router.pageMedia({
+				...page(mediaPath),
+				mediaSha256: expect.sha256,
+				mediaLength: expect.length,
+			})!;
+			assert.equal(media.routeId, route.id);
+			assert.equal(router.verification(media), media.expect);
+			const routed = routedMedia(router, media);
+			assert.equal(routed.url, `${route.base}${mediaPath}`);
+			assert.deepEqual(routed.verify, expect);
+			await assert.rejects(
+				fetchVerifiedObject(routed.url, routed.verify!, {
+					fetch: (async () => objectResponse(new Uint8Array(OBJECT_BYTES.length))) as typeof fetch,
+				}),
+				(error: unknown) => error instanceof MediaCheckError && (error as { reason: string }).reason === 'hash',
+			);
+			let refreshes = 0;
+			const recovery = new ChapterMediaRecovery(router, [routed], async () => {
+				refreshes++;
+				return [];
+			});
+			const result = await recovery.recover(0, routed.url);
+			assert.deepEqual(result.get(0), {
+				url: `${API}${mediaPath}`,
+				media: { ...media, routeId: 'owner' },
+				verify: null,
+			});
+			assert.equal(refreshes, 0);
+			assert.equal(router.current().id, 'owner');
+		}));
+}
 
 test('a refused status or MIME cancels the rest of the body', async () => {
 	const expect = await objectExpectation();

@@ -632,7 +632,7 @@ export interface ChapterOrigin {
 export interface MediaRoute {
 	id: string;
 	base: string;
-	kind: 'OWNER' | 'REGIONAL';
+	kind: 'OWNER' | 'REGIONAL' | 'HELPER';
 	region: string | null;
 }
 

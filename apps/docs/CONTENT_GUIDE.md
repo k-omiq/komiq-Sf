@@ -138,7 +138,8 @@ Opening paragraph: two or three sentences. What this page covers and who it is f
 
 /self-host/docker             /self-host/desktop-app         /self-host/first-run
 /self-host/sources            /self-host/other-devices       /self-host/internet-access
-/self-host/configuration      /self-host/update-and-backup   /self-host/troubleshooting
+/self-host/configuration      /self-host/media-cache         /self-host/update-and-backup
+/self-host/troubleshooting
 
 /guide/apps                   /guide/connect                 /guide/accounts
 /guide/browse                 /guide/reading                 /guide/library
@@ -151,7 +152,7 @@ Opening paragraph: two or three sentences. What this page covers and who it is f
 
 /developers/architecture      /developers/repository         /developers/local-development
 /developers/fetching          /developers/image-proxy        /developers/edge-caching
-/developers/media-manifests   /developers/media-routes
+/developers/media-manifests   /developers/media-routes       /developers/media-cache
 /developers/server            /developers/graphql            /developers/data-model
 /developers/catalogue-sync    /developers/canonical-works    /developers/suwayomi
 /developers/native-engine     /developers/ios                /developers/ios-engine
