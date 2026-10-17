@@ -352,9 +352,8 @@ pub struct AppState {
     /// Single-flight locks collapsing concurrent Suwayomi chapter-list refreshes
     /// for the same manga id (S1 TTL refresh).
     pub chapters_inflight: KeyedLocks,
-    /// Guards the DB-backed cover crawl (`materializeCatalogueCovers`) so two
-    /// admin clicks can't run overlapping catalogue-wide MangaDex crawls.
-    pub cover_crawl_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared per-source request windows and the media ingest hourly page budget.
+    pub(crate) source_budgets: std::sync::Arc<crate::source_budget::SourceBudgets>,
     /// Whether the catalogue sync downloads + pHashes each work's cover during the
     /// sweep (`Config::catalogue_cover_phash`). Threaded here so the admin
     /// `resyncCatalogue` kicks a cycle with the same setting as the recurring loop.
@@ -13545,8 +13544,7 @@ impl MutationRoot {
     ) -> Result<DuplicateSweepResult> {
         require_admin(ctx).await?;
         let st = state(ctx);
-        let Some(_running) = crate::request_budget::RunningGuard::try_acquire(&RECONCILE_RUNNING)
-        else {
+        let Some(_running) = reconcile_lease(&st.pool).await.map_err(gql_err)? else {
             return Err(Error::new(
                 "A catalogue reconcile is already running — try again when it finishes.",
             ));
@@ -14838,9 +14836,14 @@ impl MutationRoot {
     async fn materialize_catalogue_covers(&self, ctx: &Context<'_>) -> Result<i32> {
         require_admin(ctx).await?;
         let st = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
-        // Single-flight: refuse a second concurrent crawl (compare-and-set false→true).
-        let Some(running) =
-            crate::request_budget::RunningGuard::try_acquire(st.cover_crawl_running.clone())
+        // Single-flight: refuse a second concurrent crawl (the cover-crawl job lease,
+        // which the drainer's crawl also takes).
+        let Some(running) = crate::job_lease::JobLease::try_acquire(
+            &st.pool,
+            crate::job_lease::JobFamily::CoverCrawl,
+        )
+        .await
+        .map_err(gql_err)?
         else {
             return Err(gql_err(
                 "a cover materialization run is already in progress",
@@ -14851,12 +14854,16 @@ impl MutationRoot {
             .map_err(gql_read_err)? as i32;
         tokio::spawn(async move {
             let _running = running;
+            // An admin run has no shutdown signal of its own: a receiver whose sender
+            // is gone never reads as stopping.
             crate::cover::crawl_uncached_covers(
                 &st.pool,
                 &st.cover_pool,
                 &st.mangadex,
                 &st.suwayomi,
                 None,
+                &st.source_budgets,
+                &tokio::sync::watch::channel(false).1,
             )
             .await;
         });
@@ -14876,8 +14883,7 @@ impl MutationRoot {
     async fn reconcile_catalogue(&self, ctx: &Context<'_>) -> Result<i32> {
         require_admin(ctx).await?;
         let st = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
-        let Some(running) = crate::request_budget::RunningGuard::try_acquire(&RECONCILE_RUNNING)
-        else {
+        let Some(running) = reconcile_lease(&st.pool).await.map_err(gql_err)? else {
             return Err(gql_err("a catalogue reconcile is already in progress"));
         };
         let pending = pending_reconcile_count(&st.pool).await.map_err(gql_err)? as i32;
@@ -14913,7 +14919,10 @@ impl MutationRoot {
             st.pool.clone(),
             st.mangadex.clone(),
             st.catalogue_cover_phash,
-        ) {
+        )
+        .await
+        .map_err(gql_err)?
+        {
             return Err(gql_err(
                 "a catalogue sync cycle is already running; retry in a moment",
             ));
@@ -14955,7 +14964,7 @@ impl MutationRoot {
                 "Komika serves English only — this source is not an English source",
             ));
         }
-        let Some(job) = crate::ingest::try_start_job(&st_arc.pool, &source_id.0)
+        let Some(started) = crate::ingest::try_start_job(&st_arc.pool, &source_id.0)
             .await
             .map_err(gql_err)?
         else {
@@ -14963,7 +14972,8 @@ impl MutationRoot {
                 "An ingest job is already running for this source",
             ));
         };
-        crate::ingest::spawn_runner(st_arc, job.id.clone(), source_id.0.clone());
+        let job = started.job.clone();
+        crate::ingest::spawn_runner(st_arc, started);
         Ok(job.into())
     }
 
@@ -15017,9 +15027,9 @@ impl MutationRoot {
                 .await
                 .map_err(gql_err)?
             {
-                Some(job) => {
-                    crate::ingest::spawn_runner(st_arc.clone(), job.id.clone(), src.id.clone());
-                    jobs.push(job.into());
+                Some(started) => {
+                    jobs.push(started.job.clone().into());
+                    crate::ingest::spawn_runner(st_arc.clone(), started);
                 }
                 // Already running for this source — surface its existing job.
                 None => {
@@ -15112,8 +15122,9 @@ impl MutationRoot {
         }
         let st = state(ctx);
         let mut entries = Vec::with_capacity(suwayomi_manga_ids.len());
+        let (_stop, shutdown) = tokio::sync::watch::channel(false);
         for id in suwayomi_manga_ids {
-            let entry = match ingest_source_series(st, &id.0).await {
+            let entry = match ingest_source_series(st, &id.0, &shutdown).await {
                 Ok(r) => BulkAddEntry {
                     suwayomi_manga_id: id,
                     result: Some(r),
@@ -15144,6 +15155,7 @@ impl MutationRoot {
 pub(crate) async fn ingest_source_series(
     st: &AppState,
     raw_id: &str,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<MatchResult> {
     let mid: i64 = raw_id
         .parse()
@@ -15193,7 +15205,24 @@ pub(crate) async fn ingest_source_series(
     // reader load silently degrades the dedup signal, trading a correctness property for
     // latency on an admin action nobody is watching in real time. A separate small
     // semaphore around the fan-out is the shape that works.
-    let cover_phash = match st.suwayomi.cover_bytes(m.thumbnail_url.as_deref()).await {
+    let cover_bytes = if m
+        .thumbnail_url
+        .as_deref()
+        .is_some_and(|url| !url.is_empty())
+        && st
+            .source_budgets
+            .spend(
+                &m.source_id,
+                crate::source_budget::SourceUse::Cover,
+                shutdown,
+            )
+            .await
+    {
+        st.suwayomi.cover_bytes(m.thumbnail_url.as_deref()).await
+    } else {
+        None
+    };
+    let cover_phash = match cover_bytes {
         // dhash is CPU-bound (decode + grayscale + resize); keep it off the async
         // runtime. Best-effort: a task panic just drops the signal.
         Some(bytes) => tokio::task::spawn_blocking(move || crate::phash::dhash(&bytes))
@@ -16045,8 +16074,11 @@ async fn ban_user_once(
     Ok(row.into())
 }
 
-/// Single-flight guard for the catalogue reconcile (process-global; single replica).
-static RECONCILE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Single flight for the catalogue reconcile and duplicate consolidation: the
+/// `reconcile` job lease, on every server of this database (`job_lease.rs`).
+async fn reconcile_lease(pool: &Database) -> anyhow::Result<Option<crate::job_lease::JobLease>> {
+    crate::job_lease::JobLease::try_acquire(pool, crate::job_lease::JobFamily::Reconcile).await
+}
 
 /// Where the NEXT `consolidateExactDuplicates` call resumes. One full run is two
 /// keyset walks, in order: the pending review queue (`reviews_after`, a `merge_candidate`
@@ -16059,8 +16091,9 @@ static RECONCILE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 ///
 /// Process-global (not an `AppState` field) for the same reason as `VIEW_LIMITER`: the
 /// construction of `AppState` lives in `main.rs`. Losing the cursor on restart is
-/// harmless — it only replays work that is already idempotent. `RECONCILE_RUNNING`
+/// harmless — it only replays work that is already idempotent. The reconcile lease
 /// single-flights the sweep, so two callers can never interleave their cursor updates.
+/// (Each server keeps its own cursor; the lease only lets one of them walk at a time.)
 ///
 /// The post-ingest sweep (`run_post_ingest_dedup_ex`) deliberately does NOT share this:
 /// it runs right after a bulk ingest to clean up what THAT ingest just minted, which
@@ -16685,7 +16718,7 @@ async fn consolidate_exact_duplicates_from(
             }
             if merge {
                 // The rules judged a snapshot read OUTSIDE any transaction, and
-                // `RECONCILE_RUNNING` single-flights this sweep only against itself
+                // The reconcile lease single-flights this sweep only against itself
                 // — never against `updateSeriesMetadata`. Hand the exact values they
                 // approved to the merge as a precondition it re-checks under its own
                 // write lock, so an admin retitling a work (or clearing the `year` that
@@ -17075,7 +17108,8 @@ pub(crate) async fn run_post_ingest_dedup_ex(
     pool: &Database,
     covers: Option<&crate::database::SqliteDatabase>,
 ) {
-    let Some(_running) = crate::request_budget::RunningGuard::try_acquire(&RECONCILE_RUNNING)
+    let Some(_running) =
+        crate::job_lease::JobLease::try_take(pool, crate::job_lease::JobFamily::Reconcile).await
     else {
         tracing::info!("post-ingest dedup: a reconcile is already running; skipping");
         return;
@@ -19721,7 +19755,7 @@ mod tests {
             session_ttl_secs: 30 * 24 * 60 * 60,
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
-            cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            source_budgets: Default::default(),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,
@@ -20002,14 +20036,29 @@ mod tests {
             sqlx::query("INSERT INTO user_library(user_id,series_id,created_at,status,is_favorite) VALUES($1,$2,now(),'reading',true)").bind(user).bind(series).execute(&pool).await.unwrap();
             sqlx::query("INSERT INTO reviews(id,series_id,user_id,score,body,created_at,updated_at) VALUES($1,$2,$3,8,'r',now(),now())").bind(uuid::Uuid::new_v4()).bind(series).bind(user).execute(&pool).await.unwrap();
             sqlx::query("INSERT INTO series_admin(series_id,paused_override,updated_at) VALUES($1,true,now())").bind(series).execute(&pool).await.unwrap();
-            sqlx::query("INSERT INTO series_views(series_key,total,updated_at) VALUES($1,5,now())").bind(series).execute(&pool).await.unwrap();
-            sqlx::query("INSERT INTO series_view_bucket(series_key,hour_ts,views) VALUES($1,1,5)").bind(series).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO series_views(series_key,total,updated_at) VALUES($1,5,now())")
+                .bind(series)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO series_view_bucket(series_key,hour_ts,views) VALUES($1,1,5)")
+                .bind(series)
+                .execute(&pool)
+                .await
+                .unwrap();
         }
         let shown = crate::engine_generation::states(&pool).await.unwrap();
-        let shown = shown.iter().find(|g| g.state == "quarantined").unwrap().id.clone();
+        let shown = shown
+            .iter()
+            .find(|g| g.state == "quarantined")
+            .unwrap()
+            .id
+            .clone();
         assert!(!exec(
             &schema,
-            &format!(r#"mutation {{ startNewEngineGeneration(generationId:"{shown}") {{ state }} }}"#),
+            &format!(
+                r#"mutation {{ startNewEngineGeneration(generationId:"{shown}") {{ state }} }}"#
+            ),
             Some("bobtok"),
             "generation-admin"
         )
@@ -20018,16 +20067,26 @@ mod tests {
         .is_empty());
         let stale = exec(
             &schema,
-            &format!(r#"mutation {{ startNewEngineGeneration(generationId:"{}") {{ state }} }}"#, uuid::Uuid::new_v4()),
+            &format!(
+                r#"mutation {{ startNewEngineGeneration(generationId:"{}") {{ state }} }}"#,
+                uuid::Uuid::new_v4()
+            ),
             Some("admintok"),
             "generation-admin",
         )
         .await;
         assert!(!stale.errors.is_empty(), "another generation id is refused");
-        assert_eq!(crate::engine_generation::numeric_epoch(&pool).await.unwrap(), 0);
+        assert_eq!(
+            crate::engine_generation::numeric_epoch(&pool)
+                .await
+                .unwrap(),
+            0
+        );
         let changed = exec(
             &schema,
-            &format!(r#"mutation {{ startNewEngineGeneration(generationId:"{shown}") {{ state }} }}"#),
+            &format!(
+                r#"mutation {{ startNewEngineGeneration(generationId:"{shown}") {{ state }} }}"#
+            ),
             Some("admintok"),
             "generation-admin",
         )
@@ -20035,7 +20094,9 @@ mod tests {
         assert!(changed.errors.is_empty(), "{:?}", changed.errors);
         let again = exec(
             &schema,
-            &format!(r#"mutation {{ startNewEngineGeneration(generationId:"{shown}") {{ state }} }}"#),
+            &format!(
+                r#"mutation {{ startNewEngineGeneration(generationId:"{shown}") {{ state }} }}"#
+            ),
             Some("admintok"),
             "generation-admin",
         )
@@ -20053,7 +20114,17 @@ mod tests {
         let moved: (Option<String>, bool, i64, i64, i64) = sqlx::query_as("SELECT (SELECT status FROM user_library WHERE user_id=$1 AND series_id=$2),(SELECT is_favorite FROM user_library WHERE user_id=$1 AND series_id=$2),(SELECT count(*) FROM reviews WHERE series_id=$2),(SELECT total FROM series_views WHERE series_key=$2),(SELECT views FROM series_view_bucket WHERE series_key=$2 AND hour_ts=1)").bind(user).bind(&old_mapping.work_id).fetch_one(&pool).await.unwrap();
         assert_eq!(moved, (Some("reading".into()), true, 1, 5, 5));
         let aside: Vec<String> = sqlx::query_scalar("SELECT source_table FROM engine_detached_row WHERE generation=$1::uuid ORDER BY source_table").bind(&shown).fetch_all(&pool).await.unwrap();
-        assert_eq!(aside, ["reviews", "series_admin", "series_admin", "series_view_bucket", "series_views", "user_library"]);
+        assert_eq!(
+            aside,
+            [
+                "reviews",
+                "series_admin",
+                "series_admin",
+                "series_view_bucket",
+                "series_views",
+                "user_library"
+            ]
+        );
         let counts:(i64,i64,i64,i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM suwayomi_progress),(SELECT count(*) FROM suwayomi_progress_detached),(SELECT count(*) FROM comments WHERE target_type='detached_series'),(SELECT count(*) FROM comment_votes),(SELECT count(*) FROM comment_media)").fetch_one(&pool).await.unwrap();
         assert_eq!(counts, (0, 1, 2, 1, 1));
         let old_mapping_gone: bool =
@@ -22441,7 +22512,7 @@ mod tests {
                 session_ttl_secs: 30 * 24 * 60 * 60,
                 series_inflight: KeyedLocks::default(),
                 chapters_inflight: KeyedLocks::default(),
-                cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                source_budgets: Default::default(),
                 catalogue_cover_phash: false,
                 ext_icons_dir: std::path::PathBuf::new(),
                 media_manifests: None,
@@ -22681,7 +22752,7 @@ mod tests {
             session_ttl_secs: 30 * 24 * 60 * 60,
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
-            cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            source_budgets: Default::default(),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,
@@ -31183,7 +31254,7 @@ mod tests {
             session_ttl_secs: 30 * 24 * 60 * 60,
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
-            cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            source_budgets: Default::default(),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,
@@ -32167,7 +32238,7 @@ mod tests {
             session_ttl_secs: 30 * 24 * 60 * 60,
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
-            cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            source_budgets: Default::default(),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,

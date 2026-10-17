@@ -28,6 +28,7 @@ use anyhow::Result;
 use chrono::Utc;
 
 use crate::graphql::AppState;
+use crate::job_lease::{JobFamily, JobLease};
 use crate::suwayomi::{FetchType, SuwayomiClient, SuwayomiManga};
 
 /// Delay between browse pages — polite throttle toward the upstream source
@@ -153,10 +154,25 @@ impl Progress {
     }
 }
 
+/// A started job and the `source-ingest` job lease that owns it. The runner holds
+/// the lease until the job's terminal write; while it is held, no server's restart
+/// sweep touches the row.
+#[derive(Debug)]
+pub struct StartedJob {
+    pub job: IngestJob,
+    lease: JobLease,
+}
+
 /// Try to create a `running` job for a source. `None` when another job is
-/// already running for it — the partial unique index makes this race-free (the
-/// losing concurrent INSERT violates `uq_source_ingest_running`).
-pub async fn try_start_job(pool: &Database, source_id: &str) -> Result<Option<IngestJob>> {
+/// already running for it: another server or task holds the source's lease, or a
+/// concurrent start won the partial unique index (`uq_source_ingest_running`).
+///
+/// The lease is taken BEFORE the row exists, so every `running` row has had an
+/// owner holding its lease from the start: [`mark_interrupted_jobs`] relies on it.
+pub async fn try_start_job(pool: &Database, source_id: &str) -> Result<Option<StartedJob>> {
+    let Some(lease) = JobLease::try_acquire(pool, JobFamily::SourceIngest(source_id)).await? else {
+        return Ok(None);
+    };
     let id = format!("ing_{}", uuid::Uuid::new_v4().simple());
     let now = Utc::now();
     let res = sqlx::query(
@@ -168,7 +184,9 @@ pub async fn try_start_job(pool: &Database, source_id: &str) -> Result<Option<In
     .execute(pool)
     .await;
     match res {
-        Ok(_) => Ok(load_job(pool, &id).await?),
+        Ok(_) => Ok(load_job(pool, &id)
+            .await?
+            .map(|job| StartedJob { job, lease })),
         // X3: detect the lost one-running-job-per-source race by the PostgreSQL
         // SQLSTATE 23505, not a brittle
         // message-substring match.
@@ -239,6 +257,45 @@ async fn job_state(pool: &Database, job_id: &str) -> Result<Option<String>> {
     )
 }
 
+struct JobStopWatcher {
+    stop: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for JobStopWatcher {
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+        self.task.abort();
+    }
+}
+
+fn watch_job_cancellation(
+    pool: &Database,
+    job_id: &str,
+) -> (tokio::sync::watch::Receiver<bool>, JobStopWatcher) {
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let sender = stop.clone();
+    let pool = pool.clone();
+    let job_id = job_id.to_string();
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            match job_state(&pool, &job_id).await {
+                Ok(state) if state.as_deref() == Some(STATE_RUNNING) => {}
+                Ok(_) => {
+                    sender.send_replace(true);
+                    return;
+                }
+                Err(e) => {
+                    let e = crate::db::observed_read_database_error(e);
+                    tracing::warn!(job_id, error = %e, "ingest: cancellation check failed");
+                }
+            }
+        }
+    });
+    (shutdown, JobStopWatcher { stop, task })
+}
+
 pub async fn load_job(pool: &Database, job_id: &str) -> Result<Option<IngestJob>> {
     Ok(
         sqlx::query_as::<_, IngestJob>("SELECT * FROM source_ingest_job WHERE id = $1")
@@ -296,24 +353,52 @@ async fn finish_job(pool: &Database, job_id: &str, state: &str, error: Option<&s
     Ok(())
 }
 
-/// Startup recovery: any job still `running` was interrupted by a restart —
-/// its task is gone, so mark it failed (the row would otherwise block new jobs
-/// for its source forever via the partial unique index).
-pub async fn mark_interrupted_jobs(pool: &Database) -> Result<u64> {
+/// Fail a source's `running` rows. Only for a caller holding the source's lease
+/// and no job of its own: then no live runner owns them.
+async fn fail_unowned(pool: &Database, source_id: &str) -> Result<u64> {
     let res = sqlx::query(
         "UPDATE source_ingest_job SET state = 'failed', \
-         error = 'interrupted by server restart', finished_at = $1 WHERE state = 'running'",
+         error = 'interrupted by server restart', finished_at = $1 \
+         WHERE source_id = $2 AND state = 'running'",
     )
     .bind(Utc::now())
+    .bind(source_id)
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
 }
 
+/// Startup recovery: a job still `running` whose source lease is free was
+/// interrupted by a restart — its task is gone, so mark it failed (the row would
+/// otherwise block new jobs for its source forever via the partial unique index).
+/// A job whose lease is held belongs to a live runner, on this database's other
+/// server, and is left alone.
+pub async fn mark_interrupted_jobs(pool: &Database) -> Result<u64> {
+    let sources: Vec<String> = crate::db_types::query_scalar(
+        "SELECT DISTINCT source_id FROM source_ingest_job WHERE state = 'running' ORDER BY source_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut failed = 0;
+    for source_id in sources {
+        let Some(lease) = JobLease::try_acquire(pool, JobFamily::SourceIngest(&source_id)).await?
+        else {
+            continue;
+        };
+        failed += fail_unowned(pool, &source_id).await?;
+        lease.release().await;
+    }
+    Ok(failed)
+}
+
 /// Spawn the detached runner for a freshly-created job. Never panics; every
-/// outcome (including runner errors) lands in the job row.
-pub fn spawn_runner(state: Arc<AppState>, job_id: String, source_id: String) {
+/// outcome (including runner errors) lands in the job row. The lease is released
+/// after that terminal write.
+pub fn spawn_runner(state: Arc<AppState>, started: StartedJob) {
+    let StartedJob { job, lease } = started;
+    let (job_id, source_id) = (job.id, job.source_id);
     tokio::spawn(async move {
+        let _lease = lease;
         let pool = state.pool.clone();
         match run_job(state.clone(), &job_id, &source_id).await {
             // `warning` is set when one listing failed but another finished — the walk
@@ -408,9 +493,22 @@ async fn browse_page(
     source_id: &str,
     ty: FetchType,
     page: i64,
+    budgets: &crate::source_budget::SourceBudgets,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> Result<(bool, Vec<SuwayomiManga>)> {
     let mut attempt = 1;
     loop {
+        // Each retry reaches the source too; listing pages cost one request.
+        if !budgets
+            .spend(
+                source_id,
+                crate::source_budget::SourceUse::Discovery,
+                shutdown,
+            )
+            .await
+        {
+            anyhow::bail!("ingest stopped");
+        }
         match client.browse_source(source_id, ty, page as i32, None).await {
             Ok(v) => return Ok(v),
             Err(e) if attempt < PAGE_FETCH_ATTEMPTS => {
@@ -431,8 +529,8 @@ async fn browse_page(
 /// CONCURRENTLY, bounded by `ITEM_CONCURRENCY`, and the next page is PREFETCHED while
 /// the current page's items run). Per-ITEM errors are counted and skipped; a PAGE fetch
 /// error ends this listing after its retries (progress preserved). Cancel + progress +
-/// the one-job-per-source guarantees are unchanged (cancel is observed between pages;
-/// progress is folded once per page from the concurrent results).
+/// the one-job-per-source guarantees are unchanged. A watcher interrupts budget waits
+/// on cancellation; progress is folded from the concurrent results.
 async fn walk_listing(
     state: &Arc<AppState>,
     job_id: &str,
@@ -445,8 +543,22 @@ async fn walk_listing(
     let mut page: i64 = 1;
     // Consecutive blank pages, so one hiccup mid-catalogue doesn't end the walk.
     let mut empty_streak: i64 = 0;
+    let (shutdown, _watcher) = watch_job_cancellation(&pool, job_id);
     // Prefetch buffer: the browse result for the page we're about to process.
-    let mut pending = Some(browse_page(&state.suwayomi, source_id, ty, page).await?);
+    let first = browse_page(
+        &state.suwayomi,
+        source_id,
+        ty,
+        page,
+        &state.source_budgets,
+        &shutdown,
+    )
+    .await;
+    if *shutdown.borrow() {
+        write_progress(&pool, job_id, progress).await?;
+        return Ok(ListingOutcome::Cancelled);
+    }
+    let mut pending = Some(first?);
     loop {
         // Cancellation check between pages (cheap single-row read).
         if job_state(&pool, job_id).await?.as_deref() != Some(STATE_RUNNING) {
@@ -466,8 +578,9 @@ async fn walk_listing(
             let st = state.clone();
             let sid = source_id.to_string();
             let next = page + 1;
+            let shutdown = shutdown.clone();
             Some(tokio::spawn(async move {
-                browse_page(&st.suwayomi, &sid, ty, next).await
+                browse_page(&st.suwayomi, &sid, ty, next, &st.source_budgets, &shutdown).await
             }))
         } else {
             None
@@ -484,18 +597,45 @@ async fn walk_listing(
             let st = state.clone();
             let sem = sem.clone();
             let mid = m.id;
+            let sid = source_id.to_string();
+            let shutdown = shutdown.clone();
             set.spawn(async move {
                 let _permit = sem.acquire().await.ok();
-                (
-                    mid,
-                    crate::graphql::ingest_source_series(&st, &mid.to_string()).await,
-                )
+                let raw_id = mid.to_string();
+                let result = async {
+                    // Already-linked ids return locally from ingest_source_series. Do
+                    // the same pre-check before spending on its detail + chapter fetch.
+                    if crate::catalog::find_source_series_by_key(&st.pool, "suwayomi", &raw_id)
+                        .await?
+                        .is_none()
+                        && !st
+                            .source_budgets
+                            .spend(&sid, crate::source_budget::SourceUse::Ingest, &shutdown)
+                            .await
+                    {
+                        return Ok(None);
+                    }
+                    crate::graphql::ingest_source_series(&st, &raw_id, &shutdown)
+                        .await
+                        .map(Some)
+                }
+                .await;
+                // An item cut short by the cancel is not a failure; a finished one counts.
+                if result.is_err() && *shutdown.borrow() {
+                    return (mid, Ok(None));
+                }
+                (mid, result)
             });
         }
         while let Some(joined) = set.join_next().await {
             progress.items_seen += 1;
             match joined {
-                Ok((_, Ok(r))) => progress.record_decision(&r.decision),
+                Ok((_, Ok(Some(r)))) => progress.record_decision(&r.decision),
+                Ok((_, Ok(None))) => {
+                    // A cancelled item does not count toward progress.
+                    progress.items_seen -= 1;
+                    continue;
+                }
                 Ok((mid, Err(e))) => {
                     progress.record_failure();
                     let e = crate::db::observed_database_error(e);
@@ -523,15 +663,24 @@ async fn walk_listing(
             succeeded = progress.succeeded,
             "ingest: page done"
         );
+        if job_state(&pool, job_id).await?.as_deref() != Some(STATE_RUNNING) {
+            return Ok(ListingOutcome::Cancelled);
+        }
 
         // Resolve the prefetched next page (or finish this listing).
         match prefetch {
             None => return Ok(ListingOutcome::Done),
-            Some(handle) => match handle.await {
-                Ok(Ok(next)) => pending = Some(next),
-                Ok(Err(e)) => return Err(e),
-                Err(e) => return Err(anyhow::anyhow!("prefetch task panicked: {e}")),
-            },
+            Some(handle) => {
+                let next = handle.await;
+                if *shutdown.borrow() {
+                    return Ok(ListingOutcome::Cancelled);
+                }
+                match next {
+                    Ok(Ok(next)) => pending = Some(next),
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => return Err(anyhow::anyhow!("prefetch task panicked: {e}")),
+                }
+            }
         }
         page += 1;
         tokio::time::sleep(std::time::Duration::from_millis(PAGE_DELAY_MS)).await;
@@ -562,7 +711,10 @@ mod tests {
         // X3: the one-running-job-per-source race is detected by PostgreSQL
         // SQLSTATE (23505), returning None rather than an error.
         let pool = pool().await;
-        assert!(try_start_job(&pool, "src-x").await.unwrap().is_some());
+        let first = try_start_job(&pool, "src-x").await.unwrap().unwrap();
+        // Its lease is gone but its row was not swept yet (a server from before the
+        // leases, or a crash): the next start gets the lease and loses the index race.
+        first.lease.release().await;
         // Second concurrent start hits uq_source_ingest_running → 23505 → None.
         let dup = try_start_job(&pool, "src-x").await;
         assert!(
@@ -579,12 +731,14 @@ mod tests {
         let pool = pool().await;
         // Pretend "src-b" already has a running job (as if from an earlier start).
         let running_b = try_start_job(&pool, "src-b").await.unwrap().unwrap();
+        // Its runner is alive elsewhere: it keeps the lease.
+        let (running_b, _b_lease) = (running_b.job, running_b.lease);
 
         // Simulate the resolver's per-source loop over the extension's 3 sources.
         let mut jobs = Vec::new();
         for sid in ["src-a", "src-b", "src-c"] {
             match try_start_job(&pool, sid).await.unwrap() {
-                Some(job) => jobs.push(job),
+                Some(started) => jobs.push(started.job),
                 None => jobs.push(load_running_job(&pool, sid).await.unwrap().unwrap()),
             }
         }
@@ -615,7 +769,8 @@ mod tests {
         let pool = pool().await;
 
         // Start: creates a running row.
-        let job = try_start_job(&pool, "src-1").await.unwrap().expect("job");
+        let started = try_start_job(&pool, "src-1").await.unwrap().expect("job");
+        let job = started.job.clone();
         assert_eq!(job.state, STATE_RUNNING);
         assert_eq!(job.source_id, "src-1");
 
@@ -649,6 +804,7 @@ mod tests {
         let row = load_job(&pool, &job.id).await.unwrap().unwrap();
         assert_eq!(row.state, STATE_COMPLETED);
         assert!(row.finished_at.is_some());
+        started.lease.release().await;
         assert!(
             try_start_job(&pool, "src-1").await.unwrap().is_some(),
             "a finished job no longer blocks its source"
@@ -658,7 +814,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_flips_running_only_and_finish_does_not_resurrect() {
         let pool = pool().await;
-        let job = try_start_job(&pool, "src-1").await.unwrap().unwrap();
+        let job = try_start_job(&pool, "src-1").await.unwrap().unwrap().job;
 
         // Cancel a running job → cancelled + finished_at stamped.
         let row = cancel_job(&pool, &job.id).await.unwrap().unwrap();
@@ -682,8 +838,13 @@ mod tests {
     #[tokio::test]
     async fn startup_marks_interrupted_jobs_failed() {
         let pool = pool().await;
+        // Both runners are gone. `release` frees each lease at once; a dropped lease
+        // is freed only when PostgreSQL notices the closed socket.
         let a = try_start_job(&pool, "src-1").await.unwrap().unwrap();
         let b = try_start_job(&pool, "src-2").await.unwrap().unwrap();
+        a.lease.release().await;
+        b.lease.release().await;
+        let (a, b) = (a.job, b.job);
         finish_job(&pool, &b.id, STATE_COMPLETED, None)
             .await
             .unwrap();
@@ -700,11 +861,48 @@ mod tests {
         assert!(try_start_job(&pool, "src-1").await.unwrap().is_some());
     }
 
+    /// Two servers on one database: one restarts while the other runs a job. The
+    /// restart sweep must leave the live job alone and still fail the dead one.
+    #[tokio::test]
+    async fn restart_sweep_leaves_a_job_with_a_live_owner_running() {
+        let pool = pool().await;
+        let other_server = Database::connect_with((*pool.connect_options()).clone(), 2)
+            .await
+            .unwrap()
+            .foreground();
+        let live = try_start_job(&other_server, "src-live")
+            .await
+            .unwrap()
+            .unwrap();
+        let dead = try_start_job(&pool, "src-dead").await.unwrap().unwrap();
+        dead.lease.release().await;
+        let dead = dead.job;
+
+        assert_eq!(mark_interrupted_jobs(&pool).await.unwrap(), 1);
+        let row = load_job(&pool, &live.job.id).await.unwrap().unwrap();
+        assert_eq!(
+            row.state, STATE_RUNNING,
+            "a job whose lease is held is alive"
+        );
+        let row = load_job(&pool, &dead.id).await.unwrap().unwrap();
+        assert_eq!(row.state, STATE_FAILED);
+
+        // While the owner lives, no server starts a second job for the source.
+        assert!(try_start_job(&pool, "src-live").await.unwrap().is_none());
+        // Once it is gone, the next restart sweep fails the orphan row.
+        live.lease.release().await;
+        assert_eq!(mark_interrupted_jobs(&pool).await.unwrap(), 1);
+        let row = load_job(&pool, &live.job.id).await.unwrap().unwrap();
+        assert_eq!(row.state, STATE_FAILED);
+        assert_eq!(row.error.as_deref(), Some("interrupted by server restart"));
+        assert!(try_start_job(&pool, "src-live").await.unwrap().is_some());
+    }
+
     #[tokio::test]
     async fn list_jobs_filters_active() {
         let pool = pool().await;
-        let a = try_start_job(&pool, "src-1").await.unwrap().unwrap();
-        let b = try_start_job(&pool, "src-2").await.unwrap().unwrap();
+        let a = try_start_job(&pool, "src-1").await.unwrap().unwrap().job;
+        let b = try_start_job(&pool, "src-2").await.unwrap().unwrap().job;
         finish_job(&pool, &b.id, STATE_FAILED, Some("boom"))
             .await
             .unwrap();
@@ -780,6 +978,92 @@ mod tests {
         (format!("http://127.0.0.1:{port}"), hits)
     }
 
+    #[tokio::test]
+    async fn cancelling_a_job_interrupts_the_listing_budget_wait_without_item_failures() {
+        let pool = pool().await;
+        let (base, hits) = flaky_browse_origin(0).await;
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+            suwayomi: SuwayomiClient::new(base, None, Some("src".into())),
+            mangadex: Arc::new(
+                crate::mangadex::MangaDexClient::new("ingest-test", 50.0, 600.0)
+                    .with_bases("http://127.0.0.1:1", "http://127.0.0.1:1"),
+            ),
+            admin_users: vec![],
+            scan_health: Default::default(),
+            auth_limiter: crate::rate_limit::RateLimiter::new(100, 60),
+            comment_limiter: crate::rate_limit::RateLimiter::new(100, 60),
+            rating_limiter: crate::rate_limit::RateLimiter::new(100, 60),
+            password_work: Arc::new(tokio::sync::Semaphore::new(4)),
+            federated_limiter: crate::rate_limit::RateLimiter::new(100, 60),
+            session_ttl_secs: 3600,
+            series_inflight: Default::default(),
+            chapters_inflight: Default::default(),
+            source_budgets: Default::default(),
+            catalogue_cover_phash: false,
+            ext_icons_dir: Default::default(),
+            media_manifests: None,
+            policy: Default::default(),
+            setup_code: Default::default(),
+        });
+        state
+            .source_budgets
+            .apply_limits(&crate::scanner::merge_source_rate_limits(
+                crate::config::parse_scan_source_rate_limits("src=1/3600@1"),
+                vec![],
+            ));
+        let started = try_start_job(&pool, "src").await.unwrap().unwrap();
+        let job_id = started.job.id.clone();
+        let mut walk = tokio::spawn(async move {
+            let mut progress = Progress::default();
+            let mut seen = HashSet::new();
+            let outcome = walk_listing(
+                &state,
+                &started.job.id,
+                &started.job.source_id,
+                FetchType::Popular,
+                &mut progress,
+                &mut seen,
+            )
+            .await;
+            started.lease.release().await;
+            outcome.map(|outcome| (outcome, progress))
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while hits.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // The listing used the only request; its item must wait for the next hour.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut walk)
+                .await
+                .is_err()
+        );
+        cancel_job(&pool, &job_id).await.unwrap().unwrap();
+        let (outcome, progress) = tokio::time::timeout(std::time::Duration::from_secs(4), walk)
+            .await
+            .expect("cancellation must interrupt the hourly budget wait")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, ListingOutcome::Cancelled));
+        assert_eq!(
+            (progress.items_seen, progress.succeeded, progress.failed),
+            (0, 0, 0)
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let next = try_start_job(&pool, "src")
+            .await
+            .unwrap()
+            .expect("lease released");
+        next.lease.release().await;
+    }
+
     /// REGRESSION: a single transient page fetch failed the ENTIRE ingest job.
     ///
     /// Three production jobs died this way mid-walk — one 280 items into a source with
@@ -790,9 +1074,12 @@ mod tests {
     async fn a_transient_page_failure_is_retried_not_fatal() {
         let (base, hits) = flaky_browse_origin(1).await;
         let client = SuwayomiClient::new(base, None, Some("src".into()));
-        let (has_next, mangas) = browse_page(&client, "src", FetchType::Popular, 1)
-            .await
-            .expect("retry must recover the page");
+        let budgets = crate::source_budget::SourceBudgets::default();
+        let (_stop, shutdown) = tokio::sync::watch::channel(false);
+        let (has_next, mangas) =
+            browse_page(&client, "src", FetchType::Popular, 1, &budgets, &shutdown)
+                .await
+                .expect("retry must recover the page");
         assert!(!has_next);
         assert_eq!(mangas.len(), 1);
         assert_eq!(hits.load(Ordering::SeqCst), 2, "failed once, retried once");
@@ -803,9 +1090,13 @@ mod tests {
     async fn a_persistent_page_failure_gives_up_after_the_retry_budget() {
         let (base, hits) = flaky_browse_origin(usize::MAX).await;
         let client = SuwayomiClient::new(base, None, Some("src".into()));
-        assert!(browse_page(&client, "src", FetchType::Popular, 1)
-            .await
-            .is_err());
+        let budgets = crate::source_budget::SourceBudgets::default();
+        let (_stop, shutdown) = tokio::sync::watch::channel(false);
+        assert!(
+            browse_page(&client, "src", FetchType::Popular, 1, &budgets, &shutdown)
+                .await
+                .is_err()
+        );
         assert_eq!(
             hits.load(Ordering::SeqCst) as u32,
             PAGE_FETCH_ATTEMPTS,

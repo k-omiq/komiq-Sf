@@ -68,7 +68,7 @@ Access modes are `local`, `internet` and `direct`. The last serves the server's 
 3. **Database initialization**: takes a lifetime lock on `.komiq-server.lock` and checks for an old `komika.sqlite3` main database before anything listens. It refuses that file when PostgreSQL is empty; otherwise it warns that the file is ignored. See [Old SQLite install](/self-host/update-and-backup#old-sqlite-install). It connects to PostgreSQL and applies migrations. A second server using the directory cannot boot.
 4. **Cover recovery**: preserves an unavailable or corrupt cache and recreates it. Checks saved cover pointers in batches, including when only part of the cache is missing.
 5. **Accounts and clients**: provisions configured administrators, creates source clients and issues a setup code if no administrator exists.
-6. **Startup sweep**: marks interrupted source ingestion jobs as failed.
+6. **Startup sweep**: marks interrupted source ingestion jobs as failed. A job that another server on the same database still runs holds its job lease and is left alone.
 7. **Background tasks**: starts supervised recurring jobs.
 8. **Routes and listeners**: builds the schema and router, mounts configured web apps, binds metrics on loopback, then binds the public listener.
 
@@ -80,7 +80,22 @@ On `SIGTERM` or `Ctrl+C`, the server stops accepting connections and notifies ba
 
 ## Background jobs
 
-The main database uses PostgreSQL pools. Reader sessions are query-only; background cache writes have a separate bounded lane. Transactions use PostgreSQL locking and constraints. The shared transaction helper retries serialization failures and deadlocks with a fresh transaction and a bounded delay. SQLite locks belong only to the cover cache.
+The main database uses PostgreSQL pools. Reader sessions are query-only. Foreground (request) writes and background writes use separate pools, and background cache writes have their own bounded lane. Transactions use PostgreSQL locking and constraints. The shared transaction helper retries serialization failures and deadlocks with a fresh transaction, at most five attempts, with a bounded delay. SQLite locks belong only to the cover cache.
+
+### Writer lanes and job owners
+
+Background writes take one of two lanes (`apps/server/src/database.rs`):
+
+- **Serial**: one connection that holds a database-wide advisory lock, so its writers never overlap, on any server of the database. Every job not listed below writes here, among them scanner chapter writes, the chapter spine and release ledger, catalogue sync, merges, rebuild publication and cover publication.
+- **Parallel**: the other background connections, without that lock. The jobs in the `ParallelJob` list write here: the view and source-health flushers, garbage collection, `ANALYZE`, the engine-key, statistics, readable-date and group backfills, and exact-media ingest and pruning.
+
+`KOMIKA_BACKGROUND_WRITERS` (default 1) sets the number of background connections: one Serial, the rest Parallel. With `1`, every job shares the Serial connection. The default stays 1 because a test-host run with today's background load showed no gain from 3; raise it when large backfill drains run. Test databases use 3 so the overlap tests see real overlap.
+
+A job joins the Parallel list only with pairwise overlap tests: the job and each other writer of its tables wait on a real PostgreSQL lock, in both orders, and the rows are checked afterwards. A new backfill drain adds its own `ParallelJob` variant with those tests and runs each pass inside `Database::job_scope`. A task spawned from a pass writes on the Serial lane.
+
+A lane orders write turns; it does not choose which server runs a job. A job that must run once holds a job lease for its whole pass (`apps/server/src/job_lease.rs`): a session advisory lock on its own connection. The MangaDex catalogue cycle, chapter cycle, admin reseed and gap backfill share one lease because they share cursors. The cover crawl, reconcile, extension updates, source sync and discovery have one each, and source ingest has one per source. A loop that finds its lease held skips the pass, and an admin action is refused as already running. The lock ends with its connection, so a crash never leaves a job stuck. That connection is outside the pools: count one extra PostgreSQL connection per running leased job.
+
+Run one server per database. Leases stop two servers from running one job, but each server counts source rate limits on its own.
 
 Public cover and source-cache misses enqueue persistence in a bounded background queue. The request serves fetched data without waiting for that cache write. A full queue leaves the result uncached, so a later request can retry.
 
@@ -186,7 +201,8 @@ PostgreSQL recovery health is in the same output: archived and failed WAL counts
 - `apps/server/src/main.rs`: axum router configuration, middleware ordering and server lifecycle management.
 - `apps/server/src/config.rs`: runtime settings, defaults and environment variable parsing.
 - `apps/server/src/db.rs`: boot locks, recovery, retries, migrations and statistics refresh.
-- `apps/server/src/database.rs`: read and write pools and deferred cache persistence.
+- `apps/server/src/database.rs`: read and write pools, the Serial and Parallel lanes, and deferred cache persistence.
+- `apps/server/src/job_lease.rs`: job leases, one owner per background job family.
 - `apps/server/src/web_dir.rs`: static file serving and SPA fallback mechanics.
 - `apps/server/src/scanner.rs`: adaptive scan scheduler and cadence calculations.
 - `apps/server/src/maintenance.rs`: extension auto-update tasks and duplicate queue rechecks.

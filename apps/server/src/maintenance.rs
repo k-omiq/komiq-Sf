@@ -27,8 +27,8 @@ pub struct UpdateStatus {
     pub running: bool,
     /// When the last pass FINISHED, whatever its outcome.
     pub last_run_at: Option<String>,
-    /// Why the last pass failed as a whole (the store index could not be refreshed or
-    /// listed). `None` when it ran, even if single extensions failed.
+    /// Why the last pass failed as a whole (the lease could not be acquired or the store
+    /// index could not be refreshed or listed). `None` even if single extensions failed.
     pub last_error: Option<String>,
     /// Extensions the last pass updated, and extensions it tried and could not.
     pub last_updated: u64,
@@ -36,9 +36,6 @@ pub struct UpdateStatus {
 }
 
 static STATUS: LazyLock<Mutex<UpdateStatus>> = LazyLock::new(Default::default);
-/// One pass at a time: the automatic loop and an admin's "update now" must not both
-/// drive `updateExtension` for the same package.
-static PASS: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
 
 fn status() -> std::sync::MutexGuard<'static, UpdateStatus> {
     STATUS.lock().unwrap_or_else(|p| p.into_inner())
@@ -129,9 +126,25 @@ async fn log_attempts_once(
 /// Run one update pass and record what it did: the in-memory status, one log row per
 /// extension touched, and refreshed `source_extension` coordinates when anything changed.
 /// `origin` is 'auto' or 'manual'. Returns immediately if a pass is already in flight.
+///
+/// One pass at a time on every server of this database (the `extension-update` job
+/// lease): the automatic loop and an admin's "update now" must not both drive
+/// `updateExtension` for the same package.
 pub async fn run_update_pass(state: &AppState, origin: &'static str) {
-    let Ok(_pass) = PASS.try_lock() else {
-        return;
+    let _pass = match crate::job_lease::JobLease::try_acquire(
+        &state.pool,
+        crate::job_lease::JobFamily::ExtensionUpdate,
+    )
+    .await
+    {
+        Ok(Some(pass)) => pass,
+        Ok(None) => return,
+        Err(e) => {
+            let e = crate::db::observed_database_error(e);
+            tracing::warn!(error = %e, origin, "extension update lease acquisition failed; will retry");
+            finish_update_pass(0, 0, Some(e.to_string()));
+            return;
+        }
     };
     status().running = true;
     let result = update_extensions(&state.suwayomi).await;
@@ -155,6 +168,10 @@ pub async fn run_update_pass(state: &AppState, origin: &'static str) {
         }
         Err(e) => tracing::warn!(error = %e, origin, "extension update check failed; will retry"),
     }
+    finish_update_pass(updated, failed, error);
+}
+
+fn finish_update_pass(updated: u64, failed: u64, error: Option<String>) {
     let mut s = status();
     s.running = false;
     s.last_run_at = Some(crate::db_types::format_date(chrono::Utc::now()));

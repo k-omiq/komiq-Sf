@@ -122,6 +122,15 @@ async fn run_loop(
 
 /// One discovery pass over every subscribed English source.
 async fn discovery_pass(state: &AppState, shutdown: &watch::Receiver<bool>) {
+    // One pass at a time on every server of this database: two passes would poll every
+    // source twice and race each other's snapshot writes.
+    let Some(_lease) =
+        crate::job_lease::JobLease::try_take(&state.pool, crate::job_lease::JobFamily::Discovery)
+            .await
+    else {
+        tracing::info!("discovery: another pass is running; skipping this one");
+        return;
+    };
     let source_ids = match subscribed_source_ids(state).await {
         Ok(ids) => ids,
         Err(e) => {
@@ -152,7 +161,7 @@ async fn discovery_pass(state: &AppState, shutdown: &watch::Receiver<bool>) {
         if *shutdown.borrow() {
             break;
         }
-        match poll_source(state, source_id).await {
+        match poll_source(state, source_id, shutdown).await {
             Ok((flagged, triggered)) => {
                 sources += 1;
                 total_flagged += flagged;
@@ -195,7 +204,22 @@ async fn discovery_pass(state: &AppState, shutdown: &watch::Receiver<bool>) {
 /// Poll page 1 of one source's LATEST, diff against the snapshot, enqueue the movers, and
 /// store the new snapshot. Returns `(flagged, triggered)` — flagged = series that moved up
 /// or entered, triggered = of those, how many were enrolled series we actually woke.
-async fn poll_source(state: &AppState, source_id: &str) -> anyhow::Result<(u64, u64)> {
+async fn poll_source(
+    state: &AppState,
+    source_id: &str,
+    shutdown: &watch::Receiver<bool>,
+) -> anyhow::Result<(u64, u64)> {
+    if !state
+        .source_budgets
+        .spend(
+            source_id,
+            crate::source_budget::SourceUse::Discovery,
+            shutdown,
+        )
+        .await
+    {
+        return Ok((0, 0));
+    }
     let (_has_next, mangas) = state
         .suwayomi
         .browse_source(source_id, FetchType::Latest, 1, None)
@@ -614,7 +638,7 @@ mod tests {
             session_ttl_secs: 3600,
             series_inflight: crate::graphql::KeyedLocks::default(),
             chapters_inflight: crate::graphql::KeyedLocks::default(),
-            cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            source_budgets: Default::default(),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,

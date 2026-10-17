@@ -185,12 +185,13 @@ pub(crate) fn parse_fallback_authority(raw: &str) -> Option<(String, Option<u16>
     Some((host, port))
 }
 
-/// Per-source outbound scan rate limits (`SCAN_SOURCE_RATE_LIMITS`).
+/// Shared per-source outbound request limits (`SCAN_SOURCE_RATE_LIMITS`).
 ///
 /// Format: comma-separated `source_id=requests/window_seconds[@requests_per_scan]`, e.g.
 /// `8358420357808595754=10/300` — at most 10 HTTP requests to that source per rolling
-/// 5 minutes, i.e. 5 series scans, which `scanner::SourceThrottle` additionally spaces
+/// 5 minutes, i.e. 5 series scans, which `source_budget::SourceThrottle` additionally spaces
 /// evenly (one scan every 60 s) rather than bunching at the start of each window.
+/// Discovery, source sync, source ingest, media pages and covers share that request window.
 ///
 /// This exists because a WAF rule at a scanlator site counts requests per window, and the
 /// per-source concurrency cap (`SCAN_CONCURRENCY = 3`) bounds parallelism, not rate: three
@@ -759,6 +760,8 @@ pub struct DatabaseSessionLimits {
 pub struct DatabaseLimits {
     pub read_connections: u32,
     pub foreground_connections: u32,
+    /// Background writer connections: one Serial (leased), the rest Parallel.
+    pub background_connections: u32,
     pub readers: DatabaseSessionLimits,
     pub foreground: DatabaseSessionLimits,
     pub background: DatabaseSessionLimits,
@@ -769,6 +772,7 @@ impl Default for DatabaseLimits {
         Self {
             read_connections: 16,
             foreground_connections: 8,
+            background_connections: 1,
             readers: DatabaseSessionLimits {
                 statement_ms: 30_000,
                 lock_ms: 5_000,
@@ -803,6 +807,7 @@ impl DatabaseLimits {
         let mut limits = Self {
             read_connections: positive(&get, "DATABASE_READ_POOL_SIZE", 16) as u32,
             foreground_connections: positive(&get, "DATABASE_FOREGROUND_POOL_SIZE", 8) as u32,
+            background_connections: positive(&get, "KOMIKA_BACKGROUND_WRITERS", 1).min(64) as u32,
             ..Self::default()
         };
         for (lane, session) in [
@@ -838,19 +843,23 @@ mod database_limit_tests {
     fn database_limits_defaults_and_overrides_are_bounded() {
         let defaults = DatabaseLimits::parse(|_| None);
         assert_eq!(
-            defaults.read_connections + defaults.foreground_connections + 1,
+            defaults.read_connections
+                + defaults.foreground_connections
+                + defaults.background_connections,
             25
         );
         assert_eq!(defaults.foreground.statement_ms, 15_000);
         assert_eq!(defaults.background.idle_transaction_ms, 900_000);
         let overridden = DatabaseLimits::parse(|name| match name {
             "DATABASE_FOREGROUND_POOL_SIZE" => Some("3".into()),
+            "KOMIKA_BACKGROUND_WRITERS" => Some("3".into()),
             "DATABASE_FOREGROUND_LOCK_TIMEOUT_MS" => Some("50".into()),
             "DATABASE_READ_STATEMENT_TIMEOUT_MS" => Some("0".into()),
             "DATABASE_BACKGROUND_LOCK_TIMEOUT_MS" => Some("invalid".into()),
             _ => None,
         });
         assert_eq!(overridden.foreground_connections, 3);
+        assert_eq!(overridden.background_connections, 3);
         assert_eq!(overridden.foreground.lock_ms, 50);
         assert_eq!(overridden.readers.statement_ms, 30_000);
         assert_eq!(overridden.background.lock_ms, 60_000);

@@ -4884,7 +4884,7 @@ pub struct WorkIdentity {
 /// WHY. `merge_works` physically DELETEs the losing work — it is irreversible. The
 /// automated consolidation gate (`pair::assess`) reads the work's titles, credits, year,
 /// language, description and cover hash on a snapshot taken OUTSIDE any transaction, and
-/// `RECONCILE_RUNNING` single-flights the sweep only against itself, never against admin
+/// the reconcile job lease single-flights the sweep only against itself, never against admin
 /// mutations. An `updateSeriesMetadata` landing in that window (retitling a work, or
 /// setting the `year` that was the sole corroboration) makes the merge execute against
 /// assumptions that no longer hold, and destroys a work on the strength of them. Failing

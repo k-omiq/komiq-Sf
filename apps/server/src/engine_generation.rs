@@ -673,6 +673,8 @@ async fn detach_numeric_rows(
         .fetch_all(&mut **tx)
         .await?;
     crate::locks::lock_works(tx, &works).await?;
+    #[cfg(test)]
+    crate::catalog::guards::pause("generation-works-locked").await;
     // A merge may have moved the mappings while we waited. Locking the new set now
     // would take work locks out of order, so the operator runs it again instead.
     let current: Vec<String> = sqlx::query_scalar(&mapped_works)

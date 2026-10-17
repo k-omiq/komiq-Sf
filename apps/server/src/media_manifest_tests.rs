@@ -170,7 +170,7 @@ async fn fixture(enabled: bool) -> (TempDir, Engine, Arc<AppState>) {
         session_ttl_secs: 3600,
         series_inflight: KeyedLocks::default(),
         chapters_inflight: KeyedLocks::default(),
-        cover_crawl_running: Default::default(),
+        source_budgets: Default::default(),
         catalogue_cover_phash: false,
         ext_icons_dir: Default::default(),
         setup_code: instance::SetupCode::default(),
@@ -273,6 +273,20 @@ async fn assert_hashes(app: &AppState, copy: &str, rev: i32, expected: &[Vec<u8>
         .pages
         .iter()
         .all(|p| p.width == Some(2) && p.height == Some(3)));
+}
+
+async fn insert_orphan_object(app: &AppState, bytes: &[u8]) -> Vec<u8> {
+    let hash = Sha256::digest(bytes).to_vec();
+    sqlx::query(
+        "INSERT INTO media_object (sha256,byte_length,mime,width,height,first_seen) \
+         VALUES ($1,$2,'image/png',2,3,now())",
+    )
+    .bind(&hash)
+    .bind(bytes.len() as i64)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    hash
 }
 
 #[tokio::test]
@@ -480,6 +494,120 @@ async fn signed_manifest_keys_superseded_records_and_pruning() {
         .await
         .unwrap();
     assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn publish_retries_when_prune_removes_an_object_before_key_share() {
+    let (_dir, engine, app) = fixture(true).await;
+    let expected = {
+        let mut pages = engine.pages.lock().unwrap();
+        let repeated = pages[0].clone();
+        pages.push(repeated);
+        pages.clone()
+    };
+    let hash = insert_orphan_object(&app, &expected[0]).await;
+    let points = crate::locks::pause_points::PausePoints::default();
+    let inserted = points.arm("media-objects-inserted");
+    let publish = tokio::spawn(crate::catalog::guards::TEST_PAUSE.scope(points, {
+        let app = app.clone();
+        async move { db::test_counters::scope(ingest_chapter(&app, 8)).await }
+    }));
+    tokio::time::timeout(Duration::from_secs(5), inserted.reached())
+        .await
+        .expect("publish did not insert its objects");
+    tokio::time::timeout(Duration::from_secs(5), store::prune(&app.pool))
+        .await
+        .expect("prune did not finish while publish was paused")
+        .unwrap();
+    let present: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM media_object WHERE sha256=$1)")
+            .bind(&hash)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert!(!present, "prune did not remove the orphan");
+    inserted.release();
+    let (result, seen) = tokio::time::timeout(Duration::from_secs(15), publish)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.unwrap(), Some(1));
+    assert_eq!(seen.database.transaction_restarts, 1);
+    assert_eq!(seen.database.retries, 1);
+    let copy = store::existing_copy_for_chapter(&app.pool, 8)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_hashes(&app, &copy, 1, &expected).await;
+    let rows: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM media_copy),(SELECT count(*) FROM media_manifest),\
+         (SELECT count(*) FROM media_manifest_page)",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, (1, 1, expected.len() as i64));
+    let present: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM media_object WHERE sha256=$1)")
+            .bind(&hash)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert!(present, "retry did not restore the object");
+}
+
+#[tokio::test]
+async fn prune_skips_an_object_held_by_publish_key_share() {
+    let (_dir, engine, app) = fixture(true).await;
+    let expected = engine.pages.lock().unwrap().clone();
+    let hash = insert_orphan_object(&app, &expected[0]).await;
+    insert_orphan_object(&app, &image_bytes(9)).await;
+    let points = crate::locks::pause_points::PausePoints::default();
+    let locked = points.arm("media-objects-locked");
+    let publish = tokio::spawn(crate::catalog::guards::TEST_PAUSE.scope(points, {
+        let app = app.clone();
+        async move { ingest_chapter(&app, 8).await }
+    }));
+    tokio::time::timeout(Duration::from_secs(5), locked.reached())
+        .await
+        .expect("publish did not lock its objects");
+    tokio::time::timeout(Duration::from_secs(5), store::prune(&app.pool))
+        .await
+        .expect("prune did not skip the locked object")
+        .unwrap();
+    // The published pages are still uncommitted; only the locked orphan survives.
+    let objects: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT sha256 FROM media_object ORDER BY sha256")
+            .fetch_all(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(objects, vec![hash.clone()]);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM media_manifest_page")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    locked.release();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(15), publish)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Some(1)
+    );
+    let copy = store::existing_copy_for_chapter(&app.pool, 8)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_hashes(&app, &copy, 1, &expected).await;
+    let present: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM media_object WHERE sha256=$1)")
+            .bind(&hash)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert!(present);
 }
 
 #[tokio::test]

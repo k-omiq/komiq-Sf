@@ -351,7 +351,7 @@ async fn cached_reader_requests_survive_all_upstream_slots_hanging_and_client_li
         session_ttl_secs: 3600,
         series_inflight: KeyedLocks::default(),
         chapters_inflight: KeyedLocks::default(),
-        cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        source_budgets: Default::default(),
         catalogue_cover_phash: false,
         ext_icons_dir: std::path::PathBuf::new(),
         media_manifests: None,

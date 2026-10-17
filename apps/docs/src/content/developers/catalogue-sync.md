@@ -113,7 +113,7 @@ Outbound requests from the scanner are bounded at three levels:
 
 - Global concurrency: `SCAN_GLOBAL_CONCURRENCY` limits simultaneous scans across all sources (default 12).
 - Per-source concurrency: each source loop runs at most 3 simultaneous scans (`SCAN_CONCURRENCY`).
-- Per-source request caps: the optional `SCAN_SOURCE_RATE_LIMITS` environment variable sets a rolling rate limit for a specific source ID. For example, `source_id=10/300` allows 10 requests every 5 minutes. An administrator can add the same kind of limit at runtime with `setSourceRateLimit`, stored in `source_rate_limit`. The supervisor reads that table on each reconcile and re-paces the running loop without a restart. For a source that both name, the stored row wins. Removing the row restores the environment's limit.
+- Per-source request caps: the optional `SCAN_SOURCE_RATE_LIMITS` environment variable sets a rolling rate limit for a specific source ID. For example, `source_id=10/300` allows 10 requests every 5 minutes. An administrator can add the same kind of limit at runtime with `setSourceRateLimit`, stored in `source_rate_limit`. The supervisor reads that table on each reconcile and re-paces the running loop without a restart. For a source that both name, the stored row wins. Removing the row restores the environment's limit. The limit is one per-process budget (`source_budget.rs`) shared by every background consumer of that source: scans, discovery, source sync, source ingest, the cover crawl and warmer, and media ingest. A scan or ingest item costs `requests_per_scan`; a listing page, sync request, cover or archived page costs 1. Media ingest never waits: it skips the page when the budget has no room.
 
 ### Scan intervals
 

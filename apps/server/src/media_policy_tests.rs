@@ -129,7 +129,7 @@ async fn app(pool: db::Database, engine: &Engine, key: &std::path::Path) -> Arc<
         session_ttl_secs: 3600,
         series_inflight: KeyedLocks::default(),
         chapters_inflight: KeyedLocks::default(),
-        cover_crawl_running: Default::default(),
+        source_budgets: Default::default(),
         catalogue_cover_phash: false,
         ext_icons_dir: Default::default(),
         setup_code: instance::SetupCode::default(),

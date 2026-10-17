@@ -547,6 +547,8 @@ async fn put_chapters_attempt(
         .execute(&mut *tx)
         .await?;
     #[cfg(test)]
+    crate::catalog::guards::held().await;
+    #[cfg(test)]
     if let Ok(points) = CHAPTER_PUBLICATION_PAUSE.try_with(Clone::clone) {
         points.hit("chapters-locked").await;
     }
@@ -635,6 +637,8 @@ async fn put_chapters_attempt(
     .execute(&mut *tx)
     .await?;
     crate::engine_generation::commit_ready(pool)?;
+    #[cfg(test)]
+    crate::catalog::guards::pause("chapters-written").await;
     tx.commit().await?;
     Ok(true)
 }

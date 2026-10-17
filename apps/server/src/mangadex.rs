@@ -18,7 +18,7 @@
 //! console starts them without a restart and turning it off parks them.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -2658,18 +2658,14 @@ async fn run_backfill_pass(
         tracing::info!("backfill: catalogue seed not complete yet; deferring to a later boot");
         return PassResult::Stop;
     }
-    // Don't race the seed / recurring sync / resync for the single writer + rate limit.
-    if CATALOGUE_SYNC_RUNNING
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    // Don't race the seed / recurring sync / resync for the cursors + rate limit.
+    let Some(_lease) = catalogue_lease(pool).await else {
         tracing::info!("backfill: a catalogue sync is running; retrying after the pass gap");
         return PassResult::Retry {
             scanned: 0,
             last: None,
         };
-    }
-    let _guard = SyncGuard; // releases the lock on completion or panic
+    };
     tracing::info!("backfill: starting a catalogue gap backfill pass");
     match backfill_missing_catalogue(pool, client, cover_phash, Some(BACKFILL_PASS_BUDGET)).await {
         Ok(o) if o.is_clean_completion() => {
@@ -2687,7 +2683,7 @@ async fn run_backfill_pass(
             // the catalogue already had as a Suwayomi-only work becomes a second
             // canonical work. Fold those together now (aliases include the MangaDex
             // altTitles, so older entries under a different name match). Still inside
-            // the SyncGuard — nothing else is writing the catalogue.
+            // the catalogue lease — no other catalogue sweep is writing.
             //
             // `_ex` with the covers pool: every fold here retires a work whose cached
             // cover blob lives in the separate (un-cascaded) covers DB, so without the
@@ -2915,6 +2911,7 @@ struct PendingChapter {
     /// uuid can legitimately appear under two `source_series` rows (works that have been
     /// merged), and the work-list already named the exact rows to write.
     id: String,
+    source_series_id: String,
     /// The MangaDex chapter uuid, i.e. what goes in `ids[]`.
     external_id: String,
     published_at: Option<String>,
@@ -3020,8 +3017,8 @@ async fn chapters_needing_readable_at(
     pool: &crate::db::Database,
     limit: i64,
 ) -> Result<Vec<PendingChapter>> {
-    let rows: Vec<(String, String, Option<String>, String)> = crate::db_types::query_tuple(
-        "SELECT c.id, c.external_id, c.published_at, c.created_at \
+    let rows: Vec<(String, String, String, Option<String>, String)> = crate::db_types::query_tuple(
+        "SELECT c.id, c.source_series_id, c.external_id, c.published_at, c.created_at \
            FROM chapter c \
           WHERE c.readable_at IS NULL \
             AND EXISTS (SELECT 1 FROM source_series ss \
@@ -3034,8 +3031,9 @@ async fn chapters_needing_readable_at(
     Ok(rows
         .into_iter()
         .map(
-            |(id, external_id, published_at, created_at)| PendingChapter {
+            |(id, source_series_id, external_id, published_at, created_at)| PendingChapter {
                 id,
+                source_series_id,
                 external_id,
                 published_at,
                 created_at,
@@ -3090,7 +3088,14 @@ async fn write_readable_backfill_once(
         points.hit("readable-before-update").await;
     }
     let mut pending: Vec<_> = pending.iter().collect();
-    pending.sort_by(|a, b| a.id.cmp(&b.id));
+    pending.sort_by(|a, b| {
+        (&a.source_series_id, &a.external_id).cmp(&(&b.source_series_id, &b.external_id))
+    });
+    let sources: Vec<&str> = pending
+        .iter()
+        .map(|row| row.source_series_id.as_str())
+        .collect();
+    crate::locks::lock_source_series(&mut tx, &sources).await?;
     for row in pending {
         let resolved = resolve_readable_at(row, by_id.get(row.external_id.as_str()).copied());
         if resolved.answered {
@@ -3101,6 +3106,8 @@ async fn write_readable_backfill_once(
                 .bind(&row.external_id)
                 .execute(&mut *tx)
                 .await?;
+            #[cfg(test)]
+            crate::catalog::guards::held().await;
             if by_id[row.external_id.as_str()].readable_at.is_some() {
                 out.from_upstream += 1;
             }
@@ -3117,6 +3124,8 @@ async fn write_readable_backfill_once(
                 .bind(&row.external_id)
                 .execute(&mut *tx)
                 .await?;
+            #[cfg(test)]
+            crate::catalog::guards::held().await;
             out.unanswered += 1;
         }
         out.filled += 1;
@@ -3175,7 +3184,7 @@ pub fn spawn_readable_backfill(
     client: Arc<MangaDexClient>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    tokio::spawn(async move {
+    let pass = async move {
         /// Sleep unless shutdown fires first. `true` => stop.
         ///
         /// A dropped sender makes `changed()` return `Err` instantly and forever; treating
@@ -3225,7 +3234,7 @@ pub fn spawn_readable_backfill(
                                 external = total.external,
                                 unanswered = total.unanswered,
                                 "readable backfill: drained — every mirrored MangaDex \
-                                 chapter has a release clock"
+                             chapter has a release clock"
                             ),
                             // WARN, not info: "nothing to do but rows remain" means rows are
                             // unreachable rather than pending, which is a bug in the
@@ -3234,7 +3243,7 @@ pub fn spawn_readable_backfill(
                                 remaining,
                                 batches,
                                 "readable backfill: reported idle but rows remain — \
-                                 they are unreachable, not merely pending"
+                             they are unreachable, not merely pending"
                             ),
                             Err(e) => {
                                 let e = crate::db::observed_database_error(e);
@@ -3287,7 +3296,11 @@ pub fn spawn_readable_backfill(
                 }
             }
         }
-    });
+    };
+    tokio::spawn(crate::db::Database::job_scope(
+        crate::database::ParallelJob::ReadableBackfill,
+        pass,
+    ));
 }
 
 // ---- The scanlation-group backfill ---------------------------------------------------
@@ -3380,6 +3393,7 @@ const GROUP_WORKLIST_WHERE: &str = "c.scanlator IS NULL AND c.external_id LIKE '
 struct PendingGroupChapter {
     /// `chapter.id` — the UPDATE key, for the reason `PendingChapter::id` gives.
     id: String,
+    source_series_id: String,
     /// The MangaDex chapter uuid, i.e. what goes in `ids[]`.
     external_id: String,
 }
@@ -3475,16 +3489,16 @@ async fn chapters_needing_group(
     hot: &[String],
     limit: i64,
 ) -> Result<Vec<PendingGroupChapter>> {
-    const HOT_SQL: &str = "SELECT DISTINCT c.id, c.external_id \
+    const HOT_SQL: &str = "SELECT DISTINCT c.id, c.source_series_id, c.external_id \
            FROM unnest($1::text[]) AS hot(value) \
            JOIN source_series ss ON ss.work_id = hot.value AND ss.source_type = 'mangadex' \
            JOIN chapter c ON c.source_series_id = ss.id \
           WHERE c.scanlator IS NULL AND c.external_id LIKE '%-%' \
           LIMIT $2";
-    let mut rows: Vec<(String, String)> = Vec::new();
+    let mut rows: Vec<(String, String, String)> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !hot.is_empty() {
-        let prio: Vec<(String, String)> = crate::db_types::query_tuple(HOT_SQL)
+        let prio: Vec<(String, String, String)> = crate::db_types::query_tuple(HOT_SQL)
             .bind(hot)
             .bind(limit)
             .fetch_all(pool)
@@ -3497,12 +3511,12 @@ async fn chapters_needing_group(
     }
     if (rows.len() as i64) < limit {
         let plain_sql = format!(
-            "SELECT c.id, c.external_id FROM chapter c WHERE {GROUP_WORKLIST_WHERE} LIMIT $1"
+            "SELECT c.id, c.source_series_id, c.external_id FROM chapter c WHERE {GROUP_WORKLIST_WHERE} LIMIT $1"
         );
         // Asked for `limit` rather than the shortfall: the plain sweep can return rows the
         // priority half already took (they are still NULL until this batch writes them), and
         // the de-dup below must still be able to fill the batch.
-        let plain: Vec<(String, String)> = crate::db_types::query_tuple(&plain_sql)
+        let plain: Vec<(String, String, String)> = crate::db_types::query_tuple(&plain_sql)
             .bind(limit)
             .fetch_all(pool)
             .await?;
@@ -3517,7 +3531,11 @@ async fn chapters_needing_group(
     }
     Ok(rows
         .into_iter()
-        .map(|(id, external_id)| PendingGroupChapter { id, external_id })
+        .map(|(id, source_series_id, external_id)| PendingGroupChapter {
+            id,
+            source_series_id,
+            external_id,
+        })
         .collect())
 }
 
@@ -3570,7 +3588,14 @@ async fn write_group_backfill_once(
     let mut out = GroupFill::default();
     let mut tx = pool.begin().await?;
     let mut pending: Vec<_> = pending.iter().collect();
-    pending.sort_by(|a, b| a.id.cmp(&b.id));
+    pending.sort_by(|a, b| {
+        (&a.source_series_id, &a.external_id).cmp(&(&b.source_series_id, &b.external_id))
+    });
+    let sources: Vec<&str> = pending
+        .iter()
+        .map(|row| row.source_series_id.as_str())
+        .collect();
+    crate::locks::lock_source_series(&mut tx, &sources).await?;
     for row in pending {
         let label = match by_id.get(row.external_id.as_str()) {
             Some(c) => {
@@ -3592,6 +3617,8 @@ async fn write_group_backfill_once(
             .bind(&row.id)
             .execute(&mut *tx)
             .await?;
+        #[cfg(test)]
+        crate::catalog::guards::held().await;
         out.filled += 1;
     }
     tx.commit().await?;
@@ -3645,7 +3672,7 @@ pub fn spawn_group_backfill(
     client: Arc<MangaDexClient>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    tokio::spawn(async move {
+    let pass = async move {
         if nap_or_shutdown(GROUP_BACKFILL_BOOT_DELAY, &mut shutdown).await {
             return;
         }
@@ -3699,13 +3726,13 @@ pub fn spawn_group_backfill(
                                 no_group = total.no_group,
                                 unanswered = total.unanswered,
                                 "group backfill: drained — every mirrored MangaDex chapter \
-                                 has a scanlation group recorded"
+                             has a scanlation group recorded"
                             ),
                             Ok(remaining) => tracing::warn!(
                                 remaining,
                                 batches,
                                 "group backfill: reported idle but rows remain — they are \
-                                 unreachable, not merely pending"
+                             unreachable, not merely pending"
                             ),
                             Err(e) => {
                                 let e = crate::db::observed_database_error(e);
@@ -3756,7 +3783,11 @@ pub fn spawn_group_backfill(
                 }
             }
         }
-    });
+    };
+    tokio::spawn(crate::db::Database::job_scope(
+        crate::database::ParallelJob::GroupBackfill,
+        pass,
+    ));
 }
 
 /// Whether the `chapter` row for `(source_series_id, ch.external_id)` already exists AND
@@ -4099,55 +4130,48 @@ pub async fn sync_chapters(
     Ok(out)
 }
 
-/// Single-flight lock over `run_one_cycle`: only one catalogue sync cycle runs at a
-/// time across the whole process, whether triggered by the recurring loop or an admin
+/// Single flight over `run_one_cycle`, the chapter cycle and the gap backfill: the
+/// `mangadex-catalogue` job lease (`job_lease.rs`). Only one of them runs at a time on
+/// every server of this database, whether triggered by a recurring loop or an admin
 /// `resyncCatalogue`. This keeps a manual re-seed (which can run for hours) from racing
 /// a recurring tick — overlapping sweeps would double-fetch and could interleave cursor
-/// writes into an inconsistent seed state.
-static CATALOGUE_SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
-
-/// Releases the single-flight lock on drop (so a panic mid-cycle can't wedge it — the
-/// binary builds with `panic = "unwind"`, so Drop still runs).
-struct SyncGuard;
-impl Drop for SyncGuard {
-    fn drop(&mut self) {
-        CATALOGUE_SYNC_RUNNING.store(false, Ordering::SeqCst);
-    }
+/// writes into an inconsistent seed state. The lease dies with its session, so a panic
+/// or a crash mid-cycle cannot wedge it.
+async fn catalogue_lease(pool: &crate::db::Database) -> Option<crate::job_lease::JobLease> {
+    crate::job_lease::JobLease::try_take(pool, crate::job_lease::JobFamily::MangadexCatalogue).await
 }
 
 /// Guarded entry point for the recurring loop: run one cycle unless one is already in
 /// flight, in which case skip this tick.
 async fn sync_cycle(pool: &crate::db::Database, client: &MangaDexClient, cover_phash: bool) {
-    if CATALOGUE_SYNC_RUNNING
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    let Some(_lease) = catalogue_lease(pool).await else {
         tracing::info!("mangadex: a catalogue sync cycle is already running; skipping this tick");
         return;
-    }
-    let _guard = SyncGuard;
+    };
     run_one_cycle(pool, client, cover_phash).await;
 }
 
 /// Admin-triggered full re-seed: clear the catalogue + chapter sync cursors so the next
 /// cycle does a fresh `createdAt` seed from scratch, then run one cycle in the
 /// background. Returns `false` (doing nothing) if a sync cycle is already running so the
-/// caller can surface "busy, retry" — the single-flight lock is acquired up front and
-/// held for the whole re-seed so a recurring tick can't interleave its own cursor write
-/// between the reset and the seed.
-pub fn spawn_resync(
+/// caller can surface "busy, retry" — the catalogue lease is acquired up front and held
+/// for the whole re-seed so a recurring tick can't interleave its own cursor write
+/// between the reset and the seed. A database error is returned as such.
+pub async fn spawn_resync(
     pool: crate::db::Database,
     client: Arc<MangaDexClient>,
     cover_phash: bool,
-) -> bool {
-    if CATALOGUE_SYNC_RUNNING
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return false;
-    }
+) -> anyhow::Result<bool> {
+    let Some(lease) = crate::job_lease::JobLease::try_acquire(
+        &pool,
+        crate::job_lease::JobFamily::MangadexCatalogue,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
     tokio::spawn(async move {
-        let _guard = SyncGuard; // releases the lock on completion or panic
+        let _lease = lease; // released on completion or panic
         if let Err(e) = catalog::reset_sync_state(&pool, "catalogue").await {
             let e = crate::db::observed_database_error(e);
             tracing::error!(error = %e, "resync: failed to reset catalogue sync state; aborting");
@@ -4162,7 +4186,7 @@ pub fn spawn_resync(
         run_one_cycle(&pool, &client, cover_phash).await;
         tracing::info!("resync: fresh seed cycle complete");
     });
-    true
+    Ok(true)
 }
 
 /// Run one catalogue + chapter sync cycle. A job with no stored cursor does a full
@@ -4170,7 +4194,7 @@ pub fn spawn_resync(
 /// (CATALOGUE.md §5). The cursor advances to the cycle's start time only on success,
 /// so a failed or interrupted cycle safely retries the same window next tick. Catalogue
 /// runs before chapters (chapters attach to already-catalogued works). Call via
-/// `sync_cycle` (recurring) or `spawn_resync` (admin) — both hold the single-flight lock.
+/// `sync_cycle` (recurring) or `spawn_resync` (admin) — both hold the catalogue lease.
 async fn run_one_cycle(pool: &crate::db::Database, client: &MangaDexClient, cover_phash: bool) {
     // Wall-clock at cycle start, in MangaDex `since` form. Anything updated during the
     // cycle is >= this, so it's caught by the next cycle rather than missed.
@@ -4370,18 +4394,14 @@ async fn checkpoint_backfill(
     })
 }
 
-/// The chapter half of a cycle, on its own schedule (Phase D). Takes the same single-flight
-/// lock as the catalogue sweep: they write the same tables, and the chapter sweep's
+/// The chapter half of a cycle, on its own schedule (Phase D). Takes the same lease as
+/// the catalogue sweep: they write the same tables, and the chapter sweep's
 /// uncatalogued-work skip reads state the catalogue sweep is mutating.
 pub async fn chapter_cycle(pool: &crate::db::Database, client: &MangaDexClient) {
-    if CATALOGUE_SYNC_RUNNING
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    let Some(_lease) = catalogue_lease(pool).await else {
         tracing::debug!("mangadex: catalogue sync busy; skipping this chapter tick");
         return;
-    }
-    let _guard = SyncGuard;
+    };
     let run_start = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     run_chapter_cycle(pool, client, &run_start).await;
 }
@@ -4988,6 +5008,534 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    fn backfill_answer() -> MdChapter {
+        serde_json::from_value(serde_json::json!({
+            "id": "overlap-chapter",
+            "attributes": {
+                "readableAt": "2021-01-01T00:00:00Z",
+                "externalUrl": "https://example.test/backfill",
+            },
+            "relationships": [
+                {"id": "group", "type": "scanlation_group", "attributes": {"name": "Backfill group"}},
+            ],
+        })).unwrap()
+    }
+
+    async fn pending_backfill_chapter(pool: &crate::db::Database, ssid: &str) {
+        catalog::upsert_chapter(
+            pool,
+            ssid,
+            &catalog::ChapterInput {
+                external_id: "overlap-chapter".into(),
+                number: Some("1".into()),
+                lang: Some("en".into()),
+                title: Some("Old chapter".into()),
+                published_at: Some("2020-01-01T00:00:00Z".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn parallel_chapter_backfill(
+        pool: &crate::db::Database,
+        group: bool,
+        readable: &[PendingChapter],
+        groups: &[PendingGroupChapter],
+    ) -> Result<()> {
+        use crate::{database::ParallelJob, db::Database};
+        if group {
+            Database::job_scope(ParallelJob::GroupBackfill, async {
+                write_group_backfill(pool, groups, &[backfill_answer()])
+                    .await
+                    .map(|_| ())
+            })
+            .await
+        } else {
+            Database::job_scope(ParallelJob::ReadableBackfill, async {
+                write_readable_backfill(pool, readable, &[backfill_answer()])
+                    .await
+                    .map(|_| ())
+            })
+            .await
+        }
+    }
+
+    async fn blocked_by(pool: &crate::db::Database, blocker: i32) -> Option<i32> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let pid: Option<i32> = sqlx::query_scalar(
+                    "SELECT pid FROM pg_stat_activity WHERE datname=current_database() \
+                     AND wait_event_type='Lock' AND $1=ANY(pg_blocking_pids(pid)) LIMIT 1",
+                )
+                .bind(blocker)
+                .fetch_optional(pool)
+                .await
+                .unwrap();
+                if pid.is_some() {
+                    return pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    // The catalogue's existing pause precedes its chapter UPDATE. An AFTER UPDATE
+    // trigger holds the real upsert open here, without changing the production
+    // facade or copying its SQL. The second wait checks B against the upsert's PID,
+    // so A's wait on the test gate cannot count as the required writer overlap.
+    async fn held_chapter_persistence(
+        pool: crate::db::Database,
+        ssid: String,
+        input: catalog::ChapterInput,
+    ) -> Result<()> {
+        // `raw_sql` through `&Database` trips rustc's higher-ranked `Executor`
+        // inference inside `overlap`'s Send bound; the raw pool does not.
+        sqlx::raw_sql(
+            "CREATE FUNCTION ov2_hold_chapter_write() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN PERFORM pg_advisory_xact_lock(4930190000000002); RETURN NEW; END; $$; \
+             CREATE TRIGGER ov2_hold_chapter_write AFTER UPDATE ON chapter \
+             FOR EACH ROW EXECUTE FUNCTION ov2_hold_chapter_write()",
+        )
+        .execute(pool.write())
+        .await?;
+        let mut gate = pool.begin().await?;
+        let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *gate)
+            .await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(4930190000000002)")
+            .execute(&mut *gate)
+            .await?;
+        let writer_pool = pool.clone();
+        // Task locals do not cross spawn: the parent's guard-held pause must be
+        // reached only after the child has written and holds the chapter row.
+        let writer =
+            tokio::spawn(async move { catalog::upsert_chapter(&writer_pool, &ssid, &input).await });
+        let writer_pid = blocked_by(&pool, gate_pid).await;
+        if writer_pid.is_some() {
+            catalog::guards::held().await;
+        }
+        let waited = match writer_pid {
+            Some(pid) => blocked_by(&pool, pid).await.is_some(),
+            None => false,
+        };
+        gate.commit().await?;
+        writer.await??;
+        anyhow::ensure!(
+            waited,
+            "backfill did not wait on the catalogue upsert's real chapter lock"
+        );
+        Ok(())
+    }
+
+    async fn chapter_persistence_overlap(group: bool) {
+        use crate::catalog::phase4_tests::{overlap, pool};
+        for backfill_first in [true, false] {
+            let pool = pool().await;
+            let (_, ssid) = mirror_work(&pool, "overlap-manga", "Overlap").await;
+            pending_backfill_chapter(&pool, &ssid).await;
+            let readable = chapters_needing_readable_at(&pool, 10).await.unwrap();
+            let groups = chapters_needing_group(&pool, &[], 10).await.unwrap();
+            assert_eq!((readable.len(), groups.len()), (1, 1));
+            let backfill = move |pool: crate::db::Database| async move {
+                parallel_chapter_backfill(&pool, group, &readable, &groups).await
+            };
+            let updated = catalog::ChapterInput {
+                external_id: "overlap-chapter".into(),
+                number: Some("2".into()),
+                lang: Some("en".into()),
+                title: Some("Fresh chapter".into()),
+                published_at: Some("2020-01-01T00:00:00Z".into()),
+                readable_at: Some("2026-02-01T00:00:00Z".into()),
+                external_url: Some("https://example.test/fresh".into()),
+                scanlator: Some("Fresh group".into()),
+                ..Default::default()
+            };
+            let source = ssid.clone();
+            let (a, b) = if backfill_first {
+                overlap(&pool, backfill, move |pool| async move {
+                    catalog::upsert_chapter(&pool, &source, &updated).await
+                })
+                .await
+            } else {
+                overlap(
+                    &pool,
+                    move |pool| held_chapter_persistence(pool, source, updated),
+                    backfill,
+                )
+                .await
+            };
+            a.unwrap();
+            b.unwrap();
+            let rows: Vec<(String, String, String, chrono::DateTime<chrono::Utc>, String, String)> = sqlx::query_as(
+                "SELECT source_series_id,number,title,readable_at,external_url,scanlator FROM chapter ORDER BY id",
+            ).fetch_all(&pool).await.unwrap();
+            assert_eq!(
+                rows,
+                vec![(
+                    ssid,
+                    "2".into(),
+                    "Fresh chapter".into(),
+                    crate::db_types::date("2026-02-01T00:00:00Z").unwrap(),
+                    "https://example.test/fresh".into(),
+                    "Fresh group".into(),
+                )],
+                "{group}/{backfill_first}: persistence wins; a later backfill only fills NULLs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_readable_backfill_and_chapter_persistence_overlap_in_both_orders() {
+        chapter_persistence_overlap(false).await;
+    }
+
+    #[tokio::test]
+    async fn parallel_group_backfill_and_chapter_persistence_overlap_in_both_orders() {
+        chapter_persistence_overlap(true).await;
+    }
+
+    async fn chapter_keys_backfill_overlap(group: bool) {
+        use crate::catalog::phase4_tests::{overlap, pool};
+        for backfill_first in [true, false] {
+            let pool = pool().await;
+            let (_, first) = mirror_work(&pool, "keys-manga-a", "Keys A").await;
+            let (_, second) = mirror_work(&pool, "keys-manga-b", "Keys B").await;
+            let mut sources = [first, second];
+            sources.sort();
+            for (ssid, id) in sources.iter().zip(["z-backfill", "a-backfill"]) {
+                sqlx::query("INSERT INTO chapter(id,source_series_id,external_id,number,published_at,created_at) VALUES ($1,$2,'overlap-chapter','1','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')")
+                    .bind(id).bind(ssid).execute(&pool).await.unwrap();
+            }
+            let by_id: Vec<String> =
+                sqlx::query_scalar("SELECT source_series_id FROM chapter ORDER BY id")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(by_id, vec![sources[1].clone(), sources[0].clone()]);
+            let readable = chapters_needing_readable_at(&pool, 10).await.unwrap();
+            let groups = chapters_needing_group(&pool, &[], 10).await.unwrap();
+            assert_eq!((readable.len(), groups.len()), (2, 2));
+            let backfill = move |pool: crate::db::Database| async move {
+                let (result, seen) = crate::db::test_counters::scope(parallel_chapter_backfill(
+                    &pool, group, &readable, &groups,
+                ))
+                .await;
+                assert_eq!(seen.database.deadlocks, 0);
+                result
+            };
+            let drain = move |pool: crate::db::Database| async move {
+                let (result, seen) =
+                    crate::db::test_counters::scope(catalog::spine::drain_chapter_keys(&pool))
+                        .await;
+                assert_eq!(seen.database.deadlocks, 0);
+                result.map(|_| ())
+            };
+            let (a, b) = if backfill_first {
+                overlap(&pool, backfill, drain).await
+            } else {
+                overlap(&pool, drain, backfill).await
+            };
+            a.unwrap();
+            b.unwrap();
+            let keyed: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM chapter WHERE chapter_key IS NOT NULL")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(keyed, 2);
+            assert_eq!(
+                if group {
+                    group_backfill_remaining(&pool).await.unwrap()
+                } else {
+                    readable_backfill_remaining(&pool).await.unwrap()
+                },
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_readable_backfill_and_chapter_keys_finish_without_deadlocks() {
+        chapter_keys_backfill_overlap(false).await;
+    }
+
+    #[tokio::test]
+    async fn parallel_group_backfill_and_chapter_keys_finish_without_deadlocks() {
+        chapter_keys_backfill_overlap(true).await;
+    }
+
+    async fn suwayomi_backfill_overlap(group: bool) {
+        use crate::catalog::phase4_tests::{overlap, pool};
+        let manga: crate::suwayomi::SuwayomiManga = serde_json::from_value(serde_json::json!({
+            "id": 7, "title": "Scanner", "status": "ONGOING", "inLibrary": false,
+            "sourceId": "source", "source": {"lang": "en"},
+        }))
+        .unwrap();
+        let chapter = |id| {
+            serde_json::from_value::<crate::suwayomi::SuwayomiChapter>(serde_json::json!({
+                "id": id, "mangaId": 7, "name": "Scanner chapter", "chapterNumber": 1.0,
+                "scanlator": "Scanner group", "uploadDate": "1577836800000",
+                "isRead": false, "isBookmarked": false, "isDownloaded": false,
+                "lastPageRead": 0, "pageCount": 10,
+            }))
+            .unwrap()
+        };
+        for backfill_first in [true, false] {
+            let pool = pool().await;
+            let (work, ssid) = mirror_work(&pool, "overlap-manga", "Overlap").await;
+            pending_backfill_chapter(&pool, &ssid).await;
+            let suwa =
+                catalog::upsert_source_series(&pool, &work, "suwayomi", "source", "7", None, false)
+                    .await
+                    .unwrap();
+            crate::series_cache::put_series(&pool, &manga)
+                .await
+                .unwrap();
+            crate::series_cache::put_chapters(&pool, 7, &[chapter(8)])
+                .await
+                .unwrap();
+            let readable = chapters_needing_readable_at(&pool, 10).await.unwrap();
+            let groups = chapters_needing_group(&pool, &[], 10).await.unwrap();
+            assert_eq!((readable.len(), groups.len()), (1, 1));
+            let backfill = move |pool: crate::db::Database| async move {
+                parallel_chapter_backfill(&pool, group, &readable, &groups).await
+            };
+            let replacement = chapter(9);
+            let persist = move |pool: crate::db::Database| async move {
+                crate::series_cache::put_chapters(&pool, 7, &[replacement]).await
+            };
+            // Both source mappings share a work parent, so their writers serialize.
+            let (a, b) = if backfill_first {
+                overlap(&pool, backfill, persist).await
+            } else {
+                overlap(&pool, persist, backfill).await
+            };
+            a.unwrap();
+            b.unwrap();
+            let md: (
+                Option<chrono::DateTime<chrono::Utc>>,
+                Option<String>,
+                Option<String>,
+            ) = sqlx::query_as(
+                "SELECT readable_at,external_url,scanlator FROM chapter WHERE source_series_id=$1",
+            )
+            .bind(&ssid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                md,
+                if group {
+                    (None, None, Some("Backfill group".into()))
+                } else {
+                    (
+                        Some(crate::db_types::date("2021-01-01T00:00:00Z").unwrap()),
+                        Some("https://example.test/backfill".into()),
+                        None,
+                    )
+                }
+            );
+            let scanner: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT external_id,scanlator FROM chapter WHERE source_series_id=$1 ORDER BY external_id",
+            ).bind(&suwa).fetch_all(&pool).await.unwrap();
+            assert_eq!(scanner, vec![("9".into(), Some("Scanner group".into()))]);
+            let cached: Vec<i64> =
+                sqlx::query_scalar("SELECT id FROM suwayomi_chapter ORDER BY id")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(cached, vec![9]);
+            let orphans: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM chapter c LEFT JOIN source_series ss ON ss.id=c.source_series_id WHERE ss.id IS NULL",
+            ).fetch_one(&pool).await.unwrap();
+            assert_eq!(orphans, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_readable_backfill_and_suwayomi_replacement_overlap_in_both_orders() {
+        suwayomi_backfill_overlap(false).await;
+    }
+
+    #[tokio::test]
+    async fn parallel_group_backfill_and_suwayomi_replacement_overlap_in_both_orders() {
+        suwayomi_backfill_overlap(true).await;
+    }
+
+    async fn browse_digest(pool: &crate::db::Database, work_id: &str) -> Option<String> {
+        crate::db_types::query_scalar(
+            "SELECT work_id || '|' || reader_id || '|' || title \
+                 || '|' || COALESCE(cover_url, '~') || '|' || COALESCE(suwayomi_thumbnail, '~') \
+                 || '|' || COALESCE(comic_type, '~') || '|' || COALESCE(status, '~') \
+                 || '|' || content_rating || '|' || is_nsfw || '|' || en_chapter_count \
+                 || '|' || COALESCE(latest_chapter, '~') \
+                 || '|' || COALESCE((EXTRACT(EPOCH FROM released_at) * 1000)::bigint, -1) || '|' || pg_typeof(released_at)::text \
+                 || '|' || created_at \
+                 || '|' || COALESCE(demographic, '~') || '|' || COALESCE(original_language, '~') \
+                 || '|' || COALESCE(year::text, '~') || '|' || COALESCE(follows::text, '~') \
+                 || '|' || COALESCE(rating::text, '~') \
+             FROM browse_catalogue WHERE work_id=$1",
+        ).bind(work_id).fetch_optional(pool).await.unwrap()
+    }
+
+    async fn stale_digest_rows(pool: &crate::db::Database, work_id: &str) {
+        for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
+            let changed = sqlx::query(&format!(
+                "UPDATE {table} SET title='Stale' WHERE work_id=$1"
+            ))
+            .bind(work_id)
+            .execute(pool)
+            .await
+            .unwrap()
+            .rows_affected();
+            assert_eq!(
+                changed, 1,
+                "the rebuild must have a real {table} row to publish"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_backfills_and_rebuilds_converge_to_serial_feed_and_browse_digests() {
+        use crate::{
+            database::ParallelJob,
+            db::Database,
+            work_stats::{MdStats, PendingStats},
+        };
+        let pool = crate::catalog::phase4_tests::pool().await;
+        let (work, ssid) = mirror_work(&pool, "overlap-manga", "Overlap").await;
+        pending_backfill_chapter(&pool, &ssid).await;
+        catalog::refresh_feed_updates(&pool).await.unwrap();
+        catalog::refresh_browse_catalogue(&pool).await.unwrap();
+        assert!(feed_digest(&pool, &work).await.is_some());
+        assert!(browse_digest(&pool, &work).await.is_some());
+        stale_digest_rows(&pool, &work).await;
+        let readable = chapters_needing_readable_at(&pool, 10).await.unwrap();
+        let groups = chapters_needing_group(&pool, &[], 10).await.unwrap();
+        let upstream = [backfill_answer()];
+        let pending = [PendingStats {
+            work_id: work.clone(),
+            mangadex_id: Some("overlap-manga".into()),
+        }];
+        let stats = HashMap::from([(
+            "overlap-manga".into(),
+            MdStats {
+                follows: Some(123),
+                rating: Some(8.25),
+                rating_avg: Some(8.5),
+            },
+        )]);
+        let points = crate::locks::pause_points::PausePoints::default();
+        let held = points.arm("guard-held");
+        // Force the documented skip: stats holds the work while the chapter jobs
+        // write and rebuild publication leaves it for the next pass.
+        let (stats_fill, readable_fill, group_fill, rebuilt) = tokio::join!(
+            Database::job_scope(
+                ParallelJob::StatsBackfill,
+                catalog::guards::TEST_PAUSE.scope(points, async {
+                    crate::work_stats::write_work_stats(
+                        &pool,
+                        &pending,
+                        &stats,
+                        "2026-04-01T00:00:00Z",
+                    )
+                    .await
+                })
+            ),
+            Database::job_scope(
+                ParallelJob::ReadableBackfill,
+                write_readable_backfill(&pool, &readable, &upstream)
+            ),
+            Database::job_scope(
+                ParallelJob::GroupBackfill,
+                write_group_backfill(&pool, &groups, &upstream)
+            ),
+            async {
+                tokio::time::timeout(Duration::from_secs(5), held.reached())
+                    .await
+                    .unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(2), async {
+                    catalog::refresh_feed_updates(&pool).await?;
+                    catalog::refresh_browse_catalogue(&pool).await?;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+                held.release();
+                result.expect("publication must skip the busy work")
+            },
+        );
+        assert_eq!(stats_fill.unwrap().answered, 1);
+        assert_eq!(readable_fill.unwrap().filled, 1);
+        assert_eq!(group_fill.unwrap().filled, 1);
+        rebuilt.unwrap();
+        let skipped: (String, String) = sqlx::query_as(
+            "SELECT (SELECT title FROM feed_series_updates WHERE work_id=$1), \
+                    (SELECT title FROM browse_catalogue WHERE work_id=$1)",
+        )
+        .bind(&work)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(skipped, ("Stale".into(), "Stale".into()));
+        // A busy work is a clean skip, not a completed publication. The next
+        // rebuild must converge once all three backfill transactions have committed.
+        catalog::refresh_feed_updates(&pool).await.unwrap();
+        catalog::refresh_browse_catalogue(&pool).await.unwrap();
+        let concurrent = (
+            feed_digest(&pool, &work).await,
+            browse_digest(&pool, &work).await,
+        );
+
+        // Restore the same authority and projections, retaining ids and first-seen
+        // times, then run those exact steps serially with the rebuild last.
+        sqlx::query("UPDATE chapter SET readable_at=NULL,external_url=NULL,scanlator=NULL WHERE source_series_id=$1")
+            .bind(&ssid).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM work_stats WHERE work_id=$1")
+            .bind(&work)
+            .execute(&pool)
+            .await
+            .unwrap();
+        catalog::refresh_feed_updates(&pool).await.unwrap();
+        catalog::refresh_browse_catalogue(&pool).await.unwrap();
+        stale_digest_rows(&pool, &work).await;
+        Database::job_scope(
+            ParallelJob::StatsBackfill,
+            crate::work_stats::write_work_stats(&pool, &pending, &stats, "2026-04-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        Database::job_scope(
+            ParallelJob::ReadableBackfill,
+            write_readable_backfill(&pool, &readable, &upstream),
+        )
+        .await
+        .unwrap();
+        Database::job_scope(
+            ParallelJob::GroupBackfill,
+            write_group_backfill(&pool, &groups, &upstream),
+        )
+        .await
+        .unwrap();
+        catalog::refresh_feed_updates(&pool).await.unwrap();
+        catalog::refresh_browse_catalogue(&pool).await.unwrap();
+        // The same follow-up pass as the concurrent run must be a no-op here.
+        catalog::refresh_feed_updates(&pool).await.unwrap();
+        catalog::refresh_browse_catalogue(&pool).await.unwrap();
+        let serial = (
+            feed_digest(&pool, &work).await,
+            browse_digest(&pool, &work).await,
+        );
+        assert_eq!(
+            concurrent, serial,
+            "a skipped work must converge to the serial run on the next rebuild"
+        );
     }
 
     /// Drive the extracted writer exactly as `sync_chapters` does: a set of the
@@ -6130,6 +6678,7 @@ mod tests {
         }
         let row = PendingChapter {
             id: "c_1".into(),
+            source_series_id: "ss_1".into(),
             external_id: "chapter-uuid-1".into(),
             published_at: Some("2026-01-01T00:00:00+00:00".into()),
             created_at: "2025-12-01T00:00:00+00:00".into(),
@@ -6713,6 +7262,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
+            source_series_id: cold.clone(),
             external_id: "md-c3".into(),
         }];
         write_group_backfill(&pool, &stale, &[]).await.unwrap();
@@ -6917,6 +7467,7 @@ mod tests {
     fn group_batch_ids_never_repeat_an_id_and_keep_work_list_order() {
         let p = |id: &str, ext: &str| PendingGroupChapter {
             id: id.into(),
+            source_series_id: "ss_1".into(),
             external_id: ext.into(),
         };
         // Two chapter rows carrying one uuid collapse to one `ids[]` entry, at the place

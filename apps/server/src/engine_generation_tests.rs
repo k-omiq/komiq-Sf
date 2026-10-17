@@ -812,3 +812,212 @@ async fn quarantine_cover_file_purge_keeps_work_assets() {
         .unwrap();
     assert_eq!(asset, "w_kept@v1");
 }
+
+#[tokio::test]
+async fn suwayomi_cover_locks_generation_before_work_during_replacement() {
+    let (pool, _covers, _engine, client, fence) = setup().await;
+    let pool = pool.foreground();
+    let covers = crate::db::init_covers("sqlite::memory:").await.unwrap();
+    bind(&pool, &client).await;
+    sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES('w_cover_generation_order',now(),now()); \
+        INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES('ss_cover_generation_order','w_cover_generation_order','suwayomi','source','7',now()); \
+        UPDATE suwayomi_series SET thumbnail_url='/api/v1/manga/7/thumbnail' WHERE id=7")
+        .execute(&pool).await.unwrap();
+    let generation = fence.generation();
+    let points = crate::locks::pause_points::PausePoints::default();
+    let held = points.arm("cover-work-locked");
+    let writer = pool.clone();
+    let cache = covers.clone();
+    let cover = tokio::spawn(
+        crate::catalog::guards::TEST_PAUSE.scope(points, async move {
+            crate::cover::put_work_cover_for_suwayomi_anchor(
+                &writer,
+                &cache,
+                "w_cover_generation_order",
+                b"cover",
+                generation,
+                "/api/v1/manga/7/thumbnail",
+            )
+            .await
+        }),
+    );
+    tokio::time::timeout(Duration::from_secs(5), held.reached())
+        .await
+        .expect("cover did not lock its work");
+
+    // Find this publisher by its asset key, then check its one-bigint generation
+    // key on that same backend, before allowing any later publication step.
+    let (class, digest) = crate::locks::AdvisoryKey::new(
+        crate::locks::KeyClass::Cover,
+        &["w_cover_generation_order"],
+    )
+    .integers();
+    let publisher: i32 = sqlx::query_scalar(
+        "SELECT pid FROM pg_locks WHERE locktype='advisory' AND granted AND objsubid=2 \
+         AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) \
+         AND classid::bigint=($1::bigint & 4294967295) AND objid::bigint=($2::bigint & 4294967295)",
+    )
+    .bind(class)
+    .bind(digest)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let shared_before_work: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' \
+         AND granted AND mode='ShareLock' AND objsubid=1 \
+         AND classid::bigint=($2::bigint >> 32) AND objid::bigint=($2::bigint & 4294967295))",
+    )
+    .bind(publisher)
+    .bind(LOCK)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let replacement = tokio::spawn(async move {
+        Database::foreground_scope(fence.start_new_generation(Replace::Force)).await
+    });
+    let waited = crate::catalog::phase4_tests::wait_for_lock(&pool).await;
+    let waited_for_generation: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid \
+         WHERE a.datname=current_database() AND l.locktype='advisory' AND NOT l.granted \
+         AND l.mode='ExclusiveLock' AND l.objsubid=1 AND $1=ANY(pg_blocking_pids(l.pid)) \
+         AND l.classid::bigint=($2::bigint >> 32) AND l.objid::bigint=($2::bigint & 4294967295))",
+    )
+    .bind(publisher)
+    .bind(LOCK)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    held.release();
+    let published = tokio::time::timeout(Duration::from_secs(15), cover)
+        .await
+        .expect("cover deadlocked with generation replacement")
+        .unwrap()
+        .expect("cover publication failed");
+    tokio::time::timeout(Duration::from_secs(15), replacement)
+        .await
+        .expect("generation replacement deadlocked with cover publication")
+        .unwrap()
+        .expect("generation replacement failed");
+    assert!(
+        shared_before_work,
+        "cover held its work without the shared generation lock"
+    );
+    assert!(waited, "replacement never waited on a PostgreSQL lock");
+    assert!(
+        waited_for_generation,
+        "replacement did not wait for the publisher's generation lock"
+    );
+    assert!(published);
+    assert_ne!(current(&pool).await.unwrap(), generation);
+}
+
+#[tokio::test]
+async fn new_generation_refuses_a_work_added_after_its_work_set_was_locked() {
+    async fn rows(pool: &Database) -> Vec<Value> {
+        let mut rows = Vec::new();
+        for table in [
+            "work",
+            "source_series",
+            "engine_generation",
+            "engine_numeric_state",
+            "engine_manga_key",
+            "engine_chapter_key",
+            "suwayomi_series",
+            "suwayomi_chapter",
+            "suwayomi_progress",
+            "suwayomi_progress_detached",
+            "comments",
+            "user_library",
+            "series_views",
+            "series_admin",
+            "engine_detached_row",
+        ] {
+            rows.push(sqlx::query_scalar::<_, Value>(&format!(
+                "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text),'[]'::jsonb) FROM {table} t"
+            )).fetch_one(pool).await.unwrap());
+        }
+        rows
+    }
+
+    let (pool, covers, engine, client, fence) = setup().await;
+    let pool = pool.foreground();
+    bind(&pool, &client).await;
+    sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES('w_z_initial',now(),now()),('w_a_added',now(),now()); \
+        INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES('ss_initial','w_z_initial','suwayomi','source','7',now()); \
+        INSERT INTO users(id,username,email,password_hash,created_at) VALUES('00000000-0000-0000-0000-000000000001','reader','reader@example.test','hash',now()); \
+        INSERT INTO suwayomi_progress(user_id,chapter_id,series_id,last_page_read,read,updated_at) VALUES('00000000-0000-0000-0000-000000000001','8','7',3,false,now()); \
+        INSERT INTO comments(id,target_type,target_id,user_id,body,created_at) VALUES('00000000-0000-0000-0000-000000000002','chapter','8','00000000-0000-0000-0000-000000000001','kept',now()); \
+        INSERT INTO user_library(user_id,series_id,created_at) VALUES('00000000-0000-0000-0000-000000000001','7',now()); \
+        INSERT INTO series_views(series_key,total,updated_at) VALUES('7',3,now()); \
+        INSERT INTO series_admin(series_id,paused_override,updated_at) VALUES('7',true,now())")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO suwayomi_cover_blob VALUES(7,x'01','now')")
+        .execute(&covers)
+        .await
+        .unwrap();
+    let generation = fence.generation();
+    let marker = engine.data.lock().await.marker.clone();
+    let points = crate::locks::pause_points::PausePoints::default();
+    let held = points.arm("generation-works-locked");
+    let replacing = fence.clone();
+    let mut replacement = tokio::spawn(crate::catalog::guards::TEST_PAUSE.scope(
+        points,
+        async move {
+            Database::foreground_scope(replacing.start_new_generation(Replace::Force)).await
+        },
+    ));
+    tokio::time::timeout(Duration::from_secs(5), held.reached())
+        .await
+        .expect("replacement did not lock the initial work set");
+
+    // Commit a mapping change on a separate writer while the original parents
+    // are locked. Its new parent sorts BEFORE the already locked work.
+    let mut change = pool.begin().await.unwrap();
+    crate::locks::lock_works(&mut change, &["w_a_added"])
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES('ss_added','w_a_added','suwayomi','source','9',now())")
+        .execute(&mut *change).await.unwrap();
+    change.commit().await.unwrap();
+    let mapped: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT DISTINCT work_id FROM ({NUMERIC_WORK}) m ORDER BY work_id"
+    ))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(mapped, ["w_a_added", "w_z_initial"]);
+    let before = rows(&pool).await;
+    let mut added_work = pool.begin().await.unwrap();
+    crate::locks::lock_works(&mut added_work, &["w_a_added"])
+        .await
+        .unwrap();
+    held.release();
+    // A late lock of the rediscovered parent would wait here. The refusal must
+    // finish while that parent remains locked by the other transaction.
+    let outcome = tokio::time::timeout(Duration::from_secs(3), &mut replacement).await;
+    if outcome.is_err() {
+        replacement.abort();
+    }
+    added_work.rollback().await.unwrap();
+    let error = outcome
+        .expect("replacement tried to lock a newly discovered work late")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("start the new generation again"),
+        "{error:#}"
+    );
+    assert_eq!(
+        rows(&pool).await,
+        before,
+        "refusal must roll back every row move and keep counts unchanged"
+    );
+    assert_eq!(fence.generation(), generation);
+    assert_eq!(engine.data.lock().await.marker, marker);
+    let cached: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM suwayomi_cover_blob WHERE manga_id=7")
+            .fetch_one(&covers)
+            .await
+            .unwrap();
+    assert_eq!(cached, 1, "refusal must not purge covers");
+}

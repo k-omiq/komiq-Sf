@@ -69,6 +69,11 @@ These variables configure database connections and file storage paths.
 | `DATABASE_URL`              | `postgres://localhost/komika` | PostgreSQL URL for accounts, libraries and settings. Compose supplies the private `postgres` service and application role. |
 | `COVERS_DATABASE_URL`       | `sqlite://covers.sqlite3`     | SQLite URL for cached cover storage, separate from main database.                                                          |
 | `EXT_ICONS_DIR`             | `/srv/ext-icons`              | Directory on disk where source extension icons are cached.                                                                 |
+| `KOMIKA_BACKGROUND_WRITERS` | `1`                           | Database connections for background jobs. With `1`, every background job writes on one connection, one at a time. A higher number keeps one connection for that and lets the jobs that are safe to overlap use the others. |
+
+Each long background job (a catalogue sync, a source import, a cover crawl) also holds one extra database connection while it runs, to mark that it owns the job. Leave a few spare connections in PostgreSQL for them.
+
+Run one komiq server per database. A second server skips the background jobs the first one runs, but it counts source rate limits on its own, so your sources get twice the requests.
 
 The main database lives in `postgres-data`; covers and other server files live in `server-data`. Use a PostgreSQL dump for account and library backups. Copying the cover file does not back up those records. See [Update and back up](/self-host/update-and-backup).
 
@@ -121,7 +126,7 @@ These variables configure Cloudflare and reverse proxies, services that forward 
 
 ## Scanner and maintenance tasks
 
-Use the admin console's source settings for scan limits and extension subscriptions. Environment settings can also set source rate caps with `SCAN_SOURCE_RATE_LIMITS`, discovery page limits with `SOURCE_SYNC_MAX_PAGES` and update cadence with `EXTENSION_AUTO_UPDATE_INTERVAL_SECONDS`.
+Use the admin console's source settings for scan limits and extension subscriptions. Environment settings can also set source rate caps with `SCAN_SOURCE_RATE_LIMITS` (one cap covers every background fetch from that source), discovery page limits with `SOURCE_SYNC_MAX_PAGES` and update cadence with `EXTENSION_AUTO_UPDATE_INTERVAL_SECONDS`.
 
 The cover cache has separate download, recompression and perceptual-hash controls. Those settings affect the refetchable SQLite cache, not the PostgreSQL backup. For the full environment list, inspect `apps/server/src/config.rs` in the version you run.
 

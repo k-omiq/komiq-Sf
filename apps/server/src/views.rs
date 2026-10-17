@@ -383,6 +383,8 @@ async fn write_batch_once(pool: &Database, views: HashMap<(String, i64), i64>) -
         .bind(n)
         .execute(&mut *tx)
         .await?;
+        #[cfg(test)]
+        crate::catalog::guards::held().await;
     }
     tx.commit().await?;
     Ok(())
@@ -400,7 +402,12 @@ pub fn spawn_flusher(
         "view-flush",
         Duration::from_secs(30),
         shutdown.clone(),
-        move || run_flush_loop(pool.clone(), shutdown.clone()),
+        move || {
+            crate::db::Database::job_scope(
+                crate::database::ParallelJob::ViewFlush,
+                run_flush_loop(pool.clone(), shutdown.clone()),
+            )
+        },
     ))
 }
 
@@ -498,10 +505,19 @@ pub async fn trending_keys(pool: &Database, limit: i64) -> Result<Vec<(String, i
 /// kept forever.
 pub async fn prune_buckets(pool: &Database) -> Result<u64> {
     let cutoff = current_hour() - BUCKET_RETENTION_HOURS;
-    let r = sqlx::query("DELETE FROM series_view_bucket WHERE hour_ts <= $1")
-        .bind(cutoff)
-        .execute(pool)
-        .await?;
+    // Tests retain the statement's locks until the overlapping writer has started.
+    #[cfg(test)]
+    let mut tx = pool.begin().await?;
+    let query = sqlx::query("DELETE FROM series_view_bucket WHERE hour_ts <= $1").bind(cutoff);
+    #[cfg(not(test))]
+    let r = query.execute(pool).await?;
+    #[cfg(test)]
+    let r = query.execute(&mut *tx).await?;
+    #[cfg(test)]
+    {
+        crate::catalog::guards::held().await;
+        tx.commit().await?;
+    }
     Ok(r.rows_affected())
 }
 
@@ -596,6 +612,142 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((rows, total, buckets), (300, 300, 300));
+    }
+
+    #[tokio::test]
+    async fn view_flush_and_gc_prune_the_same_bucket_in_both_orders() {
+        use crate::catalog::phase4_tests::overlap;
+
+        for flush_first in [true, false] {
+            let pool = pool().await.foreground();
+            let old = current_hour() - BUCKET_RETENTION_HOURS - 24;
+            let recent = current_hour();
+            sqlx::query(
+                "INSERT INTO series_views(series_key,total,updated_at) VALUES ('42',7,now())",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            for (hour, views) in [(old, 5_i64), (recent, 2)] {
+                sqlx::query(
+                    "INSERT INTO series_view_bucket(series_key,hour_ts,views) VALUES ('42',$1,$2)",
+                )
+                .bind(hour)
+                .bind(views)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            let flush = move |pool: Database| async move {
+                let buffer = ViewBuffer::new();
+                assert!(buffer.push_at("42", old));
+                assert!(buffer.push_at("42", recent));
+                flush_buffer(&buffer, &pool).await.map(|_| ())
+            };
+            let prune = |pool: Database| async move { prune_buckets(&pool).await.map(|_| ()) };
+            let (a, b) = if flush_first {
+                overlap(&pool, flush, prune).await
+            } else {
+                overlap(&pool, prune, flush).await
+            };
+            a.unwrap();
+            b.unwrap();
+            let total: i64 =
+                sqlx::query_scalar("SELECT total FROM series_views WHERE series_key='42'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(total, 9, "GC never removes all-time views");
+            let rows: Vec<(i64, i64)> = sqlx::query_as(
+                "SELECT hour_ts,views FROM series_view_bucket WHERE series_key='42' ORDER BY hour_ts",
+            ).fetch_all(&pool).await.unwrap();
+            let expected = if flush_first {
+                vec![(recent, 3)]
+            } else {
+                vec![(old, 1), (recent, 3)]
+            };
+            assert_eq!(rows, expected, "flush_first={flush_first}");
+            pool.close().await;
+        }
+    }
+
+    // The generation fixture also provisions an engine and a covers database. Use
+    // the permitted merge fallback here: it moves the same totals and bucket rows.
+    #[tokio::test]
+    async fn view_flush_and_merge_fold_counts_in_both_orders() {
+        use crate::catalog::phase4_tests::{overlap, work};
+
+        for flush_first in [true, false] {
+            let pool = pool().await.foreground();
+            let loser = work(&pool, "view loser").await;
+            let survivor = work(&pool, "view survivor").await;
+            let hour = current_hour();
+            for (key, count) in [(&loser, 5_i64), (&survivor, 7)] {
+                sqlx::query(
+                    "INSERT INTO series_views(series_key,total,updated_at) VALUES ($1,$2,now())",
+                )
+                .bind(key)
+                .bind(count)
+                .execute(&pool)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "INSERT INTO series_view_bucket(series_key,hour_ts,views) VALUES ($1,$2,$3)",
+                )
+                .bind(key)
+                .bind(hour)
+                .bind(count)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            let old = loser.clone();
+            let flush = move |pool: Database| async move {
+                let buffer = ViewBuffer::new();
+                assert!(buffer.push_at(&old, hour));
+                flush_buffer(&buffer, &pool).await.map(|_| ())
+            };
+            let old = loser.clone();
+            let target = survivor.clone();
+            let merge = move |pool: Database| async move {
+                crate::catalog::merge_works(&pool, &old, &target)
+                    .await
+                    .map(|_| ())
+            };
+            let (a, b) = if flush_first {
+                overlap(&pool, flush, merge).await
+            } else {
+                overlap(&pool, merge, flush).await
+            };
+            a.unwrap();
+            b.unwrap();
+            let totals: Vec<(String, i64)> =
+                sqlx::query_as("SELECT series_key,total FROM series_views")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            let buckets: Vec<(String, i64, i64)> =
+                sqlx::query_as("SELECT series_key,hour_ts,views FROM series_view_bucket")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(totals, vec![(survivor.clone(), 13)]);
+            assert_eq!(buckets, vec![(survivor.clone(), hour, 13)]);
+            let retired: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work WHERE id=$1)")
+                .bind(&loser)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert!(!retired);
+            let redirect: String =
+                sqlx::query_scalar("SELECT new_id FROM work_redirect WHERE old_id=$1")
+                    .bind(&loser)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(redirect, survivor);
+            pool.close().await;
+        }
     }
 
     /// Two commit orders of a merge that overlaps a flush which has already found the

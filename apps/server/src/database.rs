@@ -1,4 +1,13 @@
-//! Shared readers, leased background writer, and concurrent foreground writers.
+//! Shared readers, background writer lanes, and concurrent foreground writers.
+//!
+//! Background writes take one of two lanes. The Serial lane is
+//! one connection holding the database-wide session lease, so its writers exclude
+//! each other across handles and processes, as every background write did before M9.
+//! The Parallel lane is a pool without that lease: its jobs overlap each other, the
+//! Serial lane and foreground writers, and rely only on the transaction lock
+//! protocol (`locks.rs`). Only the jobs listed in [`ParallelJob`] take it, inside
+//! [`Database::job_scope`]. `KOMIKA_BACKGROUND_WRITERS` sizes the two lanes together;
+//! with 1 the Parallel lane is the Serial connection.
 pub use crate::sqlite_database::SqliteDatabase;
 #[cfg(test)]
 pub use crate::sqlite_database::SqliteTestPoolOptions;
@@ -17,6 +26,8 @@ use sqlx::{Describe, Either, Error, Execute, Executor, PgPool, Postgres, Transac
 pub struct Database {
     readers: PgPool,
     writer: PgPool,
+    // None when KOMIKA_BACKGROUND_WRITERS is 1: the Parallel lane is `writer`.
+    parallel_writer: Option<PgPool>,
     foreground_writer: PgPool,
     lane: WriteLane,
     deferred: Arc<DeferredWrites>,
@@ -34,7 +45,43 @@ pub struct Database {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WriteLane {
     Background,
+    Parallel,
     Foreground,
+}
+
+/// The background jobs that write on the Parallel lane. Every job not named here
+/// writes on the Serial lane: scanner chapter persistence, spine and ledger,
+/// catalogue sync, merge and dedup, rebuild publication, cover publication, source
+/// sync and ingest, discovery and the rest.
+///
+/// A job joins this list only with pairwise overlap tests (real PostgreSQL lock
+/// overlap, `catalog::phase4_tests::overlap`) against every job that writes the same
+/// tables. The backfill drains of later slices (work provenance W2, the work chapter
+/// list W3a, cover files CF) are added here as their own variants, each with those
+/// tests, and run their passes in [`Database::job_scope`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParallelJob {
+    /// `series_views`, `series_view_bucket` (views.rs).
+    ViewFlush,
+    /// `source_health_bucket` (source_health.rs).
+    SourceHealthFlush,
+    /// Staged comment media, old notifications, old view and health buckets, cover
+    /// blobs (gc.rs).
+    Gc,
+    /// Planner statistics only (db.rs).
+    Analyze,
+    /// `engine_manga_key`, `engine_chapter_key` (engine_keys.rs).
+    EngineKeyBackfill,
+    /// `work_stats` and Browse's mirrored statistics (work_stats.rs).
+    StatsBackfill,
+    /// `chapter.readable_at`, `chapter.external_url` (mangadex.rs).
+    ReadableBackfill,
+    /// `chapter.scanlator` (mangadex.rs).
+    GroupBackfill,
+    /// Exact-media copies, objects and revisions (media_manifest/ingest.rs).
+    MediaIngest,
+    /// Old media revisions and unreferenced objects (media_manifest/store.rs).
+    MediaPrune,
 }
 
 // Shared AppState contains the background handle. Request execution explicitly
@@ -149,6 +196,12 @@ impl Database {
     ) -> Result<Self, Error> {
         let mut limits = crate::config::DatabaseLimits::from_env();
         limits.read_connections = read_connections.max(1);
+        // Test databases keep a Parallel pool so the overlap tests see real overlap.
+        // The one-connection default is covered by tests that pass their own limits.
+        #[cfg(test)]
+        {
+            limits.background_connections = limits.background_connections.max(3);
+        }
         Self::connect_with_limits(options, limits).await
     }
 
@@ -201,8 +254,8 @@ impl Database {
         let DatabaseOptions::Postgres(options) = options.into();
         #[cfg(not(test))]
         let options = *options;
-        // A database-scoped session lease preserves SQLite's writer exclusion
-        // across handles and raw write() callers on the background lane.
+        // The Serial lane: a database-scoped session lease keeps its writers
+        // exclusive across handles, processes and raw write() callers.
         // Lazy/min=0 is essential: idle newly-created connections must not take
         // this lease through after_connect without after_release running.
         let writer = pool_options()
@@ -239,6 +292,24 @@ impl Database {
                 })
             })
             .connect_lazy_with(options.clone());
+        // The Parallel lane: the rest of the background connections, without the
+        // lease. Raw BEGIN callers still get the leftover-transaction rollback.
+        let parallel_writer = (limits.background_connections > 1).then(|| {
+            pool_options()
+                .max_connections(limits.background_connections - 1)
+                .min_connections(0)
+                .acquire_timeout(Duration::from_secs(10))
+                .after_connect(move |connection, _| {
+                    Box::pin(async move { configure_session(connection, limits.background).await })
+                })
+                .after_release(|connection, _| {
+                    Box::pin(async move {
+                        rollback_leftover_transaction(connection).await?;
+                        Ok(true)
+                    })
+                })
+                .connect_lazy_with(options.clone())
+        });
         let foreground_writer = pool_options()
             .max_connections(limits.foreground_connections.max(1))
             .min_connections(0)
@@ -267,7 +338,11 @@ impl Database {
         let readers = match readers {
             Ok(readers) => readers,
             Err(error) => {
-                futures::join!(writer.close(), foreground_writer.close());
+                futures::join!(writer.close(), foreground_writer.close(), async {
+                    if let Some(parallel) = &parallel_writer {
+                        parallel.close().await
+                    }
+                });
                 return Err(error);
             }
         };
@@ -313,6 +388,7 @@ impl Database {
         Ok(Self {
             readers,
             writer,
+            parallel_writer,
             foreground_writer,
             lane: WriteLane::Background,
             deferred,
@@ -363,6 +439,7 @@ impl Database {
     pub fn write(&self) -> &PgPool {
         match WRITE_SCOPE.try_with(|lane| *lane).unwrap_or(self.lane) {
             WriteLane::Background => &self.writer,
+            WriteLane::Parallel => self.parallel_writer.as_ref().unwrap_or(&self.writer),
             WriteLane::Foreground => &self.foreground_writer,
         }
     }
@@ -390,6 +467,14 @@ impl Database {
     /// Deferred work always uses the leased writer, including captured clones.
     pub async fn background_scope<F: std::future::Future>(work: F) -> F::Output {
         WRITE_SCOPE.scope(WriteLane::Background, work).await
+    }
+
+    /// Run one pass of a [`ParallelJob`] on the Parallel lane. Writes of tasks it
+    /// spawns are not covered (task locals do not cross `tokio::spawn`) and take the
+    /// Serial lane, the safe default.
+    /// The job names its lane for the reader of the call site and for tests.
+    pub async fn job_scope<F: std::future::Future>(_job: ParallelJob, work: F) -> F::Output {
+        WRITE_SCOPE.scope(WriteLane::Parallel, work).await
     }
     pub fn connect_options(&self) -> Arc<PgConnectOptions> {
         self.readers.connect_options()
@@ -481,7 +566,12 @@ impl Database {
         futures::join!(
             self.readers.close(),
             self.writer.close(),
-            self.foreground_writer.close()
+            self.foreground_writer.close(),
+            async {
+                if let Some(parallel) = &self.parallel_writer {
+                    parallel.close().await
+                }
+            }
         );
     }
 }
@@ -773,6 +863,120 @@ mod tests {
         probe.close().await.unwrap();
         external.close().await;
         database.close().await;
+    }
+
+    #[tokio::test]
+    async fn parallel_view_flush_bypasses_the_serial_lease_unless_background_has_one_connection() {
+        for background_connections in [3, 1] {
+            let database = Database::connect_with_limits(
+                DatabaseOptions::Disposable,
+                crate::config::DatabaseLimits {
+                    background_connections,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            sqlx::query("CREATE TABLE bg_lane_test(value bigint PRIMARY KEY)")
+                .execute(&database)
+                .await
+                .unwrap();
+            let mut serial = database.background().begin().await.unwrap();
+            sqlx::query("INSERT INTO bg_lane_test VALUES (1)")
+                .execute(&mut *serial)
+                .await
+                .unwrap();
+            let holder: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *serial)
+                .await
+                .unwrap();
+            // A bigint advisory key appears as classid/objid, with objsubid 1.
+            let lease_sql = "SELECT EXISTS(SELECT 1 FROM pg_locks owner \
+                WHERE owner.pid=$1 AND owner.granted AND owner.locktype='advisory' \
+                AND owner.objsubid=1 \
+                AND ((owner.classid::bigint << 32) | owner.objid::bigint)=4930189972093101 \
+                AND owner.database=(SELECT oid FROM pg_database WHERE datname=current_database()))";
+            let leased: bool = sqlx::query_scalar(lease_sql)
+                .bind(holder)
+                .fetch_one(database.read())
+                .await
+                .unwrap();
+            assert!(leased);
+            let writer = database.clone();
+            let (started, starting) = tokio::sync::oneshot::channel();
+            let mut parallel =
+                tokio::spawn(Database::job_scope(ParallelJob::ViewFlush, async move {
+                    started.send(()).unwrap();
+                    let mut tx = writer.begin().await?;
+                    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                        .fetch_one(&mut *tx)
+                        .await?;
+                    let leased: bool = sqlx::query_scalar(lease_sql)
+                        .bind(pid)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                    sqlx::query("INSERT INTO bg_lane_test VALUES (2)")
+                        .execute(&mut *tx)
+                        .await?;
+                    tx.commit().await?;
+                    Ok::<_, sqlx::Error>((pid, leased))
+                }));
+            starting.await.unwrap();
+            if background_connections == 3 {
+                let (pid, leased) = tokio::time::timeout(Duration::from_secs(2), &mut parallel)
+                    .await
+                    .expect("Parallel write waited for the Serial lease")
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(pid, holder);
+                assert!(
+                    !leased,
+                    "Parallel session acquired the Serial session lease"
+                );
+                let leased: bool = sqlx::query_scalar(lease_sql)
+                    .bind(pid)
+                    .fetch_one(database.read())
+                    .await
+                    .unwrap();
+                assert!(!leased);
+                let visible: Vec<i64> =
+                    sqlx::query_scalar("SELECT value FROM bg_lane_test ORDER BY value")
+                        .fetch_all(database.read())
+                        .await
+                        .unwrap();
+                assert_eq!(visible, [2], "Parallel committed before Serial released");
+                serial.commit().await.unwrap();
+            } else {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), &mut parallel)
+                        .await
+                        .is_err(),
+                    "one connection must retain the Serial queue"
+                );
+                let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM bg_lane_test")
+                    .fetch_one(database.read())
+                    .await
+                    .unwrap();
+                assert_eq!(visible, 0);
+                serial.commit().await.unwrap();
+                let (_, leased) = tokio::time::timeout(Duration::from_secs(5), parallel)
+                    .await
+                    .expect("queued write did not resume")
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    leased,
+                    "the one-connection fallback must use the leased lane"
+                );
+            }
+            let rows: Vec<i64> =
+                sqlx::query_scalar("SELECT value FROM bg_lane_test ORDER BY value")
+                    .fetch_all(database.read())
+                    .await
+                    .unwrap();
+            assert_eq!(rows, [1, 2]);
+            database.close().await;
+        }
     }
 
     #[tokio::test]

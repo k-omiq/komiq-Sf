@@ -259,6 +259,8 @@ async fn write_work_stats_once(
     let mut tx = pool.begin().await?;
     let parents: Vec<_> = pending.iter().map(|p| &p.work_id).collect();
     let locked = crate::locks::lock_works(&mut tx, &parents).await?;
+    #[cfg(test)]
+    crate::catalog::guards::held().await;
     let mut pending: Vec<_> = pending.iter().collect();
     pending.sort_by(|a, b| a.work_id.cmp(&b.work_id));
     for p in pending {
@@ -383,7 +385,7 @@ pub fn spawn_stats_backfill(
     client: Arc<MangaDexClient>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    tokio::spawn(async move {
+    let pass = async move {
         if nap(STATS_BACKFILL_BOOT_DELAY, &mut shutdown).await {
             return;
         }
@@ -465,7 +467,11 @@ pub fn spawn_stats_backfill(
                 }
             }
         }
-    });
+    };
+    tokio::spawn(Database::job_scope(
+        crate::database::ParallelJob::StatsBackfill,
+        pass,
+    ));
 }
 
 /// The MangaDex rating to DISPLAY for a page of works, keyed by work id, in ONE `IN` query.
@@ -669,6 +675,176 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    async fn parallel_stats(pool: &Database, work_id: &str) -> Result<StatsFill> {
+        Database::job_scope(crate::database::ParallelJob::StatsBackfill, async {
+            write_work_stats(
+                pool,
+                &[PendingStats {
+                    work_id: work_id.into(),
+                    mangadex_id: Some(U1.into()),
+                }],
+                &HashMap::from([(
+                    U1.into(),
+                    MdStats {
+                        follows: Some(123),
+                        rating: Some(8.25),
+                        rating_avg: Some(8.5),
+                    },
+                )]),
+                "2026-04-01T00:00:00Z",
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn browse_row(pool: &Database, work_id: &str) -> String {
+        sqlx::query_scalar("SELECT row_to_json(b)::text FROM browse_catalogue b WHERE work_id=$1")
+            .bind(work_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn parallel_stats_and_browse_publication_converge_in_both_orders() {
+        use crate::catalog::phase4_tests::{overlap, pool};
+        for stats_first in [true, false] {
+            let pool = pool().await;
+            anchored(&pool, "w_stats_publication", U1, "2026-01-01T00:00:00Z").await;
+            crate::catalog::refresh_browse_catalogue(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE browse_catalogue SET title='Stale' WHERE work_id='w_stats_publication'",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            if stats_first {
+                let points = crate::locks::pause_points::PausePoints::default();
+                let held = points.arm("guard-held");
+                let writer = pool.clone();
+                let stats = tokio::spawn(
+                    crate::catalog::guards::TEST_PAUSE.scope(points, async move {
+                        parallel_stats(&writer, "w_stats_publication").await
+                    }),
+                );
+                tokio::time::timeout(Duration::from_secs(5), held.reached())
+                    .await
+                    .unwrap();
+                // No wait: publication uses SKIP LOCKED and leaves this work for
+                // the next rebuild while the statistics transaction stays open.
+                let rebuilt = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    crate::catalog::refresh_browse_catalogue(&pool),
+                )
+                .await;
+                let title: String = sqlx::query_scalar(
+                    "SELECT title FROM browse_catalogue WHERE work_id='w_stats_publication'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                held.release();
+                rebuilt
+                    .expect("Browse waited on a work it should skip")
+                    .unwrap();
+                assert_eq!(stats.await.unwrap().unwrap().answered, 1);
+                assert_eq!(title, "Stale", "a busy work is a documented clean skip");
+                crate::catalog::refresh_browse_catalogue(&pool)
+                    .await
+                    .unwrap();
+            } else {
+                let (publication, stats) = overlap(
+                    &pool,
+                    |pool| async move { crate::catalog::refresh_browse_catalogue(&pool).await },
+                    |pool| async move { parallel_stats(&pool, "w_stats_publication").await },
+                )
+                .await;
+                publication.unwrap();
+                assert_eq!(stats.unwrap().answered, 1);
+            }
+            let values: (Option<i64>, Option<f64>, Option<i64>, Option<f64>) = sqlx::query_as(
+                "SELECT s.follows,s.rating,b.follows,b.rating FROM work_stats s \
+                 JOIN browse_catalogue b USING(work_id) WHERE work_id='w_stats_publication'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(values, (Some(123), Some(8.25), Some(123), Some(8.25)));
+            let concurrent = browse_row(&pool, "w_stats_publication").await;
+            sqlx::query("UPDATE browse_catalogue SET follows=NULL,rating=NULL WHERE work_id='w_stats_publication'")
+                .execute(&pool).await.unwrap();
+            crate::catalog::refresh_browse_catalogue(&pool)
+                .await
+                .unwrap();
+            assert_eq!(browse_row(&pool, "w_stats_publication").await, concurrent);
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_stats_and_merge_drop_the_losers_stats_in_both_orders() {
+        use crate::catalog::phase4_tests::{overlap, pool, work};
+        for stats_first in [true, false] {
+            let pool = pool().await;
+            anchored(&pool, "w_stats_loser", U1, "2026-01-01T00:00:00Z").await;
+            stats_row(&pool, "w_stats_loser", "2025-01-01T00:00:00Z").await;
+            let winner = work(&pool, "Survivor").await;
+            stats_row(&pool, &winner, "2026-01-01T00:00:00Z").await;
+            let target = winner.clone();
+            let stats =
+                |pool: Database| async move { parallel_stats(&pool, "w_stats_loser").await };
+            let merge = move |pool: Database| async move {
+                crate::catalog::merge_works(&pool, "w_stats_loser", &target).await
+            };
+            let fill = if stats_first {
+                let (stats, merge) = overlap(&pool, stats, merge).await;
+                merge.unwrap();
+                let fill = stats.unwrap();
+                assert_eq!(fill.answered, 1);
+                fill
+            } else {
+                let (merge, stats) = overlap(&pool, merge, stats).await;
+                merge.unwrap();
+                let fill = stats.unwrap();
+                assert_eq!(
+                    fill.unanswered, 1,
+                    "a merged-away pending parent is skipped"
+                );
+                fill
+            };
+            assert_eq!(fill.fetched, 1);
+            let retired: (i64, i64, i64) = sqlx::query_as(
+                "SELECT (SELECT COUNT(*) FROM work WHERE id='w_stats_loser'), \
+                        (SELECT COUNT(*) FROM work_stats WHERE work_id='w_stats_loser'), \
+                        (SELECT COUNT(*) FROM browse_catalogue WHERE work_id='w_stats_loser')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(retired, (0, 0, 0));
+            let owner: String =
+                sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key=$1")
+                    .bind(U1)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(owner, winner);
+            let survivor: (Option<i64>, Option<f64>) =
+                sqlx::query_as("SELECT follows,rating FROM work_stats WHERE work_id=$1")
+                    .bind(&winner)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                survivor,
+                (Some(1), Some(1.0)),
+                "merge cascades the loser; it keeps the survivor's stats"
+            );
+        }
     }
 
     /// The work-list order: never-fetched first (oldest anchor first, a twice-anchored work

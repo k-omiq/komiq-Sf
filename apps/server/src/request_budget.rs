@@ -675,29 +675,6 @@ pub(crate) fn validate_fragment_expansion(
     Ok(())
 }
 
-/// A cancelled request must not strand a process-global maintenance flag. It can
-/// also move into a background task, keeping kickoff errors and task panics safe.
-pub(crate) struct RunningGuard<T: std::ops::Deref<Target = std::sync::atomic::AtomicBool>>(T);
-
-impl<T: std::ops::Deref<Target = std::sync::atomic::AtomicBool>> RunningGuard<T> {
-    pub(crate) fn try_acquire(flag: T) -> Option<Self> {
-        flag.compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-        )
-        .ok()
-        .map(|_| Self(flag))
-    }
-}
-
-impl<T: std::ops::Deref<Target = std::sync::atomic::AtomicBool>> Drop for RunningGuard<T> {
-    fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1417,8 +1394,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancellation_releases_single_flight_guard_and_admission() {
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    async fn cancellation_releases_admission() {
+        // A cancelled request gives its admission permit back.
         let permits = Arc::new(Semaphore::new(1));
         let lease = Lease {
             _held: None,
@@ -1426,15 +1403,10 @@ mod tests {
             timeout: Duration::from_secs(1),
             deadline: None,
         };
-        let flag_for_request = flag.clone();
         let response = lease
-            .run(async move {
-                let _running = RunningGuard::try_acquire(flag_for_request).unwrap();
-                std::future::pending::<Response>().await
-            })
+            .run(async move { std::future::pending::<Response>().await })
             .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(permits.available_permits(), 1);
     }
 

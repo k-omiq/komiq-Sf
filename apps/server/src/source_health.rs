@@ -390,6 +390,8 @@ async fn persist_buffer(pool: &Database, drained: HashMap<Key, Entry>) -> Result
         .bind(crate::db_types::date(&e.last_at)?)
         .execute(&mut *tx)
         .await?;
+        #[cfg(test)]
+        crate::catalog::guards::held().await;
     }
     tx.commit().await?;
     Ok(n)
@@ -405,7 +407,12 @@ pub fn spawn_flusher(
         "source-health-flush",
         Duration::from_secs(30),
         shutdown.clone(),
-        move || run_flush_loop(pool.clone(), shutdown.clone()),
+        move || {
+            crate::db::Database::job_scope(
+                crate::database::ParallelJob::SourceHealthFlush,
+                run_flush_loop(pool.clone(), shutdown.clone()),
+            )
+        },
     ))
 }
 
@@ -433,10 +440,19 @@ async fn run_flush_loop(pool: Database, mut shutdown: tokio::sync::watch::Receiv
 /// Delete buckets past [`BUCKET_RETENTION_HOURS`]. Called by the GC sweep.
 pub async fn prune_buckets(pool: &Database) -> Result<u64> {
     let cutoff = chrono::Utc::now().timestamp() / 3600 - BUCKET_RETENTION_HOURS;
-    let r = sqlx::query("DELETE FROM source_health_bucket WHERE hour_ts <= $1")
-        .bind(cutoff)
-        .execute(pool)
-        .await?;
+    // Tests retain the statement's locks until the overlapping writer has started.
+    #[cfg(test)]
+    let mut tx = pool.begin().await?;
+    let query = sqlx::query("DELETE FROM source_health_bucket WHERE hour_ts <= $1").bind(cutoff);
+    #[cfg(not(test))]
+    let r = query.execute(pool).await?;
+    #[cfg(test)]
+    let r = query.execute(&mut *tx).await?;
+    #[cfg(test)]
+    {
+        crate::catalog::guards::held().await;
+        tx.commit().await?;
+    }
     Ok(r.rows_affected())
 }
 
@@ -529,6 +545,69 @@ mod tests {
         );
         // …and a chapter number is not a status.
         assert_eq!(upstream_status("http error at chapter 404"), None);
+    }
+
+    #[tokio::test]
+    async fn source_health_flush_and_gc_prune_the_same_bucket_in_both_orders() {
+        use crate::catalog::phase4_tests::{overlap, pool};
+
+        for flush_first in [true, false] {
+            let pool = pool().await;
+            let recent = chrono::Utc::now().timestamp() / 3600;
+            let old = recent - BUCKET_RETENTION_HOURS - 24;
+            let before = "2020-01-01T00:00:00Z";
+            let after = "2020-01-02T00:00:00Z";
+            for (hour, count) in [(old, 5_i64), (recent, 2)] {
+                sqlx::query("INSERT INTO source_health_bucket(source_id,surface,hour_ts,reason,count,last_message,last_at) VALUES ('src-a','pages',$1,'ok',$2,'before',$3)")
+                    .bind(hour).bind(count).bind(crate::db_types::date(before).unwrap())
+                    .execute(&pool).await.unwrap();
+            }
+            let flush = move |pool: Database| async move {
+                let buffer = Buffer::new();
+                for hour in [old, recent] {
+                    buffer.lock().insert(
+                        (
+                            SubjectKey::Source("src-a".into()),
+                            Surface::Pages,
+                            hour,
+                            REASON_OK,
+                        ),
+                        Entry {
+                            count: 1,
+                            last_message: Some("after".into()),
+                            last_at: after.into(),
+                        },
+                    );
+                }
+                flush_buffer(&buffer, &pool).await.map(|_| ())
+            };
+            let prune = |pool: Database| async move { prune_buckets(&pool).await.map(|_| ()) };
+            let (a, b) = if flush_first {
+                overlap(&pool, flush, prune).await
+            } else {
+                overlap(&pool, prune, flush).await
+            };
+            a.unwrap();
+            b.unwrap();
+            let rows: Vec<(String, String, i64, String, i64, Option<String>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+                "SELECT source_id,surface,hour_ts,reason,count,last_message,last_at FROM source_health_bucket ORDER BY hour_ts",
+            ).fetch_all(&pool).await.unwrap();
+            let expected = if flush_first {
+                vec![(recent, 3)]
+            } else {
+                vec![(old, 1), (recent, 3)]
+            };
+            assert_eq!(rows.len(), expected.len());
+            for (row, (hour, count)) in rows.into_iter().zip(expected) {
+                assert_eq!(
+                    (row.0.as_str(), row.1.as_str(), row.2, row.3.as_str(), row.4),
+                    ("src-a", "pages", hour, "ok", count)
+                );
+                assert_eq!(row.5.as_deref(), Some("after"));
+                assert_eq!(row.6, crate::db_types::date(after).unwrap());
+            }
+            pool.close().await;
+        }
     }
 
     #[tokio::test]

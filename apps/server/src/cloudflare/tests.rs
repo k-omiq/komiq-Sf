@@ -1330,7 +1330,7 @@ async fn graphql_is_admin_only_and_drives_a_setup() {
         session_ttl_secs: 3600,
         series_inflight: KeyedLocks::default(),
         chapters_inflight: KeyedLocks::default(),
-        cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        source_budgets: Default::default(),
         catalogue_cover_phash: false,
         ext_icons_dir: std::path::PathBuf::new(),
         media_manifests: None,

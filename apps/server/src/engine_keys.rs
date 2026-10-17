@@ -284,6 +284,8 @@ async fn capture_snapshot(
         &crate::series_cache::series_publication_keys(&manga.id.to_string()),
     )
     .await?;
+    #[cfg(test)]
+    crate::catalog::guards::held().await;
     if publication_changed_on(&mut tx, manga.id, snapshot).await? {
         tx.rollback().await?;
         return Ok(());
@@ -607,7 +609,12 @@ pub fn spawn(pool: Database, engine: SuwayomiClient, shutdown: watch::Receiver<b
         "engine-key-backfill",
         Duration::from_secs(30),
         shutdown.clone(),
-        move || run_loop(pool.clone(), engine.clone(), shutdown.clone()),
+        move || {
+            crate::db::Database::job_scope(
+                crate::database::ParallelJob::EngineKeyBackfill,
+                run_loop(pool.clone(), engine.clone(), shutdown.clone()),
+            )
+        },
     ));
 }
 
@@ -726,6 +733,166 @@ mod tests {
         .fetch_all(pool)
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn parallel_key_backfill_and_chapter_replacement_overlap_in_both_orders() {
+        use crate::catalog::phase4_tests::{overlap, pool};
+        for backfill_first in [true, false] {
+            let pool = pool().await;
+            crate::series_cache::put_series(&pool, &manga(7))
+                .await
+                .unwrap();
+            let mut cached = chapter(8, 7);
+            cached.url = None;
+            crate::series_cache::put_chapters(&pool, 7, &[cached])
+                .await
+                .unwrap();
+            let engine = testsrv::spawn_status(
+                200,
+                "application/json",
+                json!({"data": {
+                    "manga": manga_json(7), "chapters": {"nodes": [chapter_json(8, 7)]}
+                }})
+                .to_string()
+                .into_bytes(),
+                Duration::ZERO,
+            )
+            .await;
+            let engine_client = client(&engine);
+            let backfill = move |pool: Database| async move {
+                Database::job_scope(crate::database::ParallelJob::EngineKeyBackfill, async {
+                    backfill_tick(&pool, &engine_client, &mut None).await
+                })
+                .await
+            };
+            let replacement = |pool: Database| async move {
+                let mut newer = chapter(9, 7);
+                newer.manga = Some(ChapterManga {
+                    source_id: "source".into(),
+                    url: "/manga/7".into(),
+                    real_url: Some("https://example.org/new/manga/7".into()),
+                    title: "Scanner title".into(),
+                });
+                crate::series_cache::put_chapters(&pool, 7, &[newer]).await
+            };
+            let (a, b) = if backfill_first {
+                overlap(&pool, backfill, replacement).await
+            } else {
+                overlap(&pool, replacement, backfill).await
+            };
+            a.unwrap();
+            b.unwrap();
+            // A later scanner list wins. An older engine read is skipped when it
+            // waited for that list, including a request made before its commit.
+            let keys: Vec<(i64, i64, String)> = sqlx::query_as(
+                "SELECT chapter_id,manga_id,chapter_key FROM engine_chapter_key ORDER BY chapter_id",
+            ).fetch_all(&pool).await.unwrap();
+            assert_eq!(keys, vec![(9, 7, "/chapter/9".into())]);
+            let cached: Vec<i64> =
+                sqlx::query_scalar("SELECT id FROM suwayomi_chapter ORDER BY id")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(cached, vec![9]);
+            let parent: (String, String, String, String) =
+                sqlx::query_as("SELECT source_id,manga_key,title,web_url FROM engine_manga_key")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                parent,
+                (
+                    "source".into(),
+                    "/manga/7".into(),
+                    "Scanner title".into(),
+                    "https://example.org/new/manga/7".into(),
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_key_backfill_is_fenced_by_a_generation_transition() {
+        use crate::catalog::phase4_tests::{overlap, pool};
+        use crate::engine_generation::{Fence, FenceError, Replace};
+        let pool = pool().await;
+        let covers = crate::database::SqliteTestPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TABLE suwayomi_cover_blob(manga_id INTEGER PRIMARY KEY,webp BLOB,updated_at TEXT); CREATE TABLE cover_variant(asset_key TEXT,width INTEGER,webp BLOB)")
+            .execute(&covers).await.unwrap();
+        let engine = crate::engine_generation::tests::MockEngine::spawn().await;
+        let mut engine_client = SuwayomiClient::new(engine.url.clone(), None, None);
+        let fence = Fence::attach(&pool, &covers, &mut engine_client)
+            .await
+            .unwrap();
+        let old = fence.generation().unwrap();
+        let (m, mut chapters) = engine_client.cached_series_and_chapters(7).await.unwrap();
+        assert_eq!(m.engine_generation, Some(old.to_string()));
+        crate::series_cache::put_series(&pool, &m).await.unwrap();
+        chapters[0].url = None;
+        crate::series_cache::put_chapters(&pool, 7, &chapters)
+            .await
+            .unwrap();
+        let transition = fence.clone();
+        let (backfill, replaced) = overlap(
+            &pool,
+            move |pool| async move {
+                Database::job_scope(crate::database::ParallelJob::EngineKeyBackfill, async {
+                    backfill_tick(&pool, &engine_client, &mut None).await
+                })
+                .await
+            },
+            move |_| async move { transition.start_new_generation(Replace::Force).await },
+        )
+        .await;
+        // Recovery blocks the in-process gate before waiting for its exclusive
+        // generation lock. The old pass may therefore be cleanly refused at commit.
+        if let Err(e) = backfill {
+            assert_eq!(
+                e.downcast_ref::<FenceError>(),
+                Some(&FenceError::Unavailable)
+            );
+        }
+        replaced.unwrap();
+        let new = fence.generation().unwrap();
+        assert_ne!(old, new);
+        fence.wait().await.unwrap();
+        let misplaced: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM engine_manga_key WHERE generation=$1) \
+                  + (SELECT COUNT(*) FROM engine_chapter_key WHERE generation=$1)",
+        )
+        .bind(new)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            misplaced, 0,
+            "an old pass cannot publish keys in the new generation"
+        );
+        let stale = Database::job_scope(crate::database::ParallelJob::EngineKeyBackfill, async {
+            capture_snapshot(
+                &pool,
+                &m,
+                &chapters,
+                &publication_snapshot(&pool).await.unwrap(),
+            )
+            .await
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            stale.downcast_ref::<FenceError>(),
+            Some(&FenceError::Unavailable)
+        );
+        let cached: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM suwayomi_series")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(cached, 0);
     }
 
     #[tokio::test]

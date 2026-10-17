@@ -163,105 +163,130 @@ pub(crate) async fn publish(
     pages: &[CollectedPage],
 ) -> Result<(String, Option<i32>)> {
     let page_count = i32::try_from(pages.len()).context("too many manifest pages")?;
-    let mut tx = pool.begin().await?;
-    crate::engine_generation::shared(&mut tx, generation).await?;
-    sqlx::query(
-        "INSERT INTO media_copy (id, source_id, manga_key, chapter_key, created_at) \
-         VALUES ($1,$2,$3,$4,now()) ON CONFLICT (source_id,manga_key,chapter_key) DO NOTHING",
-    )
-    .bind(format!("mc_{}", uuid::Uuid::new_v4().simple()))
-    .bind(&identity.source_id)
-    .bind(&identity.manga_key)
-    .bind(&identity.chapter_key)
-    .execute(&mut *tx)
-    .await?;
-    let copy: String = sqlx::query_scalar(
-        "SELECT id FROM media_copy WHERE source_id=$1 AND manga_key=$2 AND chapter_key=$3 FOR UPDATE",
-    )
-    .bind(&identity.source_id)
-    .bind(&identity.manga_key)
-    .bind(&identity.chapter_key)
-    .fetch_one(&mut *tx)
-    .await?;
-    let copy_id = copy.as_str();
-    let mut policy_epoch = crate::media_policy::hold_epoch(&mut tx).await?;
-    if let Some(epoch) = crate::media_policy::inherit_for_copy(&mut tx, copy_id).await? {
-        policy_epoch = epoch;
-    }
-    let previous: Option<(i32, bool)> = sqlx::query_as(
-        "SELECT revision,stale FROM media_manifest WHERE copy_id=$1 ORDER BY revision DESC LIMIT 1",
-    )
-    .bind(copy_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some((rev, false)) = previous {
-        let hashes: Vec<Vec<u8>> = sqlx::query_scalar(
-            "SELECT sha256 FROM media_manifest_page WHERE copy_id=$1 AND revision=$2 ORDER BY idx",
+    crate::db::retry_transaction(|| async {
+        // Lock order: shared generation, copy FOR UPDATE, policy epoch FOR SHARE,
+        // then objects in sha256 order (inserts and FOR KEY SHARE).
+        let mut tx = pool.begin().await?;
+        crate::engine_generation::shared(&mut tx, generation).await?;
+        sqlx::query(
+            "INSERT INTO media_copy (id, source_id, manga_key, chapter_key, created_at) \
+             VALUES ($1,$2,$3,$4,now()) ON CONFLICT (source_id,manga_key,chapter_key) DO NOTHING",
+        )
+        .bind(format!("mc_{}", uuid::Uuid::new_v4().simple()))
+        .bind(&identity.source_id)
+        .bind(&identity.manga_key)
+        .bind(&identity.chapter_key)
+        .execute(&mut *tx)
+        .await?;
+        let copy: String = sqlx::query_scalar(
+            "SELECT id FROM media_copy WHERE source_id=$1 AND manga_key=$2 AND chapter_key=$3 FOR UPDATE",
+        )
+        .bind(&identity.source_id)
+        .bind(&identity.manga_key)
+        .bind(&identity.chapter_key)
+        .fetch_one(&mut *tx)
+        .await?;
+        let copy_id = copy.as_str();
+        let mut policy_epoch = crate::media_policy::hold_epoch(&mut tx).await?;
+        if let Some(epoch) = crate::media_policy::inherit_for_copy(&mut tx, copy_id).await? {
+            policy_epoch = epoch;
+        }
+        let previous: Option<(i32, bool)> = sqlx::query_as(
+            "SELECT revision,stale FROM media_manifest WHERE copy_id=$1 ORDER BY revision DESC LIMIT 1",
         )
         .bind(copy_id)
-        .bind(rev)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((rev, false)) = previous {
+            let hashes: Vec<Vec<u8>> = sqlx::query_scalar(
+                "SELECT sha256 FROM media_manifest_page WHERE copy_id=$1 AND revision=$2 ORDER BY idx",
+            )
+            .bind(copy_id)
+            .bind(rev)
+            .fetch_all(&mut *tx)
+            .await?;
+            if hashes.iter().eq(pages.iter().map(|p| &p.sha256)) {
+                tx.commit().await?;
+                return Ok((copy, None));
+            }
+        }
+        let rev = previous
+            .map_or(0, |(rev, _)| rev)
+            .checked_add(1)
+            .context("manifest revision overflow")?;
+        let mut objects: Vec<_> = pages.iter().collect();
+        objects.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+        objects.dedup_by(|a, b| a.sha256 == b.sha256);
+        for page in &objects {
+            sqlx::query(
+                "INSERT INTO media_object (sha256,byte_length,mime,width,height,first_seen) \
+                 VALUES ($1,$2,$3,$4,$5,now()) ON CONFLICT DO NOTHING",
+            )
+            .bind(&page.sha256)
+            .bind(page.length)
+            .bind(&page.mime)
+            .bind(page.width)
+            .bind(page.height)
+            .execute(&mut *tx)
+            .await?;
+        }
+        #[cfg(test)]
+        crate::catalog::guards::pause("media-objects-inserted").await;
+        let hashes: Vec<_> = objects.iter().map(|page| page.sha256.clone()).collect();
+        let locked: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT sha256 FROM media_object WHERE sha256 = ANY($1) ORDER BY sha256 FOR KEY SHARE",
+        )
+        .bind(&hashes)
         .fetch_all(&mut *tx)
         .await?;
-        if hashes.iter().eq(pages.iter().map(|p| &p.sha256)) {
-            tx.commit().await?;
-            return Ok((copy, None));
+        // DO NOTHING does not lock an existing orphan; prune may have removed it.
+        if locked.len() != hashes.len() {
+            return Err(crate::locks::RestartTransaction.into());
         }
-    }
-    let rev = previous
-        .map_or(0, |(rev, _)| rev)
-        .checked_add(1)
-        .context("manifest revision overflow")?;
-    // Stable lock order for objects shared by simultaneous chapter ingests.
-    let mut objects: Vec<_> = pages.iter().collect();
-    objects.sort_by(|a, b| a.sha256.cmp(&b.sha256));
-    objects.dedup_by(|a, b| a.sha256 == b.sha256);
-    for page in objects {
+        #[cfg(test)]
+        crate::catalog::guards::pause("media-objects-locked").await;
+        if let Some((previous, _)) = previous {
+            sqlx::query(
+                "UPDATE media_manifest SET superseded_at=now() WHERE copy_id=$1 AND revision=$2",
+            )
+            .bind(copy_id)
+            .bind(previous)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // The epoch the revision is signed at: a lease older than it cannot vouch for it.
         sqlx::query(
-            "INSERT INTO media_object (sha256,byte_length,mime,width,height,first_seen) \
-             VALUES ($1,$2,$3,$4,$5,now()) ON CONFLICT DO NOTHING",
-        )
-        .bind(&page.sha256)
-        .bind(page.length)
-        .bind(&page.mime)
-        .bind(page.width)
-        .bind(page.height)
-        .execute(&mut *tx)
-        .await?;
-    }
-    if let Some((previous, _)) = previous {
-        sqlx::query(
-            "UPDATE media_manifest SET superseded_at=now() WHERE copy_id=$1 AND revision=$2",
-        )
-        .bind(copy_id)
-        .bind(previous)
-        .execute(&mut *tx)
-        .await?;
-    }
-    // The epoch the revision is signed at: a lease older than it cannot vouch for it.
-    sqlx::query(
-        "INSERT INTO media_manifest (copy_id,revision,page_count,policy_epoch,created_at) \
-         VALUES ($1,$2,$3,$4,now())",
-    )
-    .bind(copy_id)
-    .bind(rev)
-    .bind(page_count)
-    .bind(policy_epoch)
-    .execute(&mut *tx)
-    .await?;
-    for (idx, page) in pages.iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO media_manifest_page (copy_id,revision,idx,sha256) VALUES ($1,$2,$3,$4)",
+            "INSERT INTO media_manifest (copy_id,revision,page_count,policy_epoch,created_at) \
+             VALUES ($1,$2,$3,$4,now())",
         )
         .bind(copy_id)
         .bind(rev)
-        .bind(idx as i32)
-        .bind(&page.sha256)
+        .bind(page_count)
+        .bind(policy_epoch)
         .execute(&mut *tx)
         .await?;
-    }
-    crate::engine_generation::commit_ready(pool)?;
-    tx.commit().await?;
-    Ok((copy, Some(rev)))
+        for (idx, page) in pages.iter().enumerate() {
+            if let Err(error) = sqlx::query(
+                "INSERT INTO media_manifest_page (copy_id,revision,idx,sha256) VALUES ($1,$2,$3,$4)",
+            )
+            .bind(copy_id)
+            .bind(rev)
+            .bind(idx as i32)
+            .bind(&page.sha256)
+            .execute(&mut *tx)
+            .await
+            {
+                if error.as_database_error().and_then(|e| e.code()).as_deref() == Some("23503") {
+                    return Err(crate::locks::RestartTransaction.into());
+                }
+                return Err(error.into());
+            }
+        }
+        crate::engine_generation::commit_ready(pool)?;
+        tx.commit().await?;
+        Ok((copy, Some(rev)))
+    })
+    .await
 }
 
 pub(crate) async fn mark_stale(pool: &Database, copy_id: &str, revision: i32) -> Result<()> {
@@ -335,6 +360,7 @@ pub(crate) async fn prune(pool: &Database) -> Result<()> {
          DELETE FROM media_manifest_page p USING gone g \
          WHERE p.copy_id=g.copy_id AND p.revision=g.revision",
     ).execute(pool).await?;
+    // Publishing holds FOR KEY SHARE on its objects, so skip them until commit.
     sqlx::query(
         "DELETE FROM media_object WHERE sha256 IN (SELECT o.sha256 FROM media_object o \
          WHERE NOT EXISTS (SELECT 1 FROM media_manifest_page p WHERE p.sha256=o.sha256) \

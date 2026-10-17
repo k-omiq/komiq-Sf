@@ -1102,7 +1102,12 @@ pub fn spawn_analyze(pool: Database, shutdown: tokio::sync::watch::Receiver<bool
         "analyze",
         Duration::from_secs(60),
         shutdown.clone(),
-        move || analyze_loop(pool.clone(), shutdown.clone()),
+        move || {
+            Database::job_scope(
+                crate::database::ParallelJob::Analyze,
+                analyze_loop(pool.clone(), shutdown.clone()),
+            )
+        },
     ));
 }
 
@@ -1157,6 +1162,146 @@ async fn refresh_statistics(pool: &Database) {
 #[cfg(test)]
 mod boot_tests {
     use super::*;
+
+    async fn analyze_notification_fixture(pool: &Database) -> uuid::Uuid {
+        assert!(ANALYZE_TABLES.contains(&"notifications"));
+        let user = uuid::Uuid::new_v4();
+        let notification = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO users(id,username,email,password_hash,created_at) VALUES ($1,$2,$3,'unused',now())")
+            .bind(user).bind(user.to_string()).bind(format!("{user}@example.test"))
+            .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO notifications(id,user_id,kind,count,created_at) VALUES ($1,$2,'reply',1,now())")
+            .bind(notification).bind(user).execute(pool).await.unwrap();
+        notification
+    }
+
+    #[tokio::test]
+    async fn analyze_does_not_wait_for_an_open_row_writer() {
+        let pool = Database::connect("sqlite::memory:")
+            .await
+            .unwrap()
+            .foreground();
+        let id = analyze_notification_fixture(&pool).await;
+        let mut writer = pool.begin().await.unwrap();
+        sqlx::query("UPDATE notifications SET count=count+1 WHERE id=$1")
+            .bind(id)
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        // No wait: ANALYZE's ShareUpdateExclusiveLock is compatible with the open
+        // writer's RowExclusiveLock. It samples the prior committed row version.
+        let analyzed = tokio::time::timeout(
+            Duration::from_secs(2),
+            sqlx::query("ANALYZE public.\"notifications\"").execute(&pool),
+        )
+        .await;
+        writer.commit().await.unwrap();
+        analyzed
+            .expect("ANALYZE waited for the row writer")
+            .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count FROM notifications WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn row_writer_does_not_wait_for_a_running_analyze() {
+        let pool = Database::connect("sqlite::memory:")
+            .await
+            .unwrap()
+            .foreground();
+        let id = analyze_notification_fixture(&pool).await;
+        // ANALYZE evaluates expression indexes on sampled rows. Gate that evaluation
+        // in this test's session so the actual ANALYZE statement stays in flight
+        // while holding its table lock; no table-size or timing race is needed.
+        sqlx::raw_sql(
+            "CREATE FUNCTION bg_analyze_sample(value uuid) RETURNS uuid \
+             LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN \
+               IF current_setting('komika.ov1_analyze', true) = 'on' THEN \
+                 PERFORM pg_advisory_xact_lock(4930189972093102::bigint); \
+               END IF; RETURN value; END $$; \
+             CREATE INDEX bg_analyze_sample_idx ON notifications (bg_analyze_sample(id))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut gate = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(4930189972093102::bigint)")
+            .execute(&mut *gate)
+            .await
+            .unwrap();
+        let analyzer = pool.clone();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let analyze = tokio::spawn(async move {
+            let mut tx = analyzer.begin().await?;
+            sqlx::query("SELECT set_config('komika.ov1_analyze', 'on', true)")
+                .execute(&mut *tx)
+                .await?;
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *tx)
+                .await?;
+            started.send(pid).unwrap();
+            sqlx::query("ANALYZE public.\"notifications\"")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await
+        });
+        let pid = running.await.unwrap();
+        let active = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let sampling: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid \
+                     WHERE a.pid=$1 AND a.state='active' AND a.query LIKE 'ANALYZE%' \
+                     AND a.wait_event_type='Lock' AND a.wait_event='advisory' \
+                     AND l.locktype='relation' AND l.relation='public.notifications'::regclass \
+                     AND l.mode='ShareUpdateExclusiveLock' AND l.granted)",
+                ).bind(pid).fetch_one(&pool).await.unwrap();
+                if sampling {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if active.is_err() {
+            gate.rollback().await.unwrap();
+            analyze.await.unwrap().unwrap();
+            panic!("ANALYZE never reached sampling with its real table lock held");
+        }
+        // No wait: a row writer can commit while ANALYZE still holds that lock.
+        let written = tokio::time::timeout(
+            Duration::from_secs(2),
+            sqlx::query("UPDATE notifications SET count=count+1 WHERE id=$1")
+                .bind(id)
+                .execute(&pool),
+        )
+        .await;
+        assert!(!analyze.is_finished());
+        gate.commit().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), analyze)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            written
+                .expect("row writer waited for ANALYZE")
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        let count: i64 = sqlx::query_scalar("SELECT count FROM notifications WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        pool.close().await;
+    }
 
     #[tokio::test]
     async fn main_pool_uses_postgres_native_types_and_utc_on_both_lanes() {

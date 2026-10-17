@@ -68,7 +68,12 @@ pub fn spawn(pool: Database, covers: SqliteDatabase, shutdown: tokio::sync::watc
         "gc",
         Duration::from_secs(30),
         shutdown.clone(),
-        move || run_loop(pool.clone(), covers.clone(), shutdown.clone()),
+        move || {
+            crate::db::Database::job_scope(
+                crate::database::ParallelJob::Gc,
+                run_loop(pool.clone(), covers.clone(), shutdown.clone()),
+            )
+        },
     ));
 }
 
@@ -153,11 +158,20 @@ async fn sweep(pool: &Database, shutdown: &tokio::sync::watch::Receiver<bool>) {
 /// One statement, one implicit transaction: delete the staged media older than `cutoff`
 /// that no other transaction holds (see [`STAGED_MEDIA_SWEEP_SQL`]).
 async fn sweep_staged_media(pool: &Database, cutoff: &str) -> Result<u64, sqlx::Error> {
-    Ok(sqlx::query(STAGED_MEDIA_SWEEP_SQL)
-        .bind(crate::db_types::date(cutoff).expect("internally generated UTC timestamp"))
-        .execute(pool)
-        .await?
-        .rows_affected())
+    #[cfg(test)]
+    let mut tx = pool.begin().await?;
+    let query = sqlx::query(STAGED_MEDIA_SWEEP_SQL)
+        .bind(crate::db_types::date(cutoff).expect("internally generated UTC timestamp"));
+    #[cfg(not(test))]
+    let result = query.execute(pool).await?;
+    #[cfg(test)]
+    let result = query.execute(&mut *tx).await?;
+    #[cfg(test)]
+    {
+        crate::catalog::guards::held().await;
+        tx.commit().await?;
+    }
+    Ok(result.rows_affected())
 }
 
 pub(crate) async fn prune_read_notifications(
@@ -185,6 +199,8 @@ pub(crate) async fn prune_read_notifications(
                 .bind(NOTIFICATION_DELETE_BATCH as i64)
                 .execute(&mut *tx)
                 .await?;
+            #[cfg(test)]
+            crate::catalog::guards::held().await;
             tx.commit().await?;
             Ok(result.rows_affected())
         })
@@ -941,6 +957,316 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining, 1);
+    }
+
+    async fn social_gc_fixture(pool: &Database) -> (String, uuid::Uuid) {
+        let user = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users(id,username,email,password_hash,created_at) VALUES ($1,$2,$3,'unused',now())")
+            .bind(crate::db_types::uuid(&user).unwrap()).bind(&user).bind(format!("{user}@example.test"))
+            .execute(pool).await.unwrap();
+        let media = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO comment_media(id,user_id,webp,width,height,created_at) VALUES ($1,$2,decode('00','hex'),1,1,'2020-01-01')")
+            .bind(media).bind(crate::db_types::uuid(&user).unwrap()).execute(pool).await.unwrap();
+        (user, media)
+    }
+
+    async fn social_schema(pool: &Database, user: &str) -> crate::graphql::ApiSchema {
+        use crate::graphql::{AppState, RateLimiter};
+        use std::sync::Arc;
+
+        sqlx::query("INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES ($1,$2,now(),now()+interval '1 day')")
+            .bind(crate::auth::hash_token("ov1-token")).bind(crate::db_types::uuid(user).unwrap())
+            .execute(pool).await.unwrap();
+        crate::graphql::build_schema(
+            Arc::new(AppState {
+                pool: pool.foreground(),
+                cover_pool: SqliteDatabase::connect("sqlite::memory:").await.unwrap(),
+                suwayomi: crate::suwayomi::SuwayomiClient::new(
+                    "http://127.0.0.1:1".into(),
+                    None,
+                    None,
+                ),
+                mangadex: Arc::new(crate::mangadex::MangaDexClient::new("test-ua", 5.0, 40.0)),
+                admin_users: vec![],
+                scan_health: Default::default(),
+                auth_limiter: RateLimiter::new(100, 60),
+                comment_limiter: crate::graphql::comment_limiter(),
+                rating_limiter: crate::graphql::rating_limiter(),
+                password_work: Arc::new(tokio::sync::Semaphore::new(4)),
+                federated_limiter: RateLimiter::new(100, 60),
+                session_ttl_secs: 30 * 24 * 60 * 60,
+                series_inflight: Default::default(),
+                chapters_inflight: Default::default(),
+                source_budgets: Default::default(),
+                catalogue_cover_phash: false,
+                ext_icons_dir: Default::default(),
+                media_manifests: None,
+                policy: Default::default(),
+                setup_code: Default::default(),
+            }),
+            false,
+        )
+    }
+
+    async fn social_mutation(
+        schema: &crate::graphql::ApiSchema,
+        query: String,
+    ) -> async_graphql::Response {
+        Database::foreground_scope(
+            schema.execute(
+                async_graphql::Request::new(query)
+                    .data(crate::graphql::RequestAuth(Some("ov1-token".into())))
+                    .data(crate::graphql::ClientIp(Some("127.0.0.1".into()))),
+            ),
+        )
+        .await
+    }
+
+    async fn post_staged_media(
+        schema: &crate::graphql::ApiSchema,
+        work: &str,
+        media: uuid::Uuid,
+    ) -> anyhow::Result<bool> {
+        let response = social_mutation(schema, format!(
+            r#"mutation {{ postComment(input:{{targetType:"series",targetId:"{work}",body:"image",hasSpoiler:false,mediaId:"{media}"}}) {{ id }} }}"#,
+        )).await;
+        if response.errors.len() == 1 && response.errors[0].message == "attached image not found" {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            response.errors.is_empty(),
+            "postComment failed: {:?}",
+            response.errors
+        );
+        Ok(true)
+    }
+
+    // Keep the real resolver's transaction open after its writes, without exposing a
+    // private GraphQL helper. The deferred trigger runs during COMMIT with row locks
+    // still held. The test owns the advisory gate it waits on.
+    async fn hold_social_commit(
+        pool: &Database,
+        table: &str,
+    ) -> (sqlx::Transaction<'static, sqlx::Postgres>, i32) {
+        assert!(["comment_media", "notifications"].contains(&table));
+        sqlx::raw_sql(&format!(
+            "CREATE FUNCTION bg_social_commit_gate() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN PERFORM pg_advisory_xact_lock(4930189972093103::bigint); RETURN NEW; END $$; \
+             CREATE CONSTRAINT TRIGGER bg_social_commit_gate AFTER UPDATE ON {table} \
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION bg_social_commit_gate()",
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+        let mut gate = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(4930189972093103::bigint)")
+            .execute(&mut *gate)
+            .await
+            .unwrap();
+        let pid = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *gate)
+            .await
+            .unwrap();
+        (gate, pid)
+    }
+
+    async fn wait_for_social_commit(pool: &Database, gate: i32) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity a WHERE a.datname=current_database() \
+                     AND a.query LIKE 'COMMIT%' AND a.wait_event_type='Lock' AND a.wait_event='advisory' \
+                     AND $1=ANY(pg_blocking_pids(a.pid)))",
+                ).bind(gate).fetch_one(pool).await.unwrap();
+                if waiting { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("the mutation never reached COMMIT holding its row locks");
+    }
+
+    #[tokio::test]
+    async fn staged_media_gc_then_post_waits_and_cleanly_refuses_the_deleted_draft() {
+        use crate::catalog::phase4_tests::{overlap, pool, work};
+
+        let pool = pool().await;
+        let work = work(&pool, "media target").await;
+        let (user, media) = social_gc_fixture(&pool).await;
+        let schema = social_schema(&pool, &user).await;
+        let (swept, posted) = overlap(
+            &pool,
+            |pool| async move { Ok(sweep_staged_media(&pool, "2026-07-10T12:00:00Z").await?) },
+            move |_| async move { post_staged_media(&schema, &work, media).await },
+        )
+        .await;
+        assert_eq!(swept.unwrap(), 1);
+        assert!(
+            !posted.unwrap(),
+            "a deleted draft must refuse the entire post"
+        );
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM comments),(SELECT count(*) FROM comment_media)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (0, 0));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn post_then_staged_media_gc_skips_the_attached_draft_without_waiting() {
+        use crate::catalog::phase4_tests::{pool, work};
+
+        let pool = pool().await;
+        let work = work(&pool, "media target").await;
+        let (user, media) = social_gc_fixture(&pool).await;
+        let schema = social_schema(&pool, &user).await;
+        let (gate, pid) = hold_social_commit(&pool, "comment_media").await;
+        let post = tokio::spawn(async move { post_staged_media(&schema, &work, media).await });
+        wait_for_social_commit(&pool, pid).await;
+        // No wait: SKIP LOCKED excludes the draft the post already attached, even
+        // though the reader snapshot still sees it as staged until the post commits.
+        let swept = tokio::time::timeout(
+            Duration::from_secs(2),
+            sweep_staged_media(&pool, "2026-07-10T12:00:00Z"),
+        )
+        .await;
+        assert!(!post.is_finished());
+        gate.commit().await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(5), post)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap());
+        assert_eq!(
+            swept.expect("GC waited for the post's media row").unwrap(),
+            0
+        );
+        let linked: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT comment_id FROM comment_media WHERE id=$1")
+                .bind(media)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let comment = linked.expect("the attached media lost its comment");
+        let comments: i64 = sqlx::query_scalar("SELECT count(*) FROM comments WHERE id=$1")
+            .bind(comment)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(comments, 1);
+        assert_eq!(
+            sweep_staged_media(&pool, "2026-07-10T12:00:00Z")
+                .await
+                .unwrap(),
+            0
+        );
+        pool.close().await;
+    }
+
+    async fn mark_gc_notification_read(
+        schema: &crate::graphql::ApiSchema,
+        id: uuid::Uuid,
+    ) -> anyhow::Result<u64> {
+        let response = social_mutation(
+            schema,
+            format!(r#"mutation {{ markNotificationsRead(ids:["{id}"]) }}"#),
+        )
+        .await;
+        anyhow::ensure!(
+            response.errors.is_empty(),
+            "markNotificationsRead failed: {:?}",
+            response.errors
+        );
+        response.data.into_json()?["markNotificationsRead"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("markNotificationsRead did not return a count"))
+    }
+
+    async fn old_read_notification(pool: &Database) -> (String, uuid::Uuid) {
+        let (user, _) = social_gc_fixture(pool).await;
+        let id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO notifications(id,user_id,kind,created_at,read_at) VALUES ($1,$2,'reply','2020-01-01','2020-01-02')")
+            .bind(id).bind(crate::db_types::uuid(&user).unwrap()).execute(pool).await.unwrap();
+        (user, id)
+    }
+
+    #[tokio::test]
+    async fn notification_gc_then_mark_read_waits_and_skips_the_deleted_row() {
+        use crate::catalog::phase4_tests::{overlap, pool};
+
+        let pool = pool().await;
+        let (user, id) = old_read_notification(&pool).await;
+        let schema = social_schema(&pool, &user).await;
+        let (pruned, marked) = overlap(
+            &pool,
+            |pool| async move {
+                prune_read_notifications(&pool, "2026-07-10T12:00:00Z", &never_shutdown().1).await
+            },
+            move |_| async move { mark_gc_notification_read(&schema, id).await },
+        )
+        .await;
+        assert_eq!(pruned.unwrap(), 1);
+        assert_eq!(
+            marked.unwrap(),
+            0,
+            "a deleted notification is a clean no-op"
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM notifications")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn mark_read_then_notification_gc_skips_the_row_without_waiting() {
+        use crate::catalog::phase4_tests::pool;
+
+        let pool = pool().await;
+        let (user, id) = old_read_notification(&pool).await;
+        sqlx::query("UPDATE notifications SET read_at=NULL WHERE id=$1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let schema = social_schema(&pool, &user).await;
+        let (gate, pid) = hold_social_commit(&pool, "notifications").await;
+        let mark = tokio::spawn(async move { mark_gc_notification_read(&schema, id).await });
+        wait_for_social_commit(&pool, pid).await;
+        // No wait: an unread row is not a GC candidate in the committed snapshot.
+        // It becomes eligible only when the mark-read commits; a later pass prunes it.
+        let pruned = tokio::time::timeout(
+            Duration::from_secs(2),
+            prune_read_notifications(&pool, "2026-07-10T12:00:00Z", &never_shutdown().1),
+        )
+        .await;
+        assert!(!mark.is_finished());
+        gate.commit().await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), mark)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert_eq!(pruned.expect("GC waited for mark-read's row").unwrap(), 0);
+        let kept: (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
+            sqlx::query_as("SELECT id,read_at FROM notifications")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(kept.0, id);
+        assert!(kept.1 > crate::db_types::date("2020-01-02T00:00:00Z").unwrap());
+        assert_eq!(
+            prune_read_notifications(&pool, "2026-07-10T12:00:00Z", &never_shutdown().1)
+                .await
+                .unwrap(),
+            1
+        );
+        pool.close().await;
     }
 
     /// A second session of the test database, outside the one-connection pool.

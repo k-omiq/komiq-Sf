@@ -206,6 +206,20 @@ async fn run_loop(
                 // never ran the entire pass was redone from scratch on the next boot.
                 // `inner` is a clone so the select below can still borrow `shutdown`
                 // mutably; it also lets the per-item loops bail early on their own.
+                // One pass at a time on every server of this database. Another
+                // server's pass stamps its completion; come back at the retry cadence
+                // and let `source_sync_due` see it.
+                let Some(_lease) = crate::job_lease::JobLease::try_take(
+                    &state.pool,
+                    crate::job_lease::JobFamily::SourceSync,
+                )
+                .await
+                else {
+                    tracing::info!("source-sync: another pass is running; checking again later");
+                    next_at = Instant::now()
+                        + Duration::from_secs(RECONCILE_RETRY_SECS.min(interval_seconds));
+                    continue;
+                };
                 let inner = shutdown.clone();
                 let mut watcher = shutdown.clone();
                 let outcome = tokio::select! {
@@ -702,6 +716,13 @@ async fn sync_source_latest(
         if stopping(shutdown) {
             break;
         }
+        if !state
+            .source_budgets
+            .spend(source_id, crate::source_budget::SourceUse::Sync, shutdown)
+            .await
+        {
+            break;
+        }
         let (has_next, mangas) = state
             .suwayomi
             .browse_source(source_id, FetchType::Latest, page, None)
@@ -768,7 +789,14 @@ async fn sync_source_latest(
                 if stopping(shutdown) {
                     break;
                 }
-                match crate::graphql::ingest_source_series(state, &id.to_string()).await {
+                if !state
+                    .source_budgets
+                    .spend(source_id, crate::source_budget::SourceUse::Ingest, shutdown)
+                    .await
+                {
+                    break;
+                }
+                match crate::graphql::ingest_source_series(state, &id.to_string(), shutdown).await {
                     Ok(_) => added += 1,
                     Err(e) => {
                         let e = crate::db::observed_database_error(e);

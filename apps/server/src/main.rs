@@ -24,6 +24,7 @@ mod image_delivery;
 mod img_proxy;
 mod ingest;
 mod instance;
+mod job_lease;
 mod lan;
 mod legacy_sqlite;
 mod locks;
@@ -61,6 +62,7 @@ mod scanner;
 mod search;
 mod series_cache;
 mod setup_cli;
+mod source_budget;
 mod source_health;
 mod sql_params;
 mod sqlite_database;
@@ -3235,7 +3237,14 @@ async fn main() -> anyhow::Result<()> {
         session_ttl_secs: cfg.session_ttl_secs,
         series_inflight: KeyedLocks::default(),
         chapters_inflight: KeyedLocks::default(),
-        cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        source_budgets: {
+            let budgets = crate::source_budget::SourceBudgets::default();
+            budgets.apply_limits(&scanner::merge_source_rate_limits(
+                config::scan_source_rate_limits(),
+                Vec::new(),
+            ));
+            Arc::new(budgets)
+        },
         catalogue_cover_phash: cfg.catalogue_cover_phash,
         ext_icons_dir: std::path::PathBuf::from(&cfg.ext_icons_dir),
         setup_code: instance::SetupCode::default(),
@@ -3245,9 +3254,10 @@ async fn main() -> anyhow::Result<()> {
     // above), issue the one-time code the setup screen trades for the owner account.
     instance::issue_setup_code_if_needed(&pool, &state.setup_code).await?;
 
-    // Startup recovery: an ingest job still `running` was interrupted by the
-    // previous shutdown — its task is gone, so mark it failed (otherwise the
-    // partial unique index blocks new jobs for that source forever).
+    // Startup recovery: an ingest job still `running` with no lease holder was
+    // interrupted by the previous shutdown — its task is gone, so mark it failed
+    // (otherwise the partial unique index blocks new jobs for that source forever).
+    // A job another server of this database still runs keeps its lease and its row.
     match ingest::mark_interrupted_jobs(&pool).await {
         Ok(0) => {}
         Ok(n) => tracing::warn!(n, "marked interrupted source-ingest jobs as failed"),
@@ -3436,10 +3446,10 @@ async fn main() -> anyhow::Result<()> {
             cover_pool.clone(),
             mangadex.clone(),
             state.suwayomi.clone(),
-            state.cover_crawl_running.clone(),
             cfg.cover_cache_interval_secs,
             cfg.cover_cache_batch,
             shutdown_tx.subscribe(),
+            state.source_budgets.clone(),
         );
     } else {
         tracing::info!("cover cache drainer disabled (COVER_CACHE=off)");
@@ -3706,7 +3716,7 @@ mod tests {
             session_ttl_secs: 3600,
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
-            cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            source_budgets: Default::default(),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,
@@ -4511,7 +4521,7 @@ mod tests {
                 session_ttl_secs: 3600,
                 series_inflight: KeyedLocks::default(),
                 chapters_inflight: KeyedLocks::default(),
-                cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                source_budgets: Default::default(),
                 catalogue_cover_phash: false,
                 ext_icons_dir: std::path::PathBuf::new(),
                 media_manifests: None,
@@ -4593,7 +4603,7 @@ mod tests {
             session_ttl_secs: 3600,
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
-            cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            source_budgets: Default::default(),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,
@@ -4688,7 +4698,7 @@ mod tests {
             session_ttl_secs: 3600,
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
-            cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            source_budgets: Default::default(),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,
@@ -5068,7 +5078,7 @@ mod tests {
             session_ttl_secs: 3600,
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
-            cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            source_budgets: Default::default(),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,
@@ -5524,7 +5534,7 @@ mod tests {
             session_ttl_secs: 3600,
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
-            cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            source_budgets: Default::default(),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,

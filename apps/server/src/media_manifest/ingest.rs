@@ -10,7 +10,6 @@ use tokio::time::Instant;
 
 use super::store::{self, CollectedPage};
 use crate::graphql::AppState;
-use crate::rate_limit::RateLimiter;
 use crate::telemetry::{Lane, ADMISSION};
 
 const QUEUE_CAP: usize = 1024;
@@ -35,7 +34,6 @@ struct QueueState {
 pub(crate) struct IngestQueue {
     state: Mutex<QueueState>,
     wake: Notify,
-    budget: RateLimiter,
 }
 
 impl Default for IngestQueue {
@@ -43,7 +41,6 @@ impl Default for IngestQueue {
         Self {
             state: Mutex::new(QueueState::default()),
             wake: Notify::new(),
-            budget: RateLimiter::new(600, 3600),
         }
     }
 }
@@ -151,7 +148,12 @@ pub(crate) fn spawn(app: Arc<AppState>, shutdown: watch::Receiver<bool>) {
         "media-ingest",
         Duration::from_secs(30),
         shutdown.clone(),
-        move || run_loop(app.clone(), shutdown.clone()),
+        move || {
+            crate::db::Database::job_scope(
+                crate::database::ParallelJob::MediaIngest,
+                run_loop(app.clone(), shutdown.clone()),
+            )
+        },
     ));
 }
 
@@ -179,17 +181,21 @@ async fn run_loop(app: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
                 break;
             };
             let app = app.clone();
-            jobs.spawn(async move {
-                let result = ingest_chapter(&app, chapter).await;
-                if let Err(error) = &result {
-                    tracing::debug!(chapter, error = %error, "media ingest abandoned");
-                }
-                app.media_manifests
-                    .as_ref()
-                    .unwrap()
-                    .queue
-                    .finish(chapter, result.is_ok());
-            });
+            // Spawned tasks do not inherit the loop's lane: name it again.
+            jobs.spawn(crate::db::Database::job_scope(
+                crate::database::ParallelJob::MediaIngest,
+                async move {
+                    let result = ingest_chapter(&app, chapter).await;
+                    if let Err(error) = &result {
+                        tracing::debug!(chapter, error = %error, "media ingest abandoned");
+                    }
+                    app.media_manifests
+                        .as_ref()
+                        .unwrap()
+                        .queue
+                        .finish(chapter, result.is_ok());
+                },
+            ));
         }
         tokio::select! {
             _ = shutdown.changed() => return,
@@ -201,7 +207,10 @@ async fn run_loop(app: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
                 if queue.prune_due() {
                     tokio::select! {
                         _ = shutdown.changed() => return,
-                        result = store::prune(&app.pool) => {
+                        result = crate::db::Database::job_scope(
+                            crate::database::ParallelJob::MediaPrune,
+                            store::prune(&app.pool),
+                        ) => {
                             if let Err(error) = result {
                                 tracing::warn!(error = %error, "media manifest prune failed");
                             }
@@ -214,7 +223,7 @@ async fn run_loop(app: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
 }
 
 pub(crate) async fn ingest_chapter(app: &AppState, chapter: i64) -> Result<Option<i32>> {
-    let Some(media) = &app.media_manifests else {
+    let Some(_) = &app.media_manifests else {
         return Ok(None);
     };
     let engine = &app.suwayomi;
@@ -266,7 +275,11 @@ pub(crate) async fn ingest_chapter(app: &AppState, chapter: i64) -> Result<Optio
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        if media.queue.budget.check(&identity.source_id).is_err() {
+        if !app
+            .source_budgets
+            .spend_media_page(&identity.source_id, Duration::from_secs(60))
+            .await
+        {
             lane.refuse();
             bail!("ingest source budget exhausted");
         }
@@ -397,15 +410,5 @@ mod tests {
         queue.finish(8, false);
         queue.queue(8);
         assert!(queue.state.lock().unwrap().entries.contains_key(&8));
-    }
-
-    #[test]
-    fn ingest_budget_is_per_source() {
-        let queue = IngestQueue::default();
-        for _ in 0..600 {
-            assert!(queue.budget.check("source").is_ok());
-        }
-        assert!(queue.budget.check("source").is_err());
-        assert!(queue.budget.check("other-source").is_ok());
     }
 }

@@ -11,12 +11,14 @@
 //! column that rides on the `work` row already loaded on hot paths, so cover-URL
 //! resolution costs no extra query.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::database::SqliteDatabase;
 use crate::db::Database;
+use crate::source_budget::{SourceBudgets, SourceUse};
 use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 use image::{imageops, GenericImageView};
@@ -800,6 +802,8 @@ async fn publish_work_cover(
         tx.rollback().await?;
         return Ok(false);
     }
+    #[cfg(test)]
+    crate::catalog::guards::pause("cover-work-locked").await;
     // A takedown locks the same work row, so a fetch that was in flight when it landed
     // cannot store the art again after the takedown deleted it.
     let taken_down: bool = sqlx::query_scalar(
@@ -1722,6 +1726,8 @@ pub async fn crawl_uncached_covers(
     mangadex: &MangaDexClient,
     suwayomi: &crate::suwayomi::SuwayomiClient,
     limit: Option<i64>,
+    source_budgets: &SourceBudgets,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
 ) {
     // The mangadex anchor lives on `source_series`, not `work`; pick the same
     // deterministic anchor the reader uses (oldest source_series) so the cover
@@ -1888,7 +1894,11 @@ pub async fn crawl_uncached_covers(
                 (SELECT s.thumbnail_url FROM source_series ss \
                  JOIN suwayomi_series s ON s.id = CAST(ss.source_key AS INTEGER) \
                  WHERE ss.work_id = w.id AND ss.source_type = 'suwayomi' \
-                 ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS thumbnail_url \
+                 ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS thumbnail_url, \
+                (SELECT s.source_id FROM source_series ss \
+                 JOIN suwayomi_series s ON s.id = CAST(ss.source_key AS INTEGER) \
+                 WHERE ss.work_id = w.id AND ss.source_type = 'suwayomi' \
+                 ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS source_id \
          FROM work w \
          WHERE w.cover_cached_version IS NULL \
            AND NOT EXISTS (SELECT 1 FROM media_takedown td \
@@ -1908,7 +1918,7 @@ pub async fn crawl_uncached_covers(
     };
     let suw_loaded = match limit {
         Some(n) => {
-            crate::db_types::query_tuple::<(String, Option<String>)>(&format!(
+            crate::db_types::query_tuple::<(String, Option<String>, Option<String>)>(&format!(
                 "{SUW_BASE} LIMIT $2"
             ))
             .bind(crate::db_types::date(&now).expect("internally generated UTC timestamp"))
@@ -1917,16 +1927,18 @@ pub async fn crawl_uncached_covers(
             .await
         }
         None => {
-            crate::db_types::query_tuple::<(String, Option<String>)>(SUW_BASE)
+            crate::db_types::query_tuple::<(String, Option<String>, Option<String>)>(SUW_BASE)
                 .bind(crate::db_types::date(&now).expect("internally generated UTC timestamp"))
                 .fetch_all(main)
                 .await
         }
     };
-    let suw_jobs: Vec<(String, String)> = match suw_loaded {
+    let suw_jobs: Vec<(String, String, Option<String>)> = match suw_loaded {
         Ok(rows) => rows
             .into_iter()
-            .filter_map(|(work_id, thumb)| thumb.filter(|t| !t.is_empty()).map(|t| (work_id, t)))
+            .filter_map(|(work_id, thumb, source_id)| {
+                Some((work_id, thumb.filter(|t| !t.is_empty())?, source_id))
+            })
             .collect(),
         Err(e) => {
             let e = crate::db::observed_database_error(e.into());
@@ -1950,7 +1962,13 @@ pub async fn crawl_uncached_covers(
     // (they wait patiently, on-demand does not queue at all).
     const SUW_CRAWL_CONCURRENCY: usize = crate::suwayomi::WARM_COVER_CONCURRENCY;
     let (suw_saved, suw_failed) = futures::stream::iter(suw_jobs)
-        .map(|(work_id, thumb)| async move {
+        .map(|(work_id, thumb, source_id)| async move {
+            // The source's rate budget first, so a paced fetch holds no work slot.
+            if let Some(source_id) = &source_id {
+                if !source_budgets.spend(source_id, SourceUse::Cover, shutdown).await {
+                    return (0usize, 0usize);
+                }
+            }
             let work = master_cover_work().await;
             let bytes = match suwayomi.cover_bytes(Some(&thumb)).await {
                 Some(b) => b,
@@ -2236,6 +2254,7 @@ pub async fn warm_suwayomi_covers(
     limit: i64,
     cursor: &std::sync::atomic::AtomicI64,
     shutdown: &tokio::sync::watch::Receiver<bool>,
+    source_budgets: &SourceBudgets,
 ) -> (usize, usize) {
     use std::sync::atomic::Ordering as AtomicOrdering;
     let start = cursor.load(AtomicOrdering::Relaxed);
@@ -2292,6 +2311,10 @@ pub async fn warm_suwayomi_covers(
             // Cooperative shutdown: stop taking new work the moment the signal flips,
             // rather than draining a 500-item batch through a shutting-down process.
             if *shutdown.borrow() {
+                return (source_id, WarmOutcome::Skipped);
+            }
+            // The source's rate budget first, so a paced fetch holds no work slot.
+            if !source_budgets.spend(&source_id, SourceUse::Cover, shutdown).await {
                 return (source_id, WarmOutcome::Skipped);
             }
             let work = master_cover_work().await;
@@ -2482,15 +2505,15 @@ pub fn spawn(
     covers: SqliteDatabase,
     mangadex: Arc<MangaDexClient>,
     suwayomi: crate::suwayomi::SuwayomiClient,
-    inflight: Arc<AtomicBool>,
     interval_secs: u64,
     batch: i64,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    source_budgets: Arc<SourceBudgets>,
 ) {
     // Panic-supervised (crate::task::supervise): an unhandled panic in a crawl used to
     // end cover caching silently for the process lifetime. The factory re-clones the
     // loop's state on each restart. All captured handles are cheap to clone (pools are
-    // Arc-backed, the client is Arc, inflight is Arc).
+    // Arc-backed, the client is Arc).
     tokio::spawn(crate::task::supervise(
         "cover-drainer",
         Duration::from_secs(30),
@@ -2501,10 +2524,10 @@ pub fn spawn(
                 covers.clone(),
                 mangadex.clone(),
                 suwayomi.clone(),
-                inflight.clone(),
                 interval_secs,
                 batch,
                 shutdown.clone(),
+                source_budgets.clone(),
             )
         },
     ));
@@ -2516,10 +2539,10 @@ async fn run_loop(
     covers: SqliteDatabase,
     mangadex: Arc<MangaDexClient>,
     suwayomi: crate::suwayomi::SuwayomiClient,
-    inflight: Arc<AtomicBool>,
     interval_secs: u64,
     batch: i64,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    source_budgets: Arc<SourceBudgets>,
 ) {
     // Start 90s behind the scanner. This loop and the scan scheduler BOTH default
     // to a 300s period, so with both starting at t=0 they collided on every single
@@ -2542,17 +2565,20 @@ async fn run_loop(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                // Yield to a manual full crawl if one is in flight (don't stack
-                // two MangaDex crawls); we'll pick up the remainder next tick.
-                if inflight
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_err()
-                {
+                // Yield to a manual full crawl or another server's tick if one is in
+                // flight (don't stack two MangaDex crawls); we'll pick up the remainder
+                // next tick. The cover-crawl lease covers both passes of the tick.
+                let Some(_crawl) = crate::job_lease::JobLease::try_take(
+                    &main,
+                    crate::job_lease::JobFamily::CoverCrawl,
+                )
+                .await
+                else {
                     continue;
-                }
+                };
                 match pending_cover_count(&main).await {
                     Ok(0) => { /* nothing to do this tick */ }
-                    Ok(_) => crawl_uncached_covers(&main, &covers, &mangadex, &suwayomi, Some(batch)).await,
+                    Ok(_) => crawl_uncached_covers(&main, &covers, &mangadex, &suwayomi, Some(batch), &source_budgets, &warm_shutdown).await,
                     Err(e) => { let e = crate::db::observed_read_database_error(e); tracing::warn!(error = %e, "cover drainer: count failed"); },
                 }
                 // Second cache, second pass. `work_cover_blob` (above) is what
@@ -2588,13 +2614,13 @@ async fn run_loop(
                                 batch,
                                 &warm_cursor,
                                 &warm_shutdown,
+                                &source_budgets,
                             )
                             .await;
                         }
                         Err(e) => { let e = crate::db::observed_read_database_error(e); tracing::warn!(error = %e, "suwayomi cover warmer: count failed"); },
                     }
                 }
-                inflight.store(false, Ordering::SeqCst);
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
@@ -3117,7 +3143,16 @@ mod tests {
             let writer = main.clone();
             let cache = covers.clone();
             let crawl = tokio::spawn(COVER_PUBLICATION_PAUSE.scope(points, async move {
-                crawl_uncached_covers(&writer, &cache, &mangadex, &suwayomi, Some(10)).await;
+                crawl_uncached_covers(
+                    &writer,
+                    &cache,
+                    &mangadex,
+                    &suwayomi,
+                    Some(10),
+                    &SourceBudgets::default(),
+                    &tokio::sync::watch::channel(false).1,
+                )
+                .await;
             }));
             tokio::time::timeout(Duration::from_secs(30), armed.reached())
                 .await
@@ -4131,7 +4166,16 @@ mod tests {
             .with_bases("http://127.0.0.1:1", "http://127.0.0.1:1");
         assert_eq!(pending_cover_count(&main).await.unwrap(), 2);
 
-        crawl_uncached_covers(&main, &covers, &mangadex, &suwayomi, Some(10)).await;
+        crawl_uncached_covers(
+            &main,
+            &covers,
+            &mangadex,
+            &suwayomi,
+            Some(10),
+            &SourceBudgets::default(),
+            &tokio::sync::watch::channel(false).1,
+        )
+        .await;
 
         let cached: Vec<String> = sqlx::query_scalar("SELECT work_id FROM work_cover_blob")
             .fetch_all(&covers)
@@ -4392,8 +4436,16 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(false);
 
         let cursor = AtomicI64::new(WARM_CURSOR_START);
-        let (saved, failed) =
-            warm_suwayomi_covers(&covers, &main, &client, 500, &cursor, &rx).await;
+        let (saved, failed) = warm_suwayomi_covers(
+            &covers,
+            &main,
+            &client,
+            500,
+            &cursor,
+            &rx,
+            &SourceBudgets::default(),
+        )
+        .await;
         assert_eq!((saved, failed), (2, 0), "both uncached series warmed");
 
         // Exactly what `serve_suwayomi_cover` reads on the request path.
@@ -4424,7 +4476,16 @@ mod tests {
             0
         );
         assert_eq!(
-            warm_suwayomi_covers(&covers, &main, &client, 500, &cursor, &rx).await,
+            warm_suwayomi_covers(
+                &covers,
+                &main,
+                &client,
+                500,
+                &cursor,
+                &rx,
+                &SourceBudgets::default()
+            )
+            .await,
             (0, 0),
             "a fully warm cache does no work"
         );
@@ -4453,7 +4514,16 @@ mod tests {
                 (covers.clone(), main.clone(), client.clone(), rx.clone());
             tokio::spawn(async move {
                 let cursor = AtomicI64::new(WARM_CURSOR_START);
-                warm_suwayomi_covers(&covers, &main, &client, 40, &cursor, &rx).await
+                warm_suwayomi_covers(
+                    &covers,
+                    &main,
+                    &client,
+                    40,
+                    &cursor,
+                    &rx,
+                    &SourceBudgets::default(),
+                )
+                .await
             })
         };
 
@@ -4502,7 +4572,16 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(true); // already shutting down
         let _ = tx;
         let cursor = AtomicI64::new(WARM_CURSOR_START);
-        let (saved, failed) = warm_suwayomi_covers(&covers, &main, &client, 30, &cursor, &rx).await;
+        let (saved, failed) = warm_suwayomi_covers(
+            &covers,
+            &main,
+            &client,
+            30,
+            &cursor,
+            &rx,
+            &SourceBudgets::default(),
+        )
+        .await;
         assert_eq!((saved, failed), (0, 0), "no work started after shutdown");
         assert_eq!(origin.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
@@ -4531,8 +4610,16 @@ mod tests {
 
         // Three ticks of two must cover all six ids, not retry {6,5} three times.
         for expect_cursor in [5, 3, 1] {
-            let (saved, failed) =
-                warm_suwayomi_covers(&covers, &main, &client, 2, &cursor, &rx).await;
+            let (saved, failed) = warm_suwayomi_covers(
+                &covers,
+                &main,
+                &client,
+                2,
+                &cursor,
+                &rx,
+                &SourceBudgets::default(),
+            )
+            .await;
             assert_eq!(
                 (saved, failed),
                 (0, 2),
@@ -4547,7 +4634,16 @@ mod tests {
         // Bottom reached. Since 0100 the wrap does NOT re-fetch immediately: all six now
         // carry a transient marker, so the tick costs zero requests — the rotation and
         // the backoff compose (the cursor still slides, there is simply nothing to do).
-        let (_, failed) = warm_suwayomi_covers(&covers, &main, &client, 2, &cursor, &rx).await;
+        let (_, failed) = warm_suwayomi_covers(
+            &covers,
+            &main,
+            &client,
+            2,
+            &cursor,
+            &rx,
+            &SourceBudgets::default(),
+        )
+        .await;
         assert_eq!(failed, 0, "backed-off ids are not re-fetched on the wrap");
 
         // Once the backoff elapses the wrap behaves as before: newest window first.
@@ -4555,7 +4651,16 @@ mod tests {
             .execute(&main)
             .await
             .unwrap();
-        let (_, failed) = warm_suwayomi_covers(&covers, &main, &client, 2, &cursor, &rx).await;
+        let (_, failed) = warm_suwayomi_covers(
+            &covers,
+            &main,
+            &client,
+            2,
+            &cursor,
+            &rx,
+            &SourceBudgets::default(),
+        )
+        .await;
         assert_eq!(failed, 2, "wrapped and retried the newest ids");
         assert_eq!(cursor.load(AtomicOrdering::Relaxed), 5);
     }
@@ -4659,7 +4764,16 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let cursor = AtomicI64::new(WARM_CURSOR_START);
 
-        let (saved, failed) = warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await;
+        let (saved, failed) = warm_suwayomi_covers(
+            &covers,
+            &main,
+            &client,
+            10,
+            &cursor,
+            &rx,
+            &SourceBudgets::default(),
+        )
+        .await;
         assert_eq!((saved, failed), (0, 1));
         let (reason, permanent, attempts, _) = issue_row(&main, 7).await.expect("marker recorded");
         assert_eq!((reason.as_str(), permanent, attempts), ("data_uri", 1, 1));
@@ -4667,7 +4781,16 @@ mod tests {
         assert_eq!(after_first, 1);
 
         // Next cycle: the candidate is gone, so not one byte leaves the box.
-        let (saved, failed) = warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await;
+        let (saved, failed) = warm_suwayomi_covers(
+            &covers,
+            &main,
+            &client,
+            10,
+            &cursor,
+            &rx,
+            &SourceBudgets::default(),
+        )
+        .await;
         assert_eq!(
             (saved, failed),
             (0, 0),
@@ -4701,7 +4824,16 @@ mod tests {
         let cursor = AtomicI64::new(WARM_CURSOR_START);
 
         assert_eq!(
-            warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await,
+            warm_suwayomi_covers(
+                &covers,
+                &main,
+                &client,
+                10,
+                &cursor,
+                &rx,
+                &SourceBudgets::default()
+            )
+            .await,
             (0, 1)
         );
         let (reason, permanent, attempts, _) = issue_row(&main, 8).await.expect("marker recorded");
@@ -4713,7 +4845,16 @@ mod tests {
 
         // Inside the window: skipped.
         assert_eq!(
-            warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await,
+            warm_suwayomi_covers(
+                &covers,
+                &main,
+                &client,
+                10,
+                &cursor,
+                &rx,
+                &SourceBudgets::default()
+            )
+            .await,
             (0, 0)
         );
         assert_eq!(origin.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -4724,7 +4865,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await,
+            warm_suwayomi_covers(
+                &covers,
+                &main,
+                &client,
+                10,
+                &cursor,
+                &rx,
+                &SourceBudgets::default()
+            )
+            .await,
             (0, 1),
             "a transient failure must be retried after its backoff, not abandoned"
         );
@@ -4764,7 +4914,16 @@ mod tests {
         let cursor = AtomicI64::new(WARM_CURSOR_START);
 
         assert_eq!(
-            warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await,
+            warm_suwayomi_covers(
+                &covers,
+                &main,
+                &client,
+                10,
+                &cursor,
+                &rx,
+                &SourceBudgets::default()
+            )
+            .await,
             (1, 0)
         );
         assert!(
@@ -4853,7 +5012,16 @@ mod tests {
         let cursor = AtomicI64::new(WARM_CURSOR_START);
 
         assert_eq!(
-            warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await,
+            warm_suwayomi_covers(
+                &covers,
+                &main,
+                &client,
+                10,
+                &cursor,
+                &rx,
+                &SourceBudgets::default()
+            )
+            .await,
             (0, 3)
         );
         let hits = origin.hits.load(std::sync::atomic::Ordering::SeqCst);
@@ -4867,7 +5035,16 @@ mod tests {
         // A brand-new cover from the parked source: no marker of its own, still skipped.
         insert_series_from(&main, 44, Some(&thumb_path(44)), "philia", None).await;
         assert_eq!(
-            warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await,
+            warm_suwayomi_covers(
+                &covers,
+                &main,
+                &client,
+                10,
+                &cursor,
+                &rx,
+                &SourceBudgets::default()
+            )
+            .await,
             (0, 0)
         );
         assert_eq!(
@@ -4879,7 +5056,16 @@ mod tests {
         // A different source is unaffected by the park.
         insert_series_from(&main, 45, Some(&thumb_path(45)), "healthy", None).await;
         assert_eq!(
-            warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await,
+            warm_suwayomi_covers(
+                &covers,
+                &main,
+                &client,
+                10,
+                &cursor,
+                &rx,
+                &SourceBudgets::default()
+            )
+            .await,
             (0, 1)
         );
         assert_eq!(
@@ -4903,7 +5089,16 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let cursor = AtomicI64::new(WARM_CURSOR_START);
         assert_eq!(
-            warm_suwayomi_covers(&covers, &main, &dead, 10, &cursor, &rx).await,
+            warm_suwayomi_covers(
+                &covers,
+                &main,
+                &dead,
+                10,
+                &cursor,
+                &rx,
+                &SourceBudgets::default()
+            )
+            .await,
             (0, 3)
         );
         assert_eq!(suwayomi_cover_backoff_stats(&main).await.unwrap().1, 1);
@@ -4925,7 +5120,16 @@ mod tests {
         let client =
             crate::suwayomi::SuwayomiClient::new(origin.base_url.clone(), None, Some("1".into()));
         assert_eq!(
-            warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await,
+            warm_suwayomi_covers(
+                &covers,
+                &main,
+                &client,
+                10,
+                &cursor,
+                &rx,
+                &SourceBudgets::default()
+            )
+            .await,
             (3, 0)
         );
         assert_eq!(
