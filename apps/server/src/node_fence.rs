@@ -27,7 +27,10 @@ pub(crate) async fn check_on(conn: &mut PgConnection, node_id: &str) -> Result<(
         )
         .fetch_one(conn)
         .await
-        .map_err(|_| anyhow::anyhow!("node fence check: cannot read PostgreSQL node settings"))?;
+        .map_err(|e| {
+            crate::db::record_database_error(&e);
+            anyhow::anyhow!("node fence check: cannot read PostgreSQL node settings")
+        })?;
     decide(node_id, in_recovery, reported_node.as_deref())?;
     tracing::info!(node_id, ?fence_epoch, "PostgreSQL node fence check passed");
     Ok(())
