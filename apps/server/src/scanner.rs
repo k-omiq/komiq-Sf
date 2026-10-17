@@ -1707,8 +1707,9 @@ pub(crate) async fn persist_scan_for_drill(
 ///   reader renders `Ch. {latest_chapter ?? chapter_count}`), so such a card can read one
 ///   chapter high until the rebuild — the same single stale number it would have read for
 ///   the whole interval without this call;
-/// * display metadata (`title`, `reader_id`, `latest_chapter`) on a work that has a
-///   MangaDex mirror half, which the conflict clause leaves to that half in any case.
+/// * display metadata (`title`, `reader_id`, `latest_chapter`, `suwayomi_thumbnail`) on a
+///   work that has a MangaDex mirror half, which the conflict clause leaves to that half
+///   in any case.
 ///
 /// BEST-EFFORT, like the cache writes above: logged and swallowed, never propagated. A
 /// feed row is a pure cache and the periodic rebuild reconstructs it; failing a scan
@@ -1738,11 +1739,12 @@ async fn touch_feed_series_update(pool: &Database, series_id: &str, new_found: b
 /// byte-identical row. (That test therefore also pins this function to the rebuild's
 /// current text — if the rebuild's field mapping is edited, it fails here.)
 ///
-/// The display fields (`reader_id`, `title`, `cover_url`, `latest_chapter`,
+/// The display fields (`reader_id`, `title`, `cover_url`, `suwayomi_thumbnail`, `latest_chapter`,
 /// `latest_chapter_title`) follow the rebuild's mirror-wins rule by asking the same
 /// question the rebuild does: does the work have a MangaDex mirror half
-/// ([`FEED_HAS_MIRROR_HALF_SQL`])? If it does, the existing values stay, because that
-/// half owns them (`catalog::publish_mirror_feed_row` assigns them on its own writes). If
+/// ([`FEED_HAS_MIRROR_HALF_SQL`])? If it does, the existing values take precedence (with
+/// missing covers and thumbnails filled), because that half owns them
+/// (`catalog::publish_mirror_feed_row` assigns them on its own writes). If
 /// it does not, the existing row can only be this half's earlier write, so they take the
 /// fresh values. Keeping them unconditionally left a Suwayomi-only card on its first
 /// chapter label until the next rebuild.
@@ -1902,7 +1904,9 @@ fn feed_series_upsert_sql() -> String {
          cover_url = CASE WHEN {mirror} \
                           THEN COALESCE(NULLIF(feed_series_updates.cover_url, ''), excluded.cover_url) \
                           ELSE excluded.cover_url END, \
-         suwayomi_thumbnail = COALESCE(feed_series_updates.suwayomi_thumbnail, excluded.suwayomi_thumbnail), \
+         suwayomi_thumbnail = CASE WHEN {mirror} \
+                                   THEN COALESCE(feed_series_updates.suwayomi_thumbnail, excluded.suwayomi_thumbnail) \
+                                   ELSE excluded.suwayomi_thumbnail END, \
          is_nsfw = (feed_series_updates.is_nsfw OR excluded.is_nsfw), \
          status = excluded.status, \
          content_rating = excluded.content_rating"
@@ -7472,7 +7476,11 @@ mod tests {
         };
         assert_eq!(
             labels(pool.clone()).await,
-            ("Canonical Title".into(), Some("12".into()), Some("Ch 12".into()))
+            (
+                "Canonical Title".into(),
+                Some("12".into()),
+                Some("Ch 12".into())
+            )
         );
 
         // A newer chapter lands, and an admin renames the work.
@@ -7521,6 +7529,124 @@ mod tests {
             browse_digest(&pool).await.unwrap(),
             "and so must Browse's copy of the row"
         );
+    }
+
+    /// A mirrorless work's thumbnail must follow its newest Suwayomi source, just like
+    /// its reader id, including Browse's copy and the periodic rebuild.
+    #[tokio::test]
+    async fn a_suwayomi_only_card_follows_its_newest_source_thumbnail() {
+        let pool = migrated_pool().await;
+        seed_feed_fixture(&pool, Some("1785071625000")).await;
+        sqlx::query(
+            "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
+             VALUES ('ss2', 'w1', 'suwayomi', '8', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO suwayomi_series \
+                 (id, title, thumbnail_url, status, in_library, source_id, chapter_count, \
+                  latest_chapter_at, updated_at) \
+             VALUES (8, 'Second Suwayomi Title', '/thumb/8', 'ONGOING', TRUE, '1', 13, \
+                     1785071624000, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let admin = ScanAdmin::default();
+        for series_id in ["7", "8"] {
+            record_scan(
+                &pool,
+                series_id,
+                "S",
+                &admin,
+                &chaps(12),
+                at("2026-01-01T00:00:00Z"),
+            )
+            .await
+            .unwrap();
+        }
+        let first = record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(13),
+            at("2026-01-08T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert!(first);
+        touch_feed_series_update(&pool, "7", first).await;
+
+        let card = |pool: Database| async move {
+            crate::db_types::query_tuple::<(
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            )>(
+                "SELECT f.reader_id, f.cover_url, f.suwayomi_thumbnail, \
+                        b.cover_url, b.suwayomi_thumbnail \
+                   FROM feed_series_updates f \
+                   JOIN browse_catalogue b ON b.work_id = f.work_id \
+                  WHERE f.work_id = 'w1'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            card(pool.clone()).await,
+            (
+                "7".into(),
+                None,
+                Some("/thumb/7".into()),
+                None,
+                Some("/thumb/7".into()),
+            )
+        );
+
+        sqlx::query(
+            "UPDATE suwayomi_series SET chapter_count = 14, latest_chapter_at = 1785671625000 \
+             WHERE id = 8",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let second = record_scan(
+            &pool,
+            "8",
+            "S",
+            &admin,
+            &chaps(14),
+            at("2026-01-15T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert!(second);
+        touch_feed_series_update(&pool, "8", second).await;
+        assert_eq!(
+            card(pool.clone()).await,
+            (
+                "8".into(),
+                None,
+                Some("/thumb/8".into()),
+                None,
+                Some("/thumb/8".into()),
+            ),
+            "the feed and Browse must take the newest source's thumbnail without a cached cover"
+        );
+        let incremental = feed_digest(&pool).await.unwrap();
+        let incremental_browse = browse_digest(&pool).await.unwrap();
+
+        crate::catalog::refresh_feed_series_updates(&pool)
+            .await
+            .unwrap();
+        assert_eq!(incremental, feed_digest(&pool).await.unwrap());
+        assert_eq!(incremental_browse, browse_digest(&pool).await.unwrap());
     }
 
     /// A mangadex-anchored work whose MIRROR half never fires — a licensing takedown leaves
