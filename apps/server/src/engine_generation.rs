@@ -25,6 +25,9 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_AFTER_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RETRY_AFTER_TIMEOUT: Duration = Duration::from_secs(600);
 const TIMEOUT_WARN_EVERY: Duration = Duration::from_secs(60);
+/// The manga ids the emptiness read asks for. Suwayomi numbers manga from 1, so an
+/// engine that holds any manga has one of these unless its first rows were deleted.
+const EMPTY_PROBE_IDS: i64 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FenceError {
@@ -485,8 +488,7 @@ impl Fence {
                 return Ok(result);
             }
             sampled_any |= result.sampled > 0;
-            // Ask only when nothing came back, and once per check: the engine's
-            // `mangas` resolver counts and walks every row even with `first:1`.
+            // Ask only when nothing came back, and once per check.
             result.empty = match empty {
                 Some(empty) => empty,
                 None => *empty.insert(engine_empty(&self.engine).await?),
@@ -892,16 +894,21 @@ fn nodes<'a>(data: &'a Value, field: &str) -> Result<&'a Vec<Value>> {
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("Engine fingerprint omitted {field}"))
 }
-/// Whether the engine has no manga at all. The engine's `mangas` resolver counts and
-/// reads every matching row before it applies `first`, so this costs one pass over the
-/// manga table: callers ask only when no sampled binding came back.
+/// Whether the engine has no manga among the first ids it hands out: a fresh or wiped
+/// engine has none. The engine's `mangas` resolver walks every matching row, once more
+/// for each row it matches, before it applies `first`. An unfiltered read therefore
+/// never finishes on a large engine, and it keeps running after the check gives up, so
+/// this read names its ids. An engine whose first ids are all gone reads as empty: with
+/// references that quarantines it, without any it adopts an engine nothing points at.
 async fn engine_empty(engine: &SuwayomiClient) -> Result<bool> {
-    let data = engine
-        .identity_query(
-            "query EngineEmpty { mangas(first:1) { nodes { id } } }",
-            json!({}),
-        )
-        .await?;
+    let ids = (1..=EMPTY_PROBE_IDS)
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let doc = format!(
+        "query EngineEmpty {{ mangas(filter:{{id:{{in:[{ids}]}}}}) {{ nodes {{ id }} }} }}"
+    );
+    let data = engine.identity_query(&doc, json!({})).await?;
     Ok(nodes(&data, "mangas")?.is_empty())
 }
 enum Marker {

@@ -17,6 +17,8 @@ pub(crate) struct MockEngine {
     pub fingerprints: Arc<AtomicUsize>,
     pub empty_probes: Arc<AtomicUsize>,
     pub load: Arc<EngineLoad>,
+    /// Every query document the engine received, in order.
+    pub queries: Arc<std::sync::Mutex<Vec<String>>>,
     server: Arc<tokio::task::JoinHandle<()>>,
 }
 /// Requests the engine received and is still working on, including ones whose client gave up.
@@ -58,13 +60,15 @@ impl MockEngine {
         let fingerprints = Arc::new(AtomicUsize::new(0));
         let empty_probes = Arc::new(AtomicUsize::new(0));
         let load = Arc::new(EngineLoad::default());
+        let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
         let app = axum::Router::new().route("/api/graphql", axum::routing::post({
-            let data = data.clone(); let fingerprints = fingerprints.clone(); let empty_probes = empty_probes.clone(); let load = load.clone();
+            let data = data.clone(); let fingerprints = fingerprints.clone(); let empty_probes = empty_probes.clone(); let load = load.clone(); let queries = queries.clone();
             move |axum::Json(request): axum::Json<Value>| {
-                let data = data.clone(); let fingerprints = fingerprints.clone(); let empty_probes = empty_probes.clone(); let load = load.clone();
+                let data = data.clone(); let fingerprints = fingerprints.clone(); let empty_probes = empty_probes.clone(); let load = load.clone(); let queries = queries.clone();
                 // Like Suwayomi, the engine finishes a request even after its client has gone.
                 async move { tokio::spawn(async move {
                     load.requests.fetch_add(1, Ordering::SeqCst);
+                    queries.lock().unwrap().push(request["query"].as_str().unwrap().to_owned());
                     let now = load.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     load.max_in_flight.fetch_max(now, Ordering::SeqCst);
                     let delay = data.lock().await.delay;
@@ -76,6 +80,13 @@ impl MockEngine {
                     let mut d = data.lock().await;
                     let query = request["query"].as_str().unwrap();
                     let vars = &request["variables"];
+                    // Return only requested ids, as the engine's `in` filter does.
+                    let selected = |field: &str, rows: &[Value]| {
+                        let Some(start) = query.find(&format!("{field}(filter:")) else { return rows.to_vec() };
+                        let ids = query[start..].split("in:[").nth(1).unwrap().split(']').next().unwrap();
+                        let ids: Vec<i64> = ids.split(',').filter_map(|id| id.parse().ok()).collect();
+                        rows.iter().filter(|row| ids.contains(&row["id"].as_i64().unwrap())).cloned().collect::<Vec<_>>()
+                    };
                     let body = if query.contains("EngineMarker") {
                         if !d.meta { json!({"errors":[{"message":"Cannot query field 'meta' on type 'Query'"}]}) }
                         else if query.contains("setGlobalMeta") && d.fail_marker_write { json!({"errors":[{"message":"Internal server error"}]}) }
@@ -84,17 +95,10 @@ impl MockEngine {
                         else { json!({"data":{"meta":d.marker.as_ref().map(|v| json!({"key":MARKER,"value":v}))}}) }
                     } else if query.contains("EngineFingerprint") {
                         fingerprints.fetch_add(1,Ordering::SeqCst);
-                        // Return only requested ids, as the engine's `in` filter does.
-                        let selected = |field: &str, rows: &[Value]| {
-                            let start = query.find(&format!("{field}(filter:")).unwrap();
-                            let ids = query[start..].split("in:[").nth(1).unwrap().split(']').next().unwrap();
-                            let ids: Vec<i64> = ids.split(',').filter_map(|id| id.parse().ok()).collect();
-                            rows.iter().filter(|row| ids.contains(&row["id"].as_i64().unwrap())).cloned().collect::<Vec<_>>()
-                        };
                         json!({"data":{"mangas":{"nodes":selected("mangas",&d.mangas)},"chapters":{"nodes":selected("chapters",&d.chapters)}}})
                     } else if query.contains("EngineEmpty") {
                         empty_probes.fetch_add(1,Ordering::SeqCst);
-                        json!({"data":{"mangas":{"nodes":d.mangas.iter().take(1).cloned().collect::<Vec<_>>()}}})
+                        json!({"data":{"mangas":{"nodes":selected("mangas",&d.mangas).into_iter().take(1).collect::<Vec<_>>()}}})
                     } else if query.contains("fetchMangaAndChapters") {
                         json!({"data":{"fetchMangaAndChapters":{"manga":d.mangas.first(),"chapters":d.chapters}}})
                     } else if query.contains("mangas(condition:") {
@@ -118,6 +122,7 @@ impl MockEngine {
             fingerprints,
             empty_probes,
             load,
+            queries,
             server,
         }
     }
@@ -332,8 +337,9 @@ async fn restored_marker_requires_a_verified_binding() {
     {
         let mut d = engine.data.lock().await;
         d.marker = marker;
-        d.mangas = vec![manga_json(70)];
-        d.chapters = vec![chapter_json(80, 70)];
+        // A replacement engine numbers its own manga from 1.
+        d.mangas = vec![manga_json(3)];
+        d.chapters = vec![chapter_json(4, 3)];
     }
     fence.check().await;
     assert!(fence.is_blocked());
@@ -359,6 +365,68 @@ async fn restored_marker_requires_a_verified_binding() {
 }
 
 #[tokio::test]
+async fn identity_checks_never_ask_the_engine_for_every_manga() {
+    // The engine's `mangas` resolver walks every matching row, once more for each row it
+    // matches, before it applies `first`. On a large engine an unfiltered read runs for
+    // hours, and it keeps running after the check gives up.
+    for (keys, replacement) in [
+        (false, vec![]),
+        (true, vec![]),
+        (false, vec![manga_json(3)]),
+        (true, vec![manga_json(3)]),
+    ] {
+        let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
+        bind(&pool, &client).await;
+        if !keys {
+            sqlx::raw_sql("DELETE FROM engine_chapter_key; DELETE FROM engine_manga_key")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let probes = engine.empty_probes.load(Ordering::SeqCst);
+        {
+            let mut d = engine.data.lock().await;
+            d.mangas = replacement.clone();
+            d.chapters.clear();
+        }
+        fence.check().await;
+        assert_eq!(
+            engine.empty_probes.load(Ordering::SeqCst),
+            probes + 1,
+            "nothing came back, so the check asks whether the engine is empty"
+        );
+        let state = states(&pool).await.unwrap().remove(0);
+        assert_eq!(
+            (state.state.as_str(), state.reason.as_deref()),
+            match (keys, replacement.is_empty()) {
+                (_, true) => (
+                    "quarantined",
+                    Some("The engine is empty but PostgreSQL still has Suwayomi references")
+                ),
+                (true, false) => (
+                    "quarantined",
+                    Some("No stored source identity can be verified against the engine")
+                ),
+                // The marker matches and no stored binding was there to fail.
+                (false, false) => ("active", None),
+            }
+        );
+        for query in engine.queries.lock().unwrap().iter() {
+            for read in query.split("mangas(").skip(1) {
+                let ids = read
+                    .strip_prefix("filter:{id:{in:[")
+                    .and_then(|rest| rest.split(']').next())
+                    .unwrap_or_else(|| panic!("unbounded manga read: {query}"));
+                assert!(
+                    ids.split(',').count() <= EMPTY_PROBE_IDS as usize,
+                    "{query}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn timed_out_fingerprint_cannot_reopen_gate_without_a_verified_binding() {
     let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
     bind(&pool, &client).await;
@@ -368,8 +436,9 @@ async fn timed_out_fingerprint_cannot_reopen_gate_without_a_verified_binding() {
     {
         let mut d = engine.data.lock().await;
         d.marker = marker;
-        d.mangas = vec![manga_json(70)];
-        d.chapters = vec![chapter_json(80, 70)];
+        // A replacement engine numbers its own manga from 1.
+        d.mangas = vec![manga_json(3)];
+        d.chapters = vec![chapter_json(4, 3)];
         d.fingerprint_delay = Duration::from_millis(1600);
     }
     let before = engine.fingerprints.load(Ordering::SeqCst);
