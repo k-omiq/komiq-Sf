@@ -950,6 +950,10 @@ class StandbyTests(unittest.TestCase):
         for value, node, timeline, allowed in cases:
             with self.subTest(node=node, timeline=timeline, fence=value is not None):
                 self.assertEqual(h.fence_decision(value, node, timeline)[0], allowed)
+        # Switched to the fence timeline before the first checkpoint: one behind only.
+        for node, timeline, allowed in (("node-a", 2, True), ("node-a", 1, False), ("node-b", 2, False)):
+            with self.subTest(node=node, timeline=timeline, switched=True):
+                self.assertEqual(h.fence_decision(fence, node, timeline, switched=True)[0], allowed)
 
     def test_node_name_is_validated(self):
         for value in ("Node", "a_b", "-a", "a" * 64, "a b"):
@@ -1008,6 +1012,51 @@ class StandbyTests(unittest.TestCase):
             h.start(False)  # No repository: nowhere to keep a fence.
         self.execute.assert_not_called()
 
+    def test_a_fenced_volume_refuses_to_start_without_its_node_name(self):
+        self.existing()
+        self.put_fence(primary_node="node-a", timeline=2)
+        self.timeline = 2
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-a"}):
+            h.start(True)
+        self.assertEqual((h.STATE / h.NODE_MARKER).read_text(), "node-a\n")
+        self.execute.reset_mock()
+        # A release that lost the node name (or changed it) must not start an unfenced primary.
+        for env in ({}, {"KOMIKA_NODE_ID": ""}, {"KOMIKA_NODE_ID": "node-c"}):
+            with self.subTest(env=env), patch.dict(os.environ, env), \
+                    patch.object(h, "read_fence", side_effect=AssertionError("refused before the fence")), \
+                    self.assertRaises(ValueError) as refused:
+                os.environ.pop("KOMIKA_NODE_ID", None) if not env else None
+                h.start(True)
+            self.assertIn("fenced as node 'node-a'", str(refused.exception))
+            self.assertIn("KOMIKA_NODE_ID=node-a", str(refused.exception))
+        with patch.object(h, "print"):
+            self.assertFalse(h.fence_check())
+        # Nor restore into an emptied data directory on that volume.
+        shutil.rmtree(h.DATA)
+        with patch.object(h, "backup_info") as info, self.assertRaises(ValueError):
+            h.start(True)
+        info.assert_not_called()
+        self.execute.assert_not_called()
+
+    def test_a_restart_between_pg_promote_and_its_first_checkpoint_starts(self):
+        self.existing()
+        self.put_fence(epoch=5, primary_node="node-b", timeline=3)
+        self.timeline = 2  # pg_control still shows the standby's timeline.
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-b"}), self.assertRaises(ValueError):
+            h.start(True)  # No history file for timeline 3: an old copy, not a promotion.
+        (h.DATA / "pg_wal").mkdir()
+        (h.DATA / "pg_wal" / "00000003.history").write_text("2\t0/3000148\tno recovery target specified\n")
+        with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-b"}):
+            h.start(True)
+        self.assertIn("komika.node_id=node-b", self.execute.call_args.args[1])
+        # The allowance is one timeline, for the node the fence names, and nothing else.
+        for node, timeline in (("node-a", 2), ("node-b", 1)):
+            self.timeline = timeline
+            with self.subTest(node=node, timeline=timeline), patch.dict(os.environ, {"KOMIKA_NODE_ID": node}), \
+                    self.assertRaises(ValueError):
+                (h.STATE / h.NODE_MARKER).unlink(missing_ok=True)
+                h.start(True)
+
     def test_a_standby_starts_without_the_fence(self):
         self.existing(standby=True)
         self.put_fence(primary_node="node-a")
@@ -1026,6 +1075,7 @@ class StandbyTests(unittest.TestCase):
         self.assertEqual(self.store.puts[-1][1].get("if-none-match"), "*")
         # Two first starts at once: node-b reads no fence, node-a claims first.
         del self.store.objects["rehearsal/test.fence.json"]
+        (h.STATE / h.NODE_MARKER).unlink()  # node-b is another host with its own volume.
         self.store.before_put = lambda: self.put_fence(epoch=1, primary_node="node-a", timeline=1)
         with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-b"}), self.assertRaises(ValueError) as refused:
             h.start(True)
@@ -1098,6 +1148,7 @@ class StandbyTests(unittest.TestCase):
         self.assertIn("ALTER SYSTEM SET komika.node_id = 'node-b'", joined)
         self.assertIn("ALTER SYSTEM SET komika.fence_epoch = '5'", joined)
         self.assertIn("ALTER SYSTEM RESET primary_conninfo", joined)
+        self.assertEqual((h.STATE / h.NODE_MARKER).read_text(), "node-b\n")
 
     def test_two_promotions_cannot_both_win(self):
         self.put_fence(primary_node="node-a")
@@ -1267,6 +1318,8 @@ class StandbyTests(unittest.TestCase):
         self.assertIn(f"primary_conninfo = '{conninfo}'", auto)
         self.assertIn("primary_slot_name = 'komika_standby'", auto)
         self.assertTrue((h.DATA / "standby.signal").is_file())
+        # The copied data directory may name the primary; the volume names this node.
+        self.assertEqual((h.STATE / h.NODE_MARKER).read_text(), "node-b\n")
         # A second standby-init needs an empty directory.
         with patch.dict(os.environ, {"KOMIKA_NODE_ID": "node-b"}), self.assertRaises(ValueError):
             h.standby_init(["--primary", "db.example:5432"])
@@ -1343,6 +1396,33 @@ class StandbyTests(unittest.TestCase):
         for bad in ("Node=1.2.3.4", "node-c=", "node-c=bad host"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 h.standby_certs([str(out), bad])
+
+    def test_standby_certs_refuse_a_git_work_tree(self):
+        repo = self.root / "repo"
+        (repo / ".git").mkdir(parents=True)
+        out = repo / "deploy" / "certs"
+        with patch.object(h, "run", side_effect=AssertionError("no key is made")), \
+                self.assertRaises(ValueError) as refused:
+            h.standby_certs([str(out), "node-a=203.0.113.7"])
+        self.assertIn("git work tree", str(refused.exception))
+        self.assertFalse(out.exists())
+        # On purpose, for a directory the operator ignores there: it goes on to openssl.
+        with patch.object(h, "run", side_effect=OSError("openssl reached")), \
+                self.assertRaisesRegex(OSError, "openssl reached"):
+            h.standby_certs(["--inside-git-work-tree", str(out), "node-a=203.0.113.7"])
+
+    def test_the_base_compose_forwards_the_node_name(self):
+        compose = h.KIT.parent / "docker-compose.yml"
+        if not compose.is_file():  # Absent in the image.
+            self.skipTest("no docker-compose.yml beside the kit")
+        text = compose.read_text()
+        line = "KOMIKA_NODE_ID: ${KOMIKA_NODE_ID:-}"
+        # The postgres environment (shared by postgres-backup) and the server.
+        postgres = text[text.index("&postgres-environment"):text.index("\n    volumes:", text.index("&postgres-environment"))]
+        server = text[text.index("\n  server:"):text.index("\n  reader:")]
+        self.assertIn(line, postgres)
+        self.assertIn(line, server)
+        self.assertIn("environment: *postgres-environment", text)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,8 @@
 # BOTH hosts, after docker-compose.yml:
 #   docker compose -f docker-compose.yml -f docker-compose.standby.yml ...
 # Each host's deploy/.env names its own node and the other host's address range.
+# docker-compose.yml forwards KOMIKA_NODE_ID too, so a release with the base
+# file alone keeps the fence; it drops the replication port and certificates.
 services:
   postgres:
     environment:

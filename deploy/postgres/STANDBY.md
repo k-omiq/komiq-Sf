@@ -35,6 +35,18 @@ networks). Production has no standby; adding one waits for a second host.
   the local timeline is not older than the fence's. The first primary with no
   fence claims epoch 1 with a create-only write. An unreadable fence is a
   refusal, so with a node name set, a primary start needs the bucket.
+- **Node marker.** After a fence check passes (and after `standby-init` and
+  `promote`), `hosted.py` writes the node name to
+  `/var/lib/postgresql/komika-backup/node-id` on the data volume, beside the
+  data directory (a file inside it would be copied to the standby and into
+  restores). A later start as a primary refuses when that file names another
+  node or `KOMIKA_NODE_ID` is unset, so a release that lost the node name
+  cannot start an old primary with the fence off. To rename a node or leave the
+  standby setup on purpose, remove the file first:
+
+  ```sh
+  docker compose run --rm --no-deps --entrypoint rm postgres /var/lib/postgresql/komika-backup/node-id
+  ```
 - **Who checks the fence.** PostgreSQL's start, the backup scheduler (backups
   run only on the fenced primary; a standby pauses them and checks again each
   minute), `backup.sh` jobs, and `hosted.py fence-check`. The server checks the
@@ -61,7 +73,10 @@ the address or name each node is reached at; the standby checks it:
 python3 deploy/postgres/hosted.py standby-certs ~/komika-standby-certs node-a=PRIMARY_HOST node-b=STANDBY_HOST
 ```
 
-`ca.key` stays on your machine. Copy `~/komika-standby-certs/node-a/` to the
+Use a directory outside any git work tree: the tool refuses one inside a work
+tree unless you pass `--inside-git-work-tree` (the repository's `.gitignore`
+covers `*.key` and `komika-standby-certs/` as a second guard). `ca.key` stays
+on your machine. Copy `~/komika-standby-certs/node-a/` to the
 primary and `node-b/` to the standby, for example to `/srv/komika-tls`.
 Certificates last 825 days; issue new ones before then (remove the node's
 directory first; the tool never overwrites).
@@ -89,6 +104,12 @@ Use both Compose files on both hosts:
 ```sh
 dc() { docker compose -f docker-compose.yml -f docker-compose.standby.yml "$@"; }
 ```
+
+`docker-compose.yml` forwards `KOMIKA_NODE_ID` from `deploy/.env` to
+PostgreSQL, the scheduler and the server on its own, so `deploy.sh` or a plain
+`docker compose up -d` keeps the fence on. They use the base file only, though,
+which drops the replication port and the certificates: release a standby pair
+with `dc up --build -d` instead.
 
 On the primary, restart PostgreSQL and the scheduler so they pick up the
 settings. The scheduler creates `komika_replica` and grants `pg_read_all_stats`
@@ -161,6 +182,13 @@ does not have it yet, and drops and makes it again when the slot was lost.
 A rerun of `promote` after a crash continues: a fence that already names this
 node is not written again, and a node already out of recovery only finishes the
 checkpoint and the settings.
+
+A restart between `pg_promote()` and its first checkpoint also starts:
+`pg_control` still shows the old timeline, one below the fence's, but the data
+directory holds the new timeline's history file (`pg_wal/<timeline>.history`),
+and crash recovery continues on the new timeline. Without that file, a lag of
+one is refused like any old copy. Rerun `promote` once it is up: it finishes
+the checkpoint and the settings it did not reach.
 
 ## After a promotion
 

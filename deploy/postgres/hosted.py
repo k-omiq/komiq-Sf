@@ -51,6 +51,10 @@ REPLICA_ROLE = "komika_replica"
 # entrypoint.sh copies the mounted certificate directory here, postgres-owned 0600.
 TLS = Path(os.environ.get("KOMIKA_PG_TLS", "/run/komika/tls"))
 FENCE_KEYS = {"epoch", "primary_node", "timeline", "at"}
+# The last node name a fence check passed with, on the data volume beside PGDATA:
+# pg_basebackup and pgBackRest copy PGDATA, so a marker there would travel to the
+# standby and into restores with another node's name.
+NODE_MARKER = "node-id"
 STANDBY_LAG_WARN = 300  # Seconds of replay lag before health reports it.
 # The slot keeps WAL for an absent standby; postgresql.conf caps it at 2 GB
 # (max_slot_wal_keep_size), and health reports it from 1 GiB on.
@@ -402,12 +406,14 @@ def start(archive):
             # A standby takes no writes; promote() moves the fence first.
             log("existing cluster with standby.signal; starting as a standby")
         else:
+            check_node_marker()
             fence = fence_gate(archive, existing=True)
             log("existing cluster; starting normally")
     else:
         if DATA.exists() and (DATA.is_symlink() or any(DATA.iterdir())):
             raise ValueError("data directory is not empty and has no PG_VERSION")
         # A restore or a new cluster becomes a primary: the fence decides first.
+        check_node_marker()
         fence = fence_gate(archive, existing=False)
         DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
         if archive:
@@ -433,6 +439,8 @@ def start(archive):
                 raise ValueError("empty repository; initialization requires KOMIKA_PG_INIT_NEW=1")
         else:
             init_cluster()
+    if fence is not None:
+        write_node_marker(fence["primary_node"])
     hba()
     # PostgreSQL itself need not inherit backup keys; Docker env residual is
     # documented. Application password is only needed for bootstrap/health.
@@ -448,6 +456,35 @@ def node_id():
     if not NODE.fullmatch(value):
         raise ValueError("KOMIKA_NODE_ID must be 1-63 lower-case letters, digits or inner dashes")
     return value
+
+
+def node_marker_problem(node):
+    """Why this volume may not start as a primary under `node`, or None.
+
+    A volume that once passed a fence check keeps that node's name. Without it, a
+    release that dropped KOMIKA_NODE_ID would start an old primary unfenced."""
+    path = STATE / NODE_MARKER
+    if not path.is_file():
+        return None
+    marked = path.read_text().strip()
+    if marked == node:
+        return None
+    return (f"this data volume was fenced as node {marked!r} ({path}), but KOMIKA_NODE_ID is "
+            + ("unset" if node is None else repr(node))
+            + f". Set KOMIKA_NODE_ID={marked} in deploy/.env (docker-compose.yml forwards it). Only if this "
+            "volume really changes its node name or leaves the standby setup, remove that file first.")
+
+
+def check_node_marker():
+    problem = node_marker_problem(node_id())
+    if problem:
+        raise ValueError("refusing to start as primary: " + problem)
+
+
+def write_node_marker(node):
+    path = STATE / NODE_MARKER
+    if not path.is_file() or path.read_text().strip() != node:
+        atomic(path, node + "\n")
 
 
 def fence_key():
@@ -515,8 +552,11 @@ def conditional_writes_honoured():
     return second in (409, 412) and third in (409, 412)
 
 
-def fence_decision(fence, node, timeline):
-    """May this node run as the primary? (allowed, reason). Pure, for the matrix tests."""
+def fence_decision(fence, node, timeline, switched=False):
+    """May this node run as the primary? (allowed, reason). Pure, for the matrix tests.
+
+    switched: the data directory holds the fence timeline's history file, i.e.
+    pg_promote() already chose that timeline here."""
     if node is None:
         return True, "fencing is off (no KOMIKA_NODE_ID)"
     if fence is None:
@@ -524,6 +564,11 @@ def fence_decision(fence, node, timeline):
     if fence["primary_node"] != node:
         return False, (f"fence.json epoch {fence['epoch']} names {fence['primary_node']} as primary, "
                        f"not this node ({node}); this node may only be a standby")
+    if timeline is not None and timeline == fence["timeline"] - 1 and switched:
+        # Stopped between pg_promote() and its first checkpoint: pg_control still
+        # shows the old timeline; crash recovery replays onto the new one.
+        return True, (f"fence.json epoch {fence['epoch']} names this node ({node}); local timeline {timeline} "
+                      f"switched to {fence['timeline']} before its first checkpoint")
     if timeline is not None and timeline < fence["timeline"]:
         return False, (f"local timeline {timeline} is older than fence timeline {fence['timeline']}: "
                        "this data directory is an old copy")
@@ -551,11 +596,17 @@ def fence_gate(archive, existing):
             log(f"fence.json claimed: epoch 1, primary {node}")
             return claim
         fence, etag = read_fence()
-    allowed, reason = fence_decision(fence, node, timeline)
+    allowed, reason = fence_decision(fence, node, timeline,
+                                     existing and fence is not None and switched_to(fence["timeline"]))
     if not allowed:
         raise ValueError("refusing to start as primary: " + reason)
     log(reason)
     return fence
+
+
+def switched_to(timeline):
+    """pg_promote() writes the new timeline's history file before it leaves recovery."""
+    return (DATA / "pg_wal" / f"{timeline:08X}.history").is_file()
 
 
 def local_timeline():
@@ -1202,7 +1253,12 @@ def fence_check():
             if (DATA / "PG_VERSION").is_file():
                 result["local_timeline"] = local_timeline()
             result["fence"] = read_fence()[0]
-        allowed, reason = fence_decision(result["fence"], node, result["local_timeline"])
+        fenced = result["fence"]
+        allowed, reason = fence_decision(fenced, node, result["local_timeline"],
+                                         fenced is not None and switched_to(fenced["timeline"]))
+        problem = node_marker_problem(node)
+        if allowed and problem:
+            allowed, reason = False, problem
         if allowed and (DATA / "standby.signal").is_file():
             allowed, reason = False, "standby.signal is present: this node is a standby until promoted"
     except (subprocess.SubprocessError, urllib.error.URLError, OSError, ValueError, KeyError) as error:
@@ -1288,6 +1344,7 @@ def promote(argv):
           f"ALTER SYSTEM SET komika.fence_epoch = '{fence['epoch']}';\n"
           "ALTER SYSTEM RESET primary_conninfo;\nALTER SYSTEM RESET primary_slot_name;\n"
           "SELECT pg_reload_conf();\n", timeout=30)
+    write_node_marker(node)
     print(json.dumps({"promoted": True, "node_id": node, "fence": fence, "timeline": promoted.get("timeline"),
                       "last_replayed_lsn": before.get("replay_lsn"),
                       "last_replayed_commit": iso(before.get("last_replayed_commit")),
@@ -1339,7 +1396,16 @@ def standby_init(argv):
             if not re.match(r"\s*primary_(conninfo|slot_name)\s*=", line)]
     atomic(auto, "".join(kept) + f"primary_conninfo = '{conninfo}'\nprimary_slot_name = '{SLOT}'\n")
     (DATA / "standby.signal").write_text("")
+    write_node_marker(node)
     log(f"standby initialized from {host}:{port} with slot {SLOT}; start the postgres service")
+
+
+def git_work_tree(path):
+    """The work tree holding path (or the nearest existing parent), or None."""
+    for parent in (path.resolve(), *path.resolve().parents):
+        if (parent / ".git").exists():
+            return parent
+    return None
 
 
 def standby_certs(argv):
@@ -1347,9 +1413,17 @@ def standby_certs(argv):
     openssl): one CA, and per node a server certificate for HOST plus a client
     certificate for the replication role. DIR/ca.key never leaves this machine;
     copy DIR/NODE/ to that node's TLS directory."""
+    allow_git = "--inside-git-work-tree" in argv
+    argv = [arg for arg in argv if arg != "--inside-git-work-tree"]
     if len(argv) < 2:
-        raise ValueError("usage: hosted.py standby-certs DIR NODE=HOST [NODE=HOST ...]")
+        raise ValueError("usage: hosted.py standby-certs [--inside-git-work-tree] DIR NODE=HOST [NODE=HOST ...]")
     out, pairs = Path(argv[0]), []
+    tree = git_work_tree(out)
+    if tree is not None and not allow_git:
+        # ca.key signs every replication login; a `git add -A` would publish it.
+        raise ValueError(f"{out} is inside the git work tree {tree}: private keys do not belong there. "
+                         "Use a directory outside it (for example ~/komika-standby-certs), or pass "
+                         "--inside-git-work-tree if it is ignored there on purpose")
     for pair in argv[1:]:
         node, _, host = pair.partition("=")
         if not NODE.fullmatch(node) or not host:

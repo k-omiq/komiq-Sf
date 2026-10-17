@@ -21,6 +21,9 @@ apps/reader/src-tauri/gen/*
 .env.*
 !.env.example
 .dev.vars
+# Private keys, and the standby certificate directory (deploy/postgres/STANDBY.md).
+*.key
+komika-standby-certs/
 
 # deployment access metadata (VPS host, SSH user, key path)
 .credmanager.json

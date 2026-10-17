@@ -154,6 +154,11 @@ services:
       KOMIKA_POSTGRES_PASSWORD: ${KOMIKA_POSTGRES_PASSWORD:?set a URI-safe PostgreSQL password in deploy/.env}
       KOMIKA_PG_INIT_NEW: ${KOMIKA_PG_INIT_NEW:-0}
       KOMIKA_PG_ALLOWED_CIDRS: ${KOMIKA_PG_ALLOWED_CIDRS:-172.21.0.0/16,fd00:21::/64}
+      # Fenced standby (postgres/STANDBY.md): this node's name, read by every
+      # fence check. Here and not only in docker-compose.standby.yml, so a plain
+      # `up` or deploy.sh never recreates a fenced node with the fence off.
+      # Empty: no fence, as before.
+      KOMIKA_NODE_ID: ${KOMIKA_NODE_ID:-}
       KOMIKA_R2_ENDPOINT: ${KOMIKA_R2_ENDPOINT:-}
       KOMIKA_R2_BUCKET: ${KOMIKA_R2_BUCKET:-}
       KOMIKA_R2_PREFIX: ${KOMIKA_R2_PREFIX:-}
@@ -221,6 +226,9 @@ services:
     environment:
       PORT: '8080'
       DATABASE_URL: postgres://komika:${KOMIKA_POSTGRES_PASSWORD:?set a URI-safe PostgreSQL password in deploy/.env}@postgres:5432/komika
+      # With a node name the server starts only on the primary its fence check
+      # started (postgres/STANDBY.md); empty skips the check.
+      KOMIKA_NODE_ID: ${KOMIKA_NODE_ID:-}
       COVERS_DATABASE_URL: sqlite:///data/covers.sqlite3
       KOMIKA_COVERS_DIR: /data/covers
       # The /metrics scrape endpoint, on a SEPARATE listener (never the public
