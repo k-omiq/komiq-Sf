@@ -17,9 +17,14 @@ cargo test postgres_golden_sqlite_baseline -- --nocapture
 UPDATE_GOLDEN=1 cargo test postgres_golden_sqlite_baseline -- --nocapture
 ```
 
-The first command only compares. The second is the **only recording mode**. Review
-all resulting diffs. Recording never changes `search_queries.json`'s independent
-human relevance annotations. Expected search sets are deliberately not assertions
+The first command only compares. The second is the **only recording mode** and
+can now create only missing W3d `chapter_comments__<role>.json` and
+`chapter_comments_linked__<role>.json` files for the four existing roles. It uses
+exclusive file creation and compares every existing response without rewriting
+it, including those eight files once recorded. The Phase 3 prohibition on
+re-recording existing baselines remains in force. Review all resulting diffs.
+Recording never changes `search_queries.json`'s independent human relevance
+annotations. Expected search sets are deliberately not assertions
 that SQLite already satisfies: PostgreSQL's future recall gate should use them.
 The baseline test does assert today's ordered results, including its misses.
 
@@ -28,7 +33,9 @@ The baseline test does assert today's ordered results, including its misses.
 - `seed.sql`: fixed portable INSERT/UPDATE statements through `Database`, with
   boolean literals, explicit dates and identifiers. No checked-in database, FTS
   implementation SQL, rowid, SQLite functions, or SQLite conflict syntax.
-- `graphql_cases.json`: 184 named requests with roles and intentional-error flags.
+- `seed_chapter_comments_linked.sql`: a W3d overlay applied after all baseline
+  GraphQL and search reads, only for the four linked chapter-comment cases.
+- `graphql_cases.json`: 192 named requests with roles and intentional-error flags.
 - `graphql/*.json`: one full real `async_graphql::Response` per request, including
   data, error messages, locations, paths and extensions where present.
 - `search_queries.json`: 42 exact/prefix/typo/transpose/accent/case/short/CJK/alias/
@@ -44,6 +51,35 @@ expected to succeed must succeed even in recording mode. Intentional errors are
 limited to authorization/NSFW refusal, not failed SQL or schema validation.
 
 ## Fixture and deterministic construction
+
+W3d's four `chapter_comments__*` cases query the external MangaDex id
+`00000000-0000-4000-8000-000000000103` before the overlay: one existing comment,
+one root, no linked copies. The four `chapter_comments_linked__*` cases read that
+id and `710101` in one request, aliased as `mangadex` and `suwayomi`. The overlay
+links these existing copies of work 1's chapter 10.5, adds a root on the numeric
+copy and a reply there to the original comment, and adds votes on the new root.
+Both aliases should return identical pages with three comments and two roots,
+preserving each comment's own `targetId` and the reply's `parentId`. The numeric
+root has one like and one dislike, with `myVote` 1 for `user`, -1 for `nsfw_user`,
+and 0 for `anonymous`/`admin`. The work is never marked ready.
+
+All three seed authors have existing `profile__*` / `myComments` snapshots, so
+putting these extra comments in the common seed would change old outputs. The
+overlay runs only after the old responses and search have been compared. Neither
+`seed.sql` nor the unused historical `seed_sqlite.sql` needs to change.
+
+To record and then verify W3d on a machine with an installed PostgreSQL 18 test
+runtime, from `apps/server` (replace the binary directory if necessary):
+
+```sh
+KOMIKA_TEST_POSTGRES_BIN=/path/to/postgresql-18/bin UPDATE_GOLDEN=1 cargo test --offline postgres_golden_sqlite_baseline -- --nocapture
+KOMIKA_TEST_POSTGRES_BIN=/path/to/postgresql-18/bin cargo test --offline postgres_golden_sqlite_baseline -- --nocapture
+```
+
+The explicit runtime path prevents the test harness from downloading PostgreSQL.
+Review the eight new `graphql/chapter_comments*.json` files by hand. No existing
+response should have a diff. The test retains its historical SQLite-baseline name
+but now uses the PostgreSQL test harness.
 
 15 works cover MANGA, MANHWA, MANHUA, WEBTOON and COMIC, including one with no
 chapters and one NSFW work. Titles include Latin, accents, punctuation, 1/2/3-letter

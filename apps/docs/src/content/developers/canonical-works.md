@@ -93,6 +93,8 @@ Copies that existed before the list are linked by a background drain. It walks t
 
 When a work is ready, the server builds `aggregatedChapters` from the entries, in `sort_key` order. Until then it groups copies by number as before. Every chapter list carries the entry id and position of each copy (`entryId`, `entryOrder`) and applies the entry's hidden flag and title override. For a copy that is not linked yet, the list falls back to the override stored for its spine key in `chapter_override`. An administrator edits entries with `workChapterList` and `setWorkChapter` (see [GraphQL API](/developers/graphql)). The server writes a numbered entry's hidden flag and title to `chapter_override` too, so the fallback agrees.
 
+Comments on a chapter follow the entry too. A comment stays stored under the id of the copy it was posted on, and `comments(targetType: "chapter")` returns the comments of every copy linked to the same entry as one thread. See [GraphQL API](/developers/graphql).
+
 The library's chapter total of a ready work counts its visible entries that have at least one copy.
 
 ## Merge and split operations

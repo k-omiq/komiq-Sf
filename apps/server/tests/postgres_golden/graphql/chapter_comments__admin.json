@@ -1,0 +1,32 @@
+{
+  "data": {
+    "comments": {
+      "hasNextPage": false,
+      "items": [
+        {
+          "author": {
+            "avatarUrl": null,
+            "id": "00000000-0000-4000-8000-000000000901",
+            "username": "reader"
+          },
+          "body": "Half chapter comment",
+          "createdAt": "2020-01-08T01:02:03.000000+00:00",
+          "deletedBy": null,
+          "dislikes": 0,
+          "hasSpoiler": false,
+          "id": "00000000-0000-4000-8000-000000001110",
+          "likes": 0,
+          "mediaHeight": null,
+          "mediaUrl": null,
+          "mediaWidth": null,
+          "myVote": 0,
+          "parentId": null,
+          "targetId": "00000000-0000-4000-8000-000000000103",
+          "targetType": "chapter"
+        }
+      ],
+      "page": 1,
+      "total": 1
+    }
+  }
+}

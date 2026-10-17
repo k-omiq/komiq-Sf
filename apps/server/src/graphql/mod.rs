@@ -8275,6 +8275,16 @@ impl QueryRoot {
             target_id
         };
         let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
+        // The comment targets that make up the thread. A chapter thread is shared by
+        // every copy linked to the same work chapter entry; the other kinds have one.
+        let thread_targets = if target_type == "chapter" {
+            let mut conn = st.pool.acquire().await.map_err(gql_read_err)?;
+            chapter_thread_targets(&mut conn, &target_id.0)
+                .await
+                .map_err(gql_read_err)?
+        } else {
+            vec![target_id.0.clone()]
+        };
         // The viewer's own vote per comment is selected inline; '' (anonymous) matches
         // no vote row, yielding my_vote = 0.
         let viewer_id = current_user(ctx).await?.map(|u| u.id).unwrap_or_default();
@@ -8287,10 +8297,10 @@ impl QueryRoot {
         // Like/dislike tallies and the viewer's vote are correlated subqueries so the
         // whole thread's votes come back in this one query (no per-comment fan-out).
         let rows: Vec<CommentJoin> = sqlx::query_as(
-            r#"WITH RECURSIVE roots AS ( SELECT c.id, c.created_at FROM comments c JOIN users u ON u.id = c.user_id WHERE c.target_type = $1 AND c.target_id = $2 AND c.parent_id IS NULL AND (c.deleted_by IS NOT NULL OR u.is_banned = FALSE) ORDER BY c.created_at ASC NULLS FIRST, c.id ASC NULLS FIRST LIMIT $3 OFFSET $4 ), thread(id) AS ( SELECT id FROM roots UNION ALL SELECT c.id FROM comments c JOIN thread t ON c.parent_id = t.id JOIN users u ON u.id = c.user_id WHERE c.deleted_by IS NOT NULL OR u.is_banned = FALSE ) SELECT c.id, c.target_type, c.target_id, c.parent_id, c.deleted_by, c.body, c.has_spoiler, c.created_at, u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar, m.id AS media_id, m.width AS media_width, m.height AS media_height, COALESCE((SELECT COUNT(*) FROM comment_votes v WHERE v.comment_id = c.id AND v.value = 1), 0) AS likes, COALESCE((SELECT COUNT(*) FROM comment_votes v WHERE v.comment_id = c.id AND v.value = -1), 0) AS dislikes, COALESCE((SELECT v.value FROM comment_votes v WHERE v.comment_id = c.id AND v.user_id = $5), 0) AS my_vote FROM comments c JOIN users u ON u.id = c.user_id LEFT JOIN comment_media m ON m.comment_id = c.id WHERE c.id IN (SELECT id FROM thread) ORDER BY c.created_at ASC NULLS FIRST LIMIT $6"#,
+            r#"WITH RECURSIVE roots AS ( SELECT c.id, c.created_at FROM comments c JOIN users u ON u.id = c.user_id WHERE c.target_type = $1 AND c.target_id = ANY($2) AND (c.parent_id IS NULL OR NOT EXISTS (SELECT 1 FROM comments p WHERE p.id = c.parent_id AND p.target_type = $1 AND p.target_id = ANY($2))) AND (c.deleted_by IS NOT NULL OR u.is_banned = FALSE) ORDER BY c.created_at ASC NULLS FIRST, c.id ASC NULLS FIRST LIMIT $3 OFFSET $4 ), thread(id) AS ( SELECT id FROM roots UNION ALL SELECT c.id FROM comments c JOIN thread t ON c.parent_id = t.id JOIN users u ON u.id = c.user_id WHERE c.target_type = $1 AND c.target_id = ANY($2) AND (c.deleted_by IS NOT NULL OR u.is_banned = FALSE) ) SELECT c.id, c.target_type, c.target_id, c.parent_id, c.deleted_by, c.body, c.has_spoiler, c.created_at, u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar, m.id AS media_id, m.width AS media_width, m.height AS media_height, COALESCE((SELECT COUNT(*) FROM comment_votes v WHERE v.comment_id = c.id AND v.value = 1), 0) AS likes, COALESCE((SELECT COUNT(*) FROM comment_votes v WHERE v.comment_id = c.id AND v.value = -1), 0) AS dislikes, COALESCE((SELECT v.value FROM comment_votes v WHERE v.comment_id = c.id AND v.user_id = $5), 0) AS my_vote FROM comments c JOIN users u ON u.id = c.user_id LEFT JOIN comment_media m ON m.comment_id = c.id WHERE c.id IN (SELECT id FROM thread) ORDER BY c.created_at ASC NULLS FIRST LIMIT $6"#,
         )
         .bind(target_type)
-        .bind(target_id.0.clone())
+        .bind(&thread_targets)
         .bind(PAGE_SIZE)
         .bind(offset)
         .bind(uuid::Uuid::parse_str(&viewer_id).ok())
@@ -8303,11 +8313,14 @@ impl QueryRoot {
         // `total` and `has_next_page` count root threads (the paginated unit).
         let total_roots: i64 = crate::db_types::query_scalar(
             "SELECT COUNT(*) FROM comments c JOIN users u ON u.id = c.user_id \
-             WHERE c.target_type = $1 AND c.target_id = $2 AND c.parent_id IS NULL \
+             WHERE c.target_type = $1 AND c.target_id = ANY($2) \
+               AND (c.parent_id IS NULL OR NOT EXISTS ( \
+                    SELECT 1 FROM comments p WHERE p.id = c.parent_id \
+                       AND p.target_type = $1 AND p.target_id = ANY($2))) \
                AND (c.deleted_by IS NOT NULL OR u.is_banned = FALSE)",
         )
         .bind(target_type)
-        .bind(target_id.0.clone())
+        .bind(&thread_targets)
         .fetch_one(&st.pool)
         .await
         .map_err(gql_read_err)?;
@@ -10539,6 +10552,34 @@ async fn progress_sources_on(
         .await?)
 }
 
+/// The comment targets that make up one chapter thread: the copy asked for plus every
+/// copy linked to the same work chapter entry. Comments stay stored under the id of
+/// the copy they were posted on; a thread is read and answered across all of them.
+/// A copy with no link (or an id no copy knows) is a thread of its own.
+async fn chapter_thread_targets(
+    conn: &mut sqlx::PgConnection,
+    chapter_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let numeric = chapter_id.bytes().all(|b| b.is_ascii_digit());
+    let mut targets: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT m.external_id FROM chapter c \
+           JOIN source_series ss ON ss.id = c.source_series_id \
+           JOIN work_chapter_link l ON l.chapter_id = c.id \
+           JOIN work_chapter_link l2 ON l2.work_chapter_id = l.work_chapter_id \
+           JOIN chapter m ON m.id = l2.chapter_id \
+          WHERE c.external_id = $1 AND ss.source_type = $2",
+    )
+    .bind(chapter_id)
+    .bind(if numeric { "suwayomi" } else { "mangadex" })
+    .fetch_all(conn)
+    .await?;
+    if !targets.iter().any(|t| t == chapter_id) {
+        targets.push(chapter_id.to_owned());
+    }
+    targets.sort();
+    Ok(targets)
+}
+
 async fn lock_progress_owner(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user_id: &str,
@@ -12561,11 +12602,15 @@ impl MutationRoot {
         // transaction, so a comment never ends up referencing media it failed to
         // link (or media stays orphaned after the comment committed).
         let (media, stored_target) = crate::db::retry_transaction(|| async {
-            if matches!(target_type, "series" | "chapter") && input.target_id.0.bytes().all(|b| b.is_ascii_digit()) {
+            // A reply on a chapter thread may name a parent on a numeric engine copy of
+            // the same entry, so it is fenced against an engine reset like a numeric post.
+            let fenced = matches!(target_type, "series" | "chapter") && input.target_id.0.bytes().all(|b| b.is_ascii_digit())
+                || (target_type == "chapter" && input.parent_id.is_some());
+            if fenced {
                 crate::engine_generation::wait(&st.pool).await?;
             }
             let mut tx = st.pool.begin().await?;
-            if matches!(target_type, "series" | "chapter") && input.target_id.0.bytes().all(|b| b.is_ascii_digit()) {
+            if fenced {
                 crate::engine_generation::shared(&mut tx, None).await?;
             }
             crate::locks::lock_user(&mut tx, &user.id).await?;
@@ -12597,16 +12642,23 @@ impl MutationRoot {
                 if !exists { return Err(MutationValidation("No such chapter").into()); }
                 input.target_id.0.clone()
             };
-            // A reply must point at an existing comment on the SAME target — this keeps
+            // A reply must point at an existing comment on the SAME thread — this keeps
             // a thread's tree self-consistent and blocks cross-thread / cross-series
             // parent ids. The root of the tree is a NULL parent.
             if let Some(parent) = input.parent_id.as_ref() {
+                // A chapter thread is shared by every copy of the work chapter, so the
+                // parent may sit on a sibling copy of the same entry, never on another.
+                let thread_targets = if target_type == "chapter" {
+                    chapter_thread_targets(&mut tx, &stored_target).await?
+                } else {
+                    vec![stored_target.clone()]
+                };
                 let parent_deleted: Option<Option<String>> = crate::db_types::query_scalar(
-                    "SELECT deleted_by FROM comments WHERE id = $1 AND target_type = $2 AND target_id = $3 FOR UPDATE",
+                    "SELECT deleted_by FROM comments WHERE id = $1 AND target_type = $2 AND target_id = ANY($3) FOR UPDATE",
                 )
                 .bind(uuid::Uuid::parse_str(&parent.0).ok())
                 .bind(target_type)
-                .bind(&stored_target)
+                .bind(&thread_targets)
                 .fetch_optional(&mut *tx)
                 .await
                 ?;
@@ -17921,6 +17973,11 @@ mod tests {
     mod comment_deletion_tests {
         use super::*;
         include!("comment_deletion_tests.rs");
+    }
+
+    mod chapter_thread_tests {
+        use super::*;
+        include!("chapter_thread_tests.rs");
     }
 
     use super::*;

@@ -1102,5 +1102,53 @@
     "role": "admin",
     "query": "{ scanlatorTags { name ai } sourceAiTags { sourceId ai } }",
     "allow_errors": false
+  },
+  {
+    "name": "chapter_comments__anonymous",
+    "role": "anonymous",
+    "query": "{ comments(targetType: \"chapter\", targetId: \"00000000-0000-4000-8000-000000000103\") {page total hasNextPage items {id targetType targetId parentId deletedBy author {id username avatarUrl} body hasSpoiler mediaUrl mediaWidth mediaHeight createdAt likes dislikes myVote} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "chapter_comments__user",
+    "role": "user",
+    "query": "{ comments(targetType: \"chapter\", targetId: \"00000000-0000-4000-8000-000000000103\") {page total hasNextPage items {id targetType targetId parentId deletedBy author {id username avatarUrl} body hasSpoiler mediaUrl mediaWidth mediaHeight createdAt likes dislikes myVote} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "chapter_comments__admin",
+    "role": "admin",
+    "query": "{ comments(targetType: \"chapter\", targetId: \"00000000-0000-4000-8000-000000000103\") {page total hasNextPage items {id targetType targetId parentId deletedBy author {id username avatarUrl} body hasSpoiler mediaUrl mediaWidth mediaHeight createdAt likes dislikes myVote} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "chapter_comments__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ comments(targetType: \"chapter\", targetId: \"00000000-0000-4000-8000-000000000103\") {page total hasNextPage items {id targetType targetId parentId deletedBy author {id username avatarUrl} body hasSpoiler mediaUrl mediaWidth mediaHeight createdAt likes dislikes myVote} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "chapter_comments_linked__anonymous",
+    "role": "anonymous",
+    "query": "{ mangadex: comments(targetType: \"chapter\", targetId: \"00000000-0000-4000-8000-000000000103\") {page total hasNextPage items {id targetType targetId parentId deletedBy author {id username avatarUrl} body hasSpoiler mediaUrl mediaWidth mediaHeight createdAt likes dislikes myVote} } suwayomi: comments(targetType: \"chapter\", targetId: \"710101\") {page total hasNextPage items {id targetType targetId parentId deletedBy author {id username avatarUrl} body hasSpoiler mediaUrl mediaWidth mediaHeight createdAt likes dislikes myVote} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "chapter_comments_linked__user",
+    "role": "user",
+    "query": "{ mangadex: comments(targetType: \"chapter\", targetId: \"00000000-0000-4000-8000-000000000103\") {page total hasNextPage items {id targetType targetId parentId deletedBy author {id username avatarUrl} body hasSpoiler mediaUrl mediaWidth mediaHeight createdAt likes dislikes myVote} } suwayomi: comments(targetType: \"chapter\", targetId: \"710101\") {page total hasNextPage items {id targetType targetId parentId deletedBy author {id username avatarUrl} body hasSpoiler mediaUrl mediaWidth mediaHeight createdAt likes dislikes myVote} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "chapter_comments_linked__admin",
+    "role": "admin",
+    "query": "{ mangadex: comments(targetType: \"chapter\", targetId: \"00000000-0000-4000-8000-000000000103\") {page total hasNextPage items {id targetType targetId parentId deletedBy author {id username avatarUrl} body hasSpoiler mediaUrl mediaWidth mediaHeight createdAt likes dislikes myVote} } suwayomi: comments(targetType: \"chapter\", targetId: \"710101\") {page total hasNextPage items {id targetType targetId parentId deletedBy author {id username avatarUrl} body hasSpoiler mediaUrl mediaWidth mediaHeight createdAt likes dislikes myVote} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "chapter_comments_linked__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ mangadex: comments(targetType: \"chapter\", targetId: \"00000000-0000-4000-8000-000000000103\") {page total hasNextPage items {id targetType targetId parentId deletedBy author {id username avatarUrl} body hasSpoiler mediaUrl mediaWidth mediaHeight createdAt likes dislikes myVote} } suwayomi: comments(targetType: \"chapter\", targetId: \"710101\") {page total hasNextPage items {id targetType targetId parentId deletedBy author {id username avatarUrl} body hasSpoiler mediaUrl mediaWidth mediaHeight createdAt likes dislikes myVote} } }",
+    "allow_errors": false
   }
 ]

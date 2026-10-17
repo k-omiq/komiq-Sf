@@ -1,0 +1,144 @@
+{
+  "data": {
+    "mangadex": {
+      "hasNextPage": false,
+      "items": [
+        {
+          "author": {
+            "avatarUrl": null,
+            "id": "00000000-0000-4000-8000-000000000901",
+            "username": "reader"
+          },
+          "body": "Half chapter comment",
+          "createdAt": "2020-01-08T01:02:03.000000+00:00",
+          "deletedBy": null,
+          "dislikes": 0,
+          "hasSpoiler": false,
+          "id": "00000000-0000-4000-8000-000000001110",
+          "likes": 0,
+          "mediaHeight": null,
+          "mediaUrl": null,
+          "mediaWidth": null,
+          "myVote": 0,
+          "parentId": null,
+          "targetId": "00000000-0000-4000-8000-000000000103",
+          "targetType": "chapter"
+        },
+        {
+          "author": {
+            "avatarUrl": null,
+            "id": "00000000-0000-4000-8000-000000000902",
+            "username": "cjk-reader"
+          },
+          "body": "Mirror chapter root",
+          "createdAt": "2020-01-09T01:02:03.000000+00:00",
+          "deletedBy": null,
+          "dislikes": 1,
+          "hasSpoiler": true,
+          "id": "00000000-0000-4000-8000-000000001111",
+          "likes": 1,
+          "mediaHeight": null,
+          "mediaUrl": null,
+          "mediaWidth": null,
+          "myVote": -1,
+          "parentId": null,
+          "targetId": "710101",
+          "targetType": "chapter"
+        },
+        {
+          "author": {
+            "avatarUrl": null,
+            "id": "00000000-0000-4000-8000-000000000900",
+            "username": "owner"
+          },
+          "body": "Reply from the linked copy",
+          "createdAt": "2020-01-10T01:02:03.000000+00:00",
+          "deletedBy": null,
+          "dislikes": 0,
+          "hasSpoiler": false,
+          "id": "00000000-0000-4000-8000-000000001112",
+          "likes": 0,
+          "mediaHeight": null,
+          "mediaUrl": null,
+          "mediaWidth": null,
+          "myVote": 0,
+          "parentId": "00000000-0000-4000-8000-000000001110",
+          "targetId": "710101",
+          "targetType": "chapter"
+        }
+      ],
+      "page": 1,
+      "total": 2
+    },
+    "suwayomi": {
+      "hasNextPage": false,
+      "items": [
+        {
+          "author": {
+            "avatarUrl": null,
+            "id": "00000000-0000-4000-8000-000000000901",
+            "username": "reader"
+          },
+          "body": "Half chapter comment",
+          "createdAt": "2020-01-08T01:02:03.000000+00:00",
+          "deletedBy": null,
+          "dislikes": 0,
+          "hasSpoiler": false,
+          "id": "00000000-0000-4000-8000-000000001110",
+          "likes": 0,
+          "mediaHeight": null,
+          "mediaUrl": null,
+          "mediaWidth": null,
+          "myVote": 0,
+          "parentId": null,
+          "targetId": "00000000-0000-4000-8000-000000000103",
+          "targetType": "chapter"
+        },
+        {
+          "author": {
+            "avatarUrl": null,
+            "id": "00000000-0000-4000-8000-000000000902",
+            "username": "cjk-reader"
+          },
+          "body": "Mirror chapter root",
+          "createdAt": "2020-01-09T01:02:03.000000+00:00",
+          "deletedBy": null,
+          "dislikes": 1,
+          "hasSpoiler": true,
+          "id": "00000000-0000-4000-8000-000000001111",
+          "likes": 1,
+          "mediaHeight": null,
+          "mediaUrl": null,
+          "mediaWidth": null,
+          "myVote": -1,
+          "parentId": null,
+          "targetId": "710101",
+          "targetType": "chapter"
+        },
+        {
+          "author": {
+            "avatarUrl": null,
+            "id": "00000000-0000-4000-8000-000000000900",
+            "username": "owner"
+          },
+          "body": "Reply from the linked copy",
+          "createdAt": "2020-01-10T01:02:03.000000+00:00",
+          "deletedBy": null,
+          "dislikes": 0,
+          "hasSpoiler": false,
+          "id": "00000000-0000-4000-8000-000000001112",
+          "likes": 0,
+          "mediaHeight": null,
+          "mediaUrl": null,
+          "mediaWidth": null,
+          "myVote": 0,
+          "parentId": "00000000-0000-4000-8000-000000001110",
+          "targetId": "710101",
+          "targetType": "chapter"
+        }
+      ],
+      "page": 1,
+      "total": 2
+    }
+  }
+}

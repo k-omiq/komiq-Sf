@@ -6,6 +6,7 @@ use super::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const USERS: [(&str, &str, i64, &str); 3] = [
@@ -72,20 +73,23 @@ fn token(role: &str) -> Option<&'static str> {
     }
 }
 
-async fn seed(pool: &Database, root: &Path) {
+async fn apply_seed(pool: &Database, path: &Path) {
     // Ordinary SQL only. The server owns engine-specific migrations and projections.
     // No generated identifiers, current dates, FTS internals or SQLite file fixture.
-    for statement in std::fs::read_to_string(root.join("seed.sql"))
-        .unwrap()
-        .split(';')
-    {
+    for statement in std::fs::read_to_string(path).unwrap().split(';') {
         if !statement.trim().is_empty() {
             sqlx::query(statement)
                 .execute(pool)
                 .await
-                .unwrap_or_else(|e| panic!("golden seed failed: {e}\n{statement}"));
+                .unwrap_or_else(|e| {
+                    panic!("golden seed {} failed: {e}\n{statement}", path.display())
+                });
         }
     }
+}
+
+async fn seed(pool: &Database, root: &Path) {
+    apply_seed(pool, &root.join("seed.sql")).await;
     // Reuse the production alias and chapter-label rules without their stamping writers.
     let aliases: Vec<(String, String)> =
         sqlx::query_as("SELECT id, raw_title FROM work_alias ORDER BY id")
@@ -266,10 +270,44 @@ fn unaccepted_differences<'a>(
         .collect()
 }
 
+fn is_chapter_comment_case(name: &str) -> bool {
+    name.strip_prefix("chapter_comments__")
+        .or_else(|| name.strip_prefix("chapter_comments_linked__"))
+        .is_some_and(|role| matches!(role, "anonymous" | "user" | "admin" | "nsfw_user"))
+}
+
+// Phase3 baselines remain immutable. W3d may only create these eight new files,
+// using create_new so even a concurrent recorder cannot overwrite a snapshot.
+fn record_new_chapter_comments(path: &Path, actual: &str, update: bool) -> bool {
+    if !update
+        || !path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_chapter_comment_case)
+    {
+        return false;
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            file.write_all(actual.as_bytes()).unwrap();
+            eprintln!("recorded new golden {}", path.display());
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => panic!("cannot record new golden {}: {error}", path.display()),
+    }
+}
+
 fn compare(path: &Path, output: Value, update: bool) -> Option<Value> {
     let output = canonical(output);
     let actual = serde_json::to_string_pretty(&output).unwrap() + "\n";
-    assert!(!update, "snapshot recording is forbidden during Phase3");
+    if record_new_chapter_comments(path, &actual, update) {
+        return None;
+    }
     let expected = std::fs::read_to_string(path).unwrap_or_else(|e| {
         panic!(
             "{}: {e}. See tests/postgres_golden/README.md for recording.",
@@ -309,6 +347,70 @@ fn compare(path: &Path, output: Value, update: bool) -> Option<Value> {
     None
 }
 
+async fn compare_case(
+    schema: &ApiSchema,
+    root: &Path,
+    case: &Case,
+    update: bool,
+) -> (Option<Value>, Option<Value>) {
+    let response = run(schema, &case.query, token(&case.role)).await;
+    let unexpected_state = response.errors.is_empty() == case.allow_errors;
+    let unexpected_error = response.errors.iter().any(|error| {
+        !matches!(
+            error.message.as_str(),
+            "No such work" | "Not authenticated" | "Admin access required"
+        )
+    });
+    if unexpected_state || unexpected_error {
+        // Never record an API failure as a new expected response.
+        return (
+            None,
+            Some(
+                json!({"case":case.name,"errors":response.errors,"sources":error_sources(&response)}),
+            ),
+        );
+    }
+    (
+        compare(
+            &root.join("graphql").join(format!("{}.json", case.name)),
+            serde_json::to_value(response).unwrap(),
+            update,
+        ),
+        None,
+    )
+}
+
+#[test]
+fn postgres_golden_recording_preserves_existing_snapshots() {
+    let root =
+        std::env::temp_dir().join(format!("komika-golden-recording-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let new_path = root.join("chapter_comments__user.json");
+    assert!(!record_new_chapter_comments(&new_path, "new\n", false));
+    assert!(!new_path.exists());
+    assert!(record_new_chapter_comments(&new_path, "new\n", true));
+    assert!(!record_new_chapter_comments(&new_path, "changed\n", true));
+    assert_eq!(std::fs::read_to_string(&new_path).unwrap(), "new\n");
+    let baseline_path = root.join("social__user.json");
+    assert!(!record_new_chapter_comments(&baseline_path, "new\n", true));
+    std::fs::write(&baseline_path, "existing\n").unwrap();
+    assert!(!record_new_chapter_comments(
+        &baseline_path,
+        "changed\n",
+        true
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&baseline_path).unwrap(),
+        "existing\n"
+    );
+    assert!(!record_new_chapter_comments(
+        &root.join("chapter_comments__unexpected_role.json"),
+        "new\n",
+        true,
+    ));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn postgres_golden_acceptance_is_bound_to_exact_output_bytes() {
     let empty = AcceptedDifferences {
@@ -338,7 +440,6 @@ fn postgres_golden_acceptance_is_bound_to_exact_output_bytes() {
 async fn postgres_golden_sqlite_baseline() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/postgres_golden");
     let update = std::env::var("UPDATE_GOLDEN").as_deref() == Ok("1");
-    assert!(!update, "Phase3 forbids recording snapshots from PostgreSQL output; use the date-only conversion script");
     // Invalid URL scheme: even an accidental cache miss cannot open a socket.
     // Successful cases below assert no resolver errors; read the README's exclusions.
     let (schema, st) = fixture_with_users("offline://golden", &USERS).await;
@@ -349,25 +450,13 @@ async fn postgres_golden_sqlite_baseline() {
             .unwrap();
     let mut differences = Vec::new();
     let mut blocking_errors = Vec::new();
-    for case in &cases {
-        let response = run(&schema, &case.query, token(&case.role)).await;
-        let unexpected_state = response.errors.is_empty() == case.allow_errors;
-        let unexpected_error = response.errors.iter().any(|error| {
-            !matches!(
-                error.message.as_str(),
-                "No such work" | "Not authenticated" | "Admin access required"
-            )
-        });
-        if unexpected_state || unexpected_error {
-            blocking_errors.push(json!({"case":case.name,"errors":response.errors,"sources":error_sources(&response)}));
-        }
-        if let Some(diff) = compare(
-            &root.join("graphql").join(format!("{}.json", case.name)),
-            serde_json::to_value(response).unwrap(),
-            update,
-        ) {
-            differences.push(diff);
-        }
+    for case in cases
+        .iter()
+        .filter(|case| !case.name.starts_with("chapter_comments_linked__"))
+    {
+        let (difference, blocking_error) = compare_case(&schema, &root, case, update).await;
+        differences.extend(difference);
+        blocking_errors.extend(blocking_error);
     }
     let queries: Vec<SearchQuery> =
         serde_json::from_str(&std::fs::read_to_string(root.join("search_queries.json")).unwrap())
@@ -414,6 +503,17 @@ async fn postgres_golden_sqlite_baseline() {
     }
     if let Some(diff) = compare(&root.join("search_observed.json"), json!(results), update) {
         differences.push(diff);
+    }
+    // All baseline reads (including search and myComments) finish before the
+    // linked-thread overlay. The unlinked chapter 103 cases still see one comment.
+    apply_seed(&st.pool, &root.join("seed_chapter_comments_linked.sql")).await;
+    for case in cases
+        .iter()
+        .filter(|case| case.name.starts_with("chapter_comments_linked__"))
+    {
+        let (difference, blocking_error) = compare_case(&schema, &root, case, update).await;
+        differences.extend(difference);
+        blocking_errors.extend(blocking_error);
     }
     if let Ok(path) = std::env::var("KOMIKA_PHASE3_GOLDEN_DIFF_REPORT") {
         std::fs::write(

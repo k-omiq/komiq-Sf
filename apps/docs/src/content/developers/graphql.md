@@ -138,8 +138,17 @@ These operations support community discussion, ratings and user notifications:
 
 - `reviews` and `myReview`: paginated user reviews and ratings (1 to 10) for a work.
 - `postReview` and `deleteReview`: create, update or remove a review.
-- `comments` and `myComments`: comment threads for a series or chapter.
+- `comments` and `myComments`: comment threads for a series, a scanlator or a chapter.
 - `postComment` and `voteComment`: post a comment or vote (1 for like, -1 for dislike, 0 to clear).
+
+A chapter thread belongs to the chapter of the work, not to one copy of it. A comment stays stored under the id of the copy it was posted on, and `postComment` keeps that id. `comments(targetType: "chapter", targetId)` finds the chapter entry that the copy is linked to and returns the comments of every linked copy as one thread. Each returned comment keeps the `targetId` of its own copy, so do not filter the page by the id you asked for.
+
+- A reply may name a parent on any copy of the same chapter entry. A parent on another entry, or on an unlinked chapter, is refused with `reply target not found on this thread`.
+- A copy with no link, or an id that no copy knows, is a thread of its own.
+- The reply tree is built from the members of the thread only. A comment whose parent is not a member, for example after a copy moved to another work, shows as a top-level comment. A read never follows a reply out of the thread.
+- `total` and paging count the top-level comments of the whole thread.
+- Comments on a copy that the source later drops leave the shared thread, because the copy loses its link. They are still readable by asking for that copy's own id.
+- Comments on numeric chapter ids that an engine reset set aside stay hidden.
 - `notifications` and `unreadNotificationCount`: user notification inbox and badge counts.
 - `markNotificationsRead`: mark notifications as read.
 - `myActivity`: activity stream of recent user interactions.

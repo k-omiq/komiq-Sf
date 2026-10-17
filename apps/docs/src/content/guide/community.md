@@ -46,6 +46,7 @@ Komiq provides unified comment threads on series pages and at the conclusion of 
 
 - Series discussion: Open any series page and select the Discussion tab. This area hosts general conversations about the series, story arcs, and recommendations.
 - Chapter discussion: In the reader, scroll past the final page of any chapter to reach the comment section. This area is intended for reactions and analysis specific to that chapter.
+- One thread for every copy: When two sources carry the same chapter, komiq links them to one chapter of the series. Both copies show the same chapter discussion, so you see comments written on either copy. A reply can answer a comment written on the other copy. A copy that komiq has not linked keeps its own thread.
 
 ### Write a comment
 
