@@ -1,4 +1,10 @@
-import { MediaRouter, mediaOrigin, trustedMediaRoutes, type RoutedPage } from '@komika/api';
+import {
+	MediaRouter,
+	mediaOrigin,
+	routedMedia,
+	trustedMediaRoutes,
+	type RoutedPage,
+} from '@komika/api';
 import type { MediaRoute, Page } from '@komika/types';
 import { backend, images } from './context';
 import { apiOrigin, mediaHosts, target } from './config';
@@ -7,7 +13,8 @@ import { apiOrigin, mediaHosts, target } from './config';
  * Typed media routes (M5) for the hosted web build. With a non-empty
  * `PUBLIC_KOMIKA_MEDIA_HOSTS`, pages that carry an exact object (`mediaPath`) load it from
  * the session's media route; everything else loads `sourceUrl` through the image provider
- * as before. Exact object URLs never pass through the provider.
+ * as before. Exact object URLs never pass through the provider. An object on a non-owner
+ * route carries `verify`: the reader shows it only after its bytes match (PK1).
  */
 // `mediaHosts` is already empty outside a web build on the komiq backend.
 const routesOn = mediaHosts.length > 0;
@@ -87,7 +94,7 @@ export function currentMediaRouter(): MediaRouter | null {
 export async function routePage(page: Page, router: MediaRouter | null): Promise<RoutedPage> {
 	await ownerOriginReady();
 	const media = router?.pageMedia(page) ?? null;
-	if (media && router) return { url: router.href(media), media };
+	if (media && router) return routedMedia(router, media);
 	return { url: await images.resolvePage(page), media: null };
 }
 

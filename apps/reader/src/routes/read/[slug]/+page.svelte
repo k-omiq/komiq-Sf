@@ -40,7 +40,7 @@
 		type Opt,
 	} from '$lib/reader-prefs';
 	import CommentThread from '$lib/components/CommentThread.svelte';
-	import { ChapterMediaRecovery } from '@komika/api';
+	import { ChapterMediaRecovery, VerifiedObjectUrls, type RoutedPage } from '@komika/api';
 	import { currentMediaRouter, freshRoutedPages } from '$lib/media';
 
 	let { data: loadedData } = $props();
@@ -329,6 +329,7 @@
 			readMarked = data.chapterRead ?? false;
 			pageRatio = {};
 			pageError = {};
+			verifiedSrc = {};
 			warmedUrls.clear();
 			settledPages.clear();
 			queueUntil = STARTER_PAGES;
@@ -498,7 +499,7 @@
 				if (!readerViewIsCurrent(view)) return releaseStaleReaderView(view);
 				const next = view.pages;
 				for (const pg of next.slice(0, PREFETCH_IMAGES)) {
-					if (!pg?.url || warmedUrls.has(pg.url)) continue;
+					if (!pg?.url || pg.verify || warmedUrls.has(pg.url)) continue;
 					warmedUrls.add(pg.url);
 					const warm = new Image();
 					warm.decoding = 'async';
@@ -627,12 +628,16 @@
 	const settledPages = new Set<number>();
 	const eagerUntil = $derived(Math.max(queueUntil, maxScrolledPage + EAGER_AHEAD));
 
+	// A page that must be verified loads by the verify window below, not by the queue.
+	function waitsInQueue(i: number): boolean {
+		return !settledPages.has(i) && !routeOf(i)?.verify;
+	}
 	function advanceQueue(): void {
 		let inFlight = 0;
-		for (let i = 0; i < queueUntil; i++) if (!settledPages.has(i)) inFlight++;
+		for (let i = 0; i < queueUntil; i++) if (waitsInQueue(i)) inFlight++;
 		let next = queueUntil;
 		while (next < total && inFlight < QUEUE_CONCURRENCY) {
-			if (!settledPages.has(next)) inFlight++;
+			if (waitsInQueue(next)) inFlight++;
 			next++;
 		}
 		if (next !== queueUntil) queueUntil = next;
@@ -674,7 +679,11 @@
 	// the owner; when the owner fails too, the chapter's pages are fetched again ONCE with
 	// no HTTP cache. Changed URLs load again; a changed count replaces the layout in
 	// place. That spends the chapter's refresh, including for the replacement layout.
-	let pageUrl = $state<Record<number, string>>({});
+	let pageRoute = $state<Record<number, RoutedPage>>({});
+	/** Page `i` as it loads now: the recovery's replacement, else the chapter's page. */
+	function routeOf(i: number): RoutedPage | undefined {
+		return pageRoute[i] ?? pages[i];
+	}
 	const recovery = $derived.by(() => {
 		const router = currentMediaRouter();
 		const chapterId = loadedChapterId;
@@ -684,7 +693,7 @@
 		if (!router || !chapterId || !layout.some((p) => p.media)) return null;
 		return new ChapterMediaRecovery(
 			router,
-			layout.map((p) => ({ url: p.url, media: p.media ?? null })),
+			layout.map((p) => ({ url: p.url, media: p.media ?? null, verify: p.verify ?? null })),
 			() => (refreshed ? Promise.resolve([]) : freshRoutedPages(chapterId)),
 			(fresh) => {
 				if (loadedChapterId !== chapterId || loadedPages !== chapterPages || pages !== layout) {
@@ -693,15 +702,17 @@
 					}
 					return;
 				}
-				relaidPages = fresh.map(({ url, media }, index) => ({
+				relaidPages = fresh.map(({ url, media, verify }, index) => ({
 					url,
 					media,
+					verify: verify ?? null,
 					index,
 					ratio: '800 / 1200',
 					label: String(index + 1).padStart(2, '0'),
 					dim: '',
 				}));
-				pageUrl = {};
+				pageRoute = {};
+				verifiedSrc = {};
 				pageError = {};
 				pageRatio = {};
 				settledPages.clear();
@@ -724,28 +735,28 @@
 	$effect(() => {
 		recovery;
 		untrack(() => {
-			pageUrl = {};
+			pageRoute = {};
 		});
 	});
 
 	function onImgError(index: number): void {
 		const rec = recovery;
-		const failed = pageUrl[index] ?? pages[index]?.url;
+		const failed = routeOf(index)?.url;
 		if (!rec || !failed) return failPage(index);
 		void rec.recover(index, failed).then((changes) => {
 			if (rec !== recovery) return;
-			let urls = pageUrl;
+			let routes = pageRoute;
 			let errors = pageError;
 			// Every changed page takes its new URL, mounted or not: a loaded image keeps
 			// showing its bytes until the new ones arrive.
 			for (const [i, next] of changes) {
-				urls = { ...urls, [i]: next.url };
+				routes = { ...routes, [i]: next };
 				if (errors[i]) {
 					errors = { ...errors };
 					delete errors[i];
 				}
 			}
-			pageUrl = urls;
+			pageRoute = routes;
 			pageError = errors;
 			if (!changes.has(index)) failPage(index);
 		});
@@ -773,15 +784,117 @@
 		const from = pagedIdx + visiblePages.length;
 		for (let i = from; i < Math.min(total, from + PAGED_PREFETCH); i++) {
 			const pg = pages[i];
-			if (!pg?.url || warmedUrls.has(pg.url)) continue;
+			// Verified pages warm through the verify window instead.
+			if (!pg?.url || pg.verify || warmedUrls.has(pg.url)) continue;
 			warmedUrls.add(pg.url);
 			const warm = new Image();
 			warm.decoding = 'async';
+			const url = pg.url;
+			// Another chapter or layout may have replaced this page meanwhile.
 			warm.onload = () => {
-				if (pages === layout) learnRatio(i, warm.naturalWidth, warm.naturalHeight);
+				if (pages === layout && routeOf(i)?.url === url) {
+					learnRatio(i, warm.naturalWidth, warm.naturalHeight);
+				}
 			};
-			warm.src = pg.url;
+			warm.src = url;
 		}
+	});
+
+	// Exact objects on a non-owner route (`verify` set) are fetched with no credentials,
+	// checked against the owner's length, MIME type and SHA-256, and shown from a `blob:`
+	// URL. Only pages near the one being read hold a live blob: a page that leaves this
+	// window is revoked and shows its reserved placeholder until it comes back. A failed
+	// check is a load failure: the owner fallback, then the one refresh.
+	const VERIFY_BEHIND = 2;
+	const VERIFY_AHEAD = Math.max(EAGER_AHEAD, PAGED_PREFETCH);
+	// The window: BEHIND pages, at most two on screen (a double spread), AHEAD pages.
+	const VERIFY_CAP = VERIFY_BEHIND + 2 + VERIFY_AHEAD;
+	/** Page index -> the verified blob for the object URL it was made from. */
+	let verifiedSrc = $state<Record<number, { url: string; blob: string }>>({});
+	/** Fetches this window asked for, by `index url`. Each attempt is its own object, so a
+	 *  released attempt's late answer cannot clear the attempt that replaced it. */
+	const verifiedPending = new Map<string, { index: number; url: string }>();
+	const verified = new VerifiedObjectUrls({
+		cap: VERIFY_CAP,
+		onEvict: (url) => {
+			const next = { ...verifiedSrc };
+			for (const [i, v] of Object.entries(next)) if (v.url === url) delete next[+i];
+			verifiedSrc = next;
+		},
+	});
+	onDestroy(() => {
+		// Forget the attempts first: their aborts are releases, not load failures.
+		verifiedPending.clear();
+		verified.clear();
+	});
+
+	/** What page `p`'s <img> shows: its URL, its verified blob, or null (placeholder). */
+	function pageSrc(index: number): string | null {
+		const route = routeOf(index);
+		if (!route?.url) return null;
+		if (!route.verify) return route.url;
+		const v = verifiedSrc[index];
+		return v?.url === route.url ? v.blob : null;
+	}
+
+	$effect(() => {
+		const from = Math.max(0, currentIdx - VERIFY_BEHIND);
+		const to = Math.min(total, currentEnd + 1 + VERIFY_AHEAD);
+		const want = new Map<number, RoutedPage>();
+		for (let i = from; i < to; i++) {
+			const route = routeOf(i);
+			if (route?.verify && route.url && !pageError[i]) want.set(i, route);
+		}
+		untrack(() => {
+			verified.keep([...want.values()].map((r) => r.url));
+			// `keep` aborted every fetch outside the window: a page that comes back asks again.
+			for (const [key, attempt] of verifiedPending) {
+				if (want.get(attempt.index)?.url !== attempt.url) verifiedPending.delete(key);
+			}
+			let next = verifiedSrc;
+			for (const [i, v] of Object.entries(verifiedSrc)) {
+				if (want.get(+i)?.url === v.url) continue;
+				if (next === verifiedSrc) next = { ...verifiedSrc };
+				delete next[+i];
+			}
+			verifiedSrc = next;
+			for (const [i, route] of want) {
+				const key = `${i} ${route.url}`;
+				if (verifiedSrc[i]?.url === route.url || verifiedPending.has(key)) continue;
+				const attempt = { index: i, url: route.url };
+				verifiedPending.set(key, attempt);
+				const settle = () => {
+					if (verifiedPending.get(key) === attempt) verifiedPending.delete(key);
+				};
+				verified.get(route.url, route.verify!).then(
+					(blob) => {
+						settle();
+						if (routeOf(i)?.url !== route.url) return;
+						verifiedSrc = { ...verifiedSrc, [i]: { url: route.url, blob } };
+						// Paged modes mount only the visible pages; learn the others' ratios
+						// as the plain prefetch does, so double-page mode sees spreads.
+						if (mode !== 'strip' && pageRatio[i] === undefined) {
+							const probe = new Image();
+							probe.decoding = 'async';
+							probe.onload = () => {
+								// Another chapter may have replaced this page meanwhile.
+								if (routeOf(i)?.url === route.url) {
+									learnRatio(i, probe.naturalWidth, probe.naturalHeight);
+								}
+							};
+							probe.src = blob;
+						}
+					},
+					() => {
+						// Released (the page left the window, so its attempt is gone): not a
+						// failure. Anything else, a timeout included, is a load failure.
+						if (verifiedPending.get(key) !== attempt) return;
+						settle();
+						if (routeOf(i)?.url === route.url) onImgError(i);
+					},
+				);
+			}
+		});
 	});
 
 	function chapterLabel(c: { n: number; title: string }): string {
@@ -1476,11 +1589,12 @@
 				<!-- Chapter/layout changes remount images, discarding decoded frames and
 				     settling the new load queue even for URLs that stayed the same. -->
 				{#each pages as p (`${data.chapterId}:${relaidPages !== null}:${p.index}`)}
+					{@const src = pageSrc(p.index)}
 					<div class="strip-cell" style="aspect-ratio:{pageRatio[p.index] ?? DEFAULT_RATIO}">
-						{#if p.url && !pageError[p.index]}
+						{#if src && !pageError[p.index]}
 							<img
 								class="strip-img"
-								src={pageUrl[p.index] ?? p.url}
+								{src}
 								alt={`Page ${p.label}`}
 								loading={p.index < eagerUntil ? 'eager' : 'lazy'}
 								fetchpriority={p.index < STARTER_PAGES
@@ -1509,10 +1623,11 @@
 			<div class="paged fit-{fit}" class:double={visiblePages.length > 1} class:rtl={dir === 'rtl'}>
 				<!-- Remount images when the chapter or layout changes. -->
 				{#each visiblePages as p (`${data.chapterId}:${relaidPages !== null}:${p.index}`)}
-					{#if p.url && !pageError[p.index]}
+					{@const src = pageSrc(p.index)}
+					{#if src && !pageError[p.index]}
 						<img
 							class="paged-img"
-							src={pageUrl[p.index] ?? p.url}
+							{src}
 							alt={`Page ${p.label}`}
 							decoding="async"
 							onload={(e) => onImgLoad(e, p.index)}

@@ -29,10 +29,13 @@ const names = new Set([
 	'queueUntil',
 	'settledPages',
 	'pageError',
-	'pageUrl',
+	'pageRoute',
+	'routeOf',
+	'verifiedSrc',
 	'recovery',
 	'barHover',
 	'QUEUE_CONCURRENCY',
+	'waitsInQueue',
 	'advanceQueue',
 	'settlePage',
 	'onImgError',
@@ -74,13 +77,13 @@ export function createReader(fixture) {
 		fail: onImgError,
 		load: (next) => { data = next; },
 		seed: () => {
-			pageRatio = { 0: 2 }; pageError = { 0: true }; pageUrl = { 9: 'old' };
+			pageRatio = { 0: 2 }; pageError = { 0: true }; pageRoute = { 9: { url: 'old', media: null } }; verifiedSrc = { 9: { url: 'old', blob: 'blob:old' } };
 			settledPages.add(0); queueUntil = 10; warmedUrls.add('old');
 			barHover = { i: 10, x: 10 }; pageIdx = 10;
 			scrolledPage = 10; maxScrolledPage = 10;
 		},
 		get view() {
-			return { pages, total, pageUrl, pageError, pageRatio, pageIdx, pagedIdx, scrolledPage,
+			return { pages, total, pageRoute, verifiedSrc, pageError, pageRatio, pageIdx, pagedIdx, scrolledPage,
 				maxScrolledPage,
 				queueUntil, settled: [...settledPages], warmed: [...warmedUrls], barHover,
 				relaid: relaidPages !== null };
@@ -163,13 +166,16 @@ for (const count of [1, 3]) {
 			result.pages,
 			fresh.map((p, index) => ({
 				...p,
+				verify: null,
 				index,
 				ratio: '800 / 1200',
 				label: String(index + 1).padStart(2, '0'),
 				dim: '',
 			})),
 		);
-		for (const name of ['pageUrl', 'pageError', 'pageRatio']) assert.deepEqual(result[name], {});
+		for (const name of ['pageRoute', 'verifiedSrc', 'pageError', 'pageRatio']) {
+			assert.deepEqual(result[name], {});
+		}
 		assert.deepEqual(result.settled, []);
 		assert.deepEqual(result.warmed, []);
 		assert.equal(result.barHover, null);

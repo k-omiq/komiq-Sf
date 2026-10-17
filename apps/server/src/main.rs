@@ -1609,6 +1609,26 @@ fn manifest_store_error(error: anyhow::Error) -> axum::response::Response {
     image_failure_response(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// Public immutable object bytes use no cookies: the reader fetches with credentials
+/// omitted and verifies SHA-256. Run outside CorsLayer, which would otherwise echo
+/// allowlisted origins instead of the wildcard these fetches need.
+async fn media_object_cors(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let object_path = request.uri().path().starts_with("/media/v1/o/");
+    let mut response = next.run(request).await;
+    if object_path {
+        let headers = response.headers_mut();
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+        headers.remove(header::ACCESS_CONTROL_ALLOW_CREDENTIALS);
+    }
+    response
+}
+
 async fn serve_media_object(
     State(app): State<Arc<AppState>>,
     path: Result<UrlPath<(String, String)>, axum::extract::rejection::PathRejection>,
@@ -2949,6 +2969,7 @@ fn public_router(
                 .layer(PropagateRequestIdLayer::x_request_id()),
         )
         .layer(cors)
+        .layer(axum::middleware::from_fn(media_object_cors))
         .layer(SetResponseHeaderLayer::overriding(
             header::HeaderName::from_static("x-content-type-options"),
             HeaderValue::from_static("nosniff"),
@@ -5552,6 +5573,107 @@ mod tests {
 
     fn peer(ip: &str) -> SocketAddr {
         SocketAddr::new(ip.parse().unwrap(), 12345)
+    }
+
+    fn media_object_cors_test_router() -> Router {
+        let cors = CorsLayer::new()
+            .allow_origin(AllowOrigin::list([HeaderValue::from_static(
+                "https://reader.example",
+            )]))
+            .allow_credentials(true);
+        Router::new()
+            .route(
+                "/media/v1/o/{a}/{b}",
+                get(|UrlPath((a, _)): UrlPath<(String, String)>| async move {
+                    match a.as_str() {
+                        "found" => StatusCode::OK.into_response(),
+                        "busy" => page_busy_response(),
+                        "timeout" => std::future::pending::<axum::response::Response>().await,
+                        _ => image_failure_response(StatusCode::NOT_FOUND),
+                    }
+                })
+                .layer(axum::middleware::from_fn_with_state(
+                    std::time::Duration::from_secs(1),
+                    request_budget::limit_image_time,
+                )),
+            )
+            .route("/graphql", get(|| async { StatusCode::OK }))
+            .layer(cors)
+            .layer(axum::middleware::from_fn(media_object_cors))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn media_object_cors_covers_success_errors_rejections_and_timeouts() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let app = media_object_cors_test_router();
+        for (path, status) in [
+            ("/media/v1/o/found/hash", StatusCode::OK),
+            ("/media/v1/o/missing/hash", StatusCode::NOT_FOUND),
+            ("/media/v1/o/busy/hash", StatusCode::SERVICE_UNAVAILABLE),
+            ("/media/v1/o/%FF/hash", StatusCode::BAD_REQUEST),
+            ("/media/v1/o/timeout/hash", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            for origin in [
+                Some("https://reader.example"),
+                Some("https://other.example"),
+                None,
+            ] {
+                let mut request = Request::builder().uri(path);
+                if let Some(origin) = origin {
+                    request = request.header(header::ORIGIN, origin);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status, "{path}, {origin:?}");
+                let headers = response.headers();
+                assert_eq!(
+                    headers
+                        .get_all(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                        .iter()
+                        .count(),
+                    1,
+                    "{path}, {origin:?}"
+                );
+                assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+                assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn media_object_cors_preserves_graphql_cors() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let app = media_object_cors_test_router();
+        for (origin, expected) in [
+            ("https://reader.example", Some("https://reader.example")),
+            ("https://other.example", None),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/graphql")
+                        .header(header::ORIGIN, origin)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let headers = response.headers();
+            assert_eq!(
+                headers
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .and_then(|value| value.to_str().ok()),
+                expected
+            );
+            assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_CREDENTIALS], "true");
+        }
     }
 
     /// The reader's edge SSR reaches this endpoint through SvelteKit's `load({ fetch })`,

@@ -3,7 +3,7 @@ title: Media routes
 description: Learn how a web reader picks the origin it loads exact page objects from, and why the image proxy Worker never touches them.
 ---
 
-A media route is an origin that serves exact page objects, the `/media/v1/o/{copyId}/{sha256}` paths from [Exact media and signing](/developers/media-manifests). This page explains the route list, how a web reader chooses a route, what happens when an object fails to load, and the image proxy rule that keeps these objects out of the Worker. A self-hosted server needs none of it: the default list has one route, the server itself.
+A media route is an origin that serves exact page objects, the `/media/v1/o/{copyId}/{sha256}` paths from [Exact media and signing](/developers/media-manifests). This page explains the route list, how a web reader chooses a route, how it checks objects from other hosts, what happens when an object fails to load, and the image proxy rule that keeps these objects out of the Worker. A self-hosted server needs none of it: the default list has one route, the server itself.
 
 ## The route list
 
@@ -51,6 +51,25 @@ A probe is `GET {origin}/media/v1/ready`. It sends no credentials (`credentials:
 
 The first round picks the fastest route that answered. After that, a switch needs another route faster by more than 30 % and by more than 50 ms, in two rounds in a row.
 
+## Checking objects from other hosts
+
+The reader does not trust the bytes a regional host sends. The owner's `pages` answer gives each exact object its SHA-256 hash (`mediaSha256`), its length in bytes (`mediaLength`) and its MIME type (`mediaMime`). That answer comes from the API, so the browser needs no signature check.
+
+A page on a regional route loads like this:
+
+1. The reader fetches the object with `fetch`. It sends no credentials (`credentials: 'omit'`), no referrer and no headers.
+2. It checks the answer: status `200`, the MIME type without parameters, and the length. It stops reading when the body grows past the expected length.
+3. It hashes the bytes with the browser's WebCrypto (`crypto.subtle`) and compares the hash.
+4. Only then does it show the bytes, from a `blob:` URL.
+
+A page that fails any check, or whose fetch takes longer than 30 seconds, counts as a failed load (read the next section). A page without all three fields, or whose hash does not match the hash in `mediaPath`, never loads from a regional host: it loads from the owner.
+
+Pages on the owner route stay a plain `<img>` with no check.
+
+The reader keeps a `blob:` URL alive only for pages near the one you read: 2 pages behind and 6 ahead, plus the pages on screen. A page that leaves that window gives its URL back (`URL.revokeObjectURL`) and shows its placeholder. When you scroll back, the reader fetches and checks it again; the browser cache usually answers. A hard limit of 10 live URLs holds even if the window grows.
+
+The object route answers every request, errors too, with `Access-Control-Allow-Origin: *`, so the browser lets the reader read the bytes. A proxy or cache in front of a regional host must pass that header through. The route sets no cookies.
+
 ## When an object fails
 
 ```flow
@@ -60,14 +79,14 @@ Reader -> Server: pages again by POST, once per chapter
 Reader -> Reader: changed pages load again, or a new page list
 ```
 
-1. A regional object that fails loads the same path once from the owner. The region is down for the rest of the session, and a probe round starts.
+1. A regional object that fails to load or fails its check loads the same path once from the owner. The region is down for the rest of the session, and a probe round starts.
 2. If the owner fails too, the bytes have likely moved. The reader fetches the chapter's `pages` again, once per chapter, by POST. A POST skips the browser cache and the edge cache that hold anonymous GET answers. Every page whose URL changed loads again, unless it is already on screen.
 3. If the refresh returns a different number of pages, the reader replaces the chapter's page list in place, without leaving the chapter. A page number past the new end moves to the new last page.
 4. After that, a page that still fails shows the usual retry button. Each page, and the page list, is replaced by the refresh at most once, so a page never loops.
 
 ## No tokens on media
 
-An `<img>` never sends an `Authorization` header, and probes use `credentials: 'omit'`. The GraphQL client keeps the token for the API origin. The route choice never touches the API endpoint.
+An `<img>` never sends an `Authorization` header. Probes and checked fetches use `credentials: 'omit'`. The GraphQL client keeps the token for the API origin. The route choice never touches the API endpoint.
 
 ## Classification
 
@@ -90,15 +109,16 @@ The rule exists because the Worker's host allowlist includes the global server's
 
 ## Content Security Policy
 
-The web build adds the `PUBLIC_KOMIKA_MEDIA_HOSTS` origins to `connect-src`, for the probes. `img-src` already allows `https:`.
+The web build adds the `PUBLIC_KOMIKA_MEDIA_HOSTS` origins to `connect-src`, for the probes and the checked fetches. The static build writes the same list into its `_headers` file. `img-src` already allows `https:` and `blob:`.
 
 ## Where to look
 
 - `apps/server/src/media_routes.rs`: `KOMIKA_MEDIA_ROUTES` parsing and the route types.
 - `apps/server/src/graphql/mod.rs`: the `mediaRoutes` resolver.
-- `packages/api/src/media-routes.ts`: the trusted list, `MediaRouter`, probes and `ChapterMediaRecovery`.
+- `packages/api/src/media-routes.ts`: the trusted list, `MediaRouter`, probes, `ChapterMediaRecovery`, `fetchVerifiedObject` and `VerifiedObjectUrls`.
 - `packages/api/src/image-provider.ts`: `mediaOrigins`, which `resolve()` never wraps.
 - `apps/reader/src/lib/media.ts`: the reader's router and the `embedded` owner lookup.
-- `apps/reader/src/routes/read/[slug]/+page.svelte`: the fallback and refresh on an image error.
+- `apps/reader/src/routes/read/[slug]/+page.svelte`: the fallback and refresh on an image error, and the window of checked pages.
+- `apps/server/src/main.rs`: `media_object_cors`, the wildcard header on objects.
 - `apps/reader/csp.ts`: `connect-src` for media hosts.
 - `apps/worker/src/index.ts`: `isMediaRouteTarget`.

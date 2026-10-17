@@ -34,8 +34,17 @@ registerHooks({
 });
 
 const api = '../../../../../packages/api/src/';
-const { ChapterMediaRecovery, MediaRouter, mediaOrigin, parseMediaHosts, trustedMediaRoutes } =
-	await import(api + 'media-routes.ts');
+const {
+	ChapterMediaRecovery,
+	MediaCheckError,
+	MediaRouter,
+	VerifiedObjectUrls,
+	fetchVerifiedObject,
+	mediaOrigin,
+	parseMediaHosts,
+	routedMedia,
+	trustedMediaRoutes,
+} = await import(api + 'media-routes.ts');
 const { WebImageProvider } = await import(api + 'image-provider.ts');
 const { GraphQLBackend } = await import(api + 'graphql-backend.ts');
 
@@ -45,10 +54,14 @@ const EU = 'https://media-eu.example';
 const WORKER = 'https://img.example';
 const HASH = 'a'.repeat(64);
 const PATH = `/media/v1/o/mc_0123/${HASH}`;
+const EXPECT = { sha256: HASH, length: 3, mime: 'image/webp' };
 const page = (mediaPath: string | null = PATH, i = 0) => ({
 	index: i,
 	sourceUrl: `${API}/media/v1/c/7/${i}`,
 	mediaPath,
+	mediaSha256: mediaPath?.split('/').at(-1) ?? null,
+	mediaLength: EXPECT.length,
+	mediaMime: EXPECT.mime,
 });
 const serverRoutes = [
 	{ id: 'owner', base: '', kind: 'OWNER', region: null },
@@ -249,7 +262,7 @@ test('an exact object never reaches the image provider and goes out without cred
 			fetch: net.fetch,
 		});
 		const media = router.pageMedia(page());
-		assert.deepEqual(media, { kind: 'media', routeId: 'owner', path: PATH });
+		assert.deepEqual(media, { kind: 'media', routeId: 'owner', path: PATH, expect: EXPECT });
 		assert.equal(router.href(media), `${API}${PATH}`);
 		// Not an exact object path: the page keeps its sourceUrl.
 		assert.equal(router.pageMedia(page(null)), null);
@@ -264,6 +277,80 @@ test('an exact object never reaches the image provider and goes out without cred
 			assert.equal(init?.method, 'GET');
 		}
 	}));
+
+test('only verifiable exact objects use the regional route; owner objects load directly', () =>
+	withClock(async () => {
+		const net = fakeNet({ [API]: 80, [SG]: 20 });
+		const router = new MediaRouter({
+			routes: trustedMediaRoutes(serverRoutes, [SG], API),
+			fetch: net.fetch,
+		});
+		const owner = router.pageMedia(page())!;
+		assert.equal(owner.routeId, 'owner');
+		assert.deepEqual(owner.expect, EXPECT);
+		assert.equal(router.verification(owner), null);
+		assert.deepEqual(routedMedia(router, owner), {
+			url: `${API}${PATH}`,
+			media: owner,
+			verify: null,
+		});
+		await settle(router.probe());
+		assert.equal(router.current().id, 'sg');
+		const regional = router.pageMedia({ ...page(), mediaMime: ' Image/WebP ; charset=x ' })!;
+		assert.deepEqual(regional, { kind: 'media', routeId: 'sg', path: PATH, expect: EXPECT });
+		assert.equal(router.verification(regional), regional.expect);
+		assert.deepEqual(routedMedia(router, regional), {
+			url: `${SG}${PATH}`,
+			media: regional,
+			verify: EXPECT,
+		});
+		const unknown = { ...regional, routeId: 'unknown' };
+		assert.equal(router.href(unknown), `${API}${PATH}`);
+		assert.equal(router.verification(unknown), null);
+		const invalid = [
+			{ mediaSha256: undefined },
+			{ mediaSha256: null },
+			{ mediaSha256: HASH.toUpperCase() },
+			{ mediaSha256: 'a'.repeat(63) },
+			{ mediaSha256: 'g'.repeat(64) },
+			{ mediaSha256: HASH + '\n' },
+			{ mediaSha256: 'b'.repeat(64) },
+			{ mediaLength: undefined },
+			{ mediaLength: null },
+			{ mediaLength: 0 },
+			{ mediaLength: -1 },
+			{ mediaLength: 1.5 },
+			{ mediaLength: NaN },
+			{ mediaLength: Infinity },
+			{ mediaLength: Number.MAX_SAFE_INTEGER + 1 },
+			{ mediaMime: undefined },
+			{ mediaMime: null },
+			{ mediaMime: '' },
+			{ mediaMime: '; charset=x' },
+			{ mediaMime: 'webp' },
+			{ mediaMime: 'image/' },
+			{ mediaMime: '/webp' },
+			{ mediaMime: 'image/ webp' },
+			{ mediaMime: 'image/webp/extra' },
+		];
+		for (const fields of invalid) {
+			const media = router.pageMedia({ ...page(), ...fields })!;
+			assert.equal(media.routeId, 'owner', JSON.stringify(fields));
+			assert.equal(media.expect, null);
+			assert.equal(router.verification(media), null);
+		}
+		const fallback = router.fallback(regional)!;
+		assert.equal(fallback.expect, regional.expect);
+		assert.equal(router.verification(fallback), null);
+	}));
+
+test('an old server page without exact-object fields keeps its legacy URL', async () => {
+	const legacy = { index: 0, sourceUrl: `${API}/media/v1/c/7/0` };
+	const router = new MediaRouter({ routes: trustedMediaRoutes(serverRoutes, [SG], API) });
+	assert.equal(router.pageMedia(legacy), null);
+	const images = new WebImageProvider({ workerBaseUrl: WORKER, apiOrigin: API });
+	assert.equal(await images.resolvePage(legacy), `${legacy.sourceUrl}?cache_policy=2`);
+});
 
 test('probes: only with more than one route, 1 per route per 60 s, 3 rounds per session', () =>
 	withClock(async () => {
@@ -441,7 +528,7 @@ test('one owner fallback per object, then ONE fresh refresh, then nothing: no lo
 			async () => {
 				refreshes++;
 				// The bytes moved: page 0 has a new hash, page 1 falls back to its locator.
-				const m = { kind: 'media', routeId: router.current().id, path: moved };
+				const m = { kind: 'media', routeId: router.current().id, path: moved, expect: null };
 				return [
 					{ url: router.href(m), media: m },
 					{ url: `${API}/media/v1/c/7/1?cache_policy=2`, media: null },
@@ -601,4 +688,368 @@ test('mediaRoutes has its own capability flag: an old server answers once, then 
 		fetch: (async () => Response.json({ data: { mediaRoutes: serverRoutes } })) as typeof fetch,
 	});
 	assert.deepEqual(await modern.mediaRoutes(), serverRoutes);
+});
+
+const OBJECT_BYTES = new TextEncoder().encode('verified media object');
+
+async function objectExpectation() {
+	const digest = await globalThis.crypto.subtle.digest('SHA-256', OBJECT_BYTES);
+	return {
+		sha256: Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join(''),
+		length: OBJECT_BYTES.byteLength,
+		mime: 'image/webp',
+	};
+}
+
+function objectResponse(bytes = OBJECT_BYTES, headers: Record<string, string> = {}) {
+	return new Response(bytes, { headers: { 'content-type': 'image/webp', ...headers } });
+}
+
+function blobUrls() {
+	const created: { blob: Blob; url: string }[] = [];
+	const revoked: string[] = [];
+	const evicted: string[] = [];
+	return {
+		created,
+		revoked,
+		evicted,
+		createUrl: (blob: Blob) => {
+			const url = `blob:test-${created.length}`;
+			created.push({ blob, url });
+			return url;
+		},
+		revokeUrl: (url: string) => void revoked.push(url),
+		onEvict: (url: string) => void evicted.push(url),
+	};
+}
+
+test('fetchVerifiedObject checks the bytes and MIME essence without credentials or headers', async () => {
+	const expect = await objectExpectation();
+	const controller = new AbortController();
+	let request: { url: string; init?: RequestInit } | undefined;
+	const blob = await fetchVerifiedObject(`${SG}${PATH}`, expect, {
+		fetch: (async (url, init) => {
+			request = { url: String(url), init };
+			return objectResponse(OBJECT_BYTES, {
+				'content-type': 'Image/WebP; charset=x',
+				'content-length': String(expect.length),
+			});
+		}) as typeof fetch,
+		signal: controller.signal,
+		subtle: globalThis.crypto.subtle,
+	});
+	assert.ok(blob instanceof Blob);
+	assert.equal(blob.size, expect.length);
+	assert.equal(blob.type, expect.mime);
+	assert.deepEqual(new Uint8Array(await blob.arrayBuffer()), OBJECT_BYTES);
+	assert.equal(request!.url, `${SG}${PATH}`);
+	assert.equal(request!.init!.method, 'GET');
+	assert.equal(request!.init!.credentials, 'omit');
+	assert.equal(request!.init!.referrerPolicy, 'no-referrer');
+	assert.equal(request!.init!.mode, 'cors');
+	assert.equal(request!.init!.signal, controller.signal);
+	assert.equal(Object.hasOwn(request!.init!, 'headers'), false);
+	assert.equal(Object.hasOwn(request!.init!, 'cache'), false);
+});
+
+test('fetchVerifiedObject rejects mismatched hash, length, MIME and HTTP status', async () => {
+	const expect = await objectExpectation();
+	const cases = [
+		{ name: 'hash', response: objectResponse(), expect: { ...expect, sha256: HASH }, reason: 'hash' },
+		{ name: 'short body', response: objectResponse(OBJECT_BYTES.slice(1)), reason: 'length' },
+		{
+			name: 'long body',
+			response: objectResponse(new Uint8Array([...OBJECT_BYTES, 0])),
+			reason: 'length',
+		},
+		{
+			name: 'MIME',
+			response: objectResponse(OBJECT_BYTES, { 'content-type': 'image/png' }),
+			reason: 'mime',
+		},
+		{ name: 'missing MIME', response: new Response(OBJECT_BYTES), reason: 'mime' },
+		{ name: 'status', response: new Response(null, { status: 503 }), reason: 'status' },
+	];
+	for (const entry of cases) {
+		await assert.rejects(
+			fetchVerifiedObject(`${SG}${PATH}`, entry.expect ?? expect, {
+				fetch: (async () => entry.response) as typeof fetch,
+			}),
+			(error: unknown) => error instanceof MediaCheckError && (error as { reason: string }).reason === entry.reason,
+			entry.name,
+		);
+	}
+});
+
+test('fetchVerifiedObject cancels an oversized stream before reading any more chunks', async () => {
+	const expect = await objectExpectation();
+	let reads = 0;
+	let cancelled = false;
+	const body = new ReadableStream<Uint8Array>({
+		pull(controller) {
+			reads++;
+			controller.enqueue(OBJECT_BYTES);
+		},
+		cancel() {
+			cancelled = true;
+		},
+	}, { highWaterMark: 0 });
+	await assert.rejects(
+		fetchVerifiedObject(`${SG}${PATH}`, expect, {
+			fetch: (async () => new Response(body, { headers: { 'content-type': expect.mime } })) as typeof fetch,
+		}),
+		(error: unknown) => error instanceof MediaCheckError && (error as { reason: string }).reason === 'length',
+	);
+	assert.equal(cancelled, true);
+	assert.equal(reads, 2);
+});
+
+test('fetchVerifiedObject handles a null body through arrayBuffer and reports crypto failures', async () => {
+	const expect = await objectExpectation();
+	const fetch = (async () => {
+		const response = new Response(null, { headers: { 'content-type': expect.mime } });
+		response.arrayBuffer = async () => OBJECT_BYTES.slice().buffer;
+		return response;
+	}) as typeof globalThis.fetch;
+	const blob = await fetchVerifiedObject(`${SG}${PATH}`, expect, { fetch });
+	assert.deepEqual(new Uint8Array(await blob.arrayBuffer()), OBJECT_BYTES);
+	await assert.rejects(
+		fetchVerifiedObject(`${SG}${PATH}`, expect, {
+			fetch: (async () => new Response(null, { headers: { 'content-type': expect.mime } })) as typeof fetch,
+		}),
+		(error: unknown) => error instanceof MediaCheckError && (error as { reason: string }).reason === 'length',
+	);
+	await assert.rejects(
+		fetchVerifiedObject(`${SG}${PATH}`, expect, {
+			fetch,
+			subtle: { digest: async () => { throw new Error('crypto unavailable'); } } as unknown as SubtleCrypto,
+		}),
+		(error: unknown) => error instanceof MediaCheckError && (error as { reason: string }).reason === 'crypto',
+	);
+	const crypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto')!;
+	try {
+		Object.defineProperty(globalThis, 'crypto', { value: undefined, configurable: true });
+		await assert.rejects(
+			fetchVerifiedObject(`${SG}${PATH}`, expect, { fetch }),
+			(error: unknown) => error instanceof MediaCheckError && (error as { reason: string }).reason === 'crypto',
+		);
+	} finally {
+		Object.defineProperty(globalThis, 'crypto', crypto);
+	}
+});
+
+test('VerifiedObjectUrls enforces its cap and revokes the oldest two objects', async () => {
+	const expect = await objectExpectation();
+	const urls = blobUrls();
+	const cache = new VerifiedObjectUrls({
+		cap: 2,
+		fetch: (async () => objectResponse()) as typeof fetch,
+		subtle: globalThis.crypto.subtle,
+		...urls,
+	});
+	const sources = Array.from({ length: 4 }, (_, i) => `${SG}/object-${i}`);
+	const blobs: string[] = [];
+	for (const url of sources) blobs.push(await cache.get(url, expect));
+	assert.equal(cache.size, 2);
+	assert.deepEqual(urls.revoked, blobs.slice(0, 2));
+	assert.deepEqual(urls.evicted, sources.slice(0, 2));
+	assert.ok(urls.created.every(({ blob }) => blob.size === expect.length && blob.type === expect.mime));
+	cache.clear();
+	assert.equal(cache.size, 0);
+	assert.deepEqual(urls.revoked, blobs);
+	assert.deepEqual(urls.evicted, sources.slice(0, 2), 'clear does not report cap evictions');
+	cache.clear();
+	assert.deepEqual(urls.revoked, blobs, 'a released URL is not revoked twice');
+});
+
+test('VerifiedObjectUrls touches cached objects and shares one concurrent fetch per URL', async () => {
+	const expect = await objectExpectation();
+	const urls = blobUrls();
+	let calls = 0;
+	const cache = new VerifiedObjectUrls({
+		cap: 2,
+		fetch: (async () => {
+			calls++;
+			return objectResponse();
+		}) as typeof fetch,
+		...urls,
+	});
+	const [a, same] = await Promise.all([cache.get('a', expect), cache.get('a', expect)]);
+	assert.equal(a, same);
+	assert.equal(calls, 1);
+	assert.equal(urls.created.length, 1);
+	const b = await cache.get('b', expect);
+	assert.equal(await cache.get('a', expect), a);
+	await cache.get('c', expect);
+	assert.equal(calls, 3);
+	assert.deepEqual(urls.revoked, [b]);
+	assert.deepEqual(urls.evicted, ['b']);
+	assert.equal(cache.size, 2);
+	cache.clear();
+});
+
+test('VerifiedObjectUrls keep releases other blobs, aborts fetches and revokes late blobs', async () => {
+	const expect = await objectExpectation();
+	const urls = blobUrls();
+	const pending: { signal: AbortSignal; resolve: (response: Response) => void }[] = [];
+	const cache = new VerifiedObjectUrls({
+		cap: 3,
+		fetch: (async (url, init) => {
+			if (url !== 'pending') return objectResponse();
+			// This transport ignores abort, so the cache must also discard its late result.
+			return new Promise<Response>((resolve) => pending.push({ signal: init!.signal!, resolve }));
+		}) as typeof fetch,
+		...urls,
+	});
+	const a = await cache.get('a', expect);
+	const b = await cache.get('b', expect);
+	const late = cache.get('pending', expect);
+	const rejected = assert.rejects(late, { name: 'AbortError' });
+	cache.keep(new Set(['b']));
+	assert.deepEqual(urls.revoked, [a]);
+	assert.equal(cache.size, 1);
+	assert.equal(pending[0].signal.aborted, true);
+	// A new request for the same URL must survive the old request's late completion.
+	const replacement = cache.get('pending', expect);
+	pending[0].resolve(objectResponse());
+	await rejected;
+	assert.deepEqual(urls.revoked, [a, urls.created[2].url]);
+	assert.equal(cache.size, 1);
+	assert.equal(pending[1].signal.aborted, false);
+	assert.equal(cache.get('pending', expect), replacement);
+	pending[1].resolve(objectResponse());
+	const fresh = await replacement;
+	assert.equal(cache.size, 2);
+	cache.clear();
+	assert.equal(cache.size, 0);
+	assert.deepEqual(urls.revoked, [a, urls.created[2].url, b, fresh]);
+	assert.deepEqual(urls.evicted, []);
+});
+
+test('VerifiedObjectUrls clear aborts in-flight fetches and failed fetches can be retried', async () => {
+	const expect = await objectExpectation();
+	const urls = blobUrls();
+	const networkError = new TypeError('network failed');
+	let signal: AbortSignal | undefined;
+	let calls = 0;
+	const cache = new VerifiedObjectUrls({
+		cap: 2,
+		fetch: (async (_url, init) => {
+			calls++;
+			if (calls === 1) throw networkError;
+			if (calls === 2) return objectResponse(OBJECT_BYTES, { 'content-type': 'image/png' });
+			if (calls === 3) return objectResponse();
+			signal = init!.signal!;
+			return new Promise<Response>((_, reject) => {
+				signal!.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+			});
+		}) as typeof fetch,
+		...urls,
+	});
+	await assert.rejects(cache.get('retry', expect), (error: unknown) => error === networkError);
+	assert.equal(cache.size, 0);
+	await assert.rejects(
+		cache.get('retry', expect),
+		(error: unknown) => error instanceof MediaCheckError && (error as { reason: string }).reason === 'mime',
+	);
+	assert.equal(cache.size, 0);
+	assert.equal(urls.created.length, 0);
+	const blob = await cache.get('retry', expect);
+	const pending = cache.get('pending', expect);
+	const rejected = assert.rejects(pending, { name: 'AbortError' });
+	cache.clear();
+	assert.equal(signal!.aborted, true);
+	await rejected;
+	assert.equal(cache.size, 0);
+	assert.deepEqual(urls.revoked, [blob]);
+});
+
+test('a failed regional verification recovers to the owner with verify null', () =>
+	withClock(async () => {
+		const net = fakeNet({ [API]: 80, [SG]: 20 });
+		const router = new MediaRouter({
+			routes: trustedMediaRoutes(serverRoutes, [SG], API),
+			fetch: net.fetch,
+		});
+		await settle(router.probe());
+		const expect = await objectExpectation();
+		const mediaPath = `/media/v1/o/mc_0123/${expect.sha256}`;
+		const media = router.pageMedia({
+			...page(mediaPath),
+			mediaSha256: expect.sha256,
+			mediaLength: expect.length,
+		})!;
+		const regional = routedMedia(router, media);
+		assert.deepEqual(regional.verify, expect);
+		await assert.rejects(
+			fetchVerifiedObject(regional.url, regional.verify!, {
+				fetch: (async () => objectResponse(new Uint8Array(OBJECT_BYTES.length))) as typeof fetch,
+			}),
+			(error: unknown) => error instanceof MediaCheckError && (error as { reason: string }).reason === 'hash',
+		);
+		let refreshes = 0;
+		const recovery = new ChapterMediaRecovery(router, [regional], async () => {
+			refreshes++;
+			return [];
+		});
+		const result = await recovery.recover(0, regional.url);
+		assert.deepEqual(result.get(0), {
+			url: `${API}${mediaPath}`,
+			media: { ...media, routeId: 'owner' },
+			verify: null,
+		});
+		assert.equal(refreshes, 0);
+		assert.equal(router.current().id, 'owner');
+	}));
+
+test('a refused status or MIME cancels the rest of the body', async () => {
+	const expect = await objectExpectation();
+	for (const [init, reason] of [
+		[{ status: 503, headers: { 'content-type': 'image/webp' } }, 'status'],
+		[{ headers: { 'content-type': 'text/html' } }, 'mime'],
+	] as const) {
+		let cancelled = false;
+		const body = new ReadableStream<Uint8Array>({
+			pull() {},
+			cancel() {
+				cancelled = true;
+			},
+		});
+		await assert.rejects(
+			fetchVerifiedObject(`${SG}${PATH}`, expect, {
+				fetch: (async () => new Response(body, init)) as typeof fetch,
+			}),
+			(error: unknown) =>
+				error instanceof MediaCheckError && (error as { reason: string }).reason === reason,
+		);
+		assert.equal(cancelled, true, reason);
+	}
+});
+
+test('VerifiedObjectUrls fails a stalled fetch with reason timeout', async () => {
+	const expect = await objectExpectation();
+	const urls = blobUrls();
+	const cache = new VerifiedObjectUrls({
+		cap: 2,
+		timeoutMs: 20,
+		createUrl: urls.createUrl,
+		revokeUrl: urls.revokeUrl,
+		// Headers arrive, the body never ends; the abort must reach the body read.
+		fetch: (async (_url: string, init?: RequestInit) =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						init?.signal?.addEventListener('abort', () => controller.error(init.signal!.reason));
+					},
+				}),
+				{ headers: { 'content-type': expect.mime } },
+			)) as typeof fetch,
+	});
+	await assert.rejects(
+		cache.get('stalled', expect),
+		(error: unknown) =>
+			error instanceof MediaCheckError && (error as { reason: string }).reason === 'timeout',
+	);
+	assert.equal(cache.size, 0);
+	assert.equal(urls.created.length, 0);
 });

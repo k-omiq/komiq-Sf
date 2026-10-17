@@ -30,8 +30,8 @@ export function readerConnectSources(
 		// The hosted backend also supplies account/social features in Suwayomi mode.
 		addEndpoint('PUBLIC_KOMIKA_API');
 		if (env.PUBLIC_KOMIKA_BACKEND_KIND === 'suwayomi') addEndpoint('PUBLIC_SUWAYOMI_URL');
-		// Media route probes (`/media/v1/ready`) are fetches; the objects are `<img>`s,
-		// which `img-src https:` already allows.
+		// Media route probes (`/media/v1/ready`) and checked regional objects are fetches;
+		// owner objects are `<img>`s, which `img-src https:` already allows.
 		else for (const origin of mediaHostOrigins(env.PUBLIC_KOMIKA_MEDIA_HOSTS)) sources.add(origin);
 	}
 	if (env.PUBLIC_KOMIKA_IMG_MODE === 'proxy') addEndpoint('PUBLIC_KOMIKA_IMG_WORKER');

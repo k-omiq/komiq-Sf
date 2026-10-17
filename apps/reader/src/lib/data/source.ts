@@ -31,7 +31,7 @@ import type { BrowseSort, ContentRatingFilter } from '@komika/api';
 // Runtime check (not a type): the native build must keep the sequential page-fetch
 // order for canonical chapters — see `canStartPagesEarly`.
 import { isTauri } from '@komika/api';
-import type { MediaUrl, RoutedPage } from '@komika/api';
+import type { ExpectedObject, MediaUrl, RoutedPage } from '@komika/api';
 import type { Backend } from '@komika/api';
 import { backend, images } from '$lib/context';
 import { mediaRouter, routePage } from '$lib/media';
@@ -2769,6 +2769,8 @@ export interface ReaderPageView {
 	/** Set when `url` is an exact media object (typed media routes): what the reader's
 	 *  owner fallback and one-time refresh work from. */
 	media?: MediaUrl | null;
+	/** Set when `url` is on a non-owner route: the bytes must match before they show. */
+	verify?: ExpectedObject | null;
 	index: number;
 	ratio: string;
 	label: string;
@@ -3024,9 +3026,10 @@ function buildReaderView(
 		chapterRead: target.read,
 		chNum: target.number,
 		chTitle: target.title || `Chapter ${target.number}`,
-		pages: routed.map(({ url, media }, index) => ({
+		pages: routed.map(({ url, media, verify }, index) => ({
 			url,
 			media,
+			verify: verify ?? null,
 			index,
 			ratio: '800 / 1200',
 			label: String(index + 1).padStart(2, '0'),

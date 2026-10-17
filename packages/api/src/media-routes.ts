@@ -8,7 +8,9 @@ import type { MediaRoute, Page } from '@komika/types';
  * build-time list (`PUBLIC_KOMIKA_MEDIA_HOSTS`), plus the API origin as the owner. A
  * server cannot add a host to a hosted reader. Every media request goes out with no
  * credentials and no `Authorization`: an `<img>` sends no token, and probes use
- * `credentials: 'omit'` with no headers.
+ * `credentials: 'omit'` with no headers. Non-owner objects are fetched and checked
+ * (length, MIME essence, SHA-256 from the owner's pages answer), then shown as `blob:`
+ * URLs. Owner objects stay plain `<img>`.
  */
 
 /** A route the reader trusts: an absolute origin, never a path. */
@@ -17,6 +19,13 @@ export interface TrustedMediaRoute {
 	origin: string;
 	kind: 'OWNER' | 'REGIONAL';
 	region: string | null;
+}
+
+/** What the owner's `pages` answer says an exact object is; non-owner bytes must match. */
+export interface ExpectedObject {
+	sha256: string;
+	length: number;
+	mime: string;
 }
 
 /**
@@ -28,6 +37,7 @@ export interface MediaUrl {
 	readonly kind: 'media';
 	readonly routeId: string;
 	readonly path: string;
+	readonly expect: ExpectedObject | null;
 }
 
 /** A page as the reader shows it: the URL to load and, when it is an exact object, where
@@ -35,10 +45,35 @@ export interface MediaUrl {
 export interface RoutedPage {
 	url: string;
 	media: MediaUrl | null;
+	/** Null or absent loads the URL as a plain `<img>`. */
+	verify?: ExpectedObject | null;
 }
 
 /** Exact object paths only. Anything else in `mediaPath` is ignored. */
 const OBJECT_PATH = /^\/media\/v1\/o\/[A-Za-z0-9_-]+\/[0-9a-f]{64}$/;
+
+function mimeEssence(value: string): string {
+	return value.split(';', 1)[0].trim().toLowerCase();
+}
+
+function expectedObject(page: Page, path: string): ExpectedObject | null {
+	const sha256 = page.mediaSha256;
+	const length = page.mediaLength;
+	const mime = typeof page.mediaMime === 'string' ? mimeEssence(page.mediaMime) : '';
+	if (
+		typeof sha256 !== 'string' ||
+		sha256.length !== 64 ||
+		!/^[0-9a-f]{64}$/.test(sha256) ||
+		sha256 !== path.slice(path.lastIndexOf('/') + 1) ||
+		typeof length !== 'number' ||
+		!Number.isSafeInteger(length) ||
+		length <= 0 ||
+		!/^[a-z0-9!#$%&'*+.^_`|~-]+\/[a-z0-9!#$%&'*+.^_`|~-]+$/.test(mime)
+	) {
+		return null;
+	}
+	return { sha256, length, mime };
+}
 
 /** The probe target, `no-store` and `ACAO: *` on every route. */
 export const MEDIA_READY_PATH = '/media/v1/ready';
@@ -187,12 +222,20 @@ export class MediaRouter {
 	pageMedia(page: Page): MediaUrl | null {
 		const path = page.mediaPath;
 		if (!path || !OBJECT_PATH.test(path)) return null;
-		return { kind: 'media', routeId: this.current().id, path };
+		const expect = expectedObject(page, path);
+		const routeId = expect ? this.current().id : this.owner.id;
+		return { kind: 'media', routeId, path, expect };
 	}
 
 	/** The loadable URL of an exact object. */
 	href(media: MediaUrl): string {
 		return (this.route(media.routeId) ?? this.owner).origin + media.path;
+	}
+
+	/** The checks needed before showing a non-owner object; owner URLs load directly. */
+	verification(media: MediaUrl): ExpectedObject | null {
+		if (media.routeId === this.owner.id || !this.route(media.routeId)) return null;
+		return media.expect;
 	}
 
 	/**
@@ -204,7 +247,7 @@ export class MediaRouter {
 		if (media.routeId === this.owner.id || !this.route(media.routeId)) return null;
 		this.markDown(media.routeId);
 		void this.probe();
-		return { kind: 'media', routeId: this.owner.id, path: media.path };
+		return { kind: 'media', routeId: this.owner.id, path: media.path, expect: media.expect };
 	}
 
 	/** One probe round, within the limits; resolves when it is done. */
@@ -343,6 +386,188 @@ export class MediaRouter {
 	}
 }
 
+/** The URL to show and the checks it needs. */
+export function routedMedia(router: MediaRouter, media: MediaUrl): RoutedPage {
+	return { url: router.href(media), media, verify: router.verification(media) };
+}
+
+export class MediaCheckError extends Error {
+	constructor(readonly reason: 'status' | 'mime' | 'length' | 'hash' | 'crypto' | 'timeout') {
+		super(`Media object check failed: ${reason}`);
+		this.name = 'MediaCheckError';
+	}
+}
+
+/** Fetch an object without credentials and check it against the owner's metadata. */
+export async function fetchVerifiedObject(
+	url: string,
+	expect: ExpectedObject,
+	opts: { fetch?: typeof fetch; signal?: AbortSignal; subtle?: SubtleCrypto } = {},
+): Promise<Blob> {
+	const res = await (opts.fetch ?? fetch)(url, {
+		method: 'GET',
+		mode: 'cors',
+		credentials: 'omit',
+		referrerPolicy: 'no-referrer',
+		signal: opts.signal,
+	});
+	const refuse = (reason: MediaCheckError['reason']): never => {
+		void res.body?.cancel().catch(() => {});
+		throw new MediaCheckError(reason);
+	};
+	if (!res.ok) refuse('status');
+	if (mimeEssence(res.headers.get('content-type') ?? '') !== expect.mime) refuse('mime');
+	// The body decides the length, not `Content-Length`: with a content encoding that
+	// header counts the encoded bytes.
+	let bytes: Uint8Array<ArrayBuffer>;
+	if (res.body) {
+		const reader = res.body.getReader();
+		const chunks: Uint8Array[] = [];
+		let total = 0;
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				total += value.byteLength;
+				if (total > expect.length) {
+					void reader.cancel().catch(() => {});
+					throw new MediaCheckError('length');
+				}
+				chunks.push(value);
+			}
+		} finally {
+			reader.releaseLock();
+		}
+		if (total !== expect.length) throw new MediaCheckError('length');
+		bytes = new Uint8Array(total);
+		let offset = 0;
+		for (const chunk of chunks) {
+			bytes.set(chunk, offset);
+			offset += chunk.byteLength;
+		}
+	} else {
+		bytes = new Uint8Array(await res.arrayBuffer());
+		if (bytes.byteLength !== expect.length) throw new MediaCheckError('length');
+	}
+	const subtle = opts.subtle ?? globalThis.crypto?.subtle;
+	if (!subtle) throw new MediaCheckError('crypto');
+	let digest: ArrayBuffer;
+	try {
+		digest = await subtle.digest('SHA-256', bytes);
+	} catch {
+		throw new MediaCheckError('crypto');
+	}
+	const sha256 = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join(
+		'',
+	);
+	if (sha256 !== expect.sha256) throw new MediaCheckError('hash');
+	return new Blob([bytes], { type: expect.mime });
+}
+
+/** A verified fetch that takes longer fails, so the owner fallback can run. */
+export const VERIFY_TIMEOUT_MS = 30_000;
+
+/** A bounded LRU of live blob URLs for verified objects. */
+export class VerifiedObjectUrls {
+	private readonly objects = new Map<string, string>();
+	private readonly pending = new Map<
+		string,
+		{ controller: AbortController; promise: Promise<string> }
+	>();
+	private readonly createUrl: (b: Blob) => string;
+	private readonly revokeUrl: (u: string) => void;
+
+	constructor(
+		private readonly opts: {
+			cap: number;
+			fetch?: typeof fetch;
+			subtle?: SubtleCrypto;
+			createUrl?: (b: Blob) => string;
+			revokeUrl?: (u: string) => void;
+			onEvict?: (url: string) => void;
+			/** A fetch still running after this long fails with reason `timeout`. */
+			timeoutMs?: number;
+		},
+	) {
+		if (!Number.isSafeInteger(opts.cap) || opts.cap < 0) {
+			throw new RangeError('VerifiedObjectUrls needs a non-negative integer cap');
+		}
+		this.createUrl = opts.createUrl ?? ((blob) => URL.createObjectURL(blob));
+		this.revokeUrl = opts.revokeUrl ?? ((url) => URL.revokeObjectURL(url));
+	}
+
+	/** Reuse a verified blob URL or share the fetch already in progress. */
+	get(url: string, expect: ExpectedObject): Promise<string> {
+		const cached = this.objects.get(url);
+		if (cached !== undefined) {
+			this.objects.delete(url);
+			this.objects.set(url, cached);
+			return Promise.resolve(cached);
+		}
+		const held = this.pending.get(url);
+		if (held) return held.promise;
+		const controller = new AbortController();
+		const timer = setTimeout(
+			() => controller.abort(new MediaCheckError('timeout')),
+			this.opts.timeoutMs ?? VERIFY_TIMEOUT_MS,
+		);
+		const promise = fetchVerifiedObject(url, expect, {
+			fetch: this.opts.fetch,
+			subtle: this.opts.subtle,
+			signal: controller.signal,
+		})
+			.then((blob) => {
+				const blobUrl = this.createUrl(blob);
+				if (controller.signal.aborted) {
+					this.revokeUrl(blobUrl);
+					if (controller.signal.reason instanceof MediaCheckError) throw controller.signal.reason;
+					const error = new Error('Media object was released');
+					error.name = 'AbortError';
+					throw error;
+				}
+				this.objects.set(url, blobUrl);
+				while (this.objects.size > this.opts.cap) {
+					const oldest = this.objects.keys().next().value!;
+					const evicted = this.objects.get(oldest)!;
+					this.objects.delete(oldest);
+					this.revokeUrl(evicted);
+					this.opts.onEvict?.(oldest);
+				}
+				return blobUrl;
+			})
+			.finally(() => {
+				clearTimeout(timer);
+				if (this.pending.get(url)?.controller === controller) this.pending.delete(url);
+			});
+		this.pending.set(url, { controller, promise });
+		return promise;
+	}
+
+	/** Release objects and fetches outside the reader's current window. */
+	keep(urls: Iterable<string>): void {
+		const kept = new Set(urls);
+		for (const [url, blobUrl] of this.objects) {
+			if (kept.has(url)) continue;
+			this.objects.delete(url);
+			this.revokeUrl(blobUrl);
+		}
+		for (const [url, { controller }] of this.pending) {
+			if (kept.has(url)) continue;
+			this.pending.delete(url);
+			controller.abort();
+		}
+	}
+
+	/** Release all blobs and fetches when the reader is destroyed. */
+	clear(): void {
+		this.keep([]);
+	}
+
+	get size(): number {
+		return this.objects.size;
+	}
+}
+
 /**
  * Recovery for one open chapter's exact-object pages: one owner fallback per object, then
  * ONE fresh-transport refresh of the chapter's pages (`refresh`, which must skip every
@@ -382,7 +607,7 @@ export class ChapterMediaRecovery {
 		if (!failed.media) return out;
 		const owner = this.router.fallback(failed.media);
 		if (owner) {
-			const next = { url: this.router.href(owner), media: owner };
+			const next = routedMedia(this.router, owner);
 			this.pages[index] = next;
 			out.set(index, next);
 			return out;
