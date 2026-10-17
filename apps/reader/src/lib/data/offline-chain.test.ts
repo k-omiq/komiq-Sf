@@ -368,7 +368,7 @@ test('dropForeign and drain filtering clear missing predecessors in the removal 
 	}
 });
 
-test('a late cancelled replay cannot advance revisions or clear a newer in-flight marker', async () => {
+test('a cancelled replay keeps its late answer and the next drain waits instead of resending', async () => {
 	const { writes, saves } = queue();
 	writes.enqueue(progress('one'));
 	writes.enqueue(progress('two'));
@@ -383,26 +383,32 @@ test('a late cancelled replay cannot advance revisions or clear a newer in-fligh
 	}, 'A');
 	await oldEntered.promise;
 	writes.cancelReplay();
-	let calls = 0;
-	const current = writes.drain(async () => {
-		if (++calls === 1) {
+	const sent: ProgressOp[] = [];
+	const current = writes.drain(async (op) => {
+		sent.push({ ...(op as ProgressOp) });
+		if (sent.length === 1) {
 			currentEntered.resolve();
 			return currentStalled.promise;
 		}
 	}, 'A');
-	await currentEntered.promise;
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(sent.slice(), [], 'the op still on the wire is not sent a second time');
 	const before = saves.length;
 	oldStalled.resolve({ appliedRevision: 99 });
 	await old;
-	assert.deepEqual(writes.peekAll(), [one, two]);
-	assert.equal(saves.length, before);
-	writes.enqueue(progress('one', { lastPageRead: 9 }));
-	const [retained, successor, replacement] = progressOps(writes);
-	assert.deepEqual(retained, one);
-	assert.deepEqual(successor, two);
+	await currentEntered.promise;
+	assert.equal(saves.length, before + 1, 'removal and hand-over are one storage write');
+	assert.deepEqual(sent.slice(), [{ ...two, chainedTo: null, revision: 99 }]);
+	// The new drain's in-flight op survives collapse; the late old drain did not clear it.
+	writes.enqueue(progress('two', { lastPageRead: 9 }));
+	const [retained, replacement] = progressOps(writes);
+	assert.equal(retained.opId, two.opId);
 	assert.equal(replacement.chainedTo, two.opId);
-	currentStalled.resolve({ appliedRevision: 7 });
+	assert.notEqual(retained.opId, one.opId);
+	currentStalled.resolve({ appliedRevision: 100 });
 	await current;
+	assert.equal(sent.length, 2);
+	assert.equal(sent[1].revision, 100);
 	assert.equal(writes.size(), 0);
 });
 

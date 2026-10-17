@@ -185,9 +185,12 @@ export class CompositeBackend implements Backend {
 								numericEpoch: op.numericEpoch ?? null,
 								revision: op.revision ?? undefined,
 							})
-							.then((result) => ({
-								appliedRevision: result?.status === 'APPLIED' ? result.revision : null,
-							}))
+							.then((result) => {
+								this.syncRevision(owner, generation, op.workId!);
+								return {
+									appliedRevision: result?.status === 'APPLIED' ? result.revision : null,
+								};
+							})
 							.catch((e: unknown) => {
 								if (!isStaleNumericEpoch(e)) throw e;
 								dropStaleProgress(op.chapterId);
@@ -237,6 +240,20 @@ export class CompositeBackend implements Backend {
 
 	private writeIsCurrent(owner: Id | null, generation: number): boolean {
 		return owner === this.currentUserId && generation === this.writeGeneration;
+	}
+
+	/**
+	 * Mirror the hosted backend's base revision for a work into the queue's storage, so a
+	 * save queued after an offline restart still carries the revision this device last
+	 * saw. None known (a conflict, or a fresh load that brought none) forgets it, and the
+	 * save then replays against the revision known at replay, as before.
+	 */
+	private syncRevision(owner: Id | null, generation: number, workId: Id): void {
+		const queue = this.opts.queue;
+		if (!queue || !this.writeIsCurrent(owner, generation)) return;
+		const revision = this.opts.hosted.knownRevision?.(workId);
+		if (revision === undefined) queue.forgetRevision(owner, workId);
+		else queue.rememberRevision(owner, workId, revision);
 	}
 
 	/**
@@ -386,8 +403,13 @@ export class CompositeBackend implements Backend {
 		// on-device serving) lives in `canonicalChapters` / `canonicalPages`.
 		return this.opts.hosted.chapters(seriesId);
 	}
-	aggregatedChapters(workId: Id): Promise<AggregatedChapter[]> {
-		return this.opts.hosted.aggregatedChapters!(workId);
+	async aggregatedChapters(workId: Id): Promise<AggregatedChapter[]> {
+		const owner = this.currentUserId;
+		const generation = this.writeGeneration;
+		const list = await this.opts.hosted.aggregatedChapters!(workId);
+		// A list loaded now is newer than a revision remembered from an earlier run.
+		this.syncRevision(owner, generation, workId);
+		return list;
 	}
 	/**
 	 * Pages of a Suwayomi chapter (a numeric id of the SERVER's engine). Fetched by the
@@ -564,7 +586,11 @@ export class CompositeBackend implements Backend {
 				kind: 'progress',
 				chapterId: input.chapterId,
 				workId: input.workId,
-				revision: input.revision ?? hosted.knownRevision?.(input.workId) ?? null,
+				revision:
+					input.revision ??
+					hosted.knownRevision?.(input.workId) ??
+					queue.knownRevision(owner, input.workId) ??
+					null,
 				lastPageRead: input.lastPageRead,
 				read: input.read,
 				userId: owner,
@@ -580,6 +606,7 @@ export class CompositeBackend implements Backend {
 			}
 			try {
 				const result = await hosted.saveProgress!(input);
+				this.syncRevision(owner, generation, input.workId);
 				if (this.writeIsCurrent(owner, generation)) void this.flushQueue();
 				return result;
 			} catch (e) {
@@ -634,7 +661,9 @@ export class CompositeBackend implements Backend {
 				if (queue.hasPendingProgress(owner, input.workId)) {
 					throw new Error('Saved reading progress is still waiting to sync.');
 				}
-				return hosted.saveChapterRead!(input);
+				const result = await hosted.saveChapterRead!(input);
+				this.syncRevision(owner, generation, input.workId);
+				return result;
 			});
 		}
 		if (!(await this.setChapterRead(input.chapterId, input.read))) {
@@ -644,7 +673,11 @@ export class CompositeBackend implements Backend {
 	}
 
 	async viewerProgress(workId: Id): Promise<ViewerProgress | null | undefined> {
-		return this.opts.hosted.viewerProgress?.(workId);
+		const owner = this.currentUserId;
+		const generation = this.writeGeneration;
+		const progress = await this.opts.hosted.viewerProgress?.(workId);
+		this.syncRevision(owner, generation, workId);
+		return progress;
 	}
 
 	knownRevision(workId: Id): number | undefined {

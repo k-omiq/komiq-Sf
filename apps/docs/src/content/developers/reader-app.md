@@ -90,7 +90,10 @@ Each queued progress save stores a stable `opId`, its `workId`, its base `revisi
 - A chapter checkmark cannot be queued. It first sends the queued saves of its work. If they cannot be sent, the checkmark fails and the reader undoes it.
 - Removing an acknowledged save and updating its successor happen in one storage write. Account ownership checks and the captured numeric epoch still apply. The epoch identifies the source engine's generation.
 
-Two limits remain. A crash after the server applies a queued save but before the app records its answer leaves the remaining saves for that work stale. Only forward page steps with `read: false` can apply. A queued save whose base revision was never known, for example because the app started offline, uses the revision known or fetched at replay. This cannot check whether its original view was stale, as with older apps.
+- A save is never sent twice at once. When a new sign-in token cancels a replay while a save is out, the next replay waits for that request. If the server answers, the queue removes the save and passes its revision on as usual.
+- The queue's storage also keeps the last base revision the app saw for each work of the signed-in account. After an offline restart, a new save uses it, so the server can still refuse it as stale. Loading the work's chapter list from the server replaces it, or forgets it when that load brings no revision. Another account's sign-in or a sign-out clears it.
+
+One limit remains. A save the server applied whose answer never arrived, for example after a timeout or a crash, is sent again with its old base revision. The server refuses it, and the remaining saves for that work are stale: only forward page steps with `read: false` can apply. The server cannot tell such a retry from a stale save, because a save carries no ID of its own.
 
 ### Chapter entries and moved links
 

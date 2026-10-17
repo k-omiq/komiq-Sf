@@ -116,6 +116,18 @@ export type EnqueueOp =
  * write can't wedge the queue forever. */
 export const MAX_TRIES = 5;
 
+/** Remembered base revisions per user; the oldest works are forgotten first. */
+export const MAX_REMEMBERED_REVISIONS = 500;
+
+/**
+ * The trailing list element that carries remembered base revisions. It has no owner,
+ * so builds that predate it purge it on their next drain instead of misreading the list.
+ */
+interface RevisionRecord {
+	kind: 'revisions';
+	revisions: Record<string, Record<string, number>>;
+}
+
 /**
  * A `localStorage`-backed {@link StorageAdapter} keyed by `key`. Falls back to an
  * in-memory store when `localStorage` is absent (Node / SSR) or unusable (private
@@ -162,36 +174,86 @@ export function createMemoryStorageAdapter(): StorageAdapter {
  * crash/reload never loses an accepted write.
  */
 export class OfflineWriteQueue {
-	private ops: WriteOp[];
+	private ops: WriteOp[] = [];
+	/** Last base revision seen per user and work, kept across restarts (offline start). */
+	private revisions = new Map<string, Map<string, number>>();
 	private replayGeneration = 0;
 	private replay: Promise<void> | undefined;
-	private inFlight: { op: WriteOp } | undefined;
+	/** `settled` resolves after the sending drain has recorded the answer (or failure). */
+	private inFlight: { op: WriteOp; settled: Promise<void> } | undefined;
 
 	constructor(private adapter: StorageAdapter) {
-		this.ops = this.read();
+		this.read();
 	}
 
 	/** Parse the persisted list, tolerating absent/corrupt storage (→ empty). */
-	private read(): WriteOp[] {
+	private read(): void {
 		const raw = this.adapter.load();
-		if (!raw) return [];
+		if (!raw) return;
 		try {
 			const parsed = JSON.parse(raw);
-			if (!Array.isArray(parsed)) return [];
-			const ops = parsed as WriteOp[];
+			if (!Array.isArray(parsed)) return;
+			const items = parsed as (WriteOp | RevisionRecord)[];
+			for (const item of items) {
+				if (item?.kind !== 'revisions') continue;
+				for (const [user, works] of Object.entries(item.revisions ?? {})) {
+					const known = new Map<string, number>();
+					for (const [work, revision] of Object.entries(works ?? {})) {
+						if (typeof revision === 'number') known.set(work, revision);
+					}
+					if (known.size > 0) this.revisions.set(user, known);
+				}
+			}
+			const ops = items.filter((item): item is WriteOp => item?.kind !== 'revisions');
 			// Legacy identities stay in memory until the next mutation persists them.
 			for (const op of ops) {
 				if (op.kind === 'progress') op.opId ??= createOpId();
 			}
-			return ops;
+			this.ops = ops;
 		} catch {
-			return [];
+			/* corrupt storage: start empty */
 		}
 	}
 
 	/** Persist the current list. Called after every mutation. */
 	private persist(): void {
-		this.adapter.save(JSON.stringify(this.ops));
+		const items: (WriteOp | RevisionRecord)[] = [...this.ops];
+		if (this.revisions.size > 0) {
+			const revisions: RevisionRecord['revisions'] = {};
+			for (const [user, works] of this.revisions) revisions[user] = Object.fromEntries(works);
+			items.push({ kind: 'revisions', revisions });
+		}
+		this.adapter.save(JSON.stringify(items));
+	}
+
+	/**
+	 * Remember the base revision `userId` last saw for `workId`, so a save queued after an
+	 * offline restart still carries it. Revisions only rise; a lower one is ignored.
+	 */
+	rememberRevision(userId: string | null, workId: string, revision: number): void {
+		if (userId == null) return;
+		let works = this.revisions.get(userId);
+		const known = works?.get(workId);
+		if (known !== undefined && known >= revision) return;
+		if (!works) this.revisions.set(userId, (works = new Map()));
+		works.delete(workId);
+		works.set(workId, revision);
+		while (works.size > MAX_REMEMBERED_REVISIONS) works.delete(works.keys().next().value!);
+		this.persist();
+	}
+
+	/** Forget a remembered revision, e.g. once the work was loaded fresh with none known. */
+	forgetRevision(userId: string | null, workId: string): void {
+		if (userId == null) return;
+		const works = this.revisions.get(userId);
+		if (!works?.delete(workId)) return;
+		if (works.size === 0) this.revisions.delete(userId);
+		this.persist();
+	}
+
+	/** The remembered base revision of `userId` for `workId`, if any. */
+	knownRevision(userId: string | null, workId: string): number | undefined {
+		return userId == null ? undefined : this.revisions.get(userId)?.get(workId);
 	}
 
 	/** A completed predecessor releases successors even when it did not advance the revision. */
@@ -312,7 +374,7 @@ export class OfflineWriteQueue {
 	}
 
 	/**
-	 * Drop every op that does NOT belong to `userId` (C1). Called on
+	 * Drop every op and remembered revision that does NOT belong to `userId` (C1). Called on
 	 * login/logout/identity-change so a queued write can never survive into a
 	 * different session and replay under the wrong account. A `null` userId
 	 * (logout / anonymous) clears the queue entirely — nothing is retained across a
@@ -322,7 +384,11 @@ export class OfflineWriteQueue {
 		this.cancelReplay();
 		const before = this.ops.length;
 		this.ops = userId == null ? [] : this.ops.filter((op) => op.userId === userId);
-		if (this.ops.length !== before) {
+		const users = this.revisions.size;
+		for (const user of [...this.revisions.keys()]) {
+			if (user !== userId) this.revisions.delete(user);
+		}
+		if (this.ops.length !== before || this.revisions.size !== users) {
 			this.clearMissingPredecessors();
 			this.persist();
 		}
@@ -333,7 +399,8 @@ export class OfflineWriteQueue {
 	cancelReplay(): void {
 		this.replayGeneration += 1;
 		// A hung request from an obsolete auth context must not block this account's
-		// replay. Its eventual completion still owns only its old generation/head.
+		// replay. Its eventual completion still owns only its old head; only that same
+		// op waits for it, because it cannot be sent twice.
 		this.replay = undefined;
 	}
 
@@ -395,17 +462,27 @@ export class OfflineWriteQueue {
 				this.persist();
 				continue;
 			}
-			const inFlight = { op };
+			// A cancelled drain may still have this op on the wire. A second request for it
+			// would carry the same base revision and be refused if the first one applied.
+			const pending = this.inFlight;
+			if (pending?.op === op) {
+				await pending.settled;
+				continue;
+			}
+			let settle!: () => void;
+			const inFlight = { op, settled: new Promise<void>((resolve) => (settle = resolve)) };
 			this.inFlight = inFlight;
 			try {
 				const result = await flush(op);
-				if (generation !== this.replayGeneration) return;
 				// Enqueue can replace the head with a newer state while a write waits.
-				// A late completion only removes the exact operation it sent.
-				if (this.ops[0] !== op) continue;
-				this.ops.shift();
-				this.releaseSuccessors(op, result?.appliedRevision);
-				this.persist();
+				// A late completion only removes the exact operation it sent. The server
+				// answered, so even a cancelled drain records that answer; it only stops.
+				if (this.ops[0] === op) {
+					this.ops.shift();
+					this.releaseSuccessors(op, result?.appliedRevision);
+					this.persist();
+				}
+				if (generation !== this.replayGeneration) return;
 			} catch {
 				if (generation !== this.replayGeneration) return;
 				if (this.ops[0] !== op) continue;
@@ -427,6 +504,7 @@ export class OfflineWriteQueue {
 			} finally {
 				// A newer drain can await the same op, so only this request may clear its marker.
 				if (this.inFlight === inFlight) this.inFlight = undefined;
+				settle();
 			}
 		}
 	}
