@@ -121,6 +121,39 @@
         "accepted_on": "2026-10-17",
         "evidence": "Owner reply on 2026-10-17 to the concrete review of these W3a differences (chapter title override shown in every chapter list; unnumbered chapters keyed x:<chapter id> in the admin list): Yes i accept them."
       }
+    },
+    {
+      "file": "tests/postgres_golden/graphql/series_bundle__user.json",
+      "expected_sha256": "d0556ad1fe0b8316f4e7c334eced16f524722dbfbd623e7f12ad70e31b1812c8",
+      "actual_sha256": "084d02149dc623e1a143757b5272f39662184fc611560e6aaac596d86c60e20c",
+      "reason": "W3a: the admin title override of chapter 10.5 (\"Curated half chapter\") now applies to the source lists and the spine of the series page. W3b: aggregated readAnywhere is now true for chapters this reader marked read in the seed (chapter 0 on MangaDex for the two readers, chapter 10.5 on the Suwayomi source for all three). No other field changes.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-17",
+        "evidence": "Owner reply on 2026-10-17 to the concrete review of these W3a and W3b differences: Accept the 3 series_bundle files too (title change plus readAnywhere now true for chapters the test reader really read)."
+      }
+    },
+    {
+      "file": "tests/postgres_golden/graphql/series_bundle__admin.json",
+      "expected_sha256": "c5afb13000fcd500ddb9bd0e4a3038bdd26d22e4184c97cd1df24eab9163fdba",
+      "actual_sha256": "99957790dbea5bb95ea953c5f4acca5300b511033f39a709e3725100a27cbf53",
+      "reason": "W3a: the admin title override of chapter 10.5 (\"Curated half chapter\") now applies to the source lists and the spine of the series page. W3b: aggregated readAnywhere is now true for chapters this reader marked read in the seed (chapter 0 on MangaDex for the two readers, chapter 10.5 on the Suwayomi source for all three). No other field changes.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-17",
+        "evidence": "Owner reply on 2026-10-17 to the concrete review of these W3a and W3b differences: Accept the 3 series_bundle files too (title change plus readAnywhere now true for chapters the test reader really read)."
+      }
+    },
+    {
+      "file": "tests/postgres_golden/graphql/series_bundle__nsfw_user.json",
+      "expected_sha256": "347edb03385446b0d520aa8a512af1ac04874ea9f052c61994af43fe6f28e471",
+      "actual_sha256": "369b2ae20ef39bf9f55c7618f882ea48b9a5312ae8f0067e6546da2a02b3638b",
+      "reason": "W3a: the admin title override of chapter 10.5 (\"Curated half chapter\") now applies to the source lists and the spine of the series page. W3b: aggregated readAnywhere is now true for chapters this reader marked read in the seed (chapter 0 on MangaDex for the two readers, chapter 10.5 on the Suwayomi source for all three). No other field changes.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-17",
+        "evidence": "Owner reply on 2026-10-17 to the concrete review of these W3a and W3b differences: Accept the 3 series_bundle files too (title change plus readAnywhere now true for chapters the test reader really read)."
+      }
     }
   ]
 }
