@@ -235,8 +235,12 @@ const COVER_REPAIR_MAX_FAILURES: u64 = 20;
 const COVER_PLAUSIBILITY_SAMPLE: usize = 256;
 const COVER_PLAUSIBILITY_MIN_SAMPLE: usize = 32;
 /// How long a plausibility answer stands for the read-path repair before it is checked
-/// again (the GC pass always checks afresh and refreshes it).
+/// again (the GC pass always checks afresh and refreshes it). A "looks wrong" answer only
+/// delays repairs, so it stands for the full TTL; a "looks right" answer lets a repair
+/// drop rows, so it is checked again once it is older than the recheck age (a mount lost
+/// after the last check must not clear every cover read in the meantime).
 const COVER_PLAUSIBILITY_TTL: Duration = Duration::from_secs(5 * 60);
+const COVER_PLAUSIBILITY_RECHECK: Duration = Duration::from_secs(20);
 /// Read-path repairs queued at once.
 const READ_REPAIR_CAP: usize = 256;
 const COVER_FILE_GRACE: Duration = Duration::from_secs(24 * 3600);
@@ -492,7 +496,7 @@ async fn repair_missing_cover_files(
     if !covers.copy_done() {
         return Ok(0);
     }
-    if !store_plausible_cached(pool, covers, Duration::ZERO).await? {
+    if !store_plausible_cached(pool, covers, Duration::ZERO, Duration::ZERO).await? {
         return Ok(0);
     }
     let mut scanned = 0;
@@ -581,23 +585,31 @@ async fn store_plausible(pool: &Database, covers: &CoverStore) -> anyhow::Result
             missing,
             "gc: most indexed cover files are missing or unreadable; is KOMIKA_COVERS_DIR \
              the right directory? skipping the missing-file repair. If the files are really \
-             gone (a restore without cover files), run `komika-server covers repair-missing` once"
+             gone (a restore without cover files), run `komika-server covers repair-missing --yes` once"
         );
         return Ok(false);
     }
     Ok(true)
 }
 
-/// [`store_plausible`], reusing an answer younger than `max_age` (zero: always check).
-/// The answer is kept on the store, so the GC pass and the read-path repair share it and
-/// a burst of cover misses runs one check, not one each.
+/// [`store_plausible`], reusing a "plausible" answer younger than `keep_plausible` and an
+/// "implausible" one younger than `keep_implausible` (zero: always check). The answer is
+/// kept on the store, so the GC pass and the read-path repair share it. The lock is held
+/// across a check, so at most one runs at a time and a burst of cover misses waits for
+/// it and reuses its answer instead of running one each.
 async fn store_plausible_cached(
     pool: &Database,
     covers: &CoverStore,
-    max_age: Duration,
+    keep_plausible: Duration,
+    keep_implausible: Duration,
 ) -> anyhow::Result<bool> {
     let mut cached = covers.plausibility().lock().await;
     if let Some((at, plausible)) = *cached {
+        let max_age = if plausible {
+            keep_plausible
+        } else {
+            keep_implausible
+        };
         if !max_age.is_zero() && at.elapsed() < max_age {
             return Ok(plausible);
         }
@@ -731,18 +743,79 @@ pub(crate) fn check_covers_dir(dir: &std::path::Path) -> anyhow::Result<()> {
     }
 }
 
+/// What `komika-server covers repair-missing` found before it changed anything.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct MissingCount {
+    /// Rows of the cover index.
+    pub indexed: u64,
+    /// Rows whose file is missing or unreadable.
+    pub missing: u64,
+}
+
+/// Count the index rows and the rows whose file is missing, without changing anything.
+async fn count_missing_cover_files(
+    pool: &Database,
+    covers: &CoverStore,
+) -> anyhow::Result<MissingCount> {
+    let mut count = MissingCount::default();
+    let mut cursor = CoverRepairCursor::default();
+    loop {
+        let rows: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT asset_key, kind, sha256 FROM cover_object WHERE (asset_key, kind) > ($1, $2) \
+             ORDER BY asset_key, kind LIMIT $3",
+        )
+        .bind(&cursor.asset)
+        .bind(&cursor.kind)
+        .bind(COVER_SCAN_BATCH as i64)
+        .fetch_all(pool)
+        .await?;
+        let Some((last_asset, last_kind, _)) = rows.last().cloned() else {
+            break;
+        };
+        for (_, _, raw_sha) in rows {
+            count.indexed += 1;
+            if let Ok(sha) = cover_store::Sha::try_from(raw_sha.as_slice()) {
+                if !covers.object_exists(&sha).await.unwrap_or(false) {
+                    count.missing += 1;
+                }
+            }
+        }
+        cursor = CoverRepairCursor {
+            asset: last_asset,
+            kind: last_kind,
+        };
+    }
+    Ok(count)
+}
+
 /// The missing-file repair once over the whole index, WITHOUT [`store_plausible`]: the
 /// operator's answer after a restore without cover files, when most files are really
-/// gone and the guard would refuse forever. Rows are read in batches; each missing file's
-/// row is repaired as the GC pass does (an upload is restored, anything else is dropped
-/// so the cover crawl refills it). A failing row is logged and passed.
+/// gone and the guard would refuse forever. It counts first and hands the count to
+/// `counted` (the command prints it). When more than half the rows have no file, that
+/// looks the same as a wrong, empty or unmounted `KOMIKA_COVERS_DIR`, so it refuses and
+/// changes nothing unless `confirmed` (`--yes`). Rows are read in batches; each missing
+/// file's row is repaired as the GC pass does (an upload is restored, anything else is
+/// dropped so the cover crawl refills it). A failing row is logged and passed.
 pub(crate) async fn repair_all_missing_cover_files(
     pool: &Database,
     covers: &CoverStore,
+    confirmed: bool,
+    counted: impl FnOnce(&MissingCount),
 ) -> anyhow::Result<RepairAll> {
     anyhow::ensure!(
         covers.copy_done(),
         "the old cover cache copy is still running; repair after the log says `cover copy finished`"
+    );
+    let count = count_missing_cover_files(pool, covers).await?;
+    counted(&count);
+    anyhow::ensure!(
+        confirmed || count.missing * 2 <= count.indexed,
+        "{} of {} indexed cover files are missing from {}; nothing was cleared. Check \
+         KOMIKA_COVERS_DIR first. If the files are really gone (a restore without cover \
+         files), run `komika-server covers repair-missing --yes`",
+        count.missing,
+        count.indexed,
+        covers.dir().display()
     );
     let mut done = RepairAll::default();
     let mut cursor = CoverRepairCursor::default();
@@ -834,7 +907,13 @@ async fn repair_lost_master_on_read(
     work_id: &str,
     sha: cover_store::Sha,
 ) -> anyhow::Result<bool> {
-    let plausible = store_plausible_cached(pool, covers, COVER_PLAUSIBILITY_TTL).await?;
+    let plausible = store_plausible_cached(
+        pool,
+        covers,
+        COVER_PLAUSIBILITY_RECHECK,
+        COVER_PLAUSIBILITY_TTL,
+    )
+    .await?;
     let key = cover_store::index_key(work_id);
     repair_lost_object(pool, covers, &key, "master", sha, plausible).await
 }
@@ -2092,11 +2171,72 @@ mod tests {
         assert_eq!(pointer("w_00000").await, None);
     }
 
-    /// The operator's one-shot repair ignores the guard: with most files gone it clears
-    /// every row whose file is missing and keeps the rows whose files exist. A covers
-    /// path that is missing or not a directory is refused before anything is opened.
+    /// A "looks right" answer cached before the store went away (a dropped mount, an emptied
+    /// directory) does not let a read repair drop rows: once it is older than the recheck
+    /// age the guard runs again, finds the store wrong, and the row and pointer stay.
     #[tokio::test]
-    async fn repair_missing_command_clears_lost_rows_even_when_most_are_lost() {
+    async fn read_repair_rechecks_a_stale_plausible_answer_before_dropping_rows() {
+        let pool = main_pool().await;
+        let dir = cover_store::test_support::TestDir::new();
+        let covers = cover_store::test_support::store(&dir);
+        let mut shas = Vec::new();
+        for n in 0..COVER_PLAUSIBILITY_MIN_SAMPLE + 8 {
+            shas.push(
+                seed_object(
+                    &pool,
+                    &covers,
+                    &format!("icon:{n:03}"),
+                    "master",
+                    format!("icon {n}").as_bytes(),
+                )
+                .await,
+            );
+        }
+        seed_works(&pool, 0, 1).await;
+        let lost = seed_object(&pool, &covers, "w_00000", "master", b"lost master").await;
+        shas.push(lost);
+        sqlx::query("UPDATE work SET cover_cached_version = 7 WHERE id = 'w_00000'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // The last check found the store healthy, a little over the recheck age ago (and
+        // well inside the TTL that an "implausible" answer keeps).
+        let checked_at = tokio::time::Instant::now()
+            .checked_sub(COVER_PLAUSIBILITY_RECHECK + Duration::from_secs(10))
+            .unwrap();
+        assert!(COVER_PLAUSIBILITY_RECHECK + Duration::from_secs(10) < COVER_PLAUSIBILITY_TTL);
+        *covers.plausibility().lock().await = Some((checked_at, true));
+        // Then every file goes away under the same path.
+        for sha in &shas {
+            std::fs::remove_file(covers.object_path(sha)).unwrap();
+        }
+        assert!(!repair_lost_master_on_read(&pool, &covers, "w_00000", lost)
+            .await
+            .unwrap());
+        assert_eq!(object_count(&pool, "w_00000").await, 1, "the row stays");
+        let pointer: Option<i64> =
+            sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id = 'w_00000'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pointer, Some(7), "the pointer stays");
+        assert_eq!(
+            covers
+                .plausibility()
+                .lock()
+                .await
+                .map(|(_, plausible)| plausible),
+            Some(false),
+            "the fresh answer replaces the stale one"
+        );
+    }
+
+    /// The operator's one-shot repair ignores the guard: with most files gone it counts
+    /// them, refuses without `--yes` (an empty or wrong directory looks the same), and with
+    /// `--yes` clears every row whose file is missing and keeps the rows whose files exist.
+    /// A covers path that is missing or not a directory is refused before anything is opened.
+    #[tokio::test]
+    async fn repair_missing_command_needs_yes_then_clears_lost_rows_when_most_are_lost() {
         let pool = main_pool().await;
         let dir = cover_store::test_support::TestDir::new();
         let covers = cover_store::test_support::store(&dir);
@@ -2119,10 +2259,33 @@ mod tests {
             std::fs::remove_file(covers.object_path(sha)).unwrap();
         }
         assert!(!store_plausible(&pool, &covers).await.unwrap());
-        assert_eq!(
-            repair_all_missing_cover_files(&pool, &covers)
+        let expected = MissingCount {
+            indexed: rows as u64,
+            missing: rows as u64 - 4,
+        };
+        let mut seen = None;
+        assert!(
+            repair_all_missing_cover_files(&pool, &covers, false, |c| seen = Some(c.indexed))
                 .await
-                .unwrap(),
+                .is_err(),
+            "most files missing needs --yes"
+        );
+        assert_eq!(seen, Some(expected.indexed), "the counts come first");
+        let indexed: i64 = sqlx::query_scalar("SELECT count(*) FROM cover_object")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(indexed, rows as i64, "nothing is cleared without --yes");
+        let mut counted = None;
+        assert_eq!(
+            repair_all_missing_cover_files(&pool, &covers, true, |c| {
+                counted = Some(MissingCount {
+                    indexed: c.indexed,
+                    missing: c.missing,
+                })
+            })
+            .await
+            .unwrap(),
             RepairAll {
                 checked: rows as u64,
                 repaired: rows as u64 - 4,
@@ -2134,6 +2297,7 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
+        assert_eq!(counted, Some(expected));
         assert_eq!(kept, ["icon:000", "icon:001", "icon:002", "icon:003"]);
         check_covers_dir(covers.dir()).unwrap();
         assert!(check_covers_dir(&covers.dir().join("absent")).is_err());

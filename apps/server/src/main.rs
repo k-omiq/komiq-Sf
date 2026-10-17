@@ -3381,13 +3381,16 @@ async fn main() -> anyhow::Result<()> {
         pool.close().await;
         return result;
     }
-    // `komika-server covers repair-missing` — the lost-file repair once over the whole
-    // cover index, without the GC's plausibility guard (after a restore without cover
-    // files). A covers path that is missing or not a directory is refused first.
+    // `komika-server covers repair-missing [--yes]` — the lost-file repair once over the
+    // whole cover index, without the GC's plausibility guard (after a restore without cover
+    // files). A covers path that is missing or not a directory is refused first; the counts
+    // are printed before anything changes, and more than half the files missing needs `--yes`.
     if argv.first().map(String::as_str) == Some("covers") {
+        let confirmed = argv.get(2).map(String::as_str) == Some("--yes");
         anyhow::ensure!(
-            argv.len() == 2 && argv[1] == "repair-missing",
-            "usage: covers repair-missing"
+            argv.get(1).map(String::as_str) == Some("repair-missing")
+                && (argv.len() == 2 || (argv.len() == 3 && confirmed)),
+            "usage: covers repair-missing [--yes]"
         );
         gc::check_covers_dir(&cfg.covers_dir)?;
         let pool = db::connect_existing(&cfg.database_url).await?;
@@ -3399,7 +3402,13 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
         let started = std::time::Instant::now();
-        let result = gc::repair_all_missing_cover_files(&pool, &covers).await;
+        let result = gc::repair_all_missing_cover_files(&pool, &covers, confirmed, |count| {
+            println!(
+                "{} indexed cover rows, {} with a missing file",
+                count.indexed, count.missing
+            )
+        })
+        .await;
         pool.close().await;
         covers.close().await;
         let done = result?;
