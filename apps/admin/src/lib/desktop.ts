@@ -6,8 +6,7 @@
  * Contract the shell implements (Tauri commands):
  * - `start_local_server` → starts the database, the source engine, then the server, or
  *   tries a failed step again. Returns immediately; progress is read with the next
- *   command. Ignored while the server is checking or converting an old database
- *   (`import` is `preparing` or `converting`): that step is running, not failed.
+ *   command.
  * - `local_server_status` → `LocalServerStatus`.
  * - `local_server_log` → the last lines of the database, engine and server logs
  *   (string), with every warning of this start listed again on top. Kept in memory
@@ -17,10 +16,6 @@
  * - `set_local_network { enabled }` → `LocalNetwork`. Saves the choice and restarts
  *   the server on all interfaces (on) or loopback only (off), on the same port when
  *   it is free. Resolves once the server answers again; rejects with the reason.
- *   While the server is checking or converting an old database (`import` is
- *   `preparing` or `converting`) nothing is restarted: the choice is saved, the call
- *   rejects with a sentence that says it is applied as soon as the conversion is
- *   finished, and the shell applies it then.
  * - `firewall_info` → `FirewallInfo`: this computer's system, and whether the shell can
  *   open the system firewall for komiq by itself.
  * - `open_firewall` → lets komiq's server through the system firewall. Resolves with a
@@ -34,27 +29,12 @@
 
 export type LocalStage = 'database' | 'engine' | 'server' | 'ready';
 
-/**
- * What the server is doing with an old SQLite database, read from its own output:
- * nothing seen (`idle`), checking the old file (`preparing`), converting it
- * (`converting`), nothing to convert (`noop`), conversion failed (`failed`, with
- * `error` set), conversion finished (`done`).
- */
-export type LocalImport = 'idle' | 'preparing' | 'converting' | 'noop' | 'failed' | 'done';
-
 export interface LocalServerStatus {
 	/** The step running now, or `ready` once the server answers `/health`. */
 	stage: LocalStage;
 	/** Set when the current step failed; the stage says which one. */
 	error?: string | null;
-	/** The server's last line while it checks or converts an old SQLite database. */
-	progress?: string | null;
-	/** See `LocalImport`. Missing from a shell that predates it. */
-	import?: LocalImport | null;
-	/**
-	 * Things the owner should know although the start went on: the server's conversion
-	 * warnings, and programs of an earlier run that were left running. Plain sentences.
-	 */
+	/** Programs of an earlier run that were left running. Plain sentences. */
 	warnings?: string[] | null;
 	/** Server origin once ready, e.g. `http://127.0.0.1:8080`. */
 	address?: string | null;

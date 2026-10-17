@@ -36,7 +36,6 @@ services:
     environment:
       DATABASE_URL: postgres://komiq:${KOMIQ_DB_PASSWORD:?Run install.sh to generate KOMIQ_DB_PASSWORD in .env}@postgres:5432/komiq
       COVERS_DATABASE_URL: sqlite:///data/covers.sqlite3
-      KOMIKA_SQLITE_IMPORT_PATH: /data/komika.sqlite3
       TZ: ${TZ:-UTC}
       # The port published below: the server names it in the addresses it suggests.
       # Inside the container it always listens on 8080.
@@ -59,13 +58,11 @@ services:
       suwayomi:
         condition: service_started
     healthcheck:
-      # Import timing rule: docs/audits/postgres-phase5b-selfhost.md.
-      # install.sh increases and saves this grace for large SQLite sources.
       test: ['CMD', 'curl', '-fsS', 'http://localhost:8080/health/ready']
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: ${KOMIQ_IMPORT_START_PERIOD:-24h}
+      start_period: 60s
     logging:
       driver: json-file
       options: { max-size: 20m, max-file: '5' }
@@ -181,7 +178,7 @@ services:
       options: { max-size: 20m, max-file: '5' }
 
 volumes:
-  # Covers, connector files and the retained SQLite source.
+  # Covers and connector files.
   server-data:
   # Installed extensions and the engine's own database.
   engine-data:

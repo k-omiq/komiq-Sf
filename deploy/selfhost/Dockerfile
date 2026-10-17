@@ -102,7 +102,6 @@ VOLUME /data
 ENV BIND_ADDR=0.0.0.0 \
     PORT=8080 \
     COVERS_DATABASE_URL=sqlite:///data/covers.sqlite3 \
-    KOMIKA_SQLITE_IMPORT_PATH=/data/komika.sqlite3 \
     KOMIKA_WEB_DIR=/srv/web \
     SUWAYOMI_URL=http://suwayomi:4567 \
     SUWAYOMI_PUBLIC_URL=/ \
@@ -112,9 +111,8 @@ ENV BIND_ADDR=0.0.0.0 \
 EXPOSE 8080
 
 # Compose supplies DATABASE_URL; no SQLite main database fallback lives here.
-# Readiness proves the database answers. A long import stays starting for 24h;
-# the installer separately detects exits, restarts and stalled import progress.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=24h --retries=5 \
+# Readiness proves the database answers.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
     CMD curl -fsS http://localhost:8080/health/ready || exit 1
 
 ENTRYPOINT ["/usr/local/bin/komika-server"]

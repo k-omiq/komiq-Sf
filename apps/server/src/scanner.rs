@@ -4979,7 +4979,7 @@ mod tests {
         pool
     }
 
-    // Historical source migrations stay executable on SQLite for importer coverage.
+    // Historical source migrations stay executable on SQLite for their own tests.
     // They are not PostgreSQL runtime migrations; the PG engine uses the baseline.
     async fn source_migration_pool() -> sqlx::SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()

@@ -138,21 +138,17 @@ PostgreSQL 18 stores accounts, sessions, progress, libraries, discussions and ca
 
 The separate `/data/covers.sqlite3` cache stays in `server-data` and is excluded from PostgreSQL backups. An open or corruption failure preserves its files with a `.quarantined-<id>` suffix and recreates the cache. Accounts and libraries remain in PostgreSQL. Connector files are separate too; a database backup does not preserve filesystem credentials.
 
-### Conversion and restoration
-
-The server can import an old main SQLite database at first start when PostgreSQL is empty. It verifies the converted data before serving, renames the original after success and never deletes it. Progress starts with `sqlite import:`. A failure exits without serving partial data. A populated PostgreSQL database is never overwritten by automatic import. [Data model](/developers/data-model) lists what the import decides and refuses.
+### Restoration
 
 Hosted recovery uses pgBackRest restore into an empty cluster directory with PostgreSQL stopped. The procedure, with its rehearsal, is `deploy/postgres/RESTORE.md`; it is a runbook for operators of this packaging, and this page does not repeat it. A point-in-time restore combines a backup with archived WAL up to the chosen recovery point. Review the restore tooling and verify the restored database before making it available to users. Keep recovery separate from ordinary startup; never substitute an empty database for a failed restore.
-
-`export-postgres-to-sqlite` creates a SQLite export for older builds. It refuses unsupported data, such as per-user scanlator ratings. It leaves out the three `engine_*` key tables even when they hold rows, because the server fills them again, and the report lists their row counts. Its report lists deleted-comment markers lost by a migration 0121 target.
 
 `.komiq-server.lock` prevents concurrent servers using one covers directory. `phase-f` requires an existing, compatible schema and neither migrates nor recreates covers.
 
 ### Self-host and desktop
 
-The self-host Compose file runs stock PostgreSQL privately alongside the server and source engine. `deploy/selfhost/install.sh` generates the password, keeps `.env` private and detects old SQLite volumes. It extends readiness waits as import progress arrives. Self-host backups use `deploy/selfhost/backup.sh`, a documented `pg_dump` job rather than the global deployment's pgBackRest setup. Read [Update and back up](/self-host/update-and-backup) for dump and fresh-install restore commands.
+The self-host Compose file runs stock PostgreSQL privately alongside the server and source engine. `deploy/selfhost/install.sh` generates the password and keeps `.env` private. Self-host backups use `deploy/selfhost/backup.sh`, a documented `pg_dump` job rather than the global deployment's pgBackRest setup. Read [Update and back up](/self-host/update-and-backup) for dump and fresh-install restore commands.
 
-The desktop admin app bundles PostgreSQL, converts an old SQLite database at first start and saves a local dump while running when the newest is at least 20 hours old. It keeps seven completed dumps. The reader app does not run the account database.
+The desktop admin app bundles PostgreSQL and saves a local dump while running when the newest is at least 20 hours old. It keeps seven completed dumps. The reader app does not run the account database.
 
 ## Local validation
 

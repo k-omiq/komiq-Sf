@@ -3,13 +3,7 @@
 	import { href } from '$lib/paths';
 	import { goto } from '$app/navigation';
 	import { runsLocalServer, saveLocalServer, saveServer, target } from '$lib/config';
-	import {
-		bridgeError,
-		desktop,
-		handOffSetupCode,
-		type LocalImport,
-		type LocalStage,
-	} from '$lib/desktop';
+	import { bridgeError, desktop, handOffSetupCode, type LocalStage } from '$lib/desktop';
 	import Button from '$lib/components/Button.svelte';
 	import Choice from '$lib/components/Choice.svelte';
 	import Icon from '$lib/components/Icon.svelte';
@@ -44,22 +38,12 @@
 	let stage = $state<LocalStage>('database');
 	let localError = $state<string | null>(null);
 	let log = $state<string | null>(null);
-	let progress = $state<string | null>(null);
-	let importState = $state<LocalImport>('idle');
 	let warnings = $state<string[]>([]);
 	// A start that finished with warnings waits here until the owner has read them.
 	let started = $state<{ address: string; setupCode?: string | null } | null>(null);
 	let poll: ReturnType<typeof setTimeout> | null = null;
 	// One status loop at a time: Back and then Run starts a new one and ends the old.
 	let watch = 0;
-
-	/** What the server step is doing, in a few plain words. */
-	function serverText(): string {
-		if (importState === 'preparing') return 'Checking the old database…';
-		if (importState === 'converting') return 'Converting the database…';
-		if (importState === 'done') return 'Database converted. Starting…';
-		return 'Starting…';
-	}
 
 	function stepState(s: Exclude<LocalStage, 'ready'>): StepState {
 		const order = ['database', 'engine', 'server', 'ready'];
@@ -77,22 +61,10 @@
 		stage = 'database';
 		localError = null;
 		log = null;
-		progress = null;
-		importState = 'idle';
 		warnings = [];
 		started = null;
 		try {
-			// A reload, or Back and then Run, comes here while the app may already be
-			// checking or converting the old database. Starting again would be a retry of a
-			// step that is running, so the page only shows it. (The app ignores such a retry
-			// too; a start that has failed, or has not begun, is started as before.)
-			const now = await desktop.status().catch(() => null);
-			const converting =
-				!!now &&
-				!now.error &&
-				now.stage === 'server' &&
-				(now.import === 'preparing' || now.import === 'converting');
-			if (!converting) await desktop.start();
+			await desktop.start();
 			if (mine === watch) void tick(mine);
 		} catch (err) {
 			if (mine === watch) localError = bridgeError(err, 'Could not start.');
@@ -106,8 +78,6 @@
 			const status = await desktop.status();
 			if (mine !== watch) return;
 			stage = status.stage;
-			progress = status.progress ?? null;
-			importState = status.import ?? 'idle';
 			warnings = status.warnings ?? [];
 			if (status.error) {
 				localError = status.error;
@@ -251,9 +221,7 @@
 			? 'One step failed. Retry, or read the log for the cause.'
 			: started
 				? 'komiq is running. Read this before you continue.'
-				: importState === 'converting'
-					? 'Your library is being moved to the new database. This can take a while. Keep the app open.'
-					: 'This takes a few seconds the first time.'}
+				: 'This takes a few seconds the first time.'}
 	>
 		<ul class="steps">
 			{#each localSteps as s (s.stage)}
@@ -273,9 +241,7 @@
 						{state === 'done'
 							? 'Running'
 							: state === 'running'
-								? s.stage === 'server'
-									? serverText()
-									: 'Starting…'
+								? 'Starting…'
 								: state === 'failed'
 									? 'Failed'
 									: 'Waiting'}
@@ -283,9 +249,6 @@
 				</li>
 			{/each}
 		</ul>
-		{#if progress && importState === 'converting' && !localError}
-			<p class="k-hint" role="status">{progress}</p>
-		{/if}
 		{#if warnings.length > 0}
 			<ul class="notes" role="status">
 				{#each warnings as warning (warning)}
@@ -457,7 +420,6 @@
 		line-height: 1.5;
 		overflow-wrap: anywhere;
 	}
-	/* A failed conversion lists the server's repair output on lines of its own. */
 	.cause {
 		white-space: pre-line;
 		overflow-wrap: anywhere;

@@ -3,7 +3,7 @@ title: Update and back up
 description: Update your Docker admin app and protect its PostgreSQL database, server files and source engine data.
 ---
 
-You maintain the server you host, including its accounts, libraries and source engine data. This page covers the Docker installation of the admin app on your home server or virtual private server (VPS). The desktop app runs the same SQLite conversion in its own `server/` folder. The reader app connects to that server and does not manage its backups.
+You maintain the server you host, including its accounts, libraries and source engine data. This page covers the Docker installation of the admin app on your home server or virtual private server (VPS). The reader app connects to that server and does not manage its backups.
 
 ## Update komiq
 
@@ -16,55 +16,33 @@ bash deploy/selfhost/install.sh
 
 The installer keeps your database password and other settings in `deploy/selfhost/.env`. It starts PostgreSQL before building and starting the server. Database structure changes, called migrations, run automatically at server startup.
 
-For an installation already using PostgreSQL, you can also run `docker compose up -d --build` from `deploy/selfhost`. An old SQLite installation needs the installer once to add a random database password to its existing `.env`.
+You can also run `docker compose up -d --build` from `deploy/selfhost` when `.env` already holds your database password.
 
-### Automatic SQLite conversion
+## Old SQLite install
 
-The first start after the update converts an old SQLite installation. Before it listens, the server looks for `komika.sqlite3` in the server volume. If PostgreSQL is empty, it copies the data in, checks the copy against the source, and only then renames the file to `komika.sqlite3.imported-<UTC time>`, a time like `20261012T093000Z`. It serves only after that check passes. The server removes only its own work files. It never deletes the old file, the renamed file or a kept copy (below). Delete them yourself once you have checked your data.
+Komiq now stores its data only in PostgreSQL. An installation from before that kept its data in `komika.sqlite3`. This version cannot read or convert that file. The server refuses to start while the file is in the data directory and PostgreSQL is empty.
 
-The installer detects the old file, explains the conversion and shows progress. Watch from another terminal:
+To start fresh:
 
-```sh
-cd deploy/selfhost
-docker compose logs -f server
-```
+1. Stop komiq.
+2. Move `komika.sqlite3` and any `komika.sqlite3-wal`, `komika.sqlite3-shm` and `komika.sqlite3-journal` files out of the data directory.
+3. Start komiq again. The server starts empty.
 
-Progress lines begin with `sqlite import:`. Advancing progress extends the installer's wait. A stop in the middle resumes at the next start. If PostgreSQL already holds application data, the server leaves the SQLite file alone, logs the warning `PostgreSQL already holds data or a completed import; leaving SQLite in place` and starts.
+Keep the old file if you want it; komiq does not use it. In Docker, the data directory is `/data` inside the `komiq_server-data` volume. In the desktop app, it is the `server/` folder in the application data folder.
 
-### Kept copies and their two warnings
+If PostgreSQL already holds data, the server logs a warning that the old file is ignored and starts.
 
-During conversion the server keeps a saved copy of the SQLite file, `komika.sqlite3.import-work-source`, and a record, `komika.sqlite3.import-work-state`. If the SQLite file differs from that copy at a later start, for example because you put back another file, the server converts again from the beginning. First it moves the saved copy aside as `komika.sqlite3.import-kept-<UTC time>` (with `-wal` or `-journal` files if the original had them) and logs:
-
-```text
-sqlite import: warning: the copy of the SQLite database that an earlier import attempt made differs from the file now at ...
-```
-
-The line says whether the kept file is an exact copy. A second warning, `the database being imported is smaller than the copy kept at`, appears when one of `users`, `user_library`, `comments` or `work` holds fewer rows now than in the kept copy. It lists the counts, for example `users: 0 now, 3 before`. The conversion goes on after both warnings. Check which database holds your data, and delete the kept copy only then.
-
-### If conversion fails
-
-The server exits and leaves the SQLite file in place. The installer prints the failure line and stops the server to prevent repeated restarts. Some failures are refusals that name exact commands: read [Fix server problems](/self-host/troubleshooting).
-
-Before a successful conversion, you can return to the previous SQLite image. The installer tags it as `komiq-selfhost:<project>-pre-postgres` and records its immutable image ID beside `.env`. For the default `komiq` project:
-
-```sh
-cd deploy/selfhost
-KOMIQ_IMAGE=komiq-selfhost:komiq-pre-postgres docker compose \
-  -f docker-compose.yml -f docker-compose.rollback.yml \
-  up -d --no-build --no-deps server
-```
-
-If none was saved, use your previous release image or its archive: this repository specifies no published SQLite tag. Add your HTTPS and certificate-check Compose files if you used them. After a successful conversion and new writes, the kept SQLite file is behind and cannot restore your latest reading history. Use a current PostgreSQL backup instead. Do not return to an older SQLite release once PostgreSQL holds data it cannot store, such as scanlator ratings: the export back to SQLite refuses and writes no file. The export does leave out the stored source keys (the source engine's own manga and chapter keys), even when they hold rows, because the server captures them again from the engine. Its report lists how many rows it left out. Keep PostgreSQL and its backups.
+An earlier release could convert that file into PostgreSQL. If such a conversion stopped before it finished, the server refuses to start, because the database holds only part of the data. Restore a PostgreSQL backup, or empty the database to start fresh.
 
 ## Where data lives
 
 Docker named volumes are storage directories outside container images:
 
-| Volume                | Contents                                                                           |
-| --------------------- | ---------------------------------------------------------------------------------- |
-| `komiq_postgres-data` | Accounts, libraries, reading progress, comments, catalogue and settings.           |
-| `komiq_server-data`   | SQLite cover cache, connector files, and the old SQLite file with its kept copies. |
-| `komiq_engine-data`   | Installed extensions and the source engine's own data.                             |
+| Volume                | Contents                                                                 |
+| --------------------- | ------------------------------------------------------------------------ |
+| `komiq_postgres-data` | Accounts, libraries, reading progress, comments, catalogue and settings. |
+| `komiq_server-data`   | SQLite cover cache and connector files.                                  |
+| `komiq_engine-data`   | Installed extensions and the source engine's own data.                   |
 
 Names use your Compose project prefix if you changed it. Keep `.env` securely too: it holds the database password. Changing that password in `.env` does not change the password inside an existing PostgreSQL cluster.
 
@@ -123,7 +101,7 @@ There are two ways out:
 - **Re-attach the old engine data.** Restore the matching `engine-data` volume archive and start the stack. The server leaves quarantine by itself. If only its marker was lost and its source identities still match, run `komika-server engine reattach` in the server container. It checks all stored bindings and refuses different data.
 - **Start a new generation.** Keep the replacement engine. Choose **Start a new generation** on the Health page, or run `komika-server engine start-new-generation <generation-id>` in the server container. Both refuse unless that generation is current and quarantined. The server sets extension-source reading progress aside, kept but no longer shown, and sets aside comment threads on extension-source series and chapters with their replies and attachments. Library entries, reviews and view counts on extension-source series move to their works. Works, libraries and MangaDex progress stay. Scan or add the new engine's series again.
 
-After a new generation, the server refuses progress that reader apps saved offline before the change, and the apps drop it. Apps too old to send the generation epoch cannot save extension-source progress or change library membership, shelves or favourites on extension-source series for 30 days. SQLite reverse export refuses while set-aside progress, set-aside library rows or the epoch exists.
+After a new generation, the server refuses progress that reader apps saved offline before the change, and the apps drop it. Apps too old to send the generation epoch cannot save extension-source progress or change library membership, shelves or favourites on extension-source series for 30 days.
 
 An older engine without global metadata support runs with a warning, source-identity checks and write guards. Its marker protection is unavailable.
 

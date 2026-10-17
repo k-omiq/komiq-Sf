@@ -36,7 +36,7 @@ assert regex('**/*.dump').fullmatch('nested/deep/private.dump')
 assert regex('**/*.dump').fullmatch('root.dump')
 fixtures=['komiq.dump','nested/private.dump','deploy/selfhost/komiq-server-data.tgz',
           'nested/volume.tgz','deploy/selfhost/backups/opaque-private-file',
-          'deploy/selfhost/.sqlite-image-komiq','deploy/selfhost/.env',
+          'deploy/selfhost/.env',
           'deploy/selfhost/.env.bak','deploy/selfhost/.env.password.fixture',
           '.env','nested/.env']
 context=[p for p in fixtures+['deploy/selfhost/Dockerfile','apps/server/src/main.rs'] if not excluded(p)]

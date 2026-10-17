@@ -96,9 +96,7 @@ the next daemon restart, not at the next `docker compose up`.
   Rebuilding is automatic via `deploy.sh`.
 - **Persistence:** main data and avatars live in `postgres-data`. Covers remain a
   refetchable SQLite cache in `server-data:/data/covers.sqlite3`; pgBackRest excludes
-  it. The legacy `/data/komika.sqlite3` is automatically imported only into an empty
-  PostgreSQL database and renamed only after verification. Suwayomi uses
-  `suwayomi-data`. `down` retains volumes; `destroy` deletes all of them.
+  it. Suwayomi uses `suwayomi-data`. `down` retains volumes; `destroy` deletes all of them.
 
 ## Auto-updating catalog
 
@@ -114,9 +112,9 @@ user action. Admins can add/adjust more series and per-series scan policy in the
 This tree packages PostgreSQL 18.6 with pgBackRest 2.59.x. The global server has run on
 this package since the cutover on 2026-10-13. Its rehearsal gate of two clean rehearsals
 in a row was waived by the owner, not passed, and a restore or point-in-time drill against
-the live repository has not been recorded yet. Litestream is no longer part of the
-runtime; the old SQLite file, image and Litestream data are kept only as rollback assets
-until at least 2026-11-12.
+the live repository has not been recorded yet. For old SQLite installations, see
+[Old SQLite install](https://docs.komiq.cc/self-host/update-and-backup#old-sqlite-install).
+This version cannot read or convert the old main database.
 Fill all five `KOMIKA_R2_*` values in `.env`, with a dedicated R2 prefix. No backup
 variables means local initdb with a loud warning and archiving disabled. Partial
 configuration, repository errors and failed restores stop startup.
@@ -148,8 +146,8 @@ into a new directory (never `rsync --delete` into an existing one); nothing is
 built or pruned on the host; a baseline of every other container (ID, start
 time, restart count) is recorded before the first step and compared after
 every large one; the whole run happens in one tmux session, with a read-only
-watch loop in a second window while `import` and `restore` run and abort
-criteria agreed before they start; the restored directory and, at the very
+watch loop in a second window while `restore` runs and abort
+criteria agreed before it starts; the restored directory and, at the very
 end, the run's directory are each removed by their literal path as the last
 link of an identity check, never as a separate command, and that check
 stops when `findmnt` or `docker ps` itself fails (a command that prints
@@ -161,12 +159,12 @@ is run alone before the two blocks that need root, so that no password
 prompt reads a pasted line; the baseline of the other containers must not be
 empty; the drill lines are entered one at a time and never pasted whole,
 because they do not stop themselves. The exact
-commands are the sections "Pre-flight on the host", "While `import` and
-`restore` run" and "Full drill order" of
+commands are the sections "Pre-flight on the host", "While `restore` runs"
+and "Full drill order" of
 [postgres/RESTORE.md](postgres/RESTORE.md).
 
-`rehearsal.sh` has a fixed list of subcommands (`preflight`, `up`, `import`,
-`verify`, `backup`, `restore`, ...) and builds every Docker command line
+`rehearsal.sh` has a fixed list of subcommands (`preflight`, `up`, `backup`,
+`restore`, ...) and builds every Docker command line
 itself: no argument is passed through to Docker, Compose or pgBackRest, and
 `restore.sh`, `pitr-drill.sh` and `deploy.sh` refuse rehearsal selections.
 Export only `KOMIKA_REHEARSAL_PROJECT` (`komika-pg-rehearsal-*`),
@@ -208,7 +206,7 @@ estimate is measured once, under the lock, before the step: it is no
 reservation, and production can still use the disk meanwhile, so the runbook
 measures after every step. A rehearsal `up` never restores: with an empty or
 absent data volume and a prefix that already holds a backup it refuses and
-names `restore --target`. Importer, verifier and repository readers are
+names `restore --target`. Repository readers are
 removed when their step ends, also after an interrupt. If a container's
 creation was interrupted and it did not appear in time, the kit reports it as
 unresolved, every later step refuses, and `stop-source` or `down` removes it.
@@ -253,7 +251,7 @@ or command arguments.
 Offline checks: `sh server-entrypoint.test.sh` and `sh postgres/tests.sh`.
 After building, `sh image-tests.sh` also runs the owned PostgreSQL image checks
 against the files inside the image (the kit is mounted only for its tests).
-Restore/latest/PITR commands and Phase 2 verification are in the runbook.
+Restore/latest/PITR commands are in the runbook.
 
 ## Notes for a real (internet-facing) deploy
 

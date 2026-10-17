@@ -21,7 +21,7 @@ When you launch the admin app, it starts these components automatically. It retr
 
 Application data stays in your operating system's user application folder:
 
-- PostgreSQL holds server data and user accounts. Cover images live in the separate `server/covers.sqlite3` cache. Old SQLite installations convert automatically at the first start after the update. The server verifies the copy first, then keeps the original file under a new name and never deletes it.
+- PostgreSQL holds server data and user accounts. Cover images live in the separate `server/covers.sqlite3` cache.
 - Source engine files and installed extensions live in `suwayomi/`.
 
 ### For this computer
@@ -44,7 +44,7 @@ Docker Compose runs three containers:
 - `server`: the komiq server, embedded reader, and admin console.
 - `suwayomi`: the source engine that manages extensions and source connections.
 
-Your accounts, libraries, reading history, and extensions persist across updates in three volumes: `komiq_postgres-data`, `komiq_server-data` and `komiq_engine-data`. One script, `deploy/selfhost/install.sh`, checks your machine, generates a private database password, starts PostgreSQL before the server and runs setup in the terminal. Updates from SQLite convert the old database automatically. Use PostgreSQL dumps to back up your accounts and library.
+Your accounts, libraries, reading history, and extensions persist across updates in three volumes: `komiq_postgres-data`, `komiq_server-data` and `komiq_engine-data`. One script, `deploy/selfhost/install.sh`, checks your machine, generates a private database password, starts PostgreSQL before the server and runs setup in the terminal. Use PostgreSQL dumps to back up your accounts and library. For an old installation with `komika.sqlite3`, read [Old SQLite install](/self-host/update-and-backup#old-sqlite-install) before starting fresh.
 
 Devices on your local network can open `http://192.168.1.20:8080` in a browser or enter `192.168.1.20:8080` in the native reader app. Replace the example with your server's address. See [Install with Docker](/self-host/docker).
 

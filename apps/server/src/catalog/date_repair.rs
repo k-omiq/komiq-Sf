@@ -75,7 +75,7 @@ const TABLES: &[(&str, &[&str])] = &[
     ("feed_series_updates", &["work_id"]),
     ("browse_catalogue", &["work_id"]),
 ];
-// Signed historic milliseconds (back to AD 1, matching the importer's range)
+// Signed historic milliseconds (back to AD 1, matching `db_types::epoch_millis`)
 // are valid. Only recorded Suwayomi raw data can prove they need redating.
 const BAD_PROJECTION_EPOCH: &str =
     "(released_at < -62135596800000 OR released_at BETWEEN 0 AND 99999999999 OR released_at > 4102444800000 \

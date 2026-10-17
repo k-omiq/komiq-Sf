@@ -1,7 +1,7 @@
 //! Every app test gets a native PostgreSQL 18 database cloned from a migrated template.
 //! This cluster has a private socket directory, no TCP listener, and no connection
-//! to any pre-existing database. Importer tests use the same owned cluster with
-//! an empty template0 database. A pipe-watching child cleans up on process exit.
+//! to any pre-existing database. `empty_database` clones an empty template0
+//! database instead. A pipe-watching child cleans up on process exit.
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -363,10 +363,6 @@ fn cluster() -> io::Result<&'static Cluster> {
         .get_or_init(|| Cluster::start().map_err(|error| error.to_string()))
         .as_ref()
         .map_err(|error| io::Error::other(error.clone()))
-}
-/// Private owned superuser endpoint; used by importer tests, never a user URL.
-pub fn admin_url() -> io::Result<String> {
-    Ok(cluster()?.url.clone())
 }
 pub fn clone_database() -> io::Result<DisposableDatabase> {
     clone_from(false)

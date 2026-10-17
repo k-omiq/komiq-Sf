@@ -45,7 +45,7 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
-    # Non-root runtime user; owns the covers cache and legacy import directory.
+    # Non-root runtime user; owns the data directory.
     && useradd --system --create-home --uid 10001 komika \
     && mkdir -p /data \
     && chown komika:komika /data

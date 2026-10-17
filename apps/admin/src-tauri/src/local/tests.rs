@@ -155,19 +155,6 @@ fn free_port() -> u16 {
   free_loopback_port().unwrap()
 }
 
-/// Waits for a test: `normal` for an ordinary start, a generous conversion allowance.
-fn within(normal: u64) -> Bounds {
-  bounds(normal, 600, 3600)
-}
-
-fn bounds(normal: u64, inactivity: u64, total: u64) -> Bounds {
-  Bounds {
-    normal: Duration::from_secs(normal),
-    inactivity: Duration::from_secs(inactivity),
-    total: Duration::from_secs(total),
-  }
-}
-
 // ---- boot_server ---------------------------------------------------------------------
 
 /// No processes are started: changing the saved choice must not pretend the old
@@ -217,9 +204,15 @@ async fn boot_waits_for_health_and_catches_the_code() {
   let log = LogBuf::new();
   let slot = Arc::new(Mutex::new(None));
   let port = free_port();
-  let mut child = boot_server(&launch, &attempt(port), &log, &slot, &within(20))
-    .await
-    .expect("fake server boots");
+  let mut child = boot_server(
+    &launch,
+    &attempt(port),
+    &log,
+    &slot,
+    Duration::from_secs(20),
+  )
+  .await
+  .expect("fake server boots");
   assert_eq!(lock(&slot).as_deref(), Some("TEST-CODE-0042"));
   let text = log.text();
   assert!(
@@ -259,7 +252,7 @@ async fn boot_names_a_taken_port() {
     &attempt(free_port()),
     &LogBuf::new(),
     &Arc::new(Mutex::new(None)),
-    &within(20),
+    Duration::from_secs(20),
   )
   .await;
   assert_eq!(r.err(), Some(BootError::PortInUse));
@@ -274,7 +267,7 @@ async fn boot_reports_an_early_exit() {
     &attempt(free_port()),
     &log,
     &Arc::new(Mutex::new(None)),
-    &within(20),
+    Duration::from_secs(20),
   )
   .await;
   match r {
@@ -288,22 +281,13 @@ async fn boot_reports_an_early_exit() {
 #[tokio::test]
 async fn boot_gives_up_on_a_silent_server_and_kills_it() {
   let launch = fixture("hang");
-  // A SQLite file in the data folder changes nothing: only the server's own lines can
-  // lengthen the wait (an empty or stale file used to grant six hours).
-  std::fs::create_dir_all(&launch.data_dir).unwrap();
-  std::fs::write(launch.data_dir.join("komika.sqlite3"), "").unwrap();
-  std::fs::write(
-    launch.data_dir.join("komika.sqlite3.import-work-state"),
-    "not a journal",
-  )
-  .unwrap();
   let started = Instant::now();
   let r = boot_server(
     &launch,
     &attempt(free_port()),
     &LogBuf::new(),
     &Arc::new(Mutex::new(None)),
-    &bounds(1, 30, 60),
+    Duration::from_secs(1),
   )
   .await;
   match r {
@@ -312,478 +296,11 @@ async fn boot_gives_up_on_a_silent_server_and_kills_it() {
   }
   assert!(
     started.elapsed() < Duration::from_secs(15),
-    "the normal bound applied, not a conversion allowance: {:?}",
+    "the start timeout applied: {:?}",
     started.elapsed()
   );
   let pid = runs(&launch)[0].split(' ').next().unwrap().to_string();
   assert!(!alive(&pid), "the silent server was stopped");
-}
-
-// ---- the start wait and the server's import lines (N2) -----------------------------------
-// These run the real `boot_server` against a process that prints the server's real lines.
-
-#[cfg(unix)]
-async fn boot_import(mode: &str, bounds: &Bounds) -> (Result<(), String>, Arc<LogBuf>, Duration) {
-  let launch = fixture(mode);
-  let log = LogBuf::new();
-  let started = Instant::now();
-  let result = boot_server(
-    &launch,
-    &attempt(free_port()),
-    &log,
-    &Arc::new(Mutex::new(None)),
-    bounds,
-  )
-  .await;
-  let elapsed = started.elapsed();
-  let result = match result {
-    Ok(mut child) => {
-      crate::suwayomi::stop_child(&mut child).await;
-      Ok(())
-    }
-    Err(BootError::Failed(e)) => Err(e),
-    Err(BootError::PortInUse) => Err("port in use".into()),
-  };
-  (result, log, elapsed)
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn a_no_op_warning_keeps_the_normal_bound() {
-  let (result, log, elapsed) = boot_import("import-noop", &bounds(1, 30, 60)).await;
-  assert_eq!(
-    result.err().as_deref(),
-    Some("The server did not answer within 1 seconds.")
-  );
-  assert!(
-    elapsed < Duration::from_secs(15),
-    "a hung ordinary start is not given the conversion allowance: {elapsed:?}"
-  );
-  let import = log.import();
-  assert_eq!(import.state(), crate::import::ImportState::NoOp);
-  assert_eq!(import.progress_lines(), 0);
-  assert_eq!(import.warnings().len(), 1);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn checking_the_old_database_is_bounded_by_the_normal_bound() {
-  let (result, log, elapsed) = boot_import("import-prepare", &bounds(1, 30, 60)).await;
-  assert_eq!(
-    result.err().as_deref(),
-    Some("The server did not answer within 1 seconds. Its last report: checking the old database.")
-  );
-  assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
-  assert_eq!(log.import().state(), crate::import::ImportState::Preparing);
-}
-
-/// A server that prints its check line and then starts (it does so on every start once
-/// a conversion is finished, or only when an old file is there): an ordinary start.
-#[cfg(unix)]
-#[tokio::test]
-async fn a_check_with_nothing_to_convert_is_an_ordinary_start() {
-  let (result, log, _) = boot_import("import-prepare-ready", &bounds(20, 30, 60)).await;
-  assert_eq!(result, Ok(()));
-  let import = log.import();
-  assert_eq!(import.state(), crate::import::ImportState::Idle);
-  assert_eq!(import.bound_kind(), "normal");
-  assert_eq!(import.error(), None);
-  assert!(import.warnings().is_empty());
-  assert_eq!(import.progress_lines(), 0);
-  assert!(log.text().contains("sqlite import: preparing"));
-}
-
-/// A finished import whose work copy was left over (the server's import fix round 5):
-/// the server prints its check line, the scan line, reads whole files for longer than the
-/// normal bound, warns, and starts. The scan is waited for; and once the server answers,
-/// nothing is "converting" any more (before, that state stayed for as long as the server
-/// ran).
-#[cfg(unix)]
-#[tokio::test]
-async fn a_scan_that_converts_nothing_is_waited_for_and_ends_as_a_started_server() {
-  let (result, log, elapsed) = boot_import("import-scan-ready", &bounds(1, 30, 60)).await;
-  assert_eq!(result, Ok(()));
-  assert!(
-    elapsed >= Duration::from_secs(2),
-    "the scan took longer than the normal bound of this test: {elapsed:?}"
-  );
-  let import = log.import();
-  assert_eq!(import.state(), crate::import::ImportState::NoOp);
-  assert_eq!(import.bound_kind(), "normal");
-  assert_eq!(import.progress(), None);
-  assert_eq!(import.error(), None);
-  assert_eq!(import.progress_lines(), 1, "the scan line");
-  assert_eq!(import.warnings().len(), 1);
-  assert!(
-    import.warnings()[0].starts_with("PostgreSQL already holds the imported data; leaving "),
-    "{:?}",
-    import.warnings()
-  );
-}
-
-/// A start that is refused after the server read two kept copies (the server's import
-/// fix round 6): `preparing`, a scan line before each file, one error line, and the
-/// process ends. Each scan takes longer than the normal bound of this test. The error
-/// is the failure of the start, in the server's words and whole: it is several thousand
-/// characters long and the steps to take are at its end.
-#[cfg(unix)]
-#[tokio::test]
-async fn a_start_refused_after_scans_of_kept_copies_fails_with_the_whole_error() {
-  let (result, log, elapsed) = boot_import("import-scan-refused", &bounds(1, 30, 60)).await;
-  let error = result.expect_err("refused");
-  assert!(
-    elapsed >= Duration::from_secs(3),
-    "the two scans took longer than the normal bound of this test: {elapsed:?}"
-  );
-  assert!(
-    error.starts_with(
-      "The database conversion failed: recovery stage: the SQLite file /Users/José Müller/\
-       Library/Application Support/komiq desktop/server/komika.sqlite3 named by the unfinished \
-       import is missing"
-    ),
-    "{error}"
-  );
-  assert!(
-    error.chars().count() > crate::logbuf::MAX_LINE_CHARS,
-    "{}",
-    error.chars().count()
-  );
-  assert!(
-    error.contains("(comments: 4, user_library: 12, users: 3, work: 15)"),
-    "{error}"
-  );
-  assert!(
-    error.ends_with(
-      "komika.sqlite3.import-kept-20261011T070000Z out of the data directory and start again"
-    ),
-    "the steps at the end are not cut: {error}"
-  );
-  assert!(!error.contains('…'), "{error}");
-  // Not left as a running conversion: the state is the failure, and no bound runs.
-  let import = log.import();
-  assert_eq!(import.state(), crate::import::ImportState::Failed);
-  assert_eq!(import.bound_kind(), "failed");
-  assert_eq!(import.progress(), None);
-  assert_eq!(import.progress_lines(), 2, "the two scan lines");
-  assert_eq!(
-    import.failure_text(),
-    error,
-    "what the start reports is the tracker's text"
-  );
-  // The log view has the line whole as well.
-  assert!(log
-    .text()
-    .contains(&error["The database conversion failed: ".len()..]));
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn a_stalled_conversion_is_stopped_by_the_inactivity_bound() {
-  let (result, log, elapsed) = boot_import("import-stall", &bounds(1, 4, 60)).await;
-  let error = result.expect_err("stopped");
-  assert!(
-    error.starts_with("The database conversion made no progress for 1 minutes"),
-    "{error}"
-  );
-  assert!(error.contains("Its last step: copy start."), "{error}");
-  assert!(
-    elapsed >= Duration::from_secs(4),
-    "it was given more than the normal bound: {elapsed:?}"
-  );
-  assert!(
-    elapsed < Duration::from_secs(20),
-    "the warning and the unknown line did not extend the wait: {elapsed:?}"
-  );
-  assert_eq!(log.import().warnings().len(), 1);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn an_import_error_fails_at_once_with_the_repair_lines() {
-  const EXPECTED: &str = "The database conversion failed: verify stage: verifier did not pass\n\
-     Repair step output:\n  chapter: 2 rows would change\n  chapter: 2 rows applied";
-  // The process stays alive after its error line: nothing is waited out.
-  let (result, _, elapsed) = boot_import("import-error-hang", &bounds(120, 600, 3600)).await;
-  assert_eq!(result.err().as_deref(), Some(EXPECTED));
-  assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
-  // The real server exits right after the line: the same words, not "stopped while starting".
-  let (result, log, elapsed) = boot_import("import-error", &bounds(120, 600, 3600)).await;
-  assert_eq!(result.err().as_deref(), Some(EXPECTED));
-  assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
-  assert!(log
-    .text()
-    .contains("sqlite import: error: verify stage: verifier did not pass"));
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn a_running_conversion_outlives_the_normal_bound_and_becomes_ready() {
-  // About 3 seconds of conversion against a 1 second normal bound.
-  let (result, log, elapsed) = boot_import("import-ok", &bounds(1, 5, 60)).await;
-  assert_eq!(result, Ok(()));
-  assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
-  let import = log.import();
-  assert_eq!(import.state(), crate::import::ImportState::Done);
-  assert_eq!(import.bound_kind(), "normal");
-  assert_eq!(
-    import.verifier_pass(),
-    Some("sqlite import: verifier PASS: 63 tables")
-  );
-  assert!(import.renamed().is_some());
-  assert!(import.progress_lines() >= 12);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn a_finished_conversion_returns_to_the_normal_bound() {
-  let (result, _, elapsed) = boot_import("import-done-hang", &bounds(1, 30, 60)).await;
-  assert_eq!(
-    result.err().as_deref(),
-    Some("The database was converted, but the server did not answer within 1 seconds after that.")
-  );
-  assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
-}
-
-/// Poll until the start status reports the import state `wanted`.
-#[cfg(unix)]
-async fn until_import(s: &LocalServer, wanted: &str) {
-  let deadline = Instant::now() + Duration::from_secs(20);
-  while s.status().import != wanted {
-    assert!(
-      Instant::now() < deadline,
-      "import state {wanted} not reached: {:?}",
-      s.status()
-    );
-    tokio::time::sleep(Duration::from_millis(20)).await;
-  }
-}
-
-/// A5: the page asks to start again while the server converts the old database (a
-/// reload, or Back and then Run). That used to end the conversion and start it over.
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn a_retry_during_a_conversion_is_ignored_and_the_conversion_goes_on() {
-  let launch = fixture("import-ok"); // about 3 seconds of conversion
-  let s = server(launch.clone(), FakeEngine::ready(9), free_port());
-  s.start();
-  until_import(&s, "converting").await;
-  s.start();
-  s.start();
-  // A request that was already on its way to the supervisor when the conversion began.
-  lock(&s.tx).as_ref().unwrap().send(Cmd::Retry).unwrap();
-  let during = s.status();
-  assert_eq!(
-    (during.stage, during.error.clone()),
-    ("server", None),
-    "the page still sees the running start"
-  );
-  let st = settle(&s, 30).await;
-  assert_eq!((st.stage, st.error.clone()), ("ready", None));
-  assert_eq!(
-    st.import, "done",
-    "the conversion that was running finished"
-  );
-  assert_eq!(
-    runs(&launch).len(),
-    1,
-    "the server process was not started a second time: {:?}",
-    runs(&launch)
-  );
-  assert!(
-    s.log_text().contains("a retry request was ignored"),
-    "{}",
-    s.log_text()
-  );
-  s.stop().await;
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn a_retry_while_the_old_database_is_checked_is_ignored() {
-  let launch = fixture("import-prepare"); // checks for ever
-  let s = server(launch.clone(), FakeEngine::ready(9), free_port());
-  s.start();
-  until_import(&s, "preparing").await;
-  s.start();
-  lock(&s.tx).as_ref().unwrap().send(Cmd::Retry).unwrap();
-  tokio::time::sleep(Duration::from_millis(1500)).await;
-  assert_eq!(runs(&launch).len(), 1, "{:?}", runs(&launch));
-  assert_eq!(s.status().import, "preparing");
-  // Stop is never ignored.
-  let pid = runs(&launch)[0].split(' ').next().unwrap().to_string();
-  s.stop().await;
-  assert!(!alive(&pid), "the server was stopped");
-}
-
-/// M6: the server prints its first conversion line after `set_network` has looked at the
-/// conversion and before the supervisor reads the restart request. The supervisor puts
-/// the restart off. The caller used to wait for a server that was never restarted and
-/// got "The server did not come back in time."; the true answer is the one for a
-/// conversion: saved, applied when it is finished.
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn a_network_change_that_meets_the_first_conversion_line_is_answered_as_put_off() {
-  let launch = fixture("hang"); // the server process starts and prints nothing
-  let s = server(launch.clone(), FakeEngine::ready(9), free_port());
-  s.start();
-  let deadline = Instant::now() + Duration::from_secs(30);
-  while runs(&launch).is_empty() {
-    assert!(Instant::now() < deadline, "the server process was started");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-  }
-  assert_eq!(
-    s.status().import,
-    "idle",
-    "control: no conversion is seen yet"
-  );
-  let asked = Instant::now();
-  let answer = tokio::time::timeout(
-    Duration::from_secs(30),
-    s.set_network_with(true, || {
-      s.server_log
-        .push("sqlite import: source inventory start: 1060864 bytes");
-    }),
-  )
-  .await
-  .expect("the switch is answered while the conversion runs");
-  assert_eq!(answer, Err(NETWORK_AFTER_CONVERSION.to_string()));
-  assert!(
-    asked.elapsed() < Duration::from_secs(5),
-    "{:?}",
-    asked.elapsed()
-  );
-  assert!(s.network().enabled, "the choice is saved");
-  assert_eq!(s.status().import, "converting");
-  assert_eq!(
-    runs(&launch).len(),
-    1,
-    "the server process was not restarted: {:?}",
-    runs(&launch)
-  );
-  assert!(s.log_text().contains("was put off"), "{}", s.log_text());
-  s.stop().await;
-}
-
-/// F5: "Allow other devices" is switched while the server converts the old database.
-/// The restart that applies the choice used to end the conversion. It is put off: the
-/// conversion finishes, then the server starts again on the chosen address.
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn a_network_change_during_a_conversion_is_applied_after_it() {
-  let launch = fixture("import-ok"); // about 3 seconds of conversion
-  let port = free_port();
-  let s = server(launch.clone(), FakeEngine::ready(9), port);
-  s.start();
-  until_import(&s, "converting").await;
-  // The switch answers at once, with words for the page, and saves the choice.
-  let asked = Instant::now();
-  let answer = s.set_network(true).await;
-  assert_eq!(answer, Err(NETWORK_AFTER_CONVERSION.to_string()));
-  assert!(answer
-    .unwrap_err()
-    .contains("as soon as the conversion is finished"));
-  assert!(
-    asked.elapsed() < Duration::from_secs(2),
-    "{:?}",
-    asked.elapsed()
-  );
-  assert!(s.network().enabled, "the choice is saved");
-  // A restart request that was already on its way to the supervisor.
-  lock(&s.tx).as_ref().unwrap().send(Cmd::Restart).unwrap();
-  tokio::time::sleep(Duration::from_millis(700)).await;
-  assert_eq!(
-    runs(&launch).len(),
-    1,
-    "the converting server was not ended: {:?}",
-    runs(&launch)
-  );
-  let during = s.status();
-  assert_eq!(
-    (during.stage, during.error.clone(), during.import),
-    ("server", None, "converting")
-  );
-  assert_eq!(fake_env(&launch)["BIND_ADDR"], "127.0.0.1");
-  // The conversion finishes; only then the server is started again, on every interface.
-  let st = settle(&s, 40).await;
-  assert_eq!((st.stage, st.error.clone()), ("ready", None));
-  let all = runs(&launch);
-  assert_eq!(all.len(), 2, "one restart, after the conversion: {all:?}");
-  assert_eq!(fake_env(&launch)["BIND_ADDR"], "0.0.0.0");
-  assert!(
-    !alive(all[0].split(' ').next().unwrap()),
-    "old process gone"
-  );
-  let log = s.log_text();
-  assert!(
-    log.contains("a restart for a changed network choice was put off"),
-    "{log}"
-  );
-  let finished = log
-    .find("sqlite import: complete:")
-    .expect("the first conversion finished");
-  let restarted = log
-    .find("the network choice changed while the server started")
-    .expect("restarted for the choice");
-  assert!(finished < restarted, "{log}");
-  assert_eq!(s.network().port, Some(port));
-  s.stop().await;
-}
-
-/// Retry stays what it was once the conversion has failed: it starts the server again.
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn a_retry_after_a_failed_conversion_starts_the_server_again() {
-  let launch = fixture("import-error");
-  let s = server(launch.clone(), FakeEngine::ready(9), free_port());
-  s.start();
-  let st = settle(&s, 30).await;
-  assert_eq!(st.stage, "server");
-  assert!(
-    st.error
-      .as_deref()
-      .is_some_and(|e| e.starts_with("The database conversion failed")),
-    "{st:?}"
-  );
-  assert_eq!(runs(&launch).len(), 1);
-  s.start(); // Retry
-  let deadline = Instant::now() + Duration::from_secs(20);
-  while runs(&launch).len() < 2 && Instant::now() < deadline {
-    tokio::time::sleep(Duration::from_millis(50)).await;
-  }
-  assert_eq!(runs(&launch).len(), 2, "Retry started the server again");
-  let st = settle(&s, 30).await;
-  assert!(st.error.is_some(), "and it failed the same way");
-  s.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn import_state_and_warnings_reach_the_start_status_and_the_log_view() {
-  let s = server(
-    fixture("import-noop-ready"),
-    FakeEngine::ready(9),
-    free_port(),
-  );
-  s.start();
-  let st = settle(&s, 30).await;
-  assert_eq!((st.stage, st.error.clone()), ("ready", None));
-  assert_eq!(st.import, "noop");
-  assert_eq!(
-    st.warnings,
-    vec![
-      "Database conversion: PostgreSQL already holds data or a completed import; leaving \
-       SQLite in place"
-        .to_string()
-    ]
-  );
-  assert_eq!(st.progress, None);
-  let log = s.log_text();
-  assert!(
-    log.starts_with(
-      "── Warnings ──\nDatabase conversion: PostgreSQL already holds data or a completed import"
-    ),
-    "{log}"
-  );
-  s.stop().await;
 }
 
 /// N3: what the supervisor found about an earlier run's processes is in the status the
@@ -1099,7 +616,7 @@ fn the_server_ends_when_the_app_is_killed() {
           &attempt(port),
           &LogBuf::new(),
           &Arc::new(Mutex::new(None)),
-          &within(20),
+          Duration::from_secs(20),
         )
         .await
         .expect("fake server boots");
@@ -1123,31 +640,14 @@ fn the_server_ends_when_the_app_is_killed() {
 }
 
 #[test]
-fn database_stage_import_progress_and_server_environment_contract() {
+fn database_stage_and_server_environment_contract() {
   let launch = fixture("ready");
   let s = LocalServer::new(launch.clone(), FakeEngine::ready(1), LogBuf::new(), false);
   assert_eq!(s.status().stage, "database");
   s.set_stage(Stage::Engine);
   assert_eq!(s.status().stage, "engine");
   s.set_stage(Stage::Server);
-  assert_eq!(s.status().import, "idle");
-  s.server_log
-    .push("sqlite import: preparing (checking source and target)");
-  assert_eq!(s.status().import, "preparing");
-  s.server_log
-    .push("sqlite import: table users complete: 3 rows, 0.001s, 553 COPY bytes");
-  let status = s.status();
-  assert_eq!(status.import, "converting");
-  assert_eq!(
-    status.progress.as_deref(),
-    Some("sqlite import: table users complete: 3 rows, 0.001s, 553 COPY bytes")
-  );
-  s.server_log.reset_import();
-  let status = s.status();
-  assert!(
-    status.progress.is_none() && status.import == "idle",
-    "previous launch cannot extend this launch's health wait"
-  );
+  assert_eq!(s.status().stage, "server");
   s.set_ready(7580, false, None);
   assert_eq!(s.status().stage, "ready");
   let env = server_env(
@@ -1169,9 +669,5 @@ fn database_stage_import_progress_and_server_environment_contract() {
       "sqlite://{}",
       launch.data_dir.join("covers.sqlite3").display()
     )
-  );
-  assert_eq!(
-    env["KOMIKA_SQLITE_IMPORT_PATH"],
-    launch.data_dir.join("komika.sqlite3").display().to_string()
   );
 }

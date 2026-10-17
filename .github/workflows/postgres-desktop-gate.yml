@@ -145,7 +145,7 @@ jobs:
       - name: Strict desktop clippy
         id: clippy
         run: cargo clippy --locked --manifest-path apps/admin/src-tauri/Cargo.toml --all-targets --features desktop-gate -- -D warnings
-      # Every unit test of the crate: postgres::, import::, child::, local::, firewall::,
+      # Every unit test of the crate: postgres::, child::, local::, firewall::,
       # logbuf::, network::. The local:: tests start `src/local/fake_server.py` through a
       # shell script in place of the server, so they need a Unix shell and `python3`.
       - name: Desktop unit tests (Linux, macOS)
@@ -199,15 +199,15 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       # The job is green only with a passed gate in the evidence file: status "pass", and
-      # exactly the steps of this target in their order, each passed (nine on Linux and
-      # macOS; six on Windows, which does not run the three earlier-database steps). So a
+      # exactly the steps of this target in their order, each passed (eight on Linux and
+      # macOS; five on Windows, which does not run the three earlier-database steps). So a
       # run in which the gate test was filtered out, or in which no test ran at all, is
       # red: the file then still holds the "blocked" text written at the start. The same
       # two lists are in tests/desktop_postgres_gate.rs (`expected_steps`).
       - name: Require a passed gate with every step of this target
         if: always()
         env:
-          EXPECTED_STEPS: ${{ runner.os == 'Windows' && 'new_install_and_clean_persistence,stale_lock_file_of_a_reused_process_number,crash_of_app_and_database_then_recovery,relocated_runtime_same_data,sqlite_upgrade_and_later_launches,dump_restore_retention_and_failure' || 'new_install_and_clean_persistence,stale_lock_file_of_a_reused_process_number,crash_of_app_and_database_then_recovery,relocated_runtime_same_data,earlier_database_still_running_after_data_folder_rename,earlier_database_whose_program_was_moved_or_deleted,earlier_database_after_rename_and_a_start_at_the_old_name,sqlite_upgrade_and_later_launches,dump_restore_retention_and_failure' }}
+          EXPECTED_STEPS: ${{ runner.os == 'Windows' && 'new_install_and_clean_persistence,stale_lock_file_of_a_reused_process_number,crash_of_app_and_database_then_recovery,relocated_runtime_same_data,dump_restore_retention_and_failure' || 'new_install_and_clean_persistence,stale_lock_file_of_a_reused_process_number,crash_of_app_and_database_then_recovery,relocated_runtime_same_data,earlier_database_still_running_after_data_folder_rename,earlier_database_whose_program_was_moved_or_deleted,earlier_database_after_rename_and_a_start_at_the_old_name,dump_restore_retention_and_failure' }}
         run: |
           node -e '
             const expected = process.env.EXPECTED_STEPS.split(",");

@@ -19,9 +19,7 @@ The app starts and stops its database, server and engine with your session. Keep
 
 Your data stays in the application data folder under `app.komika.desktop`. PostgreSQL holds accounts, settings and library history in `server/postgres/18/data`. Its passwords are in `server/postgres/18/credentials`: without that file PostgreSQL cannot open its data, and the app never makes new passwords for an existing database. Covers stay in a separate SQLite cache, `server/covers.sqlite3`. `suwayomi/` holds installed extensions and engine data.
 
-When you update an old SQLite installation, the first start converts `server/komika.sqlite3`. The start screen shows "Checking the old database…", "Converting the database…" with the current step, then "Database converted. Starting…". The server verifies the copy before serving, then renames the old file to `komika.sqlite3.imported-<UTC time>`. It never deletes that file or a kept copy, `komika.sqlite3.import-kept-<UTC time>`. [Update and back up](/self-host/update-and-backup) explains the two warnings about kept copies. The start screen lists warnings as notes, kept-copy ones first, and waits for **Continue**.
-
-A conversion with no progress for 30 minutes, or longer than 6 hours, stops; **Retry** continues it. Do not close the app meanwhile. It needs free space of about 8 times the old database plus 256 MiB, in the folder that holds it. When the server refuses to convert, the screen shows its reason and the exact renames for files in `server/`: see [Fix server problems](/self-host/troubleshooting).
+For an old installation with `server/komika.sqlite3`, follow [Old SQLite install](/self-host/update-and-backup#old-sqlite-install) to start fresh. This version cannot read or convert that file.
 
 The app saves a PostgreSQL dump, a consistent database export without the cover cache, when none exists or the newest is at least 20 hours old. Dumps are `server/backups/komika-<UTC time>-<random>.dump`; the seven newest stay. The app has no restore button, and this guide has no restore steps for it yet. Keep dump copies elsewhere too.
 
@@ -84,6 +82,6 @@ The start screen names the cause. Your data stays. Choose **Retry** after you fi
 
 ## Status
 
-An automated check of the database handling is set up for Apple-silicon macOS, x86_64 Linux and x86_64 Windows. Intel Macs are not part of it, and the real installers are not yet verified. Conversion duration, installed size and dump duration have not been measured for this release.
+An automated check of the database handling is set up for Apple-silicon macOS, x86_64 Linux and x86_64 Windows. Intel Macs are not part of it, and the real installers are not yet verified. Installed size and dump duration have not been measured for this release.
 
 Next: [Install with Docker](/self-host/docker).

@@ -21,7 +21,7 @@ The suites cover components of both apps and their shared tooling:
 
 The admin app's API server in `apps/server` includes tests for GraphQL resolvers, catalog deduplication, cover hash calculation, authentication, session tokens, and database migrations.
 
-The server tests provision a private PostgreSQL 18.6 cluster automatically and clone isolated databases. They require permission to start local processes and bind private sockets. The cover cache, frozen migration tests and importer sources retain SQLite.
+The server tests provision a private PostgreSQL 18.6 cluster automatically and clone isolated databases. They require permission to start local processes and bind private sockets. The cover cache retains SQLite.
 
 To run the server test suite:
 
@@ -41,7 +41,7 @@ Continuous integration runs the server formatting and Clippy checks on every pul
 
 ## Self-host packaging checks
 
-The installer gate uses fake Docker calls for new installs and SQLite upgrades:
+The installer gate uses fake Docker calls for installation and startup checks:
 
 ```sh
 bash deploy/selfhost/install.test.sh
@@ -54,7 +54,7 @@ bash deploy/selfhost/install.test.sh --real komiq-selfhost:local
 sh deploy/image-smoke.test.sh komiq-postgres-server:review komiq-selfhost:local
 ```
 
-The real installer gate builds the frozen SQLite golden fixture locally, checks conversion, preserved source bytes and row counts, then checks startup failure on invalid source data. Both scripts use disposable resources with no published ports. The image smoke script provisions PostgreSQL before testing readiness, directory exclusion and restart inside both runtime images.
+The real installer gate checks a fresh PostgreSQL installation, a restart and a dump restored into another empty installation. Both scripts use disposable resources with no published ports. The image smoke script provisions PostgreSQL before testing readiness, directory exclusion and restart inside both runtime images.
 
 ## Cloudflare Worker security tests
 
@@ -202,7 +202,7 @@ To test against a real `komika-server` binary rather than a mock server:
 KOMIKA_TEST_SERVER_BIN=/path/to/komika-server cargo test -- --ignored real_server
 ```
 
-The desktop database gate starts the bundled PostgreSQL runtime, the supervisor and a release `komika-server`, then checks restarts, a left-over database process, the SQLite conversion and dumps. Stage the runtime for your system, build the server in release mode, then run the ignored test. `<target>` is a name such as `aarch64-macos`, and the stage command needs Python 3.12:
+The desktop database gate starts the bundled PostgreSQL runtime, the supervisor and a release `komika-server`, then checks restarts, a left-over database process and dumps. Stage the runtime for your system, build the server in release mode, then run the ignored test. `<target>` is a name such as `aarch64-macos`, and the stage command needs Python 3.12:
 
 ```sh
 python3 scripts/postgres-desktop-bundle.py --triple <rust triple>
@@ -214,7 +214,7 @@ TAURI_CONFIG='{"bundle":{"externalBin":[]}}' cargo test --manifest-path apps/adm
   --features desktop-gate --test desktop_postgres_gate -- --ignored --exact desktop_postgres_gate --nocapture
 ```
 
-The gate root must not exist yet. The JSON file lists each step and its result. The server's own conversion tests are in `pg_import::startup::tests` and need the private PostgreSQL cluster from `cargo test`.
+The gate root must not exist yet. The JSON file lists each step and its result.
 
 ### Reader desktop tests
 

@@ -569,8 +569,7 @@ fn fake_process_tables_require_exact_executable_and_data_argument() {
   assert!(!process::owns(&other, &image, &data, &pid));
 }
 
-/// The server converts an old database only in a folder that this user owns and that
-/// nobody else can write to; a session with umask 002 creates folders 0775.
+/// Data folders stay private even when a session with umask 002 creates folders 0775.
 #[cfg(unix)]
 #[test]
 fn data_folder_is_created_and_kept_private_and_a_link_or_foreign_folder_is_left_alone() {
@@ -589,16 +588,13 @@ fn data_folder_is_created_and_kept_private_and_a_link_or_foreign_folder_is_left_
   // leaves): tightened at the next start, content untouched.
   let open = root.0.join("open");
   fs::create_dir(&open).unwrap();
-  fs::write(open.join("komika.sqlite3"), "kept").unwrap();
+  fs::write(open.join("kept.txt"), "kept").unwrap();
   for loose in [0o775, 0o777, 0o750, 0o705] {
     fs::set_permissions(&open, fs::Permissions::from_mode(loose)).unwrap();
     assert_eq!(paths::private_dir_as(&open, me).unwrap(), None, "{loose:o}");
     assert_eq!(mode(&open), 0o700, "{loose:o}");
   }
-  assert_eq!(
-    fs::read_to_string(open.join("komika.sqlite3")).unwrap(),
-    "kept"
-  );
+  assert_eq!(fs::read_to_string(open.join("kept.txt")).unwrap(), "kept");
   // The public entry point acts for the user that runs it.
   fs::set_permissions(&open, fs::Permissions::from_mode(0o775)).unwrap();
   assert_eq!(private_dir(&open).unwrap(), None);
@@ -612,7 +608,7 @@ fn data_folder_is_created_and_kept_private_and_a_link_or_foreign_folder_is_left_
   assert_eq!(mode(&open), 0o775);
 
   // A link is never followed: the folder behind it keeps its mode, and the warning
-  // comes only when that folder would make the server refuse the conversion.
+  // comes only when that folder is writable by other users or has another owner.
   let link = root.0.join("link");
   std::os::unix::fs::symlink(&open, &link).unwrap();
   let warning = paths::private_dir_as(&link, me).unwrap().unwrap();

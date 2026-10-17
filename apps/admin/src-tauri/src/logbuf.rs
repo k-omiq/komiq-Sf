@@ -14,11 +14,6 @@ use std::sync::{Arc, Mutex};
 pub const MAX_LINES: usize = 400;
 /// Characters kept per line; the rest is cut with an ellipsis.
 pub const MAX_LINE_CHARS: usize = 2000;
-/// Characters kept of a line of the server's importer (`sqlite import: …`). The one
-/// error line of a refused start names every file with its full path and ends with the
-/// steps the owner must take; with the paths of an installed app it is several thousand
-/// characters long. It is shown on the start screen and must not lose its end.
-pub const MAX_IMPORT_LINE_CHARS: usize = 20_000;
 /// What a masked secret reads as.
 pub const MASK: &str = "••••";
 
@@ -27,8 +22,6 @@ pub const MASK: &str = "••••";
 pub struct LogBuf {
   lines: Mutex<VecDeque<String>>,
   secrets: Mutex<Vec<String>>,
-  /// The SQLite conversion of the current server process, read from its lines.
-  import: Mutex<crate::import::Tracker>,
 }
 
 impl LogBuf {
@@ -59,47 +52,14 @@ impl LogBuf {
         line = line.replace(secret.as_str(), MASK);
       }
     }
-    let most = if line.trim_start().starts_with(crate::import::PREFIX) {
-      MAX_IMPORT_LINE_CHARS
-    } else {
-      MAX_LINE_CHARS
-    };
-    if line.chars().count() > most {
-      line = line.chars().take(most).collect::<String>() + "…";
+    if line.chars().count() > MAX_LINE_CHARS {
+      line = line.chars().take(MAX_LINE_CHARS).collect::<String>() + "…";
     }
-    self
-      .import
-      .lock()
-      .unwrap_or_else(|e| e.into_inner())
-      .observe(&line, std::time::Instant::now());
     let mut lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
     lines.push_back(line);
     while lines.len() > MAX_LINES {
       lines.pop_front();
     }
-  }
-
-  /// A new server process: forget what the previous one said about its import.
-  pub fn reset_import(&self) {
-    *self.import.lock().unwrap_or_else(|e| e.into_inner()) = crate::import::Tracker::default();
-  }
-
-  /// The server answers: see [`crate::import::Tracker::ready`].
-  pub fn import_ready(&self) {
-    self
-      .import
-      .lock()
-      .unwrap_or_else(|e| e.into_inner())
-      .ready();
-  }
-
-  /// The import as the current server process has reported it so far.
-  pub fn import(&self) -> crate::import::Tracker {
-    self
-      .import
-      .lock()
-      .unwrap_or_else(|e| e.into_inner())
-      .clone()
   }
 
   pub fn text(&self) -> String {
@@ -208,43 +168,6 @@ mod tests {
     let buf = LogBuf::default();
     buf.push(&"x".repeat(MAX_LINE_CHARS * 2));
     assert_eq!(buf.text().chars().count(), MAX_LINE_CHARS + 1);
-  }
-
-  /// The importer's error line carries the owner's instructions at its end, and with
-  /// real paths it is longer than an ordinary line may be. It reaches the log view and
-  /// the import tracker whole; only a line beyond every real length is cut.
-  #[test]
-  fn a_long_line_of_the_importer_keeps_its_end() {
-    let text = format!(
-      "recovery stage: the SQLite file is missing. {} and start again",
-      "move /Users/José Müller/Application Support/komiq (old), then rename it, ".repeat(100)
-    );
-    assert!(text.chars().count() > 3 * MAX_LINE_CHARS);
-    let line = format!("sqlite import: error: {text}");
-    let buf = LogBuf::default();
-    buf.push(&line);
-    assert_eq!(buf.text(), line);
-    assert_eq!(buf.import().error(), Some(text.as_str()));
-    assert!(buf.import().failure_text().ends_with(" and start again"));
-    // Coloured, as a terminal would get it: the same.
-    let buf = LogBuf::default();
-    buf.push(&format!("\x1b[31m{line}\x1b[0m"));
-    assert_eq!(buf.import().error(), Some(text.as_str()));
-    // Without the importer's prefix the ordinary limit holds.
-    let buf = LogBuf::default();
-    buf.push(&format!("Error: {line}"));
-    assert_eq!(buf.text().chars().count(), MAX_LINE_CHARS + 1);
-    // And the importer's own limit.
-    let buf = LogBuf::default();
-    buf.push(&format!(
-      "sqlite import: error: {}",
-      "x".repeat(MAX_IMPORT_LINE_CHARS)
-    ));
-    assert_eq!(buf.text().chars().count(), MAX_IMPORT_LINE_CHARS + 1);
-    assert!(buf
-      .import()
-      .error()
-      .is_some_and(|error| error.ends_with('…')));
   }
 
   #[test]

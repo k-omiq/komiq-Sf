@@ -212,13 +212,8 @@ services:
     # Application drain is bounded at 20 seconds.
     stop_grace_period: 30s
     # Main data now lives in PostgreSQL; only the <=256 MiB covers SQLite map
-    # remains here. 4 GiB replaces the SQLite build's 6 GiB ceiling. It is the
-    # limit for serving, not for the one-time SQLite import: the import's work
-    # copy must stay in this container's page cache, and a 3.2 GB source under
-    # a 3 GiB limit made the repair stage take 75 minutes instead of 5 to 6
-    # (2026-10-13). Give a large one-time import an override with a higher
-    # limit; the hosted move used 8 GiB. Still to
-    # confirm for serving: this reduction under realistic scanner/search load.
+    # remains here. The 4 GiB serving limit still needs confirmation under
+    # realistic scanner/search load.
     mem_limit: 4g
     logging:
       driver: json-file
@@ -227,7 +222,6 @@ services:
       PORT: '8080'
       DATABASE_URL: postgres://komika:${KOMIKA_POSTGRES_PASSWORD:?set a URI-safe PostgreSQL password in deploy/.env}@postgres:5432/komika
       COVERS_DATABASE_URL: sqlite:///data/covers.sqlite3
-      KOMIKA_SQLITE_IMPORT_PATH: /data/komika.sqlite3
       # The /metrics scrape endpoint, on a SEPARATE listener (never the public
       # router). Docker forwards a published port to the container's network
       # address, never to its loopback, so a 127.0.0.1 bind here could not be

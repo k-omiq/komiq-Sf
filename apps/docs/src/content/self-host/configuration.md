@@ -68,7 +68,6 @@ These variables configure database connections and file storage paths.
 | --------------------------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
 | `DATABASE_URL`              | `postgres://localhost/komika` | PostgreSQL URL for accounts, libraries and settings. Compose supplies the private `postgres` service and application role. |
 | `COVERS_DATABASE_URL`       | `sqlite://covers.sqlite3`     | SQLite URL for cached cover storage, separate from main database.                                                          |
-| `KOMIKA_SQLITE_IMPORT_PATH` | `komika.sqlite3` beside the covers file | Absolute path of the old main SQLite file to convert; the server refuses a relative path. Compose sets `/data/komika.sqlite3`. |
 | `EXT_ICONS_DIR`             | `/srv/ext-icons`              | Directory on disk where source extension icons are cached.                                                                 |
 
 The main database lives in `postgres-data`; covers and other server files live in `server-data`. Use a PostgreSQL dump for account and library backups. Copying the cover file does not back up those records. See [Update and back up](/self-host/update-and-backup).

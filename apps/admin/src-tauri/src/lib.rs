@@ -9,7 +9,6 @@ use std::sync::{Arc, OnceLock};
 use tauri::{Manager, State};
 
 mod firewall;
-pub mod import;
 pub mod local;
 pub mod logbuf;
 mod network;

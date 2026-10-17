@@ -27,8 +27,6 @@ USAGE = """usage: rehearsal.sh <subcommand> [options]   (full drill order; see R
   up [--with-scheduler]              start postgres (and the backup scheduler); never restores
   status                             containers, jobs, unresolved jobs, kept restores, free space, backup status
   psql-check                         authenticated application query, locale and role facts
-  import --sqlite FILE --server-bin FILE [--report FILE]
-  verify --sqlite FILE --server-bin FILE [--report FILE]
   stanza-create
   backup full [--first] | backup incr
   check
@@ -42,7 +40,6 @@ USAGE = """usage: rehearsal.sh <subcommand> [options]   (full drill order; see R
   destroy-source-volumes --yes-delete-rehearsal-volumes
   restore --target NEWDIR --json-out FILE [--target-time UTC] [--source-settings FILE] [--keep]
           [--expect-marker LABEL]... [--expect-no-marker LABEL]...
-  verify-restored --target DIR --sqlite FILE --server-bin FILE [--report FILE]
   restore-cleanup --target DIR
   repo-destroy --yes-delete-rehearsal-repo
   down                               containers, jobs and network; volumes stay
@@ -57,7 +54,6 @@ takes the host-wide operation lock and is refused at once while another holds it
 # subcommand: (choices of each positional, optional trailing positional?, {flag: takes value}, required flags)
 # A flag maps to False (no value), True (one value) or MANY (a value, repeatable).
 MANY = "many"
-JOB = {"--sqlite": True, "--server-bin": True, "--report": True}
 SPEC = {
     "preflight": ((), False, {"--init-root": False}, ()),
     "up": ((), False, {"--with-scheduler": False}, ()),
@@ -69,9 +65,6 @@ SPEC = {
     "info": ((), False, {"--json": False, "--out": True}, ()),
     "repo-usage": ((), False, {"--out": True}, ()),
     "archive-status": ((), False, {}, ()),
-    "import": ((), False, JOB, ("--sqlite", "--server-bin")),
-    "verify": ((), False, JOB, ("--sqlite", "--server-bin")),
-    "verify-restored": ((), False, dict(JOB, **{"--target": True}), ("--target", "--sqlite", "--server-bin")),
     "record-settings": ((), False, {"--out": True}, ("--out",)),
     "drill": ((), False, {"--target": True, "--json-out": True}, ("--target", "--json-out")),
     "restore": ((), False, {"--target": True, "--json-out": True, "--target-time": True,
@@ -236,14 +229,6 @@ def existing_file(value, what):
     if not os.path.isfile(path) or os.path.islink(path):
         raise ValueError(f"{what} must be an existing regular file")
     return path
-
-
-def usable(path, uid, gid, need, what):
-    """The job has exactly this uid and gid and no capability: check the mode bits."""
-    status = os.stat(path)
-    shift = 6 if status.st_uid == uid else 3 if status.st_gid == gid else 0
-    if (status.st_mode >> shift) & need != need:
-        raise ValueError(f"{what} is not {'readable and executable' if need & 1 else 'readable'} by the job user {uid}:{gid}")
 
 
 def utc_time(value):
@@ -512,9 +497,8 @@ def archive_status(ctx, positional, options):
 
 def sql_marker(ctx, positional, options):
     label = marker_label(options["--label"], "--label")
-    # Own database: the application database must stay exactly what the importer
-    # and the verifier expect. The label alphabet has no quote; the insert commits
-    # before the database time is read.
+    # Keep drill markers separate from application data. The label alphabet has
+    # no quote; the insert commits before the database time is read.
     drill.marker_database()
     if drill.sql(f"INSERT INTO operator_markers(label) VALUES ('{label}') ON CONFLICT DO NOTHING RETURNING label",
                  database=drill.MARKER_DATABASE) != label:
@@ -634,107 +618,6 @@ def restore_cleanup(ctx, positional, options):
         ctx.docker("network", "rm", entry["Id"])
     say(f"removed_containers={len(containers)} removed_networks={len(networks)} (restored directory retained)")
     return 0
-
-
-def job(ctx, command, options, network, host, growth=0.0):
-    """Importer/verifier in a throwaway, non-root, read-only container."""
-    root = ctx.fence_root()
-    sqlite = existing_file(options["--sqlite"], "--sqlite")
-    binary = existing_file(options["--server-bin"], "--server-bin")
-    report = ctx.new_path(options["--report"], "--report") if "--report" in options else None
-    # Only the main file is mounted. Pending pages in a write-ahead log or a hot
-    # rollback journal would be silently left out, so refuse them.
-    for suffix in ("-wal", "-journal"):
-        if os.path.lexists(sqlite + suffix) and (os.path.islink(sqlite + suffix) or os.path.getsize(sqlite + suffix)):
-            raise ValueError(f"--sqlite has a non-empty {suffix} file beside it; use a checkpointed standalone copy")
-    image_id(ctx)
-    name = ctx.transient_name("job")
-    token = name[-8:]
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    kind = command.split("-", 1)[0]
-    work = root / f"{kind}-{stamp}-{token}"
-    # A root caller still runs the job as an unprivileged user.
-    uid, gid = (ctx.uid, ctx.gid) if ctx.uid else (65534, 65534)
-    usable(sqlite, uid, gid, 4, "--sqlite")
-    usable(binary, uid, gid, 5, "--server-bin")
-    if growth:
-        # The data volume grows by the PostgreSQL base and by WAL not yet archived.
-        gate(ctx, kind, docker_bytes=math.ceil(growth * os.path.getsize(sqlite)))
-    for directory in (work, work / "tmp"):
-        os.mkdir(directory, 0o700)
-        if not ctx.uid:
-            os.chown(directory, uid, gid)
-    limits = {name: safety.limit(ctx.values, "KOMIKA_REHEARSAL_", "JOB_" + name)[0]
-              for name in ("MEMORY", "CPUS", "PIDS")}
-    # The URL carries the password: it travels on stdin, never in argv or a file.
-    environment = (f"KOMIKA_IMPORT_POSTGRES_URL=postgres://komika:{ctx.values['KOMIKA_POSTGRES_PASSWORD']}@{host}:5432/komika\n"
-                   "SQLITE_TMPDIR=/work/tmp\nTMPDIR=/work/tmp\nHOME=/work\n")
-    say(f"work_directory={work}")
-    say(f"job_container={name}")
-    interrupted = True
-    try:
-        status = ctx.stream(
-            "run", "--rm", "--init", "--pull=never", "--name", name,
-            "--label", f"{safety.LABEL}={ctx.project}", "--network", network,
-            "--user", f"{uid}:{gid}", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
-            f"--memory={limits['MEMORY']}", f"--memory-swap={limits['MEMORY']}",
-            f"--cpus={limits['CPUS']}", f"--pids-limit={limits['PIDS']}", *safety.LOG_OPTIONS,
-            "--env-file", "/dev/stdin", "--workdir", "/work",
-            "--mount", f"type=bind,src={binary},dst=/opt/komika-server/komika-server,readonly",
-            "--mount", f"type=bind,src={sqlite},dst=/source/komika.sqlite3,readonly",
-            "--mount", f"type=bind,src={work},dst=/work",
-            # SQLite may create its empty -wal/-shm beside the read-only file here.
-            "--tmpfs", f"/source:rw,noexec,nosuid,nodev,size=64m,mode=0700,uid={uid},gid={gid}",
-            "--tmpfs", "/var/lib/postgresql:mode=0700",
-            "--entrypoint", "/opt/komika-server/komika-server",
-            safety.IMAGE, command, "--sqlite", "/source/komika.sqlite3", "--json-out", "/work/report.json",
-            input=environment)
-        interrupted = False
-    finally:
-        # Ctrl-C, SIGTERM or a lost terminal kills the client, not the container;
-        # the daemon may even create it after the client is gone.
-        outcome = ctx.remove_transient(name, settle=interrupted)
-        if outcome == "removed":
-            say(f"job_container={name} was still present and has been removed")
-        elif outcome == "unresolved":
-            say(f"job_container={name} UNRESOLVED: its creation was interrupted and it did not appear; "
-                "run `rehearsal.sh status`, then `rehearsal.sh stop-source` or `down`")
-    produced = work / "report.json"
-    if produced.is_file() and not produced.is_symlink():
-        say(f"report={produced}")
-        if report is not None:
-            # The job wrote this file: never follow a link it may have planted.
-            with os.fdopen(os.open(str(produced), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb") as source:
-                content = source.read(64 << 20)
-            descriptor = os.open(str(report), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            with os.fdopen(descriptor, "wb") as copy:
-                copy.write(content)
-            say(f"report_copy={report}")
-    say(f"{command} exit_status={status}")
-    return status
-
-
-def import_sqlite(ctx, positional, options):
-    ctx.container("postgres", running=True)
-    safety.require_label("network", ctx.network, ctx.project, ctx.inspect)
-    return job(ctx, "import-sqlite-to-postgres", options, ctx.network, ctx.containers["postgres"],
-               growth=safety.IMPORT_GROWTH)
-
-
-def verify(ctx, positional, options):
-    ctx.container("postgres", running=True)
-    safety.require_label("network", ctx.network, ctx.project, ctx.inspect)
-    return job(ctx, "verify-sqlite-postgres", options, ctx.network, ctx.containers["postgres"])
-
-
-def verify_restored(ctx, positional, options):
-    containers, networks = kept(ctx, kept_target(ctx, options["--target"]))
-    if len(containers) != 1 or len(networks) != 1 or not containers[0]["State"].get("Running"):
-        raise ValueError("no single running kept restore for this target; run `restore --keep` first")
-    name = containers[0]["Name"].lstrip("/")
-    if networks[0]["Name"] != name + "-network":
-        raise ValueError("kept restore container and network do not belong together")
-    return job(ctx, "verify-sqlite-postgres", options, networks[0]["Name"], name)
 
 
 def logs(ctx, positional, options):
@@ -962,8 +845,7 @@ def preflight(options, lock=None):
                 gate_facts = step("disk gate", ctx.disk_gate, "preflight")[0] or []
                 for fact in gate_facts:
                     say(fact)
-                say(f"disk_gate_rules=up,backup: floor; import: floor + {safety.IMPORT_GROWTH} x SQLite file size on "
-                    f"Docker's data root; restore,drill: floor + {safety.RESTORE_GROWTH} x backup database size on the "
+                say(f"disk_gate_rules=up,backup: floor; restore,drill: floor + {safety.RESTORE_GROWTH} x backup database size on the "
                     "rehearsal root (KOMIKA_REHEARSAL_MIN_FREE_GB sets the floor, 2..64, default 3). These are "
                     "estimates measured once, under the operation lock, before the step: watch free space yourself "
                     "while a step runs")
@@ -1014,7 +896,6 @@ def shown(labels):
 HANDLERS = {
     "up": up, "status": status, "psql-check": psql_check, "stanza-create": stanza_create,
     "backup": backup, "check": check, "info": info, "archive-status": archive_status,
-    "import": import_sqlite, "verify": verify, "verify-restored": verify_restored,
     "record-settings": record_settings, "drill": marker_drill, "restore": restore,
     "restore-cleanup": restore_cleanup, "sql-marker": sql_marker, "logs": logs,
     "stop-source": stop_source, "destroy-source-volumes": destroy_source_volumes,
@@ -1027,7 +908,7 @@ def main(argv=None):
         raise SystemExit(128 + signum)
     # A lost terminal (SIGHUP) and SIGTERM unwind like Ctrl-C, so every `finally`
     # that removes a job, metadata or restore container still runs. A signal the
-    # caller chose to ignore (nohup for a long import) stays ignored.
+    # caller chose to ignore (nohup for a long backup) stays ignored.
     for number in (signal.SIGTERM, signal.SIGHUP):
         if signal.getsignal(number) is not signal.SIG_IGN:
             signal.signal(number, interrupted)

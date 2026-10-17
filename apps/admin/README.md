@@ -125,13 +125,18 @@ and `KOMIKA_SUWAYOMI_JAR`.
 
 On the device the app keeps its data in the OS app-data folder
 (`app.komika.desktop`): `server/postgres/18/data` (the server's bundled PostgreSQL
-database), `server/covers.sqlite3` (the cover cache; an old `server/komika.sqlite3` is
-converted at the first start and kept), `server/desktop.json` (the server's port and the
-"Allow other devices" choice) and `suwayomi/` (the engine). The server listens on `127.0.0.1` on port 7580 (or the next
-free port, which is then kept) until "Allow other devices" is turned on in setup. The
-setup code is read from the server's output and handed to the wizard once; it is never
-logged or saved. Both processes' output is kept in memory for the start screen's log
-view.
+database), `server/covers.sqlite3` (the cover cache), `server/desktop.json` (the server's
+port and the "Allow other devices" choice) and `suwayomi/` (the engine). The server
+listens on `127.0.0.1` on port 7580 (or the next free port, which is then kept) until
+"Allow other devices" is turned on in setup. The setup code is read from the server's
+output and handed to the wizard once; it is never logged or saved. Both processes'
+output is kept in memory for the start screen's log view.
+
+An old `server/komika.sqlite3` is not converted. If PostgreSQL is empty, the server
+refuses to start and links the [old SQLite install instructions](https://docs.komiq.cc/self-host/update-and-backup#old-sqlite-install).
+Move the old file and its `-wal`, `-shm` and `-journal` files out of the data directory
+to start with an empty library. If PostgreSQL already holds data, the old file is
+ignored with a warning in the server log.
 
 Tests (the process management runs against a fake server, `python3` required):
 

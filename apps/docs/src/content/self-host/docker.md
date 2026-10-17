@@ -11,7 +11,7 @@ You need:
 
 - Linux, macOS or Windows with Docker Engine 24+ and Docker Compose v2 (`docker compose version`). Docker is a container system: it runs an application and its dependencies in an isolated environment.
 - Enough memory for PostgreSQL, the server and the source engine. The installer warns below its build memory threshold. Building compiles the Rust server and both web apps.
-- Free disk space for images, PostgreSQL data and backups. An upgrade also keeps your original SQLite database.
+- Free disk space for images, PostgreSQL data and backups.
 - A copy of the komiq repository: a release archive, or `git clone`.
 
 ## Install with one command
@@ -24,7 +24,7 @@ bash deploy/selfhost/install.sh
 
 The installer checks Docker, Compose, architecture, memory, disk space and ports. It asks for the HTTP port, access mode and home-network access. It offers host firewall changes on Linux.
 
-It writes `.env`, preserving existing settings and backing it up once to `.env.bak`. It adds a random database password when missing and keeps both files private. It starts PostgreSQL first, then builds and starts the server. For an old SQLite volume, it announces conversion and waits while progress advances.
+It writes `.env`, preserving existing settings and backing it up once to `.env.bak`. It adds a random database password when missing and keeps both files private. It starts PostgreSQL first, then builds and starts the server.
 
 Once ready, it starts terminal setup. Read [First-run setup](/self-host/first-run).
 
@@ -80,7 +80,7 @@ docker compose ps
 ```
 
 - `postgres` must pass an authenticated database query before the server starts.
-- `server` becomes `healthy` after startup and any conversion finish. Its health check queries `http://localhost:8080/health/ready`. Health grace defaults to a day; the installer increases it for larger sources.
+- `server` becomes `healthy` after startup. Its health check queries `http://localhost:8080/health/ready`.
 - `suwayomi` sets up its own database on first run. Its health check queries `http://localhost:4567/api/v1/settings/about`.
 
 Read the server log:
@@ -104,12 +104,8 @@ Use `KOMIQ_BIND=127.0.0.1` on a VPS that you reach through a Cloudflare Tunnel. 
 
 ## Storage and upgrades
 
-PostgreSQL data lives in `komiq_postgres-data`. Covers remain a SQLite cache in `komiq_server-data`, alongside connector files and any old `komika.sqlite3`. Engine data lives in `komiq_engine-data`.
+PostgreSQL data lives in `komiq_postgres-data`. Covers remain a SQLite cache in `komiq_server-data`, alongside connector files. Engine data lives in `komiq_engine-data`.
 
-Run the installer when updating an old SQLite release. The server copies the old database into an empty PostgreSQL database, verifies it and only then renames the source to `komika.sqlite3.imported-<UTC time>`. It never deletes that file. A failure or refusal exits without serving or changing the original bytes. The installer prints the error and how to start the previous image. Follow [Update and back up](/self-host/update-and-backup) for kept copies, recovery and dump commands, and [Fix server problems](/self-host/troubleshooting) for refusals.
-
-## Status
-
-Capacity and conversion duration for your library have not been measured. Allow extra disk space for both databases during conversion. The installer allows one hour per 2.75 GB of source, with a one-hour floor. An unseen stage or a larger row or byte count resets that stall timer. Repeated lines and log rotation do not extend it. For manual upgrades, set `KOMIQ_IMPORT_START_PERIOD` to at least that allowance if it exceeds the default day.
+Follow [Update and back up](/self-host/update-and-backup) for PostgreSQL dumps and recovery. An old installation with `komika.sqlite3` must [start fresh](/self-host/update-and-backup#old-sqlite-install); this version cannot read or convert that file.
 
 Next: [First-run setup](/self-host/first-run).

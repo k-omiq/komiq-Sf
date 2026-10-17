@@ -53,8 +53,6 @@ Key parts of `apps/server`:
 - `apps/server/src/auth.rs`: User password hashing with argon2id and session token verification.
 - `apps/server/src/suwayomi.rs`: HTTP client federating requests to the Suwayomi source engine.
 - `apps/server/migrations_pg/`: PostgreSQL schema and migrations for the main database.
-- `apps/server/migrations/`: frozen SQLite migration history used to prepare old import sources.
-- `apps/server/src/pg_import/`: SQLite importer and verifier, and the startup decision in `startup.rs`.
 - `apps/server/bench/`: Load testing scripts and baseline performance benchmarks.
 
 ### apps/reader

@@ -13,8 +13,8 @@ exit "${SERVER_STATUS:-0}"
 SH
 chmod +x "$scratch/bin/komika-server"
 export PATH="$scratch/bin:$PATH" ENTRYPOINT_TRACE="$scratch/trace"
-sh "$entrypoint" verify-sqlite-postgres 'path with spaces'
-test "$(cat "$ENTRYPOINT_TRACE")" = 'server <verify-sqlite-postgres> <path with spaces>'
+sh "$entrypoint" setup --setup-code 'code with spaces'
+test "$(cat "$ENTRYPOINT_TRACE")" = 'server <setup> <--setup-code> <code with spaces>'
 export SERVER_STATUS=7
 if sh "$entrypoint"; then exit 1; else test "$?" -eq 7; fi
 echo 'server-entrypoint: exec_arguments and exit_status passed'

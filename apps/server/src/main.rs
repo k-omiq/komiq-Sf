@@ -25,6 +25,7 @@ mod img_proxy;
 mod ingest;
 mod instance;
 mod lan;
+mod legacy_sqlite;
 mod locks;
 mod maintenance;
 mod mangadex;
@@ -43,8 +44,6 @@ mod notify;
 mod page_locator;
 #[cfg(test)]
 mod page_locator_tests;
-mod pg_export;
-mod pg_import;
 mod phase_f;
 mod phash;
 #[cfg(test)]
@@ -3062,15 +3061,6 @@ async fn main() -> anyhow::Result<()> {
     if argv.first().map(String::as_str) == Some("setup") {
         return setup_cli::run(cfg.port, &argv[1..]).await;
     }
-    if matches!(
-        argv.first().map(String::as_str),
-        Some("import-sqlite-to-postgres" | "verify-sqlite-postgres")
-    ) {
-        return pg_import::run_cli(&argv).await;
-    }
-    if argv.first().map(String::as_str) == Some("export-postgres-to-sqlite") {
-        return pg_export::run_cli(&argv).await;
-    }
     if argv.first().map(String::as_str) == Some("repair-upload-dates") {
         return catalog::date_repair::run_cli(&argv[1..]).await;
     }
@@ -3113,7 +3103,7 @@ async fn main() -> anyhow::Result<()> {
     // directory. The PostgreSQL writer lease does not exclude a second server's
     // background loops, and Phase 3 does not expand server concurrency.
     let _data_directory_lock = db::DataDirectoryLock::acquire(&cfg.covers_database_url)?;
-    pg_import::startup::run(&cfg.database_url, &cfg.covers_database_url).await?;
+    legacy_sqlite::refuse_unconverted(&cfg.database_url, &cfg.covers_database_url).await?;
     let pool = db::init(&cfg.database_url).await?;
     let ready_pool = ReadyDb::connect(&pool).await?;
     // Separate, un-replicated DB for cover blobs — see `db::init_covers`. Kept out

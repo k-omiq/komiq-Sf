@@ -10,18 +10,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The longest the gate waits for one start. The supervisor's own waits (src/local.rs
-/// START_BOUNDS) end a start that hangs; the small fixture converts in seconds.
+/// SERVER_READY_TIMEOUT) end a start that hangs.
 const GATE_READY: Duration = Duration::from_secs(15 * 60);
 
-/// Tables whose row count the running server changes by itself, so their count is not
-/// compared with the fixture. Established by running: the gate with
-/// `KOMIKA_DESKTOP_GATE_HOLD_SECONDS=150` keeps the converted install running, counts
-/// every one of the 63 tables every ten seconds and again after two more starts, and
-/// lists every table that differed at any point (run of 2026-10-11, aarch64 macOS:
-/// exactly these ten). The numbers are fixture rows, rows seen, and seconds after the
-/// server was ready. The gate sends no request to the server and gives it no source
-/// engine, so nothing else writes; every other table must keep the fixture's count on all
-/// three launches and in the restored dump.
+/// Tables whose row count background projection, maintenance and retention jobs can
+/// change while the gate runs. Their content hashes are not compared either.
 const NOT_COMPARED: &[(&str, &str)] = &[
   (
     "maintenance_flag",
@@ -64,32 +57,8 @@ const NOT_COMPARED: &[(&str, &str)] = &[
     "hourly source health older than the kept window is pruned (1 to 0 rows, 151 s)",
   ),
 ];
-/// These must always be compared (the brief's minimum).
-const MUST_COMPARE: &[&str] = &[
-  "users",
-  "work",
-  "source_series",
-  "chapter",
-  "comments",
-  "user_library",
-  "canonical_progress",
-];
-
-/// The one table that is compared by content instead of by its row count.
-///
-/// `instance_setting` is a key and value store, and the running server adds rows of its
-/// own to it, so its row count is not the fixture's. Seen with a server built from the
-/// tree of 2026-10-11 (aarch64 Linux and x86_64 Linux in CI, then here): the fixture has
-/// one row, the converted install has two. The second row has the key
-/// `direct_tls_generation` and a new UUID as its value; the server stores it at every
-/// start when it is not there yet (`resume_direct_tls`,
-/// apps/server/src/cloudflare/direct.rs). Established by reading the table of a kept gate
-/// run, not assumed.
-///
-/// The rule: every row of the fixture must be there with the same value and the same
-/// time, and a row that the fixture does not have is accepted only when its key is one
-/// the server is known to write by itself ([`server_written_setting`]). Any other extra
-/// row, a missing row or a changed row fails the gate.
+/// `instance_setting` is compared by content: every seeded row must keep its value and
+/// time. Extra rows are accepted only for keys the server writes by itself.
 const SETTINGS_TABLE: &str = "instance_setting";
 
 /// The rows of `instance_setting` as one JSON text: `[[key, value, updated_at], ...]`,
@@ -296,15 +265,6 @@ fn differences(fixture: &Counts, now: &Counts) -> Vec<String> {
     .collect()
 }
 
-/// Every fixture table whose count in `now` is not the fixture's, compared or not.
-fn changed(fixture: &Counts, now: &Counts) -> Vec<String> {
-  fixture
-    .iter()
-    .filter(|(table, rows)| now.get(*table) != Some(rows))
-    .map(|(table, _)| table.clone())
-    .collect()
-}
-
 /// A path the gate used, with what the brief's path rule asks about it.
 fn path_fact(path: &Path) -> Value {
   let text = path.to_string_lossy();
@@ -400,7 +360,7 @@ fn desktop_gate_worker() {
         atomic_json(
           &root.join("ready.json"),
           &json!({"status":"pass", "stage":status.stage,"address":status.address,
-            "import":status.import,"warnings":status.warnings}),
+            "warnings":status.warnings}),
         )?;
         break;
       }
@@ -453,33 +413,6 @@ struct Worker {
   ready: Value,
 }
 impl Worker {
-  /// What the supervisor read from the server's import lines in this start.
-  fn import_report(&mut self) -> Result<Value, String> {
-    serde_json::from_str(&self.request(json!({"action":"import_report"}))?)
-      .map_err(|e| format!("Invalid import report: {e}"))
-  }
-  /// An ordinary start: no conversion line, and the normal start bound in force.
-  fn expect_no_conversion(&mut self, launch: &str) -> Result<Value, String> {
-    let report = self.import_report()?;
-    if report["conversion_lines"] != 0
-      || !report["verifier_pass"].is_null()
-      || !report["renamed"].is_null()
-    {
-      return Err(format!("{launch} converted again: {report}"));
-    }
-    if report["bound"] != "normal" {
-      return Err(format!(
-        "{launch} did not use the normal start bound: {report}"
-      ));
-    }
-    if !matches!(
-      report["state"].as_str(),
-      Some("idle" | "preparing" | "noop")
-    ) {
-      return Err(format!("{launch} has an unexpected import state: {report}"));
-    }
-    Ok(report)
-  }
   /// Start the worker process. `extra`: environment of this start only.
   fn spawn(
     root: &Path,
@@ -697,10 +630,10 @@ impl Worker {
       std::thread::sleep(Duration::from_millis(100));
     }
   }
-  /// The app is force-quit: SIGKILL / TerminateProcess on THIS supervisor process, not
-  /// pg_ctl and not a name, port or process-tree kill. On Unix the database it started
-  /// is left running (the next start must find and stop it); on Windows the Job Object
-  /// ends it with the supervisor.
+  /// The app is force-quit: SIGKILL on THIS supervisor process, not pg_ctl and not a
+  /// name, port or process-tree kill. The database it started is left running (the
+  /// next start must find and stop it).
+  #[cfg(unix)]
   fn hard_kill(&mut self) -> Result<(), String> {
     self.child.kill().map_err(|e| e.to_string())?;
     self.child.wait().map_err(|e| e.to_string())?;
@@ -1415,7 +1348,7 @@ impl Drop for Worker {
   }
 }
 /// The app data folder and its server folder must be private to this user after a
-/// start (Unix mode 0700; the server refuses to convert an old database otherwise).
+/// start (Unix mode 0700).
 /// Windows has no such mode: `null`.
 fn private_modes(root: &Path) -> Result<Value, String> {
   #[cfg(unix)]
@@ -1895,11 +1828,11 @@ fn desktop_postgres_gate() {
 }
 
 /// The steps of the gate, in order, as they must stand in the evidence of a passed run:
-/// nine on Unix; six on Windows, where the three earlier-database steps are not run.
+/// eight on Unix; five on Windows, where the three earlier-database steps are not run.
 /// The workflow (.github/workflows/postgres-desktop-gate.yml, its last step) holds the
 /// same two lists.
 fn expected_steps(windows: bool) -> Vec<&'static str> {
-  const ALL: [&str; 9] = [
+  const ALL: [&str; 8] = [
     "new_install_and_clean_persistence",
     "stale_lock_file_of_a_reused_process_number",
     "crash_of_app_and_database_then_recovery",
@@ -1907,7 +1840,6 @@ fn expected_steps(windows: bool) -> Vec<&'static str> {
     "earlier_database_still_running_after_data_folder_rename",
     "earlier_database_whose_program_was_moved_or_deleted",
     "earlier_database_after_rename_and_a_start_at_the_old_name",
-    "sqlite_upgrade_and_later_launches",
     "dump_restore_retention_and_failure",
   ];
   ALL
@@ -2065,7 +1997,7 @@ fn run_gate(output: &Path) -> Result<(), String> {
   });
   fs::copy(supplied_server, &server).map_err(|e| e.to_string())?;
   let root = base.join("app data José 漢字");
-  let upgraded_root = base.join("SQLite app data José 漢字");
+  let backup_root = base.join("backup app data José 漢字");
   #[cfg(unix)]
   let before_rename = base.join("app data before a rename José 漢字");
   let after_rename = base.join("app data after a rename José 漢字");
@@ -2121,11 +2053,6 @@ fn run_gate(output: &Path) -> Result<(), String> {
       if first.sql("SELECT rolsuper FROM pg_roles WHERE rolname=current_user")? != "f" {
         return Err("Server application role is a superuser".into());
       }
-      // No SQLite file, no journal: the server prints no import line at all.
-      let import = first.import_report()?;
-      if import["state"] != "idle" || import["bound"] != "normal" {
-        return Err(format!("New install reported an import: {import}"));
-      }
       // The folders the app creates are private to this user (Unix).
       let modes = private_modes(&root)?;
       first.stop()?;
@@ -2157,7 +2084,7 @@ fn run_gate(output: &Path) -> Result<(), String> {
       worker = Some(second);
       Ok(
         json!({"paths":paths,"database_ready":true,"server_healthy":true,"committed_row_preserved":true,
-        "application_superuser":false,"import_state":import["state"],"data_folder_modes":modes,
+        "application_superuser":false,"data_folder_modes":modes,
         "uninspectable_database_stopped_by_pg_ctl":true,"next_start_after_clean_shutdown":true}),
       )
     })?;
@@ -3019,286 +2946,22 @@ fn run_gate(output: &Path) -> Result<(), String> {
           "second_server_on_shared_files":false}))
       },
     )?;
-    step("sqlite_upgrade_and_later_launches", &mut || {
-      fs::create_dir_all(upgraded_root.join("server")).map_err(|e| e.to_string())?;
-      let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(3)
-        .ok_or("Repository path missing")?;
-      let fixture = upgraded_root.join("server").join("komika.sqlite3");
-      let counts_path = upgraded_root.join("fixture-counts.json");
-      let settings_path = upgraded_root.join("fixture-instance-settings.json");
-      let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("desktop-gate-fixture.py");
-      let python = std::env::var_os("KOMIKA_PYTHON").unwrap_or_else(|| {
-        if cfg!(windows) {
-          "python".into()
-        } else {
-          "python3".into()
-        }
-      });
-      let built = Command::new(python)
-        .arg(script)
-        .arg(&fixture)
-        .arg(repo)
-        .arg(&counts_path)
-        .arg(&settings_path)
-        .output()
-        .map_err(|e| e.to_string())?;
-      if !built.status.success() {
-        return Err(format!(
-          "SQLite fixture failed: {}",
-          String::from_utf8_lossy(&built.stderr)
-        ));
-      }
-      let counts: Counts =
-        serde_json::from_slice(&fs::read(&counts_path).map_err(|e| e.to_string())?)
-          .map_err(|e| e.to_string())?;
-      // The rows of `instance_setting` in the fixture: compared by content (SETTINGS_TABLE).
-      let fixture_settings =
-        parse_settings(&fs::read_to_string(&settings_path).map_err(|e| e.to_string())?)?;
-      if fixture_settings.len() as u64 != counts[SETTINGS_TABLE] || fixture_settings.is_empty() {
-        return Err(format!(
-          "The fixture's instance_setting rows were not read: {fixture_settings:?}"
-        ));
-      }
-      let mut paths = json!({
-        "runtime": spaced_non_ascii("runtime", &runtime)?,
-        "data": spaced_non_ascii("data", &upgraded_root)?,
-        "sqlite_source": spaced_non_ascii("SQLite source", &fixture)?,
-      });
-      // The fixture has a row in every table, so every table's conversion carries data.
-      let empty: Vec<&String> = counts
-        .iter()
-        .filter(|(_, n)| **n == 0)
-        .map(|(t, _)| t)
-        .collect();
-      if !empty.is_empty() {
-        return Err(format!("Fixture tables without a row: {empty:?}"));
-      }
-      for (table, _) in NOT_COMPARED {
-        if !counts.contains_key(*table) {
-          return Err(format!("Listed table {table} is not in the fixture"));
-        }
-      }
-      for table in MUST_COMPARE {
-        if NOT_COMPARED.iter().any(|(name, _)| name == table) || !counts.contains_key(*table) {
-          return Err(format!("{table} must be compared"));
-        }
-      }
-      let compared = counts.len() - NOT_COMPARED.len();
-      let compared_rows: u64 = counts
-        .iter()
-        .filter(|(table, _)| !NOT_COMPARED.iter().any(|(name, _)| name == *table))
-        .map(|(_, rows)| rows)
-        .sum();
-      // An install made in a session with umask 002 has folders that the group can
-      // write to. The server refuses to convert an old database in such a folder, so the
-      // app must make them private before it starts the server.
-      #[cfg(unix)]
-      {
-        use std::os::unix::fs::PermissionsExt;
-        for dir in [upgraded_root.clone(), upgraded_root.join("server")] {
-          fs::set_permissions(&dir, fs::Permissions::from_mode(0o775))
-            .map_err(|e| e.to_string())?;
-        }
-      }
-      let mut imported = Worker::start(&upgraded_root, &runtime, &server)?;
-      let modes = private_modes(&upgraded_root)?;
-      // Proof that a conversion really ran in this start, from the server's own lines.
-      let report = imported.import_report()?;
-      if report["state"] != "done" {
-        return Err(format!("First start did not finish a conversion: {report}"));
-      }
-      let verifier = report["verifier_pass"]
-        .as_str()
-        .ok_or_else(|| format!("No `verifier PASS` line: {report}"))?
-        .to_string();
-      let renamed_line = report["renamed"]
-        .as_str()
-        .ok_or_else(|| format!("No `renamed original` line: {report}"))?
-        .to_string();
-      if report["conversion_lines"].as_u64().unwrap_or(0) < counts.len() as u64 {
-        return Err(format!(
-          "Too few conversion lines for {} tables: {report}",
-          counts.len()
-        ));
-      }
-      if fixture.exists() {
-        return Err("SQLite input was not renamed after import".into());
-      }
-      let renamed: Vec<PathBuf> = fs::read_dir(upgraded_root.join("server"))
-        .map_err(|e| e.to_string())?
-        .filter_map(Result::ok)
-        .filter(|e| {
-          e.file_name()
-            .to_string_lossy()
-            .starts_with("komika.sqlite3.imported-")
-        })
-        .map(|e| e.path())
-        .collect();
-      if renamed.len() != 1 {
-        return Err(format!(
-          "Expected one renamed SQLite input; found {}",
-          renamed.len()
-        ));
-      }
-      let archive = renamed[0].clone();
-      paths["archive"] = spaced_non_ascii("archive", &archive)?;
-      // The file the server says it renamed to is the file that is there, with content.
-      let named = Path::new(
-        renamed_line
-          .split_once("renamed original to ")
-          .map(|(_, path)| path)
-          .unwrap_or_default(),
-      );
-      if named.file_name() != archive.file_name()
-        || fs::metadata(&archive).map_err(|e| e.to_string())?.len() == 0
-      {
-        return Err(format!(
-          "`{renamed_line}` does not name the kept file {}",
-          archive.display()
-        ));
-      }
-      if imported.sql("SELECT completed FROM komika_import_state WHERE singleton=true")? != "t" {
-        return Err("Importer completion marker is not true".into());
-      }
-      // Every table is counted after the conversion and after each later start. All of
-      // them are recorded; all but NOT_COMPARED must have the fixture's count.
-      // Diagnostic run (KOMIKA_DESKTOP_GATE_HOLD_SECONDS=n): keep the converted install
-      // running for n seconds, past the server's delayed start work, count every table
-      // every ten seconds, and do not stop at a difference. Such a run always ends as a
-      // failure that lists what changed. This is how NOT_COMPARED was established.
-      let hold: u64 = std::env::var("KOMIKA_DESKTOP_GATE_HOLD_SECONDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-      let mut every_change: std::collections::BTreeSet<String> = Default::default();
-      let mut check = |launch: &str, now: &Counts| -> Result<(), String> {
-        if let Some(missing) = counts.keys().find(|table| !now.contains_key(*table)) {
-          return Err(format!("{launch}: table {missing} is not in the database"));
-        }
-        every_change.extend(changed(&counts, now));
-        let different = differences(&counts, now);
-        if !different.is_empty() && hold == 0 {
-          return Err(format!(
-            "{launch}: row counts differ from the fixture: {different:?}"
-          ));
-        }
-        Ok(())
-      };
-      // The original must stay gone and the archive must stay, after every start.
-      let files = |launch: &str| -> Result<(), String> {
-        if fixture.exists() {
-          return Err(format!(
-            "{launch} brought the SQLite input back at its old name"
-          ));
-        }
-        if !archive.exists() {
-          return Err(format!("{launch} removed the kept SQLite file"));
-        }
-        Ok(())
-      };
-      let after_import = imported.counts(None)?;
-      check("Conversion", &after_import)?;
-      let settings_after_import =
-        settings_check("Conversion", &fixture_settings, &imported.settings(None)?)?;
-      let mut held = Vec::new();
-      let hold_started = Instant::now();
-      while hold_started.elapsed() < Duration::from_secs(hold) {
-        std::thread::sleep(Duration::from_secs(10));
-        let now = imported.counts(None)?;
-        held.push(json!({"seconds": hold_started.elapsed().as_secs(), "changed": changed(&counts, &now)
-          .iter().map(|t| json!({"table":t,"fixture":counts[t],"now":now[t]})).collect::<Vec<_>>()}));
-        check("Held after conversion", &now)?;
-      }
-      let first_port = imported.sql("SHOW port")?;
-      imported.stop()?;
-      let mut second = Worker::start(&upgraded_root, &runtime, &server)?;
-      files("A clean restart")?;
-      let second_port = second.sql("SHOW port")?;
-      if second_port == first_port {
-        return Err("Upgrade restart did not change PostgreSQL port".into());
-      }
-      let after_second = second.counts(None)?;
-      check("Clean restart", &after_second)?;
-      let settings_after_second =
-        settings_check("Clean restart", &fixture_settings, &second.settings(None)?)?;
-      let second_report = second.expect_no_conversion("Clean upgrade restart")?;
-      // The app is force-quit. On macOS nothing ends its database with it: the next
-      // start must find it, prove it is this install's, and stop it. (Linux asks the
-      // database to shut down when the app dies, Windows ends it through the Job Object;
-      // there the next start may find it already gone.)
-      let left_running = lock_file_pid(&upgraded_root)?;
-      second.hard_kill()?;
-      let mut third = Worker::start(&upgraded_root, &runtime, &server)?;
-      second.cleanup_pending = false;
-      files("A restart after a forced quit")?;
-      let third_port = third.sql("SHOW port")?;
-      if third_port == second_port {
-        return Err("Forced upgrade restart did not change PostgreSQL port".into());
-      }
-      let adopted = third.database_log()?.contains(&format!(
-        "Stopping owned PostgreSQL left by the previous run (pid {left_running})"
-      ));
-      if cfg!(target_os = "macos") && !adopted {
-        return Err(format!(
-          "The database left running by the force-quit app (pid {left_running}) was not found and stopped"
-        ));
-      }
-      let after_third = third.counts(None)?;
-      check("Restart after a forced quit", &after_third)?;
-      let settings_after_third = settings_check(
-        "Restart after a forced quit",
-        &fixture_settings,
-        &third.settings(None)?,
-      )?;
-      let third_report = third.expect_no_conversion("Forced upgrade restart")?;
-      let warnings = third.ready["warnings"].clone();
-      let every_change: Vec<String> = every_change.into_iter().collect();
-      if hold > 0 {
-        third.stop()?;
-        return Err(format!(
-          "Diagnostic run, never a pass. Tables whose count differed from the fixture at any point: {every_change:?}. Samples while held: {}",
-          json!(held)
-        ));
-      }
-      worker = Some(third);
-      Ok(
-        json!({"paths":paths,"fixture_tables":counts.len(),"fixture_rows":counts.values().sum::<u64>(),
-        "fixture_tables_without_rows":0,"compared_tables":compared,"compared_fixture_rows":compared_rows,
-        "not_compared":NOT_COMPARED.iter().map(|(t, why)| json!({"table":t,"reason":why})).collect::<Vec<_>>(),
-        "tables_that_differed_from_the_fixture_in_this_run":every_change,
-        "compared_row_counts_match_on_three_launches":true,
-        "instance_setting_compared_by_content":{"rule":"every fixture row present with equal value and time; an extra row only with a key the server writes by itself",
-          "fixture_rows":fixture_settings,"after_conversion":settings_after_import,
-          "after_clean_restart":settings_after_second,"after_forced_restart":settings_after_third},
-        "counts":{"fixture":counts,"after_conversion":after_import,"after_clean_restart":after_second,
-          "after_forced_restart":after_third},
-        "held_seconds":hold,"held_samples":held,
-        "conversion_proof":{"verifier_line":verifier,"renamed_line":renamed_line,
-          "conversion_lines":report["conversion_lines"],"state":report["state"]},
-        "renamed_sqlite_files":1,"original_name_gone_after_every_start":true,"archive_kept_after_every_start":true,
-        "data_folders_before":if cfg!(unix) { json!("775") } else { Value::Null },
-        "data_folder_modes":modes,
-        "clean_restart":{"import_state":second_report["state"],"bound":second_report["bound"],"conversion_lines":0},
-        "forced_restart":{"import_state":third_report["state"],"bound":third_report["bound"],"conversion_lines":0,
-          "database_left_running_was_stopped":adopted,"left_running_pid":left_running,"status_warnings":warnings},
-        "postgres_ports":[first_port,second_port,third_port],"port_changed":true}),
-      )
-    })?;
-    // On the converted install, so that the dump holds the fixture's rows.
     step("dump_restore_retention_and_failure", &mut || {
-      let counts: Counts = serde_json::from_slice(
-        &fs::read(upgraded_root.join("fixture-counts.json")).map_err(|e| e.to_string())?,
-      )
-      .map_err(|e| e.to_string())?;
-      let fixture_settings = parse_settings(
-        &fs::read_to_string(upgraded_root.join("fixture-instance-settings.json"))
-          .map_err(|e| e.to_string())?,
+      let mut seeded = Worker::start(&backup_root, &runtime, &server)?;
+      seeded.sql(
+        "INSERT INTO users(id, username, email, password_hash, created_at) VALUES \
+        ('00000000-0000-4000-8000-000000000900', 'owner', 'owner@example.invalid', \
+        'fixture-secret', '2020-01-01T00:00:00Z')",
       )?;
-      let backups = upgraded_root.join("server").join("backups");
+      seeded.sql(
+        "INSERT INTO instance_setting(key, value, updated_at) VALUES \
+        ('instance_name', 'Gate fixture é 漢字', '2021-02-03T04:05:06.789Z') \
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+      )?;
+      let counts = seeded.counts(None)?;
+      let fixture_settings = seeded.settings(None)?;
+      worker = Some(seeded);
+      let backups = backup_root.join("server").join("backups");
       // The app's own dump task makes a dump by itself when the install has none. The
       // gate has not asked for a dump on this install so far. The dumps that the task
       // made in the earlier launches are set aside, and the app is started once more:
@@ -3307,13 +2970,13 @@ fn run_gate(output: &Path) -> Result<(), String> {
       worker.as_mut().unwrap().stop()?;
       worker.take();
       let earlier = postgres::dumps(&backups).unwrap_or_default();
-      let set_aside = upgraded_root.join("dumps of earlier launches");
+      let set_aside = backup_root.join("dumps of earlier launches");
       fs::create_dir(&set_aside).map_err(|e| e.to_string())?;
       for dump in &earlier {
         fs::rename(dump, set_aside.join(dump.file_name().ok_or("dump name")?))
           .map_err(|e| e.to_string())?;
       }
-      worker = Some(Worker::start(&upgraded_root, &runtime, &server)?);
+      worker = Some(Worker::start(&backup_root, &runtime, &server)?);
       let running = worker.as_mut().unwrap();
       let waited = Instant::now();
       let scheduled = loop {
@@ -3364,7 +3027,7 @@ fn run_gate(output: &Path) -> Result<(), String> {
       let changed_by_the_server = hash_differences(&hashes_before_dump, &live_hashes);
       let paths = json!({
         "runtime": spaced_non_ascii("runtime", &runtime)?,
-        "data": spaced_non_ascii("data", &upgraded_root)?,
+        "data": spaced_non_ascii("data", &backup_root)?,
         "dump": spaced_non_ascii("dump", &dump)?,
       });
       let listing = running.request(json!({"action":"inspect_dump","value":dump}))?;
@@ -3466,7 +3129,7 @@ fn run_gate(output: &Path) -> Result<(), String> {
   let mut cleanup = Vec::new();
   for data in [
     &root,
-    &upgraded_root,
+    &backup_root,
     &after_rename,
     &moved_app_root,
     &old_name,
@@ -3688,7 +3351,7 @@ fn gate_evidence_must_be_a_pass_with_exactly_the_expected_steps() {
       .collect()
   };
   let (unix, windows) = (expected_steps(false), expected_steps(true));
-  assert_eq!((unix.len(), windows.len()), (9, 6));
+  assert_eq!((unix.len(), windows.len()), (8, 5));
   assert!(windows.iter().all(|name| unix.contains(name)));
   assert_eq!(
     check(false, json!({"status":"pass","steps":steps(&unix)})),
@@ -3708,7 +3371,11 @@ fn gate_evidence_must_be_a_pass_with_exactly_the_expected_steps() {
   assert!(check(false, json!({"status":"pass","steps":[]})).is_err());
   assert!(check(false, json!({"status":"pass"})).is_err());
   // One step missing, one too many, two swapped, one not passed.
-  assert!(check(false, json!({"status":"pass","steps":steps(&unix[..8])})).is_err());
+  assert!(check(
+    false,
+    json!({"status":"pass","steps":steps(&unix[..unix.len() - 1])})
+  )
+  .is_err());
   let mut more = unix.clone();
   more.push("one_more");
   assert!(check(false, json!({"status":"pass","steps":steps(&more)})).is_err());
@@ -4609,7 +4276,6 @@ impl InstallerGate {
       return Err("Server application role is a superuser".into());
     }
     let version = worker.sql("SHOW server_version")?;
-    let import = worker.import_report()?;
     let log = worker.database_log()?;
     let clean =
       log.contains("database system was shut down at") && !log.contains("not properly shut down");
@@ -4631,7 +4297,6 @@ impl InstallerGate {
       "server_ready_at": address,
       "postgresql_version": version,
       "application_superuser": false,
-      "import_state": import["state"],
       "start_after_a_clean_shutdown": clean,
       "rows_before_this_start_all_present": true,
       "rows_now": self.rows,

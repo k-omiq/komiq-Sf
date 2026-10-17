@@ -5,12 +5,10 @@ use std::path::{Path, PathBuf};
 
 /// Create `dir` when it is missing and keep it private to this user (Unix mode 0700).
 ///
-/// The server refuses to convert a SQLite file whose folder is writable by the group or
-/// by others, or belongs to another user (`validate_directory` in
-/// apps/server/src/pg_import/startup.rs). A session with umask 002 would otherwise
-/// create the folder 0775. A folder this user owns is tightened at every start. A link is
-/// never followed and a folder of another owner is never changed: both come back as a
-/// sentence for the owner of the machine. Windows: only creates the folder.
+/// A session with umask 002 would otherwise create the folder 0775. A folder this user
+/// owns is tightened at every start. A link is never followed and a folder of another
+/// owner is never changed: both come back as a sentence for the owner of the machine.
+/// Windows: only creates the folder.
 pub fn private_dir(dir: &Path) -> Result<Option<String>, String> {
   #[cfg(unix)]
   {
@@ -28,7 +26,6 @@ pub fn private_dir(dir: &Path) -> Result<Option<String>, String> {
 #[cfg(unix)]
 pub(crate) fn private_dir_as(dir: &Path, uid: u32) -> Result<Option<String>, String> {
   use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-  const UNCONVERTED: &str = "An old database in it is not converted until this is put right";
   if fs::symlink_metadata(dir).is_err() {
     fs::DirBuilder::new()
       .recursive(true)
@@ -45,8 +42,8 @@ pub(crate) fn private_dir_as(dir: &Path, uid: u32) -> Result<Option<String>, Str
     }
     return Ok(Some(format!(
       "The data folder {} is a link, so its permissions were left alone, and the folder it \
-       points to is writable by other users or belongs to another user. {UNCONVERTED}: \
-       make that folder yours and private (chmod 700).",
+       points to is writable by other users or belongs to another user. Make that folder \
+       yours and private (chmod 700).",
       dir.display()
     )));
   }
@@ -61,7 +58,7 @@ pub(crate) fn private_dir_as(dir: &Path, uid: u32) -> Result<Option<String>, Str
   if meta.uid() != uid {
     return Ok(Some(format!(
       "The data folder {} belongs to another user (id {}), so its permissions were left \
-       alone. {UNCONVERTED}.",
+       alone. Make that folder yours and private (chmod 700).",
       dir.display(),
       meta.uid()
     )));

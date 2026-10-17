@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 
-use crate::import::{Bounds, Overdue};
 use crate::logbuf::{find_setup_code, LogBuf, MASK};
 
 /// First port tried for a new install. Then the next few, then any free one.
@@ -32,22 +31,8 @@ pub const DEFAULT_PORT: u16 = 7580;
 const PORT_TRIES: u16 = 10;
 /// Boot attempts when the chosen port turns out to be taken after all.
 const PORT_ATTEMPTS: usize = 3;
-/// How long the server may take to answer `/health` on an ordinary start (first boot
-/// runs migrations). Also how long it may check an old SQLite file before it either
-/// starts converting or carries on.
+/// How long the server may take to answer `/health` (first boot runs migrations).
 pub const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(60);
-/// While the server converts an old SQLite database: the longest silence between two of
-/// its progress lines. The server prints a line at least at every stage and table, and
-/// every 5 seconds while a table is copied (apps/server/src/pg_import/copy.rs).
-pub const IMPORT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-/// The longest a start with a conversion may take in all.
-pub const IMPORT_READY_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
-/// The waits of a real start. Tests pass shorter ones to `boot_server`.
-pub const START_BOUNDS: Bounds = Bounds {
-  normal: SERVER_READY_TIMEOUT,
-  inactivity: IMPORT_INACTIVITY_TIMEOUT,
-  total: IMPORT_READY_TIMEOUT,
-};
 /// How long to wait for the setup-code line once the server says it needs setup.
 const CODE_WAIT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(200);
@@ -86,12 +71,7 @@ pub struct Status {
   pub error: Option<String>,
   pub address: Option<String>,
   pub setup_code: Option<String>,
-  /// The server's last line while it checks or converts an old SQLite database.
-  pub progress: Option<String>,
-  /// `idle`, `preparing`, `converting`, `noop`, `failed` or `done` (src/import.rs).
-  pub import: &'static str,
-  /// What the owner should know although the start went on: the server's
-  /// `sqlite import: warning:` lines and processes of an earlier run left running.
+  /// What the owner should know about processes of an earlier run left running.
   pub warnings: Vec<String>,
 }
 
@@ -208,8 +188,6 @@ pub enum GateAction {
   DatabaseLog,
   /// The program file the supervisor starts as the database.
   PostgresProgram,
-  /// What the supervisor read from the server's import lines in this start (JSON).
-  ImportReport,
 }
 
 struct State {
@@ -222,10 +200,6 @@ struct State {
   setup_code: Option<String>,
   /// Bumped on every transition to `Ready`.
   ready_gen: u64,
-  /// Bumped every time the supervisor puts off a restart for a changed network choice
-  /// because a conversion runs. `set_network` reads it to learn what became of the
-  /// request it sent.
-  restarts_put_off: u64,
   running: bool,
 }
 
@@ -247,12 +221,6 @@ pub struct LocalServer {
 
 /// Supervisor warnings kept per app run.
 const MAX_WARNINGS: usize = 50;
-
-/// What `set_local_network` answers while the old database is checked or converted.
-pub const NETWORK_AFTER_CONVERSION: &str = "The database is being converted. Your choice is \
-   saved and is applied as soon as the conversion is finished.";
-const RESTART_DEFERRED_LOG: &str = "[komiq] a restart for a changed network choice was put off: \
-   the database conversion is running; the choice is applied when it is finished";
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
   m.lock().unwrap_or_else(|e| e.into_inner())
@@ -280,7 +248,6 @@ impl LocalServer {
         lan: false,
         setup_code: None,
         ready_gen: 0,
-        restarts_put_off: 0,
         running: false,
       }),
       prefs: Mutex::new(prefs),
@@ -311,7 +278,7 @@ impl LocalServer {
     }
   }
 
-  /// Supervisor warnings, then the server's import warnings of its current start.
+  /// Supervisor warnings of this app run.
   fn all_warnings(&self) -> Vec<String> {
     // Children whose identity could not be recorded (src/child.rs) report here. Only the
     // real app installs the child record; fake-process tests leave the queue alone.
@@ -320,30 +287,7 @@ impl LocalServer {
         self.note_warning(warning);
       }
     }
-    let mut all = lock(&self.warnings).clone();
-    for warning in self.server_log.import().warnings() {
-      let text = format!("Database conversion: {warning}");
-      if !all.contains(&text) {
-        all.push(text);
-      }
-    }
-    all
-  }
-
-  /// What the supervisor read from the server's import lines in this start.
-  #[cfg(feature = "desktop-gate")]
-  fn import_report(&self) -> String {
-    let import = self.server_log.import();
-    serde_json::json!({
-      "state": import.state().as_str(),
-      "bound": import.bound_kind(),
-      "conversion_lines": import.progress_lines(),
-      "verifier_pass": import.verifier_pass(),
-      "renamed": import.renamed(),
-      "warnings": import.warnings(),
-      "error": import.error(),
-    })
-    .to_string()
+    lock(&self.warnings).clone()
   }
 
   #[cfg(feature = "desktop-gate")]
@@ -363,8 +307,6 @@ impl LocalServer {
   pub fn start(self: &Arc<Self>) {
     let mut tx = lock(&self.tx);
     if let Some(sender) = tx.as_ref() {
-      // A page that asks again (reload, Back then Run) while the server converts the old
-      // database sends this too; the supervisor ignores it then (`import_running`).
       if sender.send(Cmd::Retry).is_ok() {
         // Cleared here, not only when the task gets to it: the start screen polls right
         // after this returns and must not read the failure it is retrying.
@@ -384,26 +326,9 @@ impl LocalServer {
     tauri::async_runtime::spawn(async move { this.run(receiver).await });
   }
 
-  /// The server step is running, nothing failed, and the server is checking or
-  /// converting an old database. A retry request is ignored for as long as this holds:
-  /// the checking state ends by itself within the normal start bound, a conversion by
-  /// its own bounds, and a failure sets the error that makes Retry valid again.
-  fn import_running(&self) -> bool {
-    let waiting = {
-      let st = lock(&self.state);
-      st.stage == Stage::Server && st.error.is_none()
-    };
-    waiting
-      && matches!(
-        self.server_log.import().state(),
-        crate::import::ImportState::Preparing | crate::import::ImportState::Converting
-      )
-  }
-
   /// `local_server_status`. The setup code is handed out once, with the first `ready`.
   pub fn status(&self) -> Status {
     let warnings = self.all_warnings();
-    let import = self.server_log.import();
     let mut st = lock(&self.state);
     let ready = st.stage == Stage::Ready;
     Status {
@@ -415,12 +340,6 @@ impl LocalServer {
         None
       },
       setup_code: if ready { st.setup_code.take() } else { None },
-      progress: if st.stage == Stage::Server {
-        import.progress().map(str::to_string)
-      } else {
-        None
-      },
-      import: import.state().as_str(),
       warnings,
     }
   }
@@ -438,8 +357,7 @@ impl LocalServer {
         }
       )
     };
-    // The logs are rings of the last lines: a warning printed early in a long
-    // conversion would scroll out. Warnings are therefore listed again, in full, on top.
+    // List warnings in full even when their lines have scrolled out of the log rings.
     let warnings = self.all_warnings();
     let mut text = String::new();
     if !warnings.is_empty() {
@@ -490,51 +408,26 @@ impl LocalServer {
   /// `set_local_network`: remember the choice and, when the server runs, restart it on
   /// the new address. Resolves once it answers again, or with the reason it did not.
   pub async fn set_network(self: &Arc<Self>, enabled: bool) -> Result<Network, String> {
-    self.set_network_with(enabled, || {}).await
-  }
-
-  /// [`LocalServer::set_network`]. `before_request` runs between the look at the
-  /// conversion and the request to the supervisor (a test puts the server's first
-  /// conversion line there).
-  async fn set_network_with(
-    self: &Arc<Self>,
-    enabled: bool,
-    before_request: impl FnOnce(),
-  ) -> Result<Network, String> {
     {
       let mut prefs = lock(&self.prefs);
       prefs.lan = enabled;
       self.save_prefs(&prefs);
     }
-    let (gen, put_off) = {
+    let gen = {
       let st = lock(&self.state);
       if !st.running {
         return Ok(self.network());
       }
-      (st.ready_gen, st.restarts_put_off)
+      st.ready_gen
     };
-    // A restart now would end a running conversion of the old database. The choice is
-    // saved; the supervisor applies it when the conversion is done (`run`). The request
-    // is still sent so that the log says so; the supervisor ignores it for the same reason.
-    let converting = self.import_running();
-    before_request();
     if let Some(tx) = lock(&self.tx).as_ref() {
       let _ = tx.send(Cmd::Restart);
-    }
-    if converting {
-      return Err(NETWORK_AFTER_CONVERSION.into());
     }
     let deadline = Instant::now() + SERVER_READY_TIMEOUT + Duration::from_secs(15);
     loop {
       tokio::time::sleep(POLL).await;
       {
         let st = lock(&self.state);
-        // The conversion began between the look above and the supervisor reading the
-        // request, and the supervisor put the restart off. The answer is the same as when
-        // the conversion was seen here: saved, applied when it is finished.
-        if st.restarts_put_off > put_off {
-          return Err(NETWORK_AFTER_CONVERSION.into());
-        }
         if st.ready_gen > gen && st.stage == Stage::Ready {
           break;
         }
@@ -738,32 +631,15 @@ impl LocalServer {
           .as_ref()
           .map(|db| db.url())
           .unwrap_or_else(|| "postgres://fake:fake@127.0.0.1:1/komika".into());
-        let boot = {
-          let booting = self.boot(&link, &url);
-          tokio::pin!(booting);
-          loop {
-            tokio::select! {
-              result = &mut booting => break result,
-              cmd = rx.recv() => match cmd {
-                // Dropping `booting` ends the server process. A retry that arrives while
-                // it converts the old database is not a reason to do that, and neither
-                // is a changed network choice: that one is applied when the conversion
-                // is done (below, after the boot).
-                Some(Cmd::Retry) if self.import_running() => {
-                  self.server_log.push("[komiq] a retry request was ignored: the database conversion is running");
-                }
-                Some(Cmd::Restart) if self.import_running() => {
-                  self.server_log.push(RESTART_DEFERRED_LOG);
-                  lock(&self.state).restarts_put_off += 1;
-                }
-                Some(Cmd::Retry) | Some(Cmd::Restart) => continue 'server,
-                Some(Cmd::Stop) | None => return self.finish(None, database.as_mut(), None).await,
-                #[cfg(feature = "desktop-gate")]
-                Some(Cmd::Gate(_, reply)) => { let _ = reply.send(Err("Server is still starting".into())); continue 'server; },
-              },
-              _ = wait_database_exit(&mut database) => { break 'server; }
-            }
-          }
+        let boot = tokio::select! {
+          result = self.boot(&link, &url) => result,
+          cmd = rx.recv() => match cmd {
+            Some(Cmd::Retry) | Some(Cmd::Restart) => continue 'server,
+            Some(Cmd::Stop) | None => return self.finish(None, database.as_mut(), None).await,
+            #[cfg(feature = "desktop-gate")]
+            Some(Cmd::Gate(_, reply)) => { let _ = reply.send(Err("Server is still starting".into())); continue 'server; },
+          },
+          _ = wait_database_exit(&mut database) => { break 'server; }
         };
         let (mut child, port, lan) = match boot {
           Ok(ok) => ok,
@@ -772,12 +648,10 @@ impl LocalServer {
             if !wait_for_retry(&mut rx).await {
               return self.finish(None, database.as_mut(), None).await;
             }
-            continue 'server; // Import/migration errors wait for explicit Retry.
+            continue 'server; // Startup errors wait for explicit Retry.
           }
         };
-        // The network choice was changed while this boot ran and its restart was put off
-        // (a conversion was running). The conversion is done now: start again on the
-        // address that was chosen. Nothing was reported as ready in between.
+        // Apply a network choice changed while this boot ran before reporting ready.
         if lock(&self.prefs).lan != lan {
           self.server_log.push(
             "[komiq] the network choice changed while the server started; restarting it on the new address",
@@ -812,7 +686,6 @@ impl LocalServer {
                 stop_dump(dump.take()).await;
                 let result = match database.as_mut() {
                   Some(db) => match action {
-                    GateAction::ImportReport => Ok(self.import_report()),
                     GateAction::Sql(sql) => db.sql(&sql, false, "komika").await,
                     GateAction::SqlIn(database, sql) => db.sql(&sql, false, &database).await,
                     GateAction::RestoreDump(path) => db.restore_dump(Path::new(&path)).await,
@@ -929,7 +802,7 @@ impl LocalServer {
         &attempt,
         &self.server_log,
         &self.code_slot,
-        &START_BOUNDS,
+        SERVER_READY_TIMEOUT,
       )
       .await
       {
@@ -999,7 +872,6 @@ pub enum BootError {
 
 /// The server's environment for one attempt. Everything else keeps the server's defaults.
 pub fn server_env(launch: &Launch, attempt: &Attempt) -> Vec<(&'static str, String)> {
-  let db = launch.data_dir.join("komika.sqlite3");
   let mut env = vec![
     ("BIND_ADDR", attempt.bind.to_string()),
     ("PORT", attempt.port.to_string()),
@@ -1012,7 +884,6 @@ pub fn server_env(launch: &Launch, attempt: &Attempt) -> Vec<(&'static str, Stri
         launch.data_dir.join("covers.sqlite3").display()
       ),
     ),
-    ("KOMIKA_SQLITE_IMPORT_PATH", db.display().to_string()),
     ("SUWAYOMI_URL", attempt.engine.url.clone()),
     ("SUWAYOMI_PUBLIC_URL", attempt.engine.public_url.clone()),
     ("CORS_ORIGINS", APP_ORIGINS.to_string()),
@@ -1031,23 +902,16 @@ pub fn server_env(launch: &Launch, attempt: &Attempt) -> Vec<(&'static str, Stri
 
 /// Spawn the server, copy its output into `log` (catching the setup code into
 /// `code_slot`), and wait until it answers `/health`, it exits, or its wait is over.
-///
-/// Which wait applies is decided by the server's own import lines, never by what files
-/// lie in the data folder: see `wait_ready` and src/import.rs.
 pub async fn boot_server(
   launch: &Launch,
   attempt: &Attempt,
   log: &Arc<LogBuf>,
   code_slot: &Arc<Mutex<Option<String>>>,
-  bounds: &Bounds,
+  timeout: Duration,
 ) -> Result<tokio::process::Child, BootError> {
-  // Private to this user: the server refuses to convert an old database in a folder that
-  // others can write to (see `private_dir`).
   // A folder that cannot be made private is reported by the supervisor's start sequence.
   crate::postgres::private_dir(&launch.data_dir)
     .map_err(|e| BootError::Failed(format!("Could not create the data folder: {e}")))?;
-  // What the previous server process said about its import says nothing about this one.
-  log.reset_import();
   log.add_secret(&attempt.database_url);
   log.push(&format!(
     "[komiq] starting the server on {}:{}",
@@ -1095,11 +959,7 @@ pub async fn boot_server(
         let _ = tokio::time::timeout(Duration::from_secs(1), p).await;
       }
       let status = status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
-      let import = log.import();
-      if import.state() == crate::import::ImportState::Failed {
-        // The server said why, in plain words, before it stopped.
-        Err(BootError::Failed(import.failure_text()))
-      } else if port_in_use(log) {
+      if port_in_use(log) {
         Err(BootError::PortInUse)
       } else {
         Err(BootError::Failed(format!(
@@ -1107,7 +967,7 @@ pub async fn boot_server(
         )))
       }
     }
-    waited = wait_ready(attempt.port, bounds, log, spawned) => waited.map_err(BootError::Failed),
+    waited = wait_ready(attempt.port, timeout, spawned) => waited.map_err(BootError::Failed),
   };
   match outcome {
     Ok(()) => Ok(child),
@@ -1251,64 +1111,15 @@ pub fn server_bin() -> PathBuf {
 #[cfg(test)]
 mod tests;
 
-/// Wait for `/health`. The bound that applies follows the server's import lines:
-///
-/// * no import line, a no-op warning, or a finished conversion: the normal bound (from
-///   spawn, from the warning, from the `complete` line);
-/// * checking the old file (`preparing`): the normal bound, from that line;
-/// * converting: no progress line for `bounds.inactivity`, or `bounds.total` since spawn;
-/// * an error line: over at once.
-async fn wait_ready(
-  port: u16,
-  bounds: &Bounds,
-  log: &LogBuf,
-  spawned: Instant,
-) -> Result<(), String> {
-  loop {
-    if wait_healthy(port, POLL).await {
-      log.import_ready();
-      return Ok(());
-    }
-    let import = log.import();
-    if let Some(overdue) = import.overdue(spawned, Instant::now(), bounds) {
-      return Err(overdue_text(overdue, &import, bounds));
-    }
-  }
-}
-
-fn overdue_text(overdue: Overdue, import: &crate::import::Tracker, bounds: &Bounds) -> String {
-  let normal = bounds.normal.as_secs();
-  match overdue {
-    Overdue::Start | Overdue::AfterNoOp => {
-      format!("The server did not answer within {normal} seconds.")
-    }
-    Overdue::Preparing => {
-      // The server may print its check line on every start, so this is not a
-      // conversion failure: an ordinary start that did not answer.
-      format!(
-        "The server did not answer within {normal} seconds. Its last report: checking the \
-         old database."
-      )
-    }
-    Overdue::AfterDone => format!(
-      "The database was converted, but the server did not answer within {normal} seconds \
-       after that."
-    ),
-    Overdue::Stalled => format!(
-      "The database conversion made no progress for {} minutes and was stopped. Its last \
-       step: {}. Retry continues it.",
-      bounds.inactivity.as_secs().div_ceil(60),
-      import
-        .progress()
-        .map(|line| line[crate::import::PREFIX.len()..].trim())
-        .unwrap_or("unknown")
-    ),
-    Overdue::TooLong => format!(
-      "The database conversion did not finish within {} hours and was stopped. Retry \
-       continues it.",
-      bounds.total.as_secs().div_ceil(3600)
-    ),
-    Overdue::Failed => import.failure_text(),
+/// Wait for `/health` within the start timeout, measured from spawn.
+async fn wait_ready(port: u16, timeout: Duration, spawned: Instant) -> Result<(), String> {
+  if wait_healthy(port, timeout.saturating_sub(spawned.elapsed())).await {
+    Ok(())
+  } else {
+    Err(format!(
+      "The server did not answer within {} seconds.",
+      timeout.as_secs()
+    ))
   }
 }
 

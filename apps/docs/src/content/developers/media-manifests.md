@@ -26,7 +26,7 @@ Four PostgreSQL tables hold the data:
 
 A **revision** is one ordered list of page hashes. Changed pages produce revision n+1; an unchanged list writes nothing. A replaced revision stays for 7 days as a signed record. Cleanup then removes it and any unused hashes.
 
-All four tables are rebuildable. A reverse export to SQLite leaves them out and lists their row counts in the report. The next ingest refills them.
+All four tables are rebuildable. The next ingest refills them.
 
 ## The ingest pass
 
@@ -89,8 +89,6 @@ The **policy epoch** is a rising number in `media_policy`. It moves in the same 
 
 The server holds the denied set in memory. It re-reads the epoch at most once every 5 seconds and rebuilds the set when it moves, and every 60 seconds anyway. This replaces the per-request block-rule read on page routes. Admin console rule changes and admin API takedowns invalidate it at once on that server. CLI changes reach a running server within about 5 seconds.
 
-Reverse export to SQLite refuses while `media_takedown` has rows. `media_policy` is rebuildable: export omits it and counts its rows in the report.
-
 ## Policy lease
 
 `GET /media/v1/policy` uses the same signed envelope and key as manifests. Its payload holds `v`, `epoch`, `issued_at`, `expires_at`, `denied_copies`, `denied_works` and `kid`. Times are Unix seconds. The lease lasts 600 seconds from the current minute's start. The server reuses signed bytes per epoch and per minute.
@@ -120,6 +118,5 @@ The gate returns the remaining lease life as `s-maxage`. After expiry, it keeps 
 - `apps/server/src/graphql/mod.rs`: admin takedown operations and viewer gates.
 - `apps/server/src/block.rs`: block rules and the takedown list gate.
 - `apps/server/src/cover.rs`: cover deletion and passes that skip takedowns.
-- `apps/server/src/pg_export/tables.rs`: reverse-export table dispositions.
 - `apps/server/migrations_pg/0007_media_manifest.sql`: the four tables.
 - `apps/server/migrations_pg/0009_media_policy.sql`: policy and takedown tables.

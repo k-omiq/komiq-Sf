@@ -92,7 +92,6 @@ export DATABASE_URL
 export COVERS_DATABASE_URL="sqlite://$scratch/covers.sqlite3"
 export CATALOGUE_SYNC=off SUWAYOMI_URL=http://127.0.0.1:9
 export BIND_ADDR=127.0.0.1 PORT=18087 RUST_LOG=komika_server=info
-unset KOMIKA_SQLITE_IMPORT_PATH
 start_server > "$scratch/first.log" 2>&1 &
 server_pid=$!
 ready=0

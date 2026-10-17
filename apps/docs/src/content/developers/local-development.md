@@ -58,7 +58,7 @@ PORT=8080 GRAPHIQL_ENABLED=on CATALOGUE_SYNC=on CORS_ORIGINS='http://localhost:5
 On startup, the server performs these steps:
 
 1. Connects to the PostgreSQL database supplied in `DATABASE_URL` and initializes the separate SQLite covers cache.
-2. Applies migrations from `apps/server/migrations_pg/`. An old main SQLite file (`komika.sqlite3`) beside the covers cache converts automatically when PostgreSQL is empty; verification precedes serving and renaming the source. [Data model](/developers/data-model) lists the cases the server refuses.
+2. Applies migrations from `apps/server/migrations_pg/`. An old `komika.sqlite3` blocks startup when PostgreSQL is empty. Read [Old SQLite install](/self-host/update-and-backup#old-sqlite-install) to start fresh.
 3. If no admin account exists, prints a one-time setup code to the terminal log.
 4. Binds to port 8080.
 

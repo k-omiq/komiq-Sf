@@ -137,14 +137,7 @@ elif args[0] == "exec":
         if needle in " ".join(args):
             sys.exit(status)
 elif args[0] == "run":
-    if "sha256sum" in args:  # The image identity check: what the image carries.
-        for path in args[args.index("sha256sum") + 2:]:
-            name = os.path.basename(path)
-            content = open(os.path.join(state["kit"], name), "rb").read() + state["image_differs"].get(name, "").encode()
-            if name not in state["image_lacks"]:
-                print(hashlib.sha256(content).hexdigest() + "  " + path)
-        sys.exit(1 if state["image_lacks"] else 0)
-    if state["run_late"] and "-job-" in " ".join(option("--name")):
+    if state["run_late"] and "-meta-" in " ".join(option("--name")):
         # The daemon creates the container only after the client was killed.
         entry = created(True)
         if os.fork() == 0:
@@ -168,15 +161,18 @@ elif args[0] == "run":
             save()
             os._exit(0)
         time.sleep(60)
-    if state["run_lingers"] and "-job-" in " ".join(option("--name")):
+    if state["run_lingers"] and "-meta-" in " ".join(option("--name")):
         # An interrupted client: the container exists and keeps running.
         state["containers"].append(created(True))
         save()
         time.sleep(state["run_lingers"])
-    for arg in args:
-        if arg.startswith("type=bind,src=") and arg.endswith(",dst=/work"):
-            with open(arg[len("type=bind,src="):-len(",dst=/work")] + "/report.json", "w") as report:
-                report.write('{"complete": true}')
+    if "sha256sum" in args:  # The image identity check: what the image carries.
+        for path in args[args.index("sha256sum") + 2:]:
+            name = os.path.basename(path)
+            content = open(os.path.join(state["kit"], name), "rb").read() + state["image_differs"].get(name, "").encode()
+            if name not in state["image_lacks"]:
+                print(hashlib.sha256(content).hexdigest() + "  " + path)
+        sys.exit(1 if state["image_lacks"] else 0)
     for needle, output in state["run"].items():
         if needle in args:
             print(output)
@@ -444,8 +440,6 @@ class UsageTests(Harness):
             ["repo-destroy", "--yes-delete-rehearsal-repo", "--repo1-path=/komika"],
             ["destroy-source-volumes"], ["destroy-source-volumes", "--yes-delete-rehearsal-volumes", "komika_server-data"],
             ["logs", "komika-server-1"], ["logs", "postgres", "--follow"], ["logs", "postgres", "postgres-backup"],
-            ["import", "--sqlite", "/a", "--sqlite", "/b", "--server-bin", "/c"], ["import", "--sqlite", "/a"],
-            ["import", "--sqlite=/a", "--server-bin=/c"], ["verify", "--sqlite", "/a", "--server-bin", "/c", "--postgres", "postgres://x"],
             ["restore", "--tar", "/x", "--json-out", "/y"], ["restore", "--target", "/x"],
             ["restore", "--target", "/x", "--json-out", "/y", "--hosted-recovery"],
             ["drill", "--target", "/x", "--json-out", "/y", "--keep"], ["sql-marker"], ["sql-marker", "--label"],
@@ -455,7 +449,6 @@ class UsageTests(Harness):
             ["restore", "--target", "/x", "--json-out", "/y", "--expect-no-marker"],
             ["restore", "--target", "/x", "--target", "/z", "--json-out", "/y"],
             ["drill", "--target", "/x", "--json-out", "/y", "--expect-marker", "a"],
-            ["verify-restored", "--target", "/x", "--sqlite", "/a", "--server-bin", "/b", "--expect-marker", "a"],
             ["up", "--network", "bridge"], ["up", "--local-s3"], ["status", "--watch-free"], ["down", "--force"],
             ["stop-source", "--jobs"], ["repo-destroy", "--yes-delete-rehearsal-repo", "--network=bridge"],
         ]
@@ -466,6 +459,12 @@ class UsageTests(Harness):
                 self.assertEqual(result.returncode, 2, self.output)
                 self.assertIn("rehearsal usage error", result.stderr)
                 self.assertEqual(self.calls, [], "a usage error must not call Docker at all")
+
+    def test_removed_database_commands_are_refused_before_docker(self):
+        for command in ("import", "verify", "verify-restored"):
+            result = self.run_rehearsal(command)
+            self.assertEqual(result.returncode, 2, self.output)
+            self.assertEqual(self.calls, [])
 
     def test_old_entry_points_never_run_a_rehearsal(self):
         legacy = dict(KOMIKA_COMPOSE_FILE=str(self.kit / "rehearsal-compose.yml"), KOMIKA_COMPOSE_PROJECT=t.PROJECT)
@@ -692,8 +691,7 @@ class TopologyTests(Harness):
         }
         commands = (["psql-check"], ["stanza-create"], ["backup", "full", "--first"], ["check"], ["info"],
                     ["archive-status"], ["sql-marker", "--label", "a"], ["status"],
-                    ["record-settings", "--out", str(self.root / "s.json")],
-                    ["import", "--sqlite", str(self.env_file), "--server-bin", str(self.env_file)])
+                    ["record-settings", "--out", str(self.root / "s.json")])
         for index, (name, deviate) in enumerate(deviations.items()):
             # Every command meets a deviating container; every deviation meets four commands.
             for command in (commands if index == 0 else commands[index % 3::3]):
@@ -861,127 +859,6 @@ class CommandTests(Harness):
         self.refused("status")
 
 
-class JobTests(Harness):
-    def setUp(self):
-        super().setUp()
-        self.sqlite = self.base / "copy.sqlite3"
-        self.sqlite.write_bytes(b"SQLite format 3\0")
-        self.binary = self.base / "komika-server"
-        self.binary.write_bytes(b"\x7fELF")
-        self.binary.chmod(0o755)
-
-    def job(self, *extra):
-        return ["--sqlite", str(self.sqlite), "--server-bin", str(self.binary), *extra]
-
-    def check_run(self, run, record, command, network_name, host):
-        work = [arg for arg in run if arg.startswith("type=bind,src=") and arg.endswith(",dst=/work")]
-        self.assertEqual(len(work), 1)
-        directory = Path(work[0][len("type=bind,src="):-len(",dst=/work")])
-        self.assertEqual(directory.parent, self.root)
-        # A root caller still runs the job as nobody, in a work directory given to it.
-        uid, gid = (os.getuid(), os.getgid()) if os.getuid() else (65534, 65534)
-        self.assertEqual((directory.stat().st_uid, directory.stat().st_gid), (uid, gid))
-        self.assertEqual(run, [
-            "run", "--rm", "--init", "--pull=never", "--name", run[5], "--label", f"{t.LABEL}={t.PROJECT}",
-            "--network", network_name, "--user", f"{uid}:{gid}", "--read-only", "--cap-drop=ALL",
-            "--security-opt=no-new-privileges", "--memory=2g", "--memory-swap=2g", "--cpus=1", "--pids-limit=256",
-            "--log-driver=json-file", "--log-opt=max-size=10m", "--log-opt=max-file=3",  # C8: bounded, explicit.
-            "--env-file", "/dev/stdin", "--workdir", "/work",
-            "--mount", f"type=bind,src={self.binary},dst=/opt/komika-server/komika-server,readonly",
-            "--mount", f"type=bind,src={self.sqlite},dst=/source/komika.sqlite3,readonly",
-            "--mount", work[0],
-            "--tmpfs", f"/source:rw,noexec,nosuid,nodev,size=64m,mode=0700,uid={uid},gid={gid}",
-            "--tmpfs", "/var/lib/postgresql:mode=0700",
-            "--entrypoint", "/opt/komika-server/komika-server",
-            safety.IMAGE, command, "--sqlite", "/source/komika.sqlite3", "--json-out", "/work/report.json"])
-        self.assertTrue(re.fullmatch(re.escape(t.PROJECT) + "-job-[0-9a-f]{8}", run[5]))
-        self.assertNotIn("0:0", run)
-        # The database URL (with the password) travels on stdin only.
-        self.assertEqual(record["stdin_keys"], ["HOME", "KOMIKA_IMPORT_POSTGRES_URL", "SQLITE_TMPDIR", "TMPDIR"])
-        self.assertTrue(record["stdin_has_password"])
-        self.assertNotIn(host + ":5432", json.dumps(run))
-        return directory
-
-    def test_import_and_verify_run_read_only_non_root_on_the_rehearsal_network(self):
-        for subcommand, command in (("import", "import-sqlite-to-postgres"), ("verify", "verify-sqlite-postgres")):
-            with self.subTest(subcommand=subcommand):
-                report = self.root / f"{subcommand}-report.json"
-                result = self.ok(subcommand, *self.job("--report", str(report)), shell=subcommand == "import")
-                runs = [record for record in self.records if record["args"][0] == "run" and not identity_call(record["args"])]
-                self.assertEqual(len(runs), 1)
-                self.assertEqual(self.mutating(), [runs[0]["args"]])
-                directory = self.check_run(runs[0]["args"], runs[0], command, t.PROJECT + "-network", t.PROJECT + "-postgres")
-                self.assertEqual(report.read_text(), '{"complete": true}')
-                self.assertEqual(stat_mode(report), 0o600)
-                self.assertEqual(stat_mode(directory), 0o700)
-                self.assertIn(f"work_directory={directory}", result.stdout)
-        self.state["run_status"] = 3
-        self.assertEqual(self.run_rehearsal("import", *self.job()).returncode, 3)  # The job's status is the result.
-
-    def test_job_inputs_and_outputs_are_fenced(self):
-        elsewhere = self.base / "elsewhere.json"
-        (self.root / "taken.json").write_text("{}")
-        link = self.base / "link.sqlite3"
-        link.symlink_to(self.sqlite)
-        cases = {
-            "report outside the root": self.job("--report", str(elsewhere)),
-            "report already exists": self.job("--report", str(self.root / "taken.json")),
-            "report below a subdirectory": self.job("--report", str(self.root / "sub" / "r.json")),
-            "report with mount syntax": self.job("--report", str(self.root / "r,x")),
-            "relative sqlite": ["--sqlite", "copy.sqlite3", "--server-bin", str(self.binary)],
-            "symlinked sqlite": ["--sqlite", str(link), "--server-bin", str(self.binary)],
-            "missing sqlite": ["--sqlite", str(self.base / "none.sqlite3"), "--server-bin", str(self.binary)],
-            "sqlite with mount option": ["--sqlite", str(self.sqlite) + ",readonly=false", "--server-bin", str(self.binary)],
-            "directory as binary": ["--sqlite", str(self.sqlite), "--server-bin", str(self.base)],
-            "dotted path": ["--sqlite", str(self.base / "bin" / ".." / "copy.sqlite3"), "--server-bin", str(self.binary)],
-        }
-        for name, arguments in cases.items():
-            with self.subTest(case=name):
-                self.refused("import", *arguments)
-                self.assertFalse(elsewhere.exists())
-        for path, mode, restore in ((self.sqlite, 0o200, 0o644), (self.binary, 0o644, 0o755), (self.binary, 0o311, 0o755)):
-            path.chmod(mode)
-            self.assertIn("by the job user", self.refused("import", *self.job()).stderr)
-            path.chmod(restore)
-        self.assertEqual(sorted(p.name for p in self.root.iterdir()), [safety.ROOT_MARKER, "taken.json"])
-        (self.base / "copy.sqlite3-wal").write_bytes(b"pending pages")
-        result = self.refused("import", *self.job())
-        self.assertIn("-wal", result.stderr)
-        (self.base / "copy.sqlite3-wal").write_bytes(b"")  # An empty log holds nothing.
-        self.ok("verify", *self.job())
-        (self.base / "copy.sqlite3-journal").write_bytes(b"hot journal")
-        self.refused("verify", *self.job())
-        (self.base / "copy.sqlite3-journal").unlink()
-        self.state["containers"][0]["State"].update(Running=False, Status="exited")
-        result = self.refused("import", *self.job())
-        self.assertIn("not running", result.stderr)
-
-    def test_rehearsal_root_is_fenced_before_any_directory_or_container(self):
-        before = sorted(os.listdir(self.root))
-        (self.root / safety.ROOT_MARKER).unlink()
-        result = self.refused("import", *self.job())
-        self.assertIn("marker", result.stderr)
-        (self.root / safety.ROOT_MARKER).write_text(safety.marker_text(os.getuid()))
-        self.root.chmod(0o755)
-        self.refused("verify", *self.job())
-        self.root.chmod(0o700)
-        # Root inside Docker's data root, and around a production mount source.
-        self.rehome(self.base)
-        result = self.refused("import", *self.job())
-        self.assertIn("Docker data root", result.stderr)
-        self.rehome(self.base / "docker-data")
-        production = dict(t.container(), Name="/komika-server-1", Id="d" * 64)
-        production["Config"] = dict(production["Config"], Labels={"com.docker.compose.project": "komika"})
-        production["Mounts"] = [{"Type": "bind", "Source": str(self.root / "data"), "Destination": "/data"}]
-        self.state["containers"].append(production)
-        result = self.refused("record-settings", "--out", str(self.root / "s.json"))
-        self.assertIn("komika-server-1", result.stderr)
-        self.assertEqual(sorted(os.listdir(self.root)), before + [])
-        self.refused("import", *self.job(), KOMIKA_REHEARSAL_ROOT=str(self.base / "missing"))
-        self.refused("import", *self.job(), KOMIKA_REHEARSAL_ROOT="/")
-        self.refused("import", *self.job(), KOMIKA_REHEARSAL_ROOT=str(self.base))  # Exists, never initialised.
-
-
 class RestoreTests(Harness):
     def kept(self, target, name="komika-pitr-0123456789ab", project=t.PROJECT):
         labels = {t.LABEL: project, safety.TARGET_LABEL: str(target)}
@@ -990,20 +867,12 @@ class RestoreTests(Harness):
         net = {"Id": "8" * 64, "Name": name + "-network", "Labels": dict(labels), "IPAM": {"Config": [{"Subnet": "172.29.42.0/24"}]}}
         return entry, net
 
-    def test_cleanup_and_verifier_find_a_kept_restore_by_its_directory_only(self):
+    def test_cleanup_finds_a_kept_restore_by_its_directory_only(self):
         target = self.root / "pitr"
         target.mkdir()
         entry, net = self.kept(target)
         self.state["containers"].append(entry)
         self.state["networks"].append(net)
-        sqlite, binary = self.base / "copy.sqlite3", self.base / "komika-server"
-        sqlite.write_bytes(b"x")
-        binary.write_bytes(b"x")
-        binary.chmod(0o755)
-        self.ok("verify-restored", "--target", str(target), "--sqlite", str(sqlite), "--server-bin", str(binary))
-        run = self.mutating()[0]
-        self.assertEqual(run[run.index("--network") + 1], "komika-pitr-0123456789ab-network")
-        self.assertEqual(run[run.index(safety.IMAGE) + 1], "verify-sqlite-postgres")
         self.ok("restore-cleanup", "--target", str(target))
         self.assertEqual(self.mutating(), [
             ["exec", "--user", "postgres", "9" * 64, "pg_ctl", "-D", "/restore", "-w", "-m", "fast", "stop"],
@@ -1169,28 +1038,6 @@ class DiskGateTests(Harness):
                 self.assertEqual(self.calls, [], "an invalid floor is refused before any Docker call")
         self.refused("up", KOMIKA_REHEARSAL_MIN_FREE_GB="2")  # Only the env file may set it.
 
-    def test_import_adds_the_measured_growth_of_the_sqlite_file(self):
-        sqlite, binary = self.base / "copy.sqlite3", self.base / "komika-server"
-        sqlite.write_bytes(b"x" * 1000)
-        binary.write_bytes(b"x")
-        binary.chmod(0o755)
-        job = ["--sqlite", str(sqlite), "--server-bin", str(binary)]
-        need = FLOOR + 2200  # floor + 2.2 x 1000 bytes
-        self.assertEqual(safety.IMPORT_GROWTH, 2.2)
-        self.free(docker=need - 1, root=50 * GIB, same=False)
-        result = self.refused("import", *job)
-        self.assertIn(f"disk gate: import needs {need} free bytes on the filesystem of Docker's data root", result.stderr)
-        self.assertIn(f"available {need - 1}", result.stderr)
-        self.assertEqual(sorted(os.listdir(self.root)), [safety.ROOT_MARKER])  # No work directory was made.
-        self.free(docker=need, root=FLOOR - 1, same=False)
-        self.assertIn("the rehearsal root", self.refused("import", *job).stderr)
-        self.free(docker=need, root=FLOOR, same=False)
-        result = self.ok("import", *job)
-        self.assertIn(f"disk_gate step=import needed_bytes={need} available_bytes={need}", result.stdout)
-        # The verifier writes nothing to the data volume: no growth is added.
-        self.free(docker=1, root=1)
-        self.ok("verify", *job)
-
     def test_status_shows_free_bytes_and_the_floor_without_refusing(self):
         self.free(docker=7 * GIB, root=FLOOR - 5, same=False)
         result = self.ok("status")
@@ -1236,10 +1083,6 @@ class ImageIdentityTests(Harness):
         self.assertLess(self.calls.index(check), self.calls.index(up))
 
     def test_any_differing_or_missing_file_refuses_every_start_from_the_image(self):
-        sqlite, binary = self.base / "copy.sqlite3", self.base / "komika-server"
-        sqlite.write_bytes(b"x")
-        binary.write_bytes(b"x")
-        binary.chmod(0o755)
         for name in safety.IMAGE_FILES:
             with self.subTest(differs=name):
                 self.state["image_differs"] = {name: "# one byte more\n"}
@@ -1250,9 +1093,7 @@ class ImageIdentityTests(Harness):
         self.assertIn("hosted.py, safety.py differ from", self.refused("up").stderr)
         self.linux()
         self.state["containers"] = []
-        for command in (["import", "--sqlite", str(sqlite), "--server-bin", str(binary)],
-                        ["verify", "--sqlite", str(sqlite), "--server-bin", str(binary)],
-                        ["info"], ["repo-destroy", "--yes-delete-rehearsal-repo"],
+        for command in (["info"], ["repo-destroy", "--yes-delete-rehearsal-repo"],
                         ["restore", "--target", str(self.root / "r"), "--json-out", str(self.root / "r.json")],
                         ["drill", "--target", str(self.root / "d"), "--json-out", str(self.root / "d.json")]):
             with self.subTest(command=command[0]):
@@ -1280,25 +1121,18 @@ class CleanupTests(Harness):
 
     def setUp(self):
         super().setUp()
-        self.sqlite = self.base / "copy.sqlite3"
-        self.sqlite.write_bytes(b"SQLite format 3\0")
-        self.binary = self.base / "komika-server"
-        self.binary.write_bytes(b"\x7fELF")
-        self.binary.chmod(0o755)
         self.job_container = labelled_container(t.PROJECT + "-job-0123abcd", "1")
         self.meta_container = labelled_container(t.PROJECT + "-meta-89abcdef", "2", running=False)
 
-    def test_a_job_container_that_outlives_its_client_is_removed_in_the_same_run(self):
-        # The fake `docker run` registers the container and returns like a killed client.
+    def test_a_metadata_container_left_after_its_check_is_removed_in_the_same_run(self):
+        # The fake `docker run` returns while its metadata container still exists.
         self.state["run_lingers"] = 0.01
-        self.state["run_status"] = 137
-        result = self.run_rehearsal("import", "--sqlite", str(self.sqlite), "--server-bin", str(self.binary))
-        self.assertEqual(result.returncode, 137)
-        run = [call for call in self.mutating() if call[0] == "run"][0]
+        result = self.run_rehearsal("up")
+        self.assertEqual(result.returncode, 0)
+        run = [call for call in self.calls if call[0] == "run"][0]
         name = run[run.index("--name") + 1]
         import hashlib
-        self.assertEqual(self.mutating()[-1], ["rm", "-f", "-v", hashlib.sha256(name.encode()).hexdigest()])
-        self.assertIn(f"job_container={name} was still present and has been removed", result.stdout)
+        self.assertIn(["rm", "-f", "-v", hashlib.sha256(name.encode()).hexdigest()], self.mutating())
 
     def test_sigterm_sighup_and_sigint_remove_the_running_job_container(self):
         import hashlib
@@ -1319,7 +1153,7 @@ class CleanupTests(Harness):
                 self.state["containers"] = [t.container()]
                 kit = self.prepare_process()
                 process = subprocess.Popen(
-                    ["sh", str(kit / "rehearsal.sh"), "import", "--sqlite", str(self.sqlite), "--server-bin", str(self.binary)],
+                    ["sh", str(kit / "rehearsal.sh"), "up"],
                     env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL,
                     preexec_fn=dispositions(ignored))
                 self.addCleanup(process.kill)
@@ -1331,10 +1165,10 @@ class CleanupTests(Harness):
                         present = [e["Name"].lstrip("/") for e in json.loads(self.state_file.read_text())["containers"]]
                     except ValueError:
                         continue  # The fake is writing its state at this moment.
-                    name = next((n for n in present if "-job-" in n), None)
+                    name = next((n for n in present if "-meta-" in n), None)
                 self.assertIsNotNone(name, "the job container never started")
                 if ignored:
-                    # Under nohup a lost terminal does not end a long import.
+                    # Under nohup a lost terminal does not end a long image check.
                     process.send_signal(signal.SIGHUP)
                     time.sleep(1.5)
                     self.assertIsNone(process.poll(), "an ignored SIGHUP must stay ignored")
@@ -1343,7 +1177,6 @@ class CleanupTests(Harness):
                 self.assertEqual(process.returncode, status, out + err)
                 calls = [json.loads(line)["args"] for line in self.log.read_text().splitlines()]
                 self.assertIn(["rm", "-f", "-v", hashlib.sha256(name.encode()).hexdigest()], calls)
-                self.assertIn(f"job_container={name} was still present and has been removed", out)
                 left = [e["Name"] for e in json.loads(self.state_file.read_text())["containers"]]
                 self.assertEqual(left, ["/" + t.PROJECT + "-postgres"])
 
@@ -1355,7 +1188,7 @@ class CleanupTests(Harness):
         self.state["run_late"] = 0.8
         kit = self.prepare_process()
         process = subprocess.Popen(
-            ["sh", str(kit / "rehearsal.sh"), "import", "--sqlite", str(self.sqlite), "--server-bin", str(self.binary)],
+            ["sh", str(kit / "rehearsal.sh"), "up"],
             env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL,
             preexec_fn=lambda: signal.signal(signal.SIGTERM, signal.SIG_DFL))
         self.addCleanup(process.kill)
@@ -1365,7 +1198,7 @@ class CleanupTests(Harness):
             time.sleep(0.02)
             for line in (self.log.read_text().splitlines() if self.log.exists() else []):
                 call = json.loads(line)["args"]
-                if call[0] == "run" and "sha256sum" not in call:
+                if call[0] == "run":
                     name = call[call.index("--name") + 1]
         self.assertIsNotNone(name, "the job never reached docker run")
         process.send_signal(signal.SIGTERM)
@@ -1769,16 +1602,7 @@ USAGE = dict(objects=4, bytes=100 + (6 << 20) + 77 + (5 << 20), archive_objects=
              write_requests_floor=1 + (2 + 2) + 1 + 1)
 
 
-class JobFiles(Harness):
-    def setUp(self):
-        super().setUp()
-        self.sqlite = self.base / "copy.sqlite3"
-        self.sqlite.write_bytes(b"SQLite format 3\0")
-        self.binary = self.base / "komika-server"
-        self.binary.write_bytes(b"\x7fELF")
-        self.binary.chmod(0o755)
-        self.job = ["--sqlite", str(self.sqlite), "--server-bin", str(self.binary)]
-
+class OperationHarness(Harness):
     def sync(self):
         """Take over what the fake daemon holds now (another process changed it)."""
         self.state = json.loads(self.state_file.read_text())
@@ -1787,13 +1611,12 @@ class JobFiles(Harness):
         return [entry["name"] for entry in safety.read_ledger(self.lock_path)[1]]
 
 
-class StorageTests(JobFiles):
+class StorageTests(OperationHarness):
     """C1: a rehearsal label is no proof of rehearsal storage."""
 
     def commands(self):
         return (["up"], ["status"], ["psql-check"], ["backup", "full", "--first"], ["stanza-create"], ["check"], ["info"],
-                ["repo-usage"], ["archive-status"], ["sql-marker", "--label", "a"], ["import", *self.job],
-                ["verify", *self.job], ["destroy-source-volumes", "--yes-delete-rehearsal-volumes"],
+                ["repo-usage"], ["archive-status"], ["sql-marker", "--label", "a"], ["destroy-source-volumes", "--yes-delete-rehearsal-volumes"],
                 ["repo-destroy", "--yes-delete-rehearsal-repo"], ["record-settings", "--out", str(self.root / "s.json")],
                 ["restore", "--target", str(self.root / "r"), "--json-out", str(self.root / "r.json")])
 
@@ -1857,7 +1680,7 @@ class StorageTests(JobFiles):
             "the volumes directory": [{"Type": "bind", "Source": self.state["docker_root"] + "/volumes", "Destination": "/v"}],
         }
         for name, mounts in cases.items():
-            for command in (["up"], ["backup", "incr"], ["import", *self.job]):
+            for command in (["up"], ["backup", "incr"], ["info"]):
                 with self.subTest(case=name, command=command[0]):
                     self.state["containers"] = [t.container(), dict(production, Mounts=mounts)]
                     result = self.refused(*command)
@@ -2029,16 +1852,16 @@ class ImplicitRestoreTests(Harness):
         self.assertEqual((len(self.ups()), self.readers()), (1, []))
 
 
-class OperationLockRunTests(JobFiles):
+class OperationLockRunTests(OperationHarness):
     """C4: one operation at a time on a host; a second invocation is refused at once."""
 
     def hold(self):
-        """A real `rehearsal.sh import` whose job keeps running: it holds the lock."""
+        """A real `rehearsal.sh up` whose image check keeps running: it holds the lock."""
         import signal
         import time
         self.state["run_lingers"] = 60
         kit = self.prepare_process()
-        process = subprocess.Popen(["sh", str(kit / "rehearsal.sh"), "import", *self.job], env=self.env,
+        process = subprocess.Popen(["sh", str(kit / "rehearsal.sh"), "up"], env=self.env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL,
                                    preexec_fn=lambda: signal.signal(signal.SIGTERM, signal.SIG_DFL))
         self.addCleanup(process.kill)
@@ -2046,18 +1869,18 @@ class OperationLockRunTests(JobFiles):
         while time.monotonic() < deadline:
             time.sleep(0.05)
             try:
-                if any("-job-" in e["Name"] for e in json.loads(self.state_file.read_text())["containers"]):
+                if any("-meta-" in e["Name"] for e in json.loads(self.state_file.read_text())["containers"]):
                     break
             except ValueError:
                 continue
         else:
-            self.fail("the first import never started its job")
+            self.fail("the first image check never started its job")
         self.live_state = True  # The first process owns the fake daemon's state from here on.
         return process
 
     def test_a_second_invocation_is_refused_at_once_before_it_checks_or_measures_anything(self):
-        """The checker's two-admission case: the first step passed its disk check and
-        is still writing; the second must not be admitted against the same free bytes."""
+        """The checker's two-admission case: the first step is still running;
+        the second must not be admitted against the same free bytes."""
         import signal
         import time
         first = self.hold()
@@ -2067,10 +1890,9 @@ class OperationLockRunTests(JobFiles):
         self.assertIn("holds the host-wide operation lock", result.stderr)
         self.assertEqual(self.calls, [], "the second invocation reached Docker")
         holder = safety.read_ledger(self.lock_path)[0]
-        self.assertEqual(holder["subcommand"], "import")
+        self.assertEqual(holder["subcommand"], "up")
         target = ["--target", str(self.root / "r"), "--json-out", str(self.root / "r.json")]
         commands = (["up"], ["restore", *target], ["drill", *target], ["backup", "full"], ["backup", "incr"],
-                    ["import", *self.job], ["verify", *self.job], ["verify-restored", "--target", str(self.root), *self.job],
                     ["destroy-source-volumes", "--yes-delete-rehearsal-volumes"], ["repo-destroy", "--yes-delete-rehearsal-repo"],
                     ["stop-source"], ["down"], ["restore-cleanup", "--target", str(self.root)], ["preflight"],
                     ["preflight", "--init-root"], ["stanza-create"], ["check"], ["info"], ["info", "--json"], ["repo-usage"],
@@ -2084,7 +1906,7 @@ class OperationLockRunTests(JobFiles):
                     self.assertLess(time.monotonic() - before, 5.0)  # Refused, never queued behind the first.
                     self.assertEqual(result.returncode, 1, self.output)
                     self.assertIn(f"another rehearsal.sh invocation holds the host-wide operation lock {self.lock_path} "
-                                  f"(pid {holder['pid']}, subcommand import, since {holder['since']})", result.stderr)
+                                  f"(pid {holder['pid']}, subcommand up, since {holder['since']})", result.stderr)
                     self.assertIn("nothing was checked or started", result.stderr)
                     self.assertEqual(self.calls, [], "the second invocation reached Docker")
                     self.assertEqual(result.stdout, "")
@@ -2094,17 +1916,16 @@ class OperationLockRunTests(JobFiles):
         self.assertEqual(safety.read_ledger(self.lock_path)[0], holder)  # No loser wrote into the record.
         # Read-only subcommands work while the operation runs, and say who holds the lock.
         result = self.ok("status")
-        self.assertIn(f"operation recorded: subcommand=import pid={holder['pid']} since={holder['since']} process=running",
+        self.assertIn(f"operation recorded: subcommand=up pid={holder['pid']} since={holder['since']} process=running",
                       result.stdout)
-        self.assertRegex(result.stdout, "job container " + re.escape(t.PROJECT) + "-job-[0-9a-f]{8}: state=running")
+        self.assertRegex(result.stdout, "job container " + re.escape(t.PROJECT) + "-meta-[0-9a-f]{8}: state=running")
         for command in (["psql-check"], ["archive-status"], ["logs"]):
             self.ok(*command)
-        self.assertIsNone(first.poll(), "the first import must still be running")
+        self.assertIsNone(first.poll(), "the first image check must still be running")
         # The first ends (here: by a signal); its cleanup ran under the lock; the next step is admitted.
         first.send_signal(signal.SIGTERM)
         out, err = first.communicate(timeout=60)
         self.assertEqual(first.returncode, 143, out + err)
-        self.assertIn("was still present and has been removed", out)
         self.assertIsNone(safety.read_ledger(self.lock_path)[0])
         self.sync()
         self.live_state = False
@@ -2131,15 +1952,15 @@ class OperationLockRunTests(JobFiles):
         with patch.object(safety, "process_environment", wrapped(safety.process_environment, "validation")), \
                 patch.object(safety.Rehearsal, "disk_gate", wrapped(safety.Rehearsal.disk_gate, "disk gate")), \
                 patch.object(safety.Rehearsal, "remove_transient", wrapped(safety.Rehearsal.remove_transient, "cleanup")):
-            self.ok("import", *self.job)
+            self.ok("up")
             self.assertEqual({what for what, _ in seen}, {"validation", "disk gate", "cleanup"})
             self.assertEqual({state for _, state in seen}, {"held"}, seen)
             probe("after the step")
             # A refused step and a failing step give the lock back too.
             self.refused("up", DOCKER_HOST="tcp://remote:2375")
             probe("after a refusal")
-            self.state["run_status"] = 3
-            self.assertEqual(self.run_rehearsal("verify", *self.job).returncode, 3)
+            self.state["exec_status"] = {"/opt/komika-postgres/backup.sh": 3}
+            self.assertEqual(self.run_rehearsal("backup", "incr").returncode, 3)
             probe("after a failed job")
         self.assertEqual([entry for entry in seen if entry[0].startswith("after")],
                          [("after the step", "free"), ("after a refusal", "free"), ("after a failed job", "free")])
@@ -2182,7 +2003,7 @@ class OperationLockRunTests(JobFiles):
 
         for name, make in (("a link to a production file", link), ("mode 0666", wide), ("two names", second_name)):
             make()
-            for command in (["up"], ["import", *self.job], ["down"], ["preflight"]):
+            for command in (["up"], ["info"], ["down"], ["preflight"]):
                 for shell in (False, command == ["up"]):
                     with self.subTest(lock=name, command=command[0], shell=shell):
                         result = self.run_rehearsal(*command, shell=shell)
@@ -2194,15 +2015,15 @@ class OperationLockRunTests(JobFiles):
             self.assertEqual(production.read_bytes(), b"production bytes")
             os.unlink(self.lock_path)
         # A rehearsal root may not contain the lock.
-        result = self.refused("import", *self.job, KOMIKA_REHEARSAL_ROOT=str(self.base))
+        result = self.refused("up", KOMIKA_REHEARSAL_ROOT=str(self.base))
         self.assertIn("rehearsal root must not contain the operation lock", result.stderr)
 
 
-class UnresolvedTests(JobFiles):
+class UnresolvedTests(OperationHarness):
     """C6: an interrupted creation that was not seen is unresolved, never "absent"."""
 
     def interrupt(self, late, **constants):
-        """Kill a real `import` while its create request is on its way. With
+        """Kill a real `up` while its image check request is on its way. With
         late="gate" the fake daemon creates the container only when the test
         calls arrive(): no assertion depends on how fast this machine is."""
         import signal
@@ -2210,7 +2031,7 @@ class UnresolvedTests(JobFiles):
         if self.gate.exists():
             self.gate.unlink()
         kit = self.prepare_process(**constants)
-        process = subprocess.Popen(["sh", str(kit / "rehearsal.sh"), "import", *self.job], env=self.env,
+        process = subprocess.Popen(["sh", str(kit / "rehearsal.sh"), "up"], env=self.env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL,
                                    preexec_fn=lambda: signal.signal(signal.SIGTERM, signal.SIG_DFL))
         self.addCleanup(process.kill)
@@ -2220,12 +2041,16 @@ class UnresolvedTests(JobFiles):
             time.sleep(0.02)
             for line in (self.log.read_text().splitlines() if self.log.exists() else []):
                 call = json.loads(line)["args"]
-                if call[0] == "run" and "sha256sum" not in call:
+                if call[0] == "run":
                     name = call[call.index("--name") + 1]
         self.assertIsNotNone(name, "the job never reached docker run")
         process.send_signal(signal.SIGTERM)
         out, err = process.communicate(timeout=60)
         self.assertEqual(process.returncode, 143, out + err)
+        # Only the interrupted image check is late; later metadata checks run normally.
+        self.state = json.loads(self.state_file.read_text())
+        self.state["run_late"] = 0
+        self.state_file.write_text(json.dumps(self.state))
         self.live_state = True  # The late creation is still on its way into the state file.
         return name, out, err
 
@@ -2250,7 +2075,7 @@ class UnresolvedTests(JobFiles):
 
     def large(self):
         target = ["--target", str(self.root / "r"), "--json-out", str(self.root / "r.json")]
-        return (["up"], ["backup", "full"], ["import", *self.job], ["verify", *self.job], ["restore", *target],
+        return (["up"], ["backup", "full"], ["restore", *target],
                 ["drill", *target], ["stanza-create"], ["info"], ["repo-usage"],
                 ["destroy-source-volumes", "--yes-delete-rehearsal-volumes"], ["repo-destroy", "--yes-delete-rehearsal-repo"])
 
@@ -2269,10 +2094,9 @@ class UnresolvedTests(JobFiles):
         """The checker's state: the daemon creates the container later than the wait."""
         import hashlib
         name, out, err = self.interrupt("gate", SETTLE_SECONDS=0.5)
-        # Not "absent": unresolved, by name, on both streams and in the lock file's record.
+        # Not "absent": unresolved, by name, in the error and the lock file's record.
         self.assertIn(f"UNRESOLVED: the request that creates container {name} was interrupted", err)
         self.assertIn("It is NOT known to be absent", err)
-        self.assertIn(f"job_container={name} UNRESOLVED", out)
         self.assertNotIn("has been removed", out)
         self.assertEqual(self.ledger(), [name])
         self.assertFalse(self.present(name))
@@ -2304,7 +2128,7 @@ class UnresolvedTests(JobFiles):
         self.state["run_late"] = 0
         self.state["containers"] = [t.container()]
         self.ok("backup", "incr")
-        self.ok("import", *self.job)
+        self.ok("up")
 
     def test_stop_source_and_down_wait_for_a_creation_that_is_still_on_its_way(self):
         import hashlib
@@ -2338,20 +2162,22 @@ class UnresolvedTests(JobFiles):
                 self.assertFalse(self.present(name))
 
     def test_a_creation_that_never_arrives_is_cleared_only_by_stop_source_or_down(self):
-        def killed(self_, *args, input=None):
+        docker = safety.Rehearsal.docker
+
+        def killed(self_, *args, **kwargs):
             if args[0] == "run":
                 raise KeyboardInterrupt  # The client died before the daemon answered; nothing is ever created.
-            return 0
+            return docker(self_, *args, **kwargs)
 
-        with patch.object(safety.Rehearsal, "stream", killed), patch.object(safety, "SETTLE_SECONDS", 0.3):
-            result = self.run_rehearsal("import", *self.job)
+        with patch.object(safety.Rehearsal, "docker", killed), patch.object(safety, "SETTLE_SECONDS", 0.3):
+            result = self.run_rehearsal("up")
         self.assertEqual(result.returncode, 130, self.output)
         self.assertEqual(len(self.ledger()), 1)
         name = self.ledger()[0]
         self.assertIn(f"UNRESOLVED: the request that creates container {name} was interrupted", result.stderr)
         self.refused_everywhere(name, "creation never confirmed")
         # A record of another project on the same host is reported, and blocks nobody here.
-        lock = safety.OperationLock().acquire("import")
+        lock = safety.OperationLock().acquire("up")
         lock.note("komika-pg-rehearsal-other-job-00000001")
         lock.resolve([name])
         lock.release()
@@ -2359,14 +2185,14 @@ class UnresolvedTests(JobFiles):
                       self.ok("status").stdout)
         self.assertIn("it belongs to another rehearsal project on this host", self.ok("status").stdout)
         self.ok("backup", "incr")
-        lock = safety.OperationLock().acquire("import")
+        lock = safety.OperationLock().acquire("up")
         lock.note(name)
         lock.release()
         with patch.object(safety, "UNRESOLVED_AGE", 0.6):
             result = self.ok("down")
         self.assertRegex(result.stdout, f"unresolved job container {name}: it never appeared in [0-9]+ s; record cleared")
         self.assertEqual(self.ledger(), ["komika-pg-rehearsal-other-job-00000001"])  # Not ours: left alone.
-        self.ok("import", *self.job)
+        self.ok("up")
 
     def test_a_forged_record_cannot_stretch_the_wait_or_crash_a_step(self):
         """Fix round 6 (F4): the record is the caller's own file, and still not trusted
@@ -2375,7 +2201,7 @@ class UnresolvedTests(JobFiles):
 
         def forge(noted=None, pid="4321"):
             entries = "" if noted is None else '{"name": "%s", "noted": %s}' % (name, noted)
-            Path(self.lock_path).write_text('{"holder": {"pid": %s, "subcommand": "import", "since": '
+            Path(self.lock_path).write_text('{"holder": {"pid": %s, "subcommand": "up", "since": '
                                             '"2026-10-12T00:00:00Z"}, "unresolved": [%s]}' % (pid, entries))
             os.chmod(self.lock_path, 0o600)
 
@@ -2429,7 +2255,7 @@ class UnresolvedTests(JobFiles):
         self.assertEqual(self.ledger(), [])
 
 
-class RefusalTextTests(JobFiles):
+class RefusalTextTests(OperationHarness):
     """Fix round 6 (F3, F8): a refusal says what is wrong and what to do, never only the class of an exception."""
 
     BARE = r"(?m)(?:refused|REFUSAL: [a-z ]+): [A-Za-z]*(?:Error|Exception)\s*$"
@@ -2438,8 +2264,7 @@ class RefusalTextTests(JobFiles):
         self.linux()  # `restore` and `drill` need the Linux mount table.
         absent = str(self.base / "no-such-root")
         target = ["--target", absent + "/r", "--json-out", absent + "/r.json"]
-        for command in (["import", *self.job], ["verify", *self.job], ["verify-restored", "--target", absent + "/r", *self.job],
-                        ["restore", *target], ["drill", *target], ["restore-cleanup", "--target", absent + "/r"],
+        for command in (["restore", *target], ["drill", *target], ["restore-cleanup", "--target", absent + "/r"],
                         ["record-settings", "--out", absent + "/s.json"], ["info", "--json", "--out", absent + "/i.json"],
                         ["repo-usage", "--out", absent + "/u.json"]):
             with self.subTest(command=command[0]):
@@ -2456,7 +2281,7 @@ class RefusalTextTests(JobFiles):
 
     def test_a_missing_env_file_names_the_path_and_the_variable(self):
         absent = str(self.base / "no-such.env")
-        for command in (["up"], ["status"], ["stop-source"], ["down"], ["import", *self.job]):
+        for command in (["up"], ["status"], ["stop-source"], ["down"], ["info"]):
             with self.subTest(command=command[0]):
                 result = self.refused(*command, KOMIKA_COMPOSE_ENV_FILE=absent)
                 self.assertIn(f"rehearsal refused: the env file {absent} does not exist: KOMIKA_COMPOSE_ENV_FILE must "
@@ -2499,7 +2324,7 @@ class RefusalTextTests(JobFiles):
         self.addCleanup(os.chmod, closed, 0o700)
         path = str(closed / "komika-pg-rehearsal.lock")
         with patch.object(safety, "LOCK_PATH", path):
-            for command in (["up"], ["stop-source"], ["import", *self.job], ["preflight"]):
+            for command in (["up"], ["stop-source"], ["info"], ["preflight"]):
                 with self.subTest(command=command[0]):
                     result = self.refused(*command)
                     self.assertIn(f"rehearsal refused: the caller (uid {os.getuid()}) may not create the operation lock "

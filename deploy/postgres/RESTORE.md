@@ -5,9 +5,7 @@ on it since the cutover on 2026-10-13. Phase 6's gate of two clean rehearsals in
 was waived by the owner, not passed: rehearsal 1 was clean, rehearsal 2 was ended
 early. A restore or point-in-time drill against the live post-cutover repository has not
 been recorded yet. Use PostgreSQL 18.6 and this image's pgBackRest 2.59.3 for every
-restore. Do not delete old volumes or SQLite copies. Keep the old SQLite file, image
-and Litestream data until at least 2026-11-12; removing them after that date is a
-separate, explicit decision, never an automatic one.
+restore. Keep existing PostgreSQL volumes until you have verified the restored data.
 
 There are two separate paths:
 
@@ -40,7 +38,7 @@ things must exist before it.
 
 **The image, built and saved off the host.** Build on a Linux machine with the
 host's CPU architecture, from the reviewed tree, and save the image, the kit
-and the reviewed `komika-server` Linux binary as files with their hashes:
+as files with their hashes:
 
 ```sh
 # On the BUILD machine, never on a host that runs production. `out` is a new directory.
@@ -53,8 +51,7 @@ docker image inspect --format '{{.Id}}' komika-postgres:18.6-pgbackrest-2.59 > "
 docker save -o "$out/komika-postgres-image.tar" komika-postgres:18.6-pgbackrest-2.59
 gzip -- "$out/komika-postgres-image.tar"
 tar -C deploy -czf "$out/komika-postgres-kit.tar.gz" --exclude=__pycache__ --exclude='test_*.py' --exclude=tests.sh --exclude=image-test.sh postgres
-cp -- /absolute/reviewed/linux-build/komika-server "$out/komika-server"
-(cd -- "$out" && sha256sum komika-postgres-image.tar.gz komika-postgres-kit.tar.gz komika-server image-id.txt > SHA256SUMS && sha256sum SHA256SUMS)
+(cd -- "$out" && sha256sum komika-postgres-image.tar.gz komika-postgres-kit.tar.gz image-id.txt > SHA256SUMS && sha256sum SHA256SUMS)
 ```
 
 Write down the last line (the hash of `SHA256SUMS`) where the host cannot
@@ -117,9 +114,7 @@ endings. It is the only source of settings and credentials. Only plain
   `KOMIKA_REHEARSAL_PG_MEMORY` (default `3g`, ceiling `4g`), `_PG_SHM` (`1g`),
   `_PG_CPUS` (default `1`, ceiling `2`), `_PG_PIDS` (`256`). Backup scheduler:
   `KOMIKA_REHEARSAL_BACKUP_MEMORY` (`512m`), `_BACKUP_CPUS` (`1`),
-  `_BACKUP_PIDS` (`128`). Importer and verifier: `KOMIKA_REHEARSAL_JOB_MEMORY`
-  (default `2g`, ceiling `4g`), `_JOB_CPUS` (default `1`, ceiling `2`),
-  `_JOB_PIDS` (`256`). Throwaway restore: `KOMIKA_RESTORE_MEMORY` (default
+  `_BACKUP_PIDS` (`128`). Throwaway restore: `KOMIKA_RESTORE_MEMORY` (default
   `3g`, ceiling `4g`), `KOMIKA_RESTORE_CPUS` (default `1`, ceiling `2`),
   `KOMIKA_RESTORE_PIDS` (default `128`, ceiling `256`). Memory also caps swap.
   PostgreSQL keeps its 1 GiB shared buffers, so leave headroom above that; the
@@ -174,9 +169,8 @@ compares device and inode numbers of the root and its ancestors and, on Linux,
 the backing source of the root's mount in `/proc/self/mountinfo`. A host
 container that bind-mounts `/` or an ancestor of the root (some monitoring
 agents do) therefore blocks the rehearsal; choose a root that no container
-sees. Every output file (`--report`, `--out`, `--json-out`) and every restore
-target (`--target`) must be a new name directly under the root. The SQLite copy
-and the server binary are read from anywhere, read-only.
+sees. Every output file (`--out`, `--json-out`) and every restore
+target (`--target`) must be a new name directly under the root.
 
 Before every subcommand the tooling checks the SHA-256 of
 `rehearsal-compose.yml` against the value pinned in `safety.py`, renders the
@@ -232,7 +226,6 @@ prints one `disk_gate` line per filesystem.
 | Step | Estimated need on Docker's data root | Estimated need on the rehearsal root |
 | --- | --- | --- |
 | `up`, `backup` | floor | floor |
-| `import` | floor + 2.2 x the SQLite file size | floor |
 | `restore` | floor | floor + 1.3 x the database size of the backup it will use (`backup[].info.size` of `pgbackrest info`) |
 | `drill` | floor | floor + 1.3 x that size, while the source still fills the disk |
 
@@ -241,16 +234,6 @@ When both are one filesystem the two needs are added to one floor.
 What this gate is and is not. It is an estimate, measured once before the
 step. It is not a reservation and not a guarantee that the floor holds:
 
-- The factors come from one production-sized run: a 2.76 GB SQLite file became
-  a 3.4 GB PostgreSQL base and up to 4.0 GB of WAL that stayed in `pg_wal`
-  until the stanza existed. That is 7.4 GB, or 2.7 x the SQLite file, more
-  than the 2.2 x the gate asks for. The pre-flight below therefore checks
-  the image, 2.7 x the SQLite file and the floor by hand before anything is
-  loaded. Where the free space is several times that (the host measured for
-  the first production-side run had 77 GB free and 18 GB of available
-  memory on 2026-10-12) the check passes and the documented order stands:
-  `import` before `stanza-create`. The check stays, because the next host
-  or the next data set may be different. Other data can need more.
 - WAL that a restore recovers, temporary files of a job and Docker's own
   metadata are not in the estimate.
 - Two kit steps cannot run at once (the operation lock), but production and
@@ -262,7 +245,7 @@ So watch the disk yourself: `status` prints `watch-free` lines (free bytes and
 the floor of both filesystems), `preflight` prints the gate and its rules, and
 the pre-flight below defines `after`, which prints both filesystems after
 every step, and a watch loop for the two long steps with the abort criteria
-("While `import` and `restore` run"). A `drill`, or a `restore` before the source volumes are gone,
+("While `restore` runs"). A `drill`, or a `restore` before the source volumes are gone,
 needs source and target at once; when that does not fit, the refusal names the
 order that does: `stop-source`, `destroy-source-volumes
 --yes-delete-rehearsal-volumes`, then `restore --target-time`.
@@ -271,7 +254,7 @@ order that does: `stop-source`, `destroy-source-volumes
 
 Work in one terminal multiplexer session for the whole run, so that a lost
 SSH connection does not end a step (a lost terminal sends SIGHUP; the kit
-then unwinds cleanly, but an import of an hour is lost):
+then unwinds cleanly, but the active step is interrupted):
 
 ```sh
 command -v tmux && tmux new-session -s komika-pg-phase5a-r5
@@ -280,8 +263,7 @@ command -v tmux && tmux new-session -s komika-pg-phase5a-r5
 Reattach after a lost connection with `tmux attach -t komika-pg-phase5a-r5`.
 If the host has neither `tmux` nor `screen`, stop and decide with the host's
 owner; this runbook installs nothing on the host. Everything below runs in
-the first window of that session (bash); the watch loop of "While `import`
-and `restore` run" gets a second window.
+the first window of that session (bash); the watch loop of "While `restore` runs" gets a second window.
 
 **Paste one block, read what it printed, then paste the next.** Every block
 is a function that runs when its last line is pasted. A check that fails
@@ -361,11 +343,11 @@ this host; no volume has driver options you do not know (if a volume of
 another project shows options with credentials, do not copy that output
 anywhere). Free space on Docker's data root, measured now, must cover
 everything that is still to come: the loaded image (block C checks its
-uncompressed size), the SQLite copy and the binary if they land on the same
-filesystem, 2.7 x the SQLite file for the import, and the 3 GiB floor. If the
+uncompressed size), the rehearsal dataset and its PostgreSQL storage, and the
+3 GiB floor. If the
 daemon keeps images on another filesystem (a separate containerd store),
 measure that one too. Available memory must cover the rehearsal's limits
-(3 GiB PostgreSQL, 2 GiB job, 3 GiB restore; the restore runs after the
+(3 GiB PostgreSQL, 3 GiB restore; the restore runs after the
 source is gone) beside production's current use. What a `STOP` line of this
 block means: `DOCKER_HOST` or `DOCKER_CONTEXT` is set in the shell (another
 socket would pass the next test, and block C loads the image before block D
@@ -442,8 +424,6 @@ preflight_b() {
   root=$base/root
   records=$base/records
   env_file=$base/private/rehearsal.env
-  sqlite=$base/input/copy.sqlite3
-  server_bin=$base/input/komika-server
   image=komika-postgres:18.6-pgbackrest-2.59
   made=
   test ! -e "$base" && test ! -L "$base" && echo "base is new: $base" \
@@ -487,62 +467,40 @@ directory. No `--delete`, no other target:
 
 ```sh
 # On the BUILD machine. HOST is the host's SSH name.
-scp -- "$out/komika-postgres-image.tar.gz" "$out/komika-postgres-kit.tar.gz" "$out/komika-server" "$out/image-id.txt" "$out/SHA256SUMS" HOST:/srv/komika-pg-phase5a-r5/transfer/
+scp -- "$out/komika-postgres-image.tar.gz" "$out/komika-postgres-kit.tar.gz" "$out/image-id.txt" "$out/SHA256SUMS" HOST:/srv/komika-pg-phase5a-r5/transfer/
 ```
 
-Put the checkpointed standalone SQLite copy at `$sqlite` (mode 0600 or 0640,
-readable by you) and write the env file at `$env_file` with an editor under
-`umask 077`. How the SQLite copy is taken is not part of this kit: it must be
-a consistent copy made without stopping or locking production (for example
-from the existing backup), never the live file; record its size and how it
-was made.
-
-The copy must be at the latest SQLite migration of the reviewed tree
-(`apps/server/migrations`). `import` checks that first and refuses a copy
-that is behind within seconds (`source is not at latest SQLite migration`);
-nothing is written then, but the run must be aborted, because block C has
-recorded the hash of the copy and the report name is used. Production may
-run an older release than the tree (seen on 2026-10-12: one migration
-behind). Block C prints the count and the highest version of the copy's
-migration history; compare them with the tree (`ls apps/server/migrations |
-wc -l` and the highest file number) before you go on. When the copy is
-behind, bring the COPY up, never the live file, before block C: with
-`sqlx-cli` of the tree's sqlx version (`sqlx migrate run --source
-MIGRATIONS --database-url sqlite:///ABSOLUTE/copy.sqlite3`), built off the
-host and run in a container without network and with memory, CPU and
-process limits, on a directory that holds only the copy. It also compares
-the checksum of every migration that is already applied with the tree's
-file. Afterwards no `-wal` or `-journal` file may be left beside the copy.
-The hosted cutover of Phase 6 does not need this step: there the server's
-own start-up import migrates its staged copy.
+Write the env file at `$env_file` with an editor under `umask 077`.
+The rehearsal needs an application dataset already in PostgreSQL 18 format,
+including the `work`, `chapter` and `users` tables. Prepare a consistent
+PostgreSQL dump and record its size, hash and expected row counts separately.
+This kit does not load application data. After `r up`, restore that dump into
+the rehearsal's empty `komika` database before taking its first backup. Keep
+the dataset private and never connect a serving application to the rehearsal.
 
 ```sh
 # C. Hashes, inputs and space first; only then the load. Nothing is built or pruned.
 preflight_c() {
   test "$gate" = B || { echo "STOP: block B has not passed in this shell"; return 1; }
   (cd -- "$base/transfer" && sha256sum SHA256SUMS && sha256sum -c SHA256SUMS) || { echo "STOP: a transferred file does not have its recorded hash"; return 1; }
-  stat -c '%u %a %s %n' -- "$env_file" "$sqlite" "$base/transfer/komika-server" || { echo "STOP: the env file, the SQLite copy or the binary is missing"; return 1; }
+  stat -c '%u %a %s %n' -- "$env_file" || { echo "STOP: the env file is missing"; return 1; }
   test -f "$env_file" && test ! -L "$env_file" && test "$(stat -c '%u %a' -- "$env_file")" = "$(id -u) 600" || { echo "STOP: the env file is not your own regular file with mode 600"; return 1; }
-  test -f "$sqlite" && test ! -L "$sqlite" && test ! -s "$sqlite-wal" && test ! -s "$sqlite-journal" || { echo "STOP: the SQLite copy is not a standalone regular file"; return 1; }
-  python3 -I -c 'import sqlite3, sys; c = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro&immutable=1", uri=True); print("sqlite_migrations count=%d highest=%d not_successful=%d" % c.execute("select count(*), max(version), sum(not success) from _sqlx_migrations").fetchone())' "$sqlite" || { echo "STOP: the migration history of the SQLite copy could not be read"; return 1; }
   sed -n 's/^\([A-Z0-9_]*\)=.*/\1/p' -- "$env_file"
   gzip -l -- "$base/transfer/komika-postgres-image.tar.gz"
   df -B1 -- "$docker_root" "$base"
   image_bytes=$(gzip -l -- "$base/transfer/komika-postgres-image.tar.gz" | awk 'NR == 2 {print $2}')
   test "${image_bytes:-0}" -gt 0 || { echo "STOP: image size unknown; nothing was loaded"; return 1; }
-  need=$(( image_bytes + $(stat -c %s -- "$sqlite") * 27 / 10 + 3 * 1024 * 1024 * 1024 ))
+  need=$(( image_bytes + 3 * 1024 * 1024 * 1024 ))
   avail=$(df -B1 --output=avail -- "$docker_root" | tail -n 1 | tr -d ' ')
   if test "$avail" -ge "$need"
-  then echo "headroom ok: $avail free on Docker's data root >= $need (image + 2.7 x SQLite + 3 GiB floor)"
-  else echo "STOP: image, import peak and floor need $need bytes on Docker's data root, $avail are free; nothing was loaded"; return 1
+  then echo "headroom ok: $avail free on Docker's data root >= $need (image + 3 GiB floor)"
+  else echo "STOP: image and floor need $need bytes on Docker's data root, $avail are free; nothing was loaded"; return 1
   fi
   tar -xzf "$base/transfer/komika-postgres-kit.tar.gz" -C "$kit" --strip-components=1 --no-same-owner || { echo "STOP: the kit archive could not be unpacked"; return 1; }
-  install -m 0755 -- "$base/transfer/komika-server" "$server_bin" || return 1
   gzip -dc -- "$base/transfer/komika-postgres-image.tar.gz" | docker load || { echo "STOP: docker load failed"; return 1; }
   docker image inspect --format '{{.Id}}' "$image" || { echo "STOP: the loaded image does not carry the expected tag"; return 1; }
   cat -- "$base/transfer/image-id.txt"
   rm -- "$base/transfer/komika-postgres-image.tar.gz"
-  sha256sum -- "$sqlite" "$server_bin" | tee "$records/input-hashes.txt"
   after load || return 1
   echo "BLOCK C OK"
 }
@@ -551,17 +509,13 @@ preflight_c && gate=C; echo "gate=$gate (C expected)"
 
 Read as well, or stop: the first hash equals the one you wrote down on the
 build machine; the `sed` line prints key NAMES only (never print the file)
-and they are the keys listed above; the `sqlite_migrations` line shows the
-count and the highest version of the tree's `apps/server/migrations` and
-`not_successful=0` (the line opens the copy read-only and immutable, so it
-creates no file beside it; `-I` keeps Python from loading a module out of the
-kit directory); the env file has a new `KOMIKA_R2_PREFIX` that starts
+and they are the keys listed above; the env file has a new `KOMIKA_R2_PREFIX` that starts
 with `rehearsal/`, `KOMIKA_PRODUCTION_R2_PREFIX` set to production's real
 prefix, `KOMIKA_PG_INIT_NEW` present and no `KOMIKA_R2_VERIFY_TLS`; the two
 image IDs printed at the end are equal (if the two machines use different
 image stores they can differ: then `preflight` must still report the seven
 kit files as identical, and you record both IDs). The space check runs before
-anything is loaded: it asks for the uncompressed image, 2.7 x the SQLite file
+anything is loaded: it asks for the uncompressed image
 and the 3 GiB floor on Docker's data root. On a host with several times that
 free it passes; it stays in the block because the next host may be smaller.
 The image's size comes from `gzip -l`; a missing or zero value stops the
@@ -616,13 +570,12 @@ dashboard: R2, the bucket's metrics, and the account's R2 usage). Note that
 these counters lag; write down how long you waited. The kit has no command
 for account metrics and none that lists production's prefix.
 
-### While `import` and `restore` run
+### While `restore` runs
 
-`import` and `restore` are the two long steps and the two that load the
-disk; nothing in the kit limits block I/O. Run them at the quiet time of the
-production service. Before each of them, open a second window in the same
-tmux session (`Ctrl-b c`), paste this block once, and start the loop
-(`watch_step import`, later `watch_step restore`). It is read-only, takes no
+`restore` can take a long time and load the disk; nothing in the kit limits
+block I/O. Run it at a quiet time for production. Open a second window in the
+same tmux session (`Ctrl-b c`), paste this block once, and start the loop
+(`watch_step restore`). It is read-only, takes no
 lock and writes only into the run's `records` directory; stop it with Ctrl-C
 when the step has ended.
 
@@ -659,18 +612,13 @@ Docker's data root and on the run's directory, the available memory, the
 I/O wait of the last five seconds (`vmstat`, column `wa`), PostgreSQL's
 archiver counters with the number of WAL segments that wait and the size of
 `pg_wal`, and whether the baseline of the other containers still holds.
-Expected during a production-sized `import`: the free bytes on Docker's data
-root fall by up to 2.7 x the SQLite file (7.4 GB for 2.76 GB), `pg_wal_bytes`
-rises to about 4 GB, `ready_segments` climbs to a few hundred and
-`failed_count` grows slowly (no stanza exists yet, see "Notes on single
-steps"), and the available memory does not fall by more than about 5 GB
-(3 GiB PostgreSQL and 2 GiB job). During `restore` there is no source
-container, so the archiver line is replaced by a note.
+During `restore` there is no source container, so the archiver line is
+replaced by a note.
 
 Abort when any one of these holds; agree on them before the step starts:
 
 - free bytes on Docker's data root below 20 GiB, or fallen by more than
-  12 GB since the start of the import;
+  12 GB since the start of the step;
 - `pg_wal_bytes` above 6 GB;
 - `MemAvailable` below 4 GiB;
 - a production container's restart count or start time changed (`after`, or
@@ -716,9 +664,8 @@ so the lines after a failed step, among them the removal of the source
 volumes and of the rehearsal repository, would still run.
 Every line prints the step's exit status and then runs `after`; stop at the
 first status that is not 0 and at the first `STOP`. The long steps carry
-`time`, so their wall time is on record. Start `watch_step import` in the
-second window before the `import` line and `watch_step restore` before the
-`restore` line. Never run `r drill` on a host that keeps the source and has
+`time`, so their wall time is on record. Start `watch_step restore` in the
+second window before the `restore` line. Never run `r drill` on a host that keeps the source and has
 little disk: this order removes the source before it restores.
 
 ```sh
@@ -726,9 +673,7 @@ test "$gate" = D && echo "pre-flight passed: the drill may start" || echo "STOP:
 r preflight --init-root ; echo "exit=$?" ; after preflight
 r up ; echo "exit=$?" ; after up
 r psql-check ; echo "exit=$?"
-time r import --sqlite "$sqlite" --server-bin "$server_bin" --report "$root/import.json" ; echo "exit=$?" ; after import
-time r verify --sqlite "$sqlite" --server-bin "$server_bin" --report "$root/verify.json" ; echo "exit=$?" ; after verify
-sha256sum -c -- "$records/input-hashes.txt"
+# Stop here until the PostgreSQL application dataset is loaded and its row counts checked.
 r stanza-create ; echo "exit=$?"
 time r backup full --first ; echo "exit=$?" ; after backup-full
 r logs postgres --tail 99999 2>&1 | grep -ci 'dropped' | tee "$records/dropped-wal-lines.txt"
@@ -748,7 +693,6 @@ r status ; echo "exit=$?"
 r stop-source ; echo "exit=$?" ; after stop-source
 r destroy-source-volumes --yes-delete-rehearsal-volumes ; echo "exit=$?" ; after destroy-source-volumes
 time r restore --target "$root/pitr" --target-time "$T" --source-settings "$root/source-settings.json" --keep --json-out "$root/pitr.json" --expect-marker before-pitr --expect-no-marker after-pitr ; echo "exit=$?" ; after restore
-time r verify-restored --target "$root/pitr" --sqlite "$sqlite" --server-bin "$server_bin" --report "$root/pitr-verify.json" ; echo "exit=$?" ; after verify-restored
 r restore-cleanup --target "$root/pitr" ; echo "exit=$?" ; after restore-cleanup
 r repo-usage --out "$root/usage-before-destroy.json" ; echo "exit=$?"
 r repo-destroy --yes-delete-rehearsal-repo ; echo "exit=$?" ; after repo-destroy
@@ -763,11 +707,9 @@ What to check after each step:
 | `preflight --init-root` | Last line `PREFLIGHT OK`; `new_project=` line (nothing of this project existed); seven image files identical; both prefixes as intended; `source_storage=` line; both subnets free; the root's owner, mode and mount. |
 | `up` | `postgres state=running health=healthy`; a new cluster was initialized (first `up` on a new prefix). `up` itself has compared the created container's real limits, environment and mount sources with the model. Then set `KOMIKA_PG_INIT_NEW=0` in the env file with an editor. |
 | `psql-check` | `application_health=ok`; PostgreSQL 18.6; data checksums on; SCRAM; the role is no superuser; locale and `pg_trgm` as expected. |
-| `import` | Exit 0 and `complete` true in `import.json`; the wall time that `time` printed; the lowest `free_bytes_docker_root` and the highest `pg_wal_bytes` in `records/watch-import.txt`; no job container is left (`r status`). |
-| `verify` | Exit 0 and `complete` true; the `sha256sum -c` line says `OK` for both inputs. |
 | `stanza-create` | Exit 0. |
 | `backup full --first` | Exit 0; the wall time. |
-| the `grep -ci 'dropped'` line | A number, kept in `records/dropped-wal-lines.txt`. It counts lines of the PostgreSQL log that mention dropped WAL. With `archive-push-queue-max` (1 GiB) pgBackRest may drop queued segments once the stanza exists instead of uploading the whole queue of the import. That is harmless for the drill (the base of the point-in-time restore is the full backup taken afterwards) and explains an `archive_bytes` below the estimate; record the number. |
+| the `grep -ci 'dropped'` line | A number, kept in `records/dropped-wal-lines.txt`. It counts lines of the PostgreSQL log that mention dropped WAL. With `archive-push-queue-max` (1 GiB) pgBackRest may drop queued segments once the stanza exists when uploads fall behind. That is harmless for the drill (the base of the point-in-time restore is the full backup taken afterwards) and explains an `archive_bytes` below the estimate; record the number. |
 | `info --json --out`, `repo-usage --out` | Both files exist under the root: per-backup database and repository sizes, and the object count and bytes under the rehearsal prefix. |
 | `check` | Exit 0. |
 | `sql-marker --label before-pitr` | `T=` printed, a UTC time; it is also in `records/target-time.txt`. If the shell is lost, read it from there. |
@@ -780,7 +722,6 @@ What to check after each step:
 | `stop-source` | Only the rehearsal's containers were removed; `after` says the other containers are unchanged. |
 | `destroy-source-volumes` | Both volumes removed; `after` shows the space is back; the rehearsal network is still there. |
 | `restore` | Exit 0; the wall time; `marker expectations met: present=before-pitr absent=after-pitr`; `operator_markers=before-pitr`; `pitr.json` holds `restore_seconds`, `recovery_seconds`, `restored_bytes`, the per-backup sizes and `repository_usage`. |
-| `verify-restored` | Exit 0 and `complete` true against the same SQLite copy. |
 | `restore-cleanup` | `removed_containers=1 removed_networks=1`; the restored directory stays. |
 | `repo-destroy` | Exit 0; `repository_files_after=0`. |
 | `down`, `status` | Services, volumes, network, jobs and kept restores of the project are all absent. |
@@ -790,7 +731,7 @@ first. If it shows a job container or an `UNRESOLVED` line, run `r
 stop-source` (it waits for a late creation, at most 30 seconds, removes the
 container and clears the record), then `r up` again and continue; see "Notes
 on single steps". To give the run up instead, follow the abort action under
-"While `import` and `restore` run".
+"While `restore` runs".
 
 When the results are accepted, remove the restored directory. It belongs to
 the image's postgres user (uid 999), so this needs root. Stop the watch loop
@@ -839,11 +780,11 @@ count as "nothing is mounted" or "no container".
 
 Finally read the account's R2 numbers again, after the counters' lag, and
 record them beside the first reading and the three `usage-*.json` files. The
-reports under `$root`, the records, the SQLite copy and the env file stay
+reports under `$root`, the records, the PostgreSQL dump and the env file stay
 until the results are accepted.
 
 Before the last removal, copy the evidence off the host: the removal deletes
-the records (`watch-*.txt`, `input-hashes.txt`, `others-*.txt`, the target
+the records (`watch-*.txt`, `others-*.txt`, the target
 time) and every report under `$root`. Run this on the build machine, into
 the `out` directory of the build; it copies the records and the top-level
 JSON reports only, never the `private` or the `input` directory:
@@ -856,8 +797,7 @@ scp -- 'HOST:/srv/komika-pg-phase5a-r5/root/*.json' "$out/evidence/"
 ls -l -- "$out/evidence" "$out/evidence/records"
 ```
 
-Read the listing: the reports (`import.json`, `verify.json`, `pitr.json`,
-`pitr-verify.json`, `source-settings.json`, the two `*-info.json` and the
+Read the listing: the reports (`pitr.json`, `source-settings.json`, the two `*-info.json` and the
 three `usage-*.json`) and the records are there and not empty. Only then
 the one directory of this run, which holds a copy of production's data and
 the env file, is removed the same way as the restored directory, again as
@@ -901,17 +841,6 @@ the archived WAL: without one it ends recovery with `recovery ended before
 configured recovery target was reached` and shuts down. The kit then fails at
 once with that line and the advice to choose an earlier time.
 
-What `verify-restored` compares. The Phase 2 verifier compares the application
-database `komika` in the restored server with the SQLite copy. That is the
-state at T only if nothing wrote to `komika` between the import and T, and
-that is how the drill is built: no application runs against the rehearsal
-database, and everything the drill itself writes before and after T (both
-markers, the marker drill's rows) goes to the separate database
-`komika_pitr_drill`, which the verifier does not read. So use the same SQLite
-copy for `import`, `verify` and `verify-restored`. Changes to `komika` after
-the import would make `verify` and `verify-restored` fail, correctly: there is
-then no SQLite file that represents T.
-
 Other subcommands: `r status` (containers, health, volumes, job containers,
 kept restores, the operation recorded in the lock file, unresolved job
 containers, `watch-free`, backup status, `pgbackrest info`), `r info [--json
@@ -925,27 +854,6 @@ target at once).
 
 Notes on single steps:
 
-- `import` and `verify` run the given `komika-server` Linux binary in a
-  throwaway container from the same image: unprivileged user, read-only root
-  filesystem, no capability, rehearsal network only, memory, CPU and PID
-  limits. The binary must run inside that image: the image is Debian 12
-  (bookworm) with the GNU C library 2.36, for the CPU architecture it was
-  built on. So build the binary for the same architecture against glibc 2.36
-  or older, which is what the builder stage of `deploy/server.Dockerfile`
-  does (`rust:1-slim-bookworm`), or as a fully static musl binary. A binary
-  built on a newer distribution (for example Ubuntu 24.04, glibc 2.39) or on
-  macOS does not start there. Check it before the run, without network:
-  `docker run --rm --network none --entrypoint /bin/sh --mount
-  type=bind,src=/absolute/komika-server,dst=/b/komika-server,readonly
-  komika-postgres:18.6-pgbackrest-2.59 -c 'ldd /b/komika-server'` must
-  resolve every library and print no `not found`. The SQLite file and the
-  binary are mounted read-only; the database URL with the password travels on
-  standard input. The SQLite file must be a checkpointed standalone copy: a
-  non-empty `-wal` or `-journal` beside it is refused. Each run gets a new work
-  directory under the root holding `report.json`; `--report` copies it. The
-  job's exit status is the subcommand's exit status. A root caller's job runs as
-  uid 65534, so the copy must be readable and the binary executable by that
-  user.
 - Job containers are named `<project>-job-<8 hex>`, metadata readers
   `<project>-meta-<8 hex>`, and both carry the rehearsal label and explicit
   log bounds (`json-file`, `max-size=10m`, `max-file=3`), like the restore
@@ -962,27 +870,18 @@ Notes on single steps:
   appeared and clears the record. The daemon may still create a
   container later than that; the next step would then find it by its label
   and refuse again, and `stop-source` removes it. After an
-  interrupted `import` run the same `import` again with the same SQLite copy:
-  the importer continues its own unfinished import of the identical source and
-  refuses any other target state. To start from an empty database instead, run
-  `stop-source`, `destroy-source-volumes --yes-delete-rehearsal-volumes` and
-  begin again at `up`. After a kill that no handler can catch (SIGKILL, power
-  loss) `r status` lists what is left and `stop-source` or `down` removes it.
-- `verify` and `verify-restored` compare against the application database
-  `komika` only. Markers of `sql-marker` and of the drill live in their own
-  database `komika_pitr_drill`, because the importer needs an empty target and
-  the verifier fingerprints every schema of `komika`.
+  interruption, run `r status` before continuing. After a kill that no handler
+  can catch (SIGKILL, power loss), `stop-source` or `down` removes leftovers.
 - `record-settings` must run after the last change of a source ceiling and
   before `destroy-source-volumes`.
 - `archive-status` prints PostgreSQL's own counters since the cluster was
-  created. In the documented order the stanza is created after the import, so
-  every archive attempt before `stanza-create` fails and stays in
-  `failed_count` (66 in the local run). What matters after `backup`:
+  created. Archive attempts before `stanza-create` fail and stay in
+  `failed_count`. What matters after `backup`:
   `last_archived_time` is later than `last_failed_time`, `ready_segments=0`,
   and `pg_wal_bytes` no longer grows.
 - `drill` and `restore` print the row counts of `work`, `chapter` and `users`
-  of the restored `komika` database. A backup taken before `import` has no
-  such tables; the step then fails and says so.
+  of the restored `komika` database. A backup taken before loading the
+  application dataset has no such tables; the step then fails and says so.
 - `up` in a rehearsal starts an existing cluster or initializes a new one on
   an empty repository. It never restores. When the source volumes are empty or
   absent and the rehearsal prefix already holds a backup, `up` is refused
@@ -1020,8 +919,7 @@ Notes on single steps:
   `safety.py`). Everything else is refused before pgBackRest runs, including
   `--reset-*`, `--no-*`, `--config*`, `--repo*`, `--stanza`, `expire` and
   `repo-rm`.
-- Network. The two services, the importer, the verifier and every repository
-  reader join only the rehearsal bridge `172.30.21.0/24`; the image identity
+- Network. The two services and every repository reader join only the rehearsal bridge `172.30.21.0/24`; the image identity
   check runs with `--network none`; a restore has its own bridge
   `172.29.42.0/24`. No rehearsal container joins Docker's default bridge.
   Both bridges have outbound access, because PostgreSQL and pgBackRest must
@@ -1033,8 +931,8 @@ repository: every `KOMIKA_R2_*` value and `KOMIKA_PRODUCTION_R2_PREFIX` must
 then be absent (the wrapper and the image both refuse them), pgBackRest is
 never configured, PostgreSQL runs with `archive_mode=off` and logs a loud
 warning, and `stanza-create`, `backup`, `check`, `info`, `drill`, `restore`,
-`repo-destroy` and `up --with-scheduler` are refused. It proves import, verify
-and the guards; it proves nothing about backup or recovery.
+`repo-destroy` and `up --with-scheduler` are refused. It proves the startup
+and storage guards; it proves nothing about backup or recovery.
 
 For another rehearsal use a new project, prefix and root: `preflight
 --init-root` refuses to create a root while any container, volume or network
@@ -1091,13 +989,12 @@ You must make sure of these yourself:
 - The image was built from the reviewed tree. The kit proves that image and
   kit directory carry the same seven files, nothing about the base image, the
   installed packages or the executables; compare the hash of the image file.
-- `docker` on `PATH` is the real client; the server binary is the reviewed
-  build; no production resource carries a `cc.komiq.rehearsal` label.
+- `docker` on `PATH` is the real client; no production resource carries a `cc.komiq.rehearsal` label.
 - Memory, CPU, PID and log limits are set and compared; block I/O is not
   limited: Compose's `blkio_config.weight` is accepted by Docker but has no
   effect unless the host uses the BFQ scheduler or enables `io.cost`, and a
   throughput limit needs the host's own device path, which the fixed topology
-  cannot name. Run the import and the restore at a quiet time and watch the
+  cannot name. Run the restore at a quiet time and watch the
   host and production's response times.
 - The disk gate is an estimate before a step, not a reservation (see "Disk
   space"). The operation lock serializes this kit, not the host.
@@ -1182,7 +1079,7 @@ items fail startup. Match it to the selected Compose bridge. Application access
 is TCP SCRAM only; the Unix socket permits only postgres OS-user peer access.
 Health uses TCP SCRAM and stays false until recovery ends.
 
-## First hosted installation / Phase 6 import
+## First hosted installation
 
 Set `KOMIKA_POSTGRES_PASSWORD` to random hex (at least 24 URI-safe characters).
 Set all five `KOMIKA_R2_*` variables in the mode-0600 `.env` beside the hosted
@@ -1196,10 +1093,7 @@ empty-volume startup; finish provisioning on the retained original volume.
 hc up -d --build postgres
 hc exec -T --user postgres postgres /opt/komika-postgres/health.sh
 hc exec -T --user postgres postgres /opt/komika-postgres/pgbackrest.sh stanza-create
-# Hosted cutover: start the server for automatic import while public writes are stopped.
-# /data/komika.sqlite3 must be the checked final snapshot, not a live SQLite file.
 hc up -d --build server
-# Wait for import + verifier to finish; on failure server exits, SQLite stays intact.
 hc logs server
 hc exec -T --user postgres postgres /opt/komika-postgres/backup.sh bootstrap-full
 hc exec -T --user postgres postgres /opt/komika-postgres/backup.sh check
@@ -1208,19 +1102,10 @@ hc up -d postgres-backup
 ```
 
 Return `KOMIKA_PG_INIT_NEW=0` in `.env` after provisioning. Check both database and
-backup health before public traffic. Phase 6 must isolate this first imported
-server from users until verification, first full and WAL checks succeed.
-The server renames SQLite only after verified import; retain that renamed copy.
+backup health before public traffic.
 No backup variables means local initdb without archiving and a loud warning.
 Partial configuration, authentication/network/corruption errors and failed
 restores fail startup. Do not bypass a failure with the new-install flag.
-
-The server that `hc up -d --build server` starts imports under the Compose
-file's serving limit of 4 GiB. That does not hold a large SQLite file: with
-3 GiB and a source of 3.24 GB the import's repair stage took 75 minutes
-instead of 5 to 6 (2026-10-13). Give a large import an override with a
-higher limit (the hosted move used 8 GiB) and check that limit against the
-file sizes first.
 
 The scheduler runs full Sunday 02:00 UTC, check daily 02:00 UTC and incremental
 daily 03:00 UTC, including Sunday. Two full chains are retained, normally about
@@ -1265,15 +1150,12 @@ hcr exec -T --user postgres postgres \
   psql -X -w -U postgres -d komika -Atc "SELECT 'work=' || count(*) FROM work UNION ALL SELECT 'chapter=' || count(*) FROM chapter UNION ALL SELECT 'users=' || count(*) FROM users"
 ```
 
-Compare counts with the recorded snapshot. With a matching SQLite copy, use the
-Phase 2 verifier (output path must not exist; URL travels via environment):
+Compare counts with the recorded PostgreSQL snapshot.
 
 ```sh
-hcr run --rm --no-deps \
-  --entrypoint /bin/sh server -c 'export KOMIKA_IMPORT_POSTGRES_URL="$DATABASE_URL"; exec komika-server verify-sqlite-postgres --sqlite /data/final-cutover.sqlite3 --json-out /data/latest-verify.json'
 hcr exec -T --user postgres postgres /opt/komika-postgres/backup.sh check
 hcr exec -T --user postgres postgres /opt/komika-postgres/backup.sh full
-# Only after verifier, fresh full and application smoke checks succeed:
+# Only after row-count checks, fresh full and application smoke checks succeed:
 hcr up -d server postgres-backup
 ```
 
@@ -1284,7 +1166,7 @@ to make a failed restore appear to succeed.
 
 ## Point-in-time inspection in an empty directory
 
-A rehearsal uses `r restore`, `r verify-restored` and `r restore-cleanup` from
+A rehearsal uses `r restore` and `r restore-cleanup` from
 the rehearsal section. The hosted recovery form needs separate operator
 authorization, the hosted exports above, no `KOMIKA_REHEARSAL_*` variable and
 the explicit flag:
@@ -1338,28 +1220,13 @@ a late success is rejected.
 With `--keep` the helper prints `restored_directory`, `throwaway_container` and
 `throwaway_network` and includes them in the JSON. The restored HBA permits
 role `komika` over TCP only from `172.29.42.0/24`, plus the postgres peer
-socket; source and production CIDRs are removed. A rehearsal verifies with
-`r verify-restored --target DIR ...`, which finds the kept container by the
-target directory. Hosted recovery runs the built server verifier on the
-restore's bridge:
+socket; source and production CIDRs are removed. Inspect the restored rows
+and marker results before cleanup.
 
 ```sh
 # Replace both names below with the exact printed names.
 restore_container=komika-pitr-PRINTEDNAME
 restore_network=komika-pitr-PRINTEDNAME-network
-# Matching SQLite copy must represent this same instant, not today's database.
-# Load the password from the private env file in a subshell; only its NAME is in argv.
-(
-  set +x
-  set -a
-  . "$KOMIKA_COMPOSE_ENV_FILE"
-  set +a
-  docker run --rm --network "$restore_network" -e KOMIKA_POSTGRES_PASSWORD \
-    -e "RESTORE_HOST=$restore_container" \
-    --mount type=bind,src=/absolute/verification,dst=/verification \
-    --entrypoint /bin/sh komiq-postgres-server:review -c \
-    'export KOMIKA_IMPORT_POSTGRES_URL="postgres://komika:${KOMIKA_POSTGRES_PASSWORD}@${RESTORE_HOST}:5432/komika"; exec komika-server verify-sqlite-postgres --sqlite /verification/matching-T.sqlite3 --json-out /verification/pitr-verify.json'
-)
 # Then stop and remove exactly these two, nothing else:
 docker exec --user postgres "$restore_container" pg_ctl -D /restore -w -m fast stop
 docker rm -v "$restore_container"
@@ -1389,7 +1256,7 @@ database time T → WAL switch/archive acknowledgement and actual archive-get �
 second commit → WAL switch/archive-get. It restores a pre-T backup to T into a
 new directory and proves first present/second absent, with authenticated
 application access and row counts. It always stops/removes its container, keeps
-the directory for the verifier, prints backup set/restore/recovery seconds/bytes,
+the directory for inspection, prints backup set/restore/recovery seconds/bytes,
 and lists total prefix bytes from repo-ls. Request counts are printed if
 pgBackRest reports statistics; otherwise it explicitly reports unavailable. R2 account metrics are
 the billing authority; object counts are not request counts.
@@ -1412,7 +1279,7 @@ Missing size/archive fields are null, never invented zeros. The separately
 printed repo-ls byte sum includes WAL/metadata; request counts remain distinct.
 
 Run twice in Phase 6. Marker checks prove the target boundary, not complete data
-integrity; run the canonical Phase 2 verifier when a matching SQLite copy exists.
+integrity; compare restored row counts and application behavior with recorded expectations.
 Record actual WAL/day, incremental/full compressed sizes, peak R2 storage through
 expiration of a third full, request counts and restore time at real size.
 
@@ -1563,30 +1430,3 @@ at start and logs one line. Check it as the application role:
 ```sh
 hc exec -T postgres sh -c 'PGPASSWORD="$KOMIKA_POSTGRES_PASSWORD" psql -X -w -h "$HOSTNAME" -U komika -d komika -Atc "SELECT count(*) FROM pg_ls_waldir()"'
 ```
-
-## Returning to an older SQLite build (reverse export)
-
-PostgreSQL is the main database. Going back to an older SQLite build needs a **new** SQLite
-file made by `komika-server export-postgres-to-sqlite`. It copies into a byte copy of the
-kept SQLite file and never writes the kept file or PostgreSQL. After the cutover, users
-wrote to PostgreSQL, so the kept SQLite file alone is behind and cannot be used as it is.
-
-The export **refuses and writes no SQLite output** when PostgreSQL holds data that the
-SQLite build cannot store. Per-user scanlator ratings are the case today: the SQLite
-schema has no table for them, so a nonempty `scanlator_rating` stops the run. It also
-refuses any table of the PostgreSQL database that is not classified in the exporter. The
-error says "nothing was exported" and tells you to keep PostgreSQL. With `--json-out`, the report file
-records the refusal as `complete: false` with the error. Do not work around it. Keep
-PostgreSQL and its pgBackRest backups, and return to an older build only after a
-separately verified way to keep those rows exists.
-
-A run that passes reports the PostgreSQL-only tables it left out, with row counts, in
-`postgres_only_not_copied`, and every other table it did not copy in `not_copied`.
-Engine-derived identities and `progress_untick` may be populated: unticked chapters
-stay unread in the export, but the old build may read them again on a later finish.
-Read the whole report before putting the file in place.
-
-The two targets differ. A kept file at SQLite migration 0121 has no marker for a deleted
-comment that kept its replies. Such comments are written as comments with an empty body,
-and the report lists each one under `comment_tombstones_written_without_marker`. A file
-at 0122 loses nothing of this. The kept file's level is never changed by the export.

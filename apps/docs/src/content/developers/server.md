@@ -65,7 +65,7 @@ Access modes are `local`, `internet` and `direct`. The last serves the server's 
 
 1. **Environment and logging**: loads variables and initializes text or JSON logs.
 2. **Configuration**: parses runtime settings and handles utility commands before creating server state.
-3. **Database initialization**: takes a lifetime lock on `.komiq-server.lock`, then runs the SQLite import check, `pg_import::startup::run`, before anything listens. It converts an old source when eligible, verifies it and keeps the original file; [Data model](/developers/data-model) lists the cases. Then it connects to PostgreSQL and applies migrations. A second server using the directory cannot boot.
+3. **Database initialization**: takes a lifetime lock on `.komiq-server.lock` and checks for an old `komika.sqlite3` main database before anything listens. It refuses that file when PostgreSQL is empty; otherwise it warns that the file is ignored. See [Old SQLite install](/self-host/update-and-backup#old-sqlite-install). It connects to PostgreSQL and applies migrations. A second server using the directory cannot boot.
 4. **Cover recovery**: preserves an unavailable or corrupt cache and recreates it. Checks saved cover pointers in batches, including when only part of the cache is missing.
 5. **Accounts and clients**: provisions configured administrators, creates source clients and issues a setup code if no administrator exists.
 6. **Startup sweep**: marks interrupted source ingestion jobs as failed.
@@ -80,7 +80,7 @@ On `SIGTERM` or `Ctrl+C`, the server stops accepting connections and notifies ba
 
 ## Background jobs
 
-The main database uses PostgreSQL pools. Reader sessions are query-only; background cache writes have a separate bounded lane. Transactions use PostgreSQL locking and constraints. The shared transaction helper retries serialization failures and deadlocks with a fresh transaction and a bounded delay. SQLite locks belong only to the cover cache and retained source tooling.
+The main database uses PostgreSQL pools. Reader sessions are query-only; background cache writes have a separate bounded lane. Transactions use PostgreSQL locking and constraints. The shared transaction helper retries serialization failures and deadlocks with a fresh transaction and a bounded delay. SQLite locks belong only to the cover cache.
 
 Public cover and source-cache misses enqueue persistence in a bounded background queue. The request serves fetched data without waiting for that cache write. A full queue leaves the result uncached, so a later request can retry.
 

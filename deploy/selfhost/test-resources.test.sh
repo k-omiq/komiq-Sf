@@ -66,27 +66,6 @@ grep -qx 'network rm owned-network' "$RESOURCE_CALLS"
 grep -qx 'volume rm owned-volume' "$RESOURCE_CALLS"
 if grep -q '^container rm .*foreign' "$RESOURCE_CALLS"; then echo 'FAIL: removed foreign ownership' >&2; exit 1; fi
 echo 'PASS: cleanup removes only recorded IDs with the matching run label'
-# Execute the real rename assertion locally against both correct and broken output.
-python3 - "$source_dir/install.real.test.sh" "$scratch" <<'PY'
-import pathlib, re, subprocess, sys
-script = pathlib.Path(sys.argv[1]).read_text()
-root = pathlib.Path(sys.argv[2])
-(root / 'data').mkdir()
-(root / 'fixture').mkdir()
-(root / 'fixture/komika.sqlite3').write_bytes(b'original bytes')
-(root / 'data/komika.sqlite3.imported-test').write_bytes(b'original bytes')
-assertion = re.search(r"-c '(test ! -e /data/komika.sqlite3[^\n]+)'", script)[1]
-assertion = assertion.replace('/data/', str(root / 'data') + '/').replace('/fixture/', str(root / 'fixture') + '/')
-assert subprocess.run(['sh', '-c', assertion]).returncode == 0
-(root / 'data/komika.sqlite3').write_bytes(b'original bytes')
-assert subprocess.run(['sh', '-c', assertion]).returncode != 0, 'original plus copy must fail'
-# Also prove the actual failure exit-code guard rejects exit 0.
-guard = re.search(r'\[ "\$exit_code" -ne 0 \]', script)[0]
-assert subprocess.run(['sh', '-c', 'exit_code=0; ' + guard]).returncode != 0
-assert subprocess.run(['sh', '-c', 'exit_code=1; ' + guard]).returncode == 0
-PY
-echo 'PASS: real rename assertion rejects original plus copy; failure guard rejects exit zero'
-
 # A foreign resource appears after the preflight check but before create returns.
 for kind in volume network container; do
   export COLLISION=returned-$kind

@@ -17,7 +17,6 @@ import os
 from pathlib import Path
 import re
 import shutil
-import sqlite3
 import subprocess
 import tarfile
 import tempfile
@@ -233,23 +232,15 @@ class RunbookTests(unittest.TestCase):
         image.write_bytes(b"image layers" * 1000)
         subprocess.run(["gzip", str(image)], check=True)
         shutil.move(str(image) + ".gz", transfer / "komika-postgres-image.tar.gz")
-        (transfer / "komika-server").write_bytes(b"\x7fELF")
         (transfer / "image-id.txt").write_text("sha256:imageid\n")
-        names = ("komika-postgres-image.tar.gz", "komika-postgres-kit.tar.gz", "komika-server", "image-id.txt")
+        names = ("komika-postgres-image.tar.gz", "komika-postgres-kit.tar.gz", "image-id.txt")
         (transfer / "SHA256SUMS").write_text("".join(
             f"{hashlib.sha256((transfer / name).read_bytes()).hexdigest()}  {name}\n" for name in names))
         (self.base / "private" / "rehearsal.env").write_text(
             "KOMIKA_REHEARSAL_PROJECT=x\nKOMIKA_POSTGRES_PASSWORD=never-printed-value\n")
-        # A real database: block C reads the migration history of the copy.
-        copy = sqlite3.connect(self.base / "input" / "copy.sqlite3")
-        copy.execute("CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, success BOOLEAN NOT NULL)")
-        copy.executemany("INSERT INTO _sqlx_migrations VALUES (?, 1)", [(121,), (122,)])
-        copy.commit()
-        copy.close()
-        self.assertEqual((self.base / "input" / "copy.sqlite3").stat().st_size, 8192)
         staged = self.top / "staged"
         staged.mkdir()
-        for name in ("transfer", "private", "input"):
+        for name in ("transfer", "private"):
             shutil.copytree(self.base / name, staged / name)
         shutil.rmtree(self.base)
 
@@ -272,7 +263,7 @@ class RunbookTests(unittest.TestCase):
         self.assertTrue((self.base / "kit" / "rehearsal.sh").is_file())
         self.assertFalse((self.base / "transfer" / "komika-postgres-image.tar.gz").exists())
         self.assertEqual(sorted(os.listdir(self.base / "records")),
-                         ["input-hashes.txt", "others-after-load.txt", "others-before.txt", "r2-metrics-before-time.txt"])
+                         ["others-after-load.txt", "others-before.txt", "r2-metrics-before-time.txt"])
         self.assertEqual(self.called("sudo")[0], ["sudo", "-n", "true"])  # Before the first command that needs root.
         # Each block alone, in a shell where the one before it has not passed: refused, nothing done.
         shutil.rmtree(self.base)
@@ -409,13 +400,10 @@ class RunbookTests(unittest.TestCase):
     def test_block_c_stops_before_the_load_and_block_d_without_the_lease(self):
         self.stage()
         cases = {
-            "a transferred file does not have its recorded hash": 'printf x >> "$base/transfer/komika-server"\n',
-            "the env file, the SQLite copy or the binary is missing": 'rm "$sqlite"\n',
+            "a transferred file does not have its recorded hash": 'printf x >> "$base/transfer/image-id.txt"\n',
+            "the env file is missing": 'rm "$env_file"\n',
             "the env file is not your own regular file with mode 600": 'chmod 644 "$env_file"\n',
             "the env file is not your own regular file with mode 600\n": 'mv "$env_file" "$env_file.real" && ln -s "$env_file.real" "$env_file"\n',
-            "the SQLite copy is not a standalone regular file": 'printf x > "$sqlite-wal"\n',
-            "the SQLite copy is not a standalone regular file\n": 'printf x > "$sqlite-journal"\n',
-            "the migration history of the SQLite copy could not be read": 'printf x > "$sqlite"\n',
         }
         for text, damage in cases.items():
             with self.subTest(text=text[:50]):
@@ -439,11 +427,11 @@ class RunbookTests(unittest.TestCase):
                 self.assertEqual(self.called("docker", "load") + self.called("flock"), [])
                 self.assertFalse((self.base / "kit" / "rehearsal.sh").exists())
                 shutil.rmtree(self.base)
-        # Too little space for the image, 2.7 x the SQLite file and the floor: nothing is loaded.
-        need = 3 * 1024 ** 3 + 12000 + 8192 * 27 // 10  # 8192: the size of the staged SQLite copy
+        # Too little space for the image and the floor: nothing is loaded.
+        need = 3 * 1024 ** 3 + 12000
         self.state["free"] = str(need - 1)
         out = self.run_blocks("A", "B", after=self.provision() + self.blocks["C"])
-        self.assertIn(f"STOP: image, import peak and floor need {need} bytes on Docker's data root, "
+        self.assertIn(f"STOP: image and floor need {need} bytes on Docker's data root, "
                       f"{need - 1} are free; nothing was loaded", out)
         self.assertEqual(self.called("docker", "load"), [])
         shutil.rmtree(self.base)

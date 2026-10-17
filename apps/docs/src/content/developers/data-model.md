@@ -22,17 +22,9 @@ The main schema uses native PostgreSQL values: UUID account identities, timezone
 
 Covers retain SQLite connection settings and recovery in `apps/server/src/db.rs`. PostgreSQL planner maintenance uses `ANALYZE`; the cover cache retains its separate SQLite maintenance path.
 
-### Automatic conversion
+### Old installations
 
-Before `db::init`, every start runs `pg_import::startup::run`. It looks for the old main SQLite file at `KOMIKA_SQLITE_IMPORT_PATH` (absolute) or `komika.sqlite3` beside the covers file. It decides from that file, a record beside it (`<file>.import-work-state`) and what PostgreSQL holds:
-
-- Nothing to import: no output.
-- A file and an empty PostgreSQL: copy, migrate and repair a work copy, import, verify, then rename the original to `<file>.imported-<UTC time>` and serve.
-- A file and a PostgreSQL in use: one warning; the file stays.
-- An unfinished import resumes, or restarts once if the file, the migrations or the plan changed. PostgreSQL rows are reset only when `public.komika_startup_import` proves that this record began the import. A start that only finishes an interrupted archive rename ends with a `sqlite import: complete:` line.
-- Anything else: one `sqlite import: error:` line that names the files and the ways out. Nothing changes.
-
-The server never deletes a file that may be the last copy of the owner's data. A saved copy that differs from the file now at the original name is moved to `<file>.import-kept-<UTC time>` with a warning. A SQLite migration newer than this server knows, or a PostgreSQL migration it does not embed, is refused as from a newer release. `public.komika_server_started` is written before a normal start, and no import starts after that. Work files need 8 times the source size plus 256 MiB free. On Unix the source folder must belong to the server user and not be group- or world-writable.
+The server cannot read or convert an old `komika.sqlite3` main database. It refuses to start while that file is in the data directory and PostgreSQL is empty. If PostgreSQL already holds data, it warns that the old file is ignored and starts. Read [Old SQLite install](/self-host/update-and-backup#old-sqlite-install) to start fresh.
 
 ## Core tables and relationships
 
@@ -66,11 +58,11 @@ Catalogue works are independent of source copies:
 - `work_external_id`: maps canonical works to external database identifiers from services like AniList, MyAnimeList, MangaUpdates, Kitsu and MangaDex. The primary key is `(provider, external_id)`.
 - `merge_candidate`: records potential duplicate matches between a `source_series` and a candidate `work(id)`. It stores a confidence score and a detection method, allowing administrators to review and resolve candidates.
 - `work_field_pin`: records administrator overrides for source-managed fields like author, artist, year and status. Database triggers automatically restore pinned values if an automated synchronization pass updates the underlying `work` row.
-- `engine_generation`, `engine_manga_key` and `engine_chapter_key`: the source engine's own manga and chapter keys and web links, added by migration `0005_engine_keys.sql`. Keys are stored per generation, and each generation row has a state of `active`, `quarantined` or `detached`; the server adopts or creates one `active` generation at start. `chapterOrigin` reads these rows. The tables exist only in PostgreSQL, and the reverse export to SQLite leaves them out because the server rebuilds them from the engine.
-- `engine_numeric_state` and `suwayomi_progress_detached`, added by migration `0006_engine_fence.sql`: the numeric epoch that fences queued progress writes after an engine change, and the extension-source reading progress set aside when an administrator starts a new engine generation. The reverse export to SQLite refuses while either holds rows.
-- `engine_detached_row`, added by migration `0008_engine_detached_row.sql`: numeric library, review, view-count and per-series scan-setting rows that a new engine generation set aside. Rows whose series had a work moved to that work instead. Each row keeps its old generation, its source table and the original row as JSON. The reverse export to SQLite refuses while it holds rows.
-- `media_policy` and `media_takedown`, added by migration `0009_media_policy.sql`: the policy epoch, which moves with every site-wide block rule or takedown change, and the operator takedowns of works and chapter copies. The reverse export to SQLite leaves `media_policy` out and refuses while `media_takedown` holds rows, because a rollback without it would serve taken-down content again. Read [Takedowns](/admin/takedowns).
-- `progress_untick`, added by migration `0010_progress_untick.sql`: one row per explicit untick of one chapter copy (user id, chapter id, time). The reverse export to SQLite omits it and counts it in its report. It does not refuse, because losing the table only brings back the old behaviour: the chapters stay unread. A new engine generation deletes the records of numeric chapter ids.
+- `engine_generation`, `engine_manga_key` and `engine_chapter_key`: the source engine's own manga and chapter keys and web links, added by migration `0005_engine_keys.sql`. Keys are stored per generation, and each generation row has a state of `active`, `quarantined` or `detached`; the server adopts or creates one `active` generation at start. `chapterOrigin` reads these rows.
+- `engine_numeric_state` and `suwayomi_progress_detached`, added by migration `0006_engine_fence.sql`: the numeric epoch that fences queued progress writes after an engine change, and the extension-source reading progress set aside when an administrator starts a new engine generation.
+- `engine_detached_row`, added by migration `0008_engine_detached_row.sql`: numeric library, review, view-count and per-series scan-setting rows that a new engine generation set aside. Rows whose series had a work moved to that work instead. Each row keeps its old generation, its source table and the original row as JSON.
+- `media_policy` and `media_takedown`, added by migration `0009_media_policy.sql`: the policy epoch, which moves with every site-wide block rule or takedown change, and the operator takedowns of works and chapter copies. Read [Takedowns](/admin/takedowns).
+- `progress_untick`, added by migration `0010_progress_untick.sql`: one row per explicit untick of one chapter copy (user id, chapter id, time). A new engine generation deletes the records of numeric chapter ids.
 
 ### Identity and social tables
 
@@ -114,23 +106,22 @@ Precomputed tables support browse and search:
 
 ## How migrations work
 
-The main migration history lives in `apps/server/migrations_pg/`. It begins with the PostgreSQL baseline. The files in `apps/server/migrations/` are frozen SQLite history for old import sources and historical tests; never apply them to PostgreSQL.
+The main migration history lives in `apps/server/migrations_pg/`. It begins with the PostgreSQL baseline. The files in `apps/server/migrations/` are frozen SQLite history that only historical tests use; never apply them to PostgreSQL.
 
 ### Execution at startup
 
 `apps/server/src/db.rs` applies main migrations with SQLx's PostgreSQL migrator. `_sqlx_migrations` records versions and checksums, so changing an applied historical migration causes a startup error. Add a new migration for a new schema change.
 
-The importer prepares the old source schema using the frozen SQLite migrator on a temporary copy. Type conversion and canonical checksums live in `apps/server/src/pg_import/`. The separate covers schema is initialized and checked on its own SQLite connection.
+The separate covers schema is initialized and checked on its own SQLite connection.
 
 ### Migration changes
 
-Keep applied migrations immutable. Add new files for schema changes and backfills. Test the resulting constraints and queries on PostgreSQL. Covers and old import sources keep their own SQLite history; a PostgreSQL change must not rewrite that source history.
+Keep applied migrations immutable. Add new files for schema changes and backfills. Test the resulting constraints and queries on PostgreSQL.
 
 ## Where to look
 
 - `apps/server/migrations_pg/`: PostgreSQL baseline and migration history.
-- `apps/server/migrations/`: frozen SQLite source migration history.
-- `apps/server/src/pg_import/`: type conversion, import, verification and the startup decision (`startup.rs`).
+- `apps/server/migrations/`: frozen SQLite migration history for historical tests.
 - `apps/server/src/media_policy.rs`: the policy epoch, takedowns and the in-memory denied set.
 - `apps/server/src/db.rs`: PostgreSQL initialization, migration runners and SQLite cover recovery.
 - `apps/server/src/catalog/`: Rust data access logic for canonical works, aliases, external IDs and duplicate merging.

@@ -7153,8 +7153,7 @@ enum SyncCheckpoint {
 
 /// The reset generation of a sync job lives in `instance_setting` under this key prefix.
 /// It has to outlive [`reset_sync_state`], which deletes the job's `catalogue_sync_state`
-/// row, and a key/value row needs no schema change: a new table or column would also have
-/// to be added to the SQLite importer's table, column and index inventories.
+/// row, and a key/value row needs no schema change.
 const SYNC_GENERATION_PREFIX: &str = "catalogue_sync_generation:";
 
 fn sync_job_key(job: &str) -> crate::locks::AdvisoryKey {

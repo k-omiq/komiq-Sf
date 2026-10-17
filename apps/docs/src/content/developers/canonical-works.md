@@ -21,10 +21,10 @@ The server's matching pipeline processes series during ingestion, source synchro
 
 ## The work data model
 
-The canonical catalogue layer uses several related PostgreSQL tables defined in `apps/server/migrations_pg/0001_baseline.sql`. The frozen SQLite history remains for importing old installations:
+The canonical catalogue layer uses several related PostgreSQL tables defined in `apps/server/migrations_pg/0001_baseline.sql`:
 
 - `work`: the central record representing one logical comic series. It holds canonical metadata including title, author, artist, year, language, status, content rating, `is_nsfw`, and a 64-bit perceptual cover hash (`cover_phash`).
-- `work_alias`: alternative titles populated from MangaDex and admin edits. It stores `normalized_title` (lowercased text with punctuation folded to spaces, diacritics folded, and trailing noise markers removed) and `match_key` (an article-insensitive key that removes "the", "a", and "an" except in the last position, added by `apps/server/migrations/0111_work_alias_match_key.sql`).
+- `work_alias`: alternative titles populated from MangaDex and admin edits. It stores `normalized_title` (lowercased text with punctuation folded to spaces, diacritics folded, and trailing noise markers removed) and `match_key` (an article-insensitive key that removes "the", "a", and "an" except in the last position).
 - `work_external_id`: external catalogue identifiers such as AniList (`al`), MyAnimeList (`mal`), MangaUpdates (`mu`), Kitsu (`kt`), AnimePlanet (`ap`), and MangaDex (`mangadex`). The primary key spans `(provider, external_id)` so identities remain globally unique.
 - `source_series`: represents a concrete series on an upstream source, linked to `work.id` by foreign key. One canonical work can own multiple source mappings from different websites.
 - `chapter`: mirrored chapter records linked to `source_series.id`. Because chapters belong to the source mapping rather than the work, re-pointing a source mapping carries all its chapters automatically.

@@ -1,11 +1,5 @@
 use std::env;
 
-/// Absolute legacy main database path for first-start import. Unset searches
-/// beside the SQLite covers file. An empty or relative value is rejected at boot.
-pub fn sqlite_import_path() -> Option<std::path::PathBuf> {
-    env::var_os("KOMIKA_SQLITE_IMPORT_PATH").map(std::path::PathBuf::from)
-}
-
 /// A secret string that never prints its value in `Debug` output (Config is
 /// logged wholesale at startup via `?cfg`).
 #[derive(Clone, Default)]

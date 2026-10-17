@@ -12,7 +12,7 @@ Fix Docker setup, container and source problems by checking your server logs. Fo
 - "Port 8080 is in use. Try --port 8081.": another program has the HTTP port. Run the installer again with the port it names.
 - "Port 443 is in use. Free it before continuing.": another program, often a web server, holds a port komiq needs. Stop it, or choose `tunnel`.
 - "Could not check ports.": install `ss`, `lsof` or `netstat`.
-- "Server did not become healthy.": startup stopped making progress. Read the server log, as described below. Import progress extends the wait.
+- "Server did not become healthy.": the server did not finish startup. Read the server log, as described below.
 
 ## No setup code in the server log
 
@@ -46,32 +46,9 @@ For a PostgreSQL connection error, inspect `docker compose logs postgres`. Keep 
 
 If Compose says `Run install.sh to generate KOMIQ_DB_PASSWORD`, run `bash deploy/selfhost/install.sh` from the repository root. It adds the password without removing old settings.
 
-### SQLite conversion stops or is refused
+### Old SQLite file blocks startup
 
-On an update from SQLite, the server converts `/data/komika.sqlite3` into an empty PostgreSQL database: read [Update and back up](/self-host/update-and-backup). A failed or refused start prints `sqlite import: error: <stage> stage: ...` and exits. The installer stops the server.
-
-A refusal usually says `Nothing was changed`, names the files involved and gives the exact renames and deletions for each way out. When it offers a kept copy, it gives that copy's row counts (or `empty`), so you can pick the copy that holds your data. This is the end of one such line, when only the work copy is left:
-
-```text
-To import it, rename /data/komika.sqlite3.import-work-source to /data/komika.sqlite3 and start again. Or, to start with an empty database, move the listed files out of the data directory and start again
-```
-
-In Docker those paths are inside the `komiq_server-data` volume (the prefix follows your Compose project name). Stop the server with `docker compose stop server` (in `deploy/selfhost`), make each rename in a temporary container, then run `docker compose up -d`:
-
-```sh
-docker run --rm -v komiq_server-data:/data busybox \
-  mv /data/komika.sqlite3.import-work-source /data/komika.sqlite3
-```
-
-| The line says                                                                       | What to do                                                                                                           |
-| ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `is missing`, `cannot be used`                                                      | Put the SQLite file back, or rename the saved copy as the line says.                                                 |
-| `from a newer release`, `belongs to a newer release`, `differs from the migration`  | A newer komiq wrote the SQLite file or the PostgreSQL database. Start that release. |
-| `already holds other data, while`                                                   | Wrong database: correct `DATABASE_URL`. Right one: delete the record and work files the line names.                  |
-| `changed after PostgreSQL received its data`                                        | To keep PostgreSQL's data, move the SQLite file elsewhere and delete the record and work files.                      |
-| `started with the import-sqlite-to-postgres command`                                | The server never resets that import. Finish it with the command, or follow the line's other way if PostgreSQL holds nothing you need. |
-| `must be owned by the user that runs the server`                                    | Run the `chmod 700` it names, and `chown` the folder to the server user (ID `10001` in Docker).                      |
-| `not enough free disk space`                                                        | Free 8 times the SQLite files' size plus 256 MiB in the folder the line names.                                       |
+If PostgreSQL is empty and `komika.sqlite3` is still in the data directory, the server refuses to start. Follow [Old SQLite install](/self-host/update-and-backup#old-sqlite-install) to move the old files out and start fresh. This version cannot read or convert them. If PostgreSQL already holds data, the server warns that the old file is ignored and starts.
 
 ## Port 443 or 80 does not answer
 

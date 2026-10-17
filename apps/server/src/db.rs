@@ -2228,12 +2228,6 @@ mod observation_scan_tests {
             "accepted: the receiver is db::retry_transaction, which counts every attempt \
              and marks the error before this closure writes the user text",
         ),
-        (
-            "pg_import/startup.rs",
-            "SQLite cannot write temporary files in the work directory",
-            "accepted: a PRAGMA on the importer's private in-memory SQLite connection, \
-             not a PostgreSQL error; no PostgreSQL counter applies",
-        ),
     ];
 
     /// Same length as the input. Comments and the contents of string/char
