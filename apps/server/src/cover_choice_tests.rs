@@ -500,3 +500,70 @@ async fn the_warmer_skips_covers_the_prune_removes() {
         1
     );
 }
+
+/// Plan nodes a subquery runs more than once: work repeated per outer row.
+fn repeated_subplans(node: &serde_json::Value, out: &mut Vec<String>) {
+    if node["Parent Relationship"] == "SubPlan" && node["Actual Loops"].as_f64() > Some(1.0) {
+        out.push(format!(
+            "{} loops={}",
+            node["Subplan Name"], node["Actual Loops"]
+        ));
+    }
+    for child in node["Plans"].as_array().into_iter().flatten() {
+        repeated_subplans(child, out);
+    }
+}
+
+#[tokio::test]
+async fn the_prune_preview_counts_each_source_in_one_pass() {
+    let (main, covers, _dir) = pools().await;
+    // One unpicked cover from each of 12 sources: the work shows its first source.
+    for i in 0..12u8 {
+        let w = format!("w_p{i}");
+        work(&main, &w).await;
+        mapping(
+            &main,
+            &w,
+            &format!("ss_p{i}a"),
+            "src-keep",
+            &format!("{}", 100 + i as i64),
+            "2026-01-01",
+        )
+        .await;
+        mapping(
+            &main,
+            &w,
+            &format!("ss_p{i}b"),
+            &format!("src-{i}"),
+            &format!("{}", 200 + i as i64),
+            "2026-01-02",
+        )
+        .await;
+        cover::put_suwayomi_cover(&main, &covers, 200 + i as i64, &webp(100 + i))
+            .await
+            .unwrap();
+        cover::put_source_work_cover(&main, &covers, &w, &webp(150 + i), "src-keep")
+            .await
+            .unwrap();
+    }
+    let preview = prune_preview(&main).await.unwrap();
+    assert_eq!(preview.len(), 12);
+    for (source, count, bytes) in &preview {
+        assert_eq!(*count, 1, "{source}");
+        assert!(*bytes > 0, "{source}");
+    }
+
+    let plan: serde_json::Value = sqlx::query_scalar(&format!(
+        "EXPLAIN (ANALYZE, FORMAT JSON) {}",
+        prune_preview_sql()
+    ))
+    .fetch_one(&main)
+    .await
+    .unwrap();
+    let mut repeated = Vec::new();
+    repeated_subplans(&plan[0]["Plan"], &mut repeated);
+    assert!(
+        repeated.is_empty(),
+        "work repeated per source: {repeated:?}"
+    );
+}

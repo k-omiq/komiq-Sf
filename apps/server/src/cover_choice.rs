@@ -550,23 +550,30 @@ fn unpicked_sql(scope: &str) -> String {
     )
 }
 
-/// What the prune would remove, per source: `(source_id, covers, bytes)`. Bytes count
-/// only files no kept cover shares, so the total is the space it frees.
-pub(crate) async fn prune_preview(main: &Database) -> Result<Vec<(String, i64, i64)>> {
-    let sql = format!(
-        "WITH cand AS ({}), \
-         rows AS (SELECT o.sha256, o.byte_length, cand.source_id \
-                  FROM cover_object o JOIN cand ON cand.asset_key = o.asset_key), \
-         exclusive AS (SELECT DISTINCT ON (r.sha256) r.sha256, r.byte_length, r.source_id FROM rows r \
-                       WHERE NOT EXISTS (SELECT 1 FROM cover_object x WHERE x.sha256 = r.sha256 \
-                             AND NOT EXISTS (SELECT 1 FROM cand k WHERE k.asset_key = x.asset_key)) \
-                       ORDER BY r.sha256, r.source_id) \
-         SELECT cand.source_id, COUNT(*)::bigint, \
-                COALESCE((SELECT SUM(e.byte_length) FROM exclusive e WHERE e.source_id = cand.source_id), 0)::bigint \
-         FROM cand GROUP BY cand.source_id ORDER BY 3 DESC, 1",
+/// The prune preview: rows `(source_id, covers, bytes)`. Bytes count only files no
+/// kept cover shares, so the total is the space it frees. Every step runs once: a
+/// per-source subquery here ran the whole byte count again for each source and
+/// passed the request deadline on a catalogue with hundreds of sources.
+pub(crate) fn prune_preview_sql() -> String {
+    format!(
+        "WITH cand AS MATERIALIZED ({}), \
+         kept AS (SELECT DISTINCT o.sha256 FROM cover_object o \
+                  WHERE NOT EXISTS (SELECT 1 FROM cand k WHERE k.asset_key = o.asset_key)), \
+         freed AS (SELECT DISTINCT ON (o.sha256) o.sha256, o.byte_length, cand.source_id \
+                   FROM cover_object o JOIN cand ON cand.asset_key = o.asset_key \
+                   WHERE NOT EXISTS (SELECT 1 FROM kept WHERE kept.sha256 = o.sha256) \
+                   ORDER BY o.sha256, cand.source_id), \
+         bytes AS (SELECT source_id, SUM(byte_length)::bigint AS bytes FROM freed GROUP BY source_id) \
+         SELECT cand.source_id, COUNT(*)::bigint, COALESCE(MAX(b.bytes), 0)::bigint \
+         FROM cand LEFT JOIN bytes b ON b.source_id = cand.source_id \
+         GROUP BY cand.source_id ORDER BY 3 DESC, 1",
         unpicked_sql("")
-    );
-    Ok(sqlx::query_as(&sql).fetch_all(main).await?)
+    )
+}
+
+/// What the prune would remove, per source: `(source_id, covers, bytes)`.
+pub(crate) async fn prune_preview(main: &Database) -> Result<Vec<(String, i64, i64)>> {
+    Ok(sqlx::query_as(&prune_preview_sql()).fetch_all(main).await?)
 }
 
 /// Run the prune from its cursor while the setting is on: each unpicked cover's index
