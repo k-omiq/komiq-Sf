@@ -1,4 +1,6 @@
-import type { Handle } from '@sveltejs/kit';
+import type { Handle, HandleFetch } from '@sveltejs/kit';
+import { config } from '$lib/config';
+import { ssrGraphqlFetch } from '$lib/data/ssr-graphql';
 import { seriesSearch } from '$lib/series-url';
 
 const SERIES_ROUTE = '/(app)/series/[slug]';
@@ -39,3 +41,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 	);
 	return response;
 };
+
+// The API reads of a server-side render go to `/graphql/ssr` (see `ssr-graphql.ts`).
+const ssrFetch = ssrGraphqlFetch(config.apiEndpoint);
+export const handleFetch: HandleFetch = ({ request, fetch }) => ssrFetch(request, fetch);

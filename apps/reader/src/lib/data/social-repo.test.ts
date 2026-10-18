@@ -5,7 +5,7 @@ import { registerHooks } from 'node:module';
 import { beforeEach, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
-import { testGlobals } from './node-test-hooks.ts';
+import { persistedServer, testGlobals } from './node-test-hooks.ts';
 import type { CommentView } from './social-repo';
 
 const {
@@ -257,19 +257,23 @@ test('the comments query selects deletedBy for anonymous GET and signed-in POST'
 	const client = new GraphQLBackend({ endpoint: testGlobals.config.apiEndpoint });
 	testGlobals.backend.comments = client.comments.bind(client);
 	const requests: { query: string; variables: unknown; authorization: string | null }[] = [];
-	t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
-		const url = new URL(String(input));
-		const payload = init?.body
-			? JSON.parse(String(init.body))
-			: {
-					query: url.searchParams.get('query'),
-					variables: JSON.parse(url.searchParams.get('variables')!),
-				};
-		requests.push({ ...payload, authorization: new Headers(init?.headers).get('authorization') });
-		return Response.json({
-			data: { comments: { items: [], page: 1, total: 0, hasNextPage: false } },
-		});
-	});
+	t.mock.method(
+		globalThis,
+		'fetch',
+		persistedServer(async (input: RequestInfo | URL, init?: RequestInit) => {
+			const url = new URL(String(input));
+			const payload = init?.body
+				? JSON.parse(String(init.body))
+				: {
+						query: url.searchParams.get('query'),
+						variables: JSON.parse(url.searchParams.get('variables')!),
+					};
+			requests.push({ ...payload, authorization: new Headers(init?.headers).get('authorization') });
+			return Response.json({
+				data: { comments: { items: [], page: 1, total: 0, hasNextPage: false } },
+			});
+		}),
+	);
 	await loadChapterComments('chapter', 'key');
 	client.setToken('test-token');
 	await loadSeriesComments('series', 'key');

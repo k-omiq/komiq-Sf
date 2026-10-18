@@ -1,8 +1,9 @@
 /**
- * Run: node --test --experimental-strip-types src/lib/data/sha256.test.ts
+ * Run: node --test packages/api/src/sha256.test.ts
  *
  * The tag id of a non-ASCII tag name is derived from this digest on BOTH sides (the
- * server's `tags::slug` uses the `sha2` crate), so it must be bit-exact SHA-256.
+ * server's `tags::slug` uses the `sha2` crate), and so is a persisted
+ * document id, so it must be bit-exact SHA-256.
  */
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';

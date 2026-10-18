@@ -118,6 +118,7 @@ import { notifyProgressConflict } from './progress-conflict.js';
 import { NOT_AUTHENTICATED, notifyAuthRejected } from './session-keeper.js';
 import { failedOnlyAt, GraphQLRequestError, tolerablePartialErrors } from './partial-errors.js';
 import type { GraphQLErrorLike, PathSegment } from './partial-errors.js';
+import { persistedId } from './persisted.js';
 
 export interface BackendConfig {
 	/** GraphQL endpoint of the unified backend, e.g. https://api.komika.app/graphql */
@@ -128,6 +129,13 @@ export interface BackendConfig {
 	schemaGeneration?: string;
 	/** Optional fetch override (SSR / tests). Defaults to global fetch. */
 	fetch?: typeof fetch;
+	/**
+	 * Send a signed-in viewer's catalogue reads ({@link PUBLIC_READS} and the series page)
+	 * without the token, as GETs an edge cache can keep, while the viewer's answers are the
+	 * anonymous ones (no NSFW opt-in, no block rule of their own). The viewer's own data
+	 * then comes from separate POSTs. The reader sets it; the admin console does not.
+	 */
+	publicReads?: boolean;
 }
 
 /**
@@ -186,6 +194,107 @@ const NUMERIC_ID_READS = new Set([
 const LIBRARY_WRITES = new Set([ops.MARK, ops.SET_LIBRARY_STATUS, ops.SET_FAVORITE]);
 
 /**
+ * Catalogue reads whose answer depends on the viewer only through the NSFW opt-in and
+ * block rules (`viewer_show_nsfw`, `viewer_blocks` on the server). With
+ * {@link BackendConfig.publicReads} a signed-in viewer without either sends them anonymous.
+ * Their card fields `isMarked`, `libraryStatus` and `isFavorite` then read signed out; the
+ * reader shows them only on the series page, which lays its viewer data over the page
+ * (`seriesPage`).
+ */
+const PUBLIC_READS = new Set([
+	ops.DISCOVERY,
+	ops.UPDATES,
+	ops.UPDATES_FEED,
+	ops.CANONICAL_UPDATES,
+	ops.SEARCH,
+	ops.TAGS,
+	ops.GENRE_FACETS,
+	ops.BROWSE_SOURCES,
+	ops.SCANLATOR_TAGS,
+	ops.SOURCE_AI_TAGS,
+	ops.PAGES,
+	ops.CANONICAL_PAGES,
+	ops.MEDIA_ROUTES,
+]);
+
+/** How long a viewer's posture (see {@link GraphQLBackend.anonymousPosture}) is kept. */
+const POSTURE_TTL_MS = 5 * 60_000;
+
+/**
+ * How {@link GraphQLBackend.gql} sends a request. `auto`: a GET when nothing needs the
+ * token, else a POST. `post`: always a POST, with the token. `public`: never the token,
+ * whether or not the viewer is signed in.
+ */
+type Transport = 'auto' | 'post' | 'public';
+
+/** Refusal codes of a persisted-document GET (`apps/server/src/persisted.rs`): 400 for an
+ *  id the server does not hold, 405 for document text on a server that takes only ids. */
+const PERSISTED_NOT_FOUND = 'PERSISTED_QUERY_NOT_FOUND';
+const PERSISTED_REQUIRED = 'PERSISTED_QUERY_REQUIRED';
+
+/** The `extensions.code` of an error answer, if it has one. */
+async function refusalCode(res: Response): Promise<string | undefined> {
+	try {
+		const body = (await res.json()) as { errors?: { extensions?: { code?: unknown } }[] };
+		const code = body.errors?.[0]?.extensions?.code;
+		return typeof code === 'string' ? code : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** What `seriesPageViewer` answers: the viewer's part of a `seriesPage`. */
+interface SeriesPageViewerData {
+	workId: Id;
+	viewerProgress?: ViewerProgress | null;
+	library: {
+		seriesId: Id;
+		isMarked: boolean;
+		libraryStatus: LibraryStatus | null;
+		isFavorite: boolean;
+	}[];
+	chapters: { sourceType: string; chapterId: Id; read: boolean; lastPageRead: number }[];
+	aggregated?: { entryId?: string | null; key: string }[];
+}
+
+/**
+ * `seriesPageViewer` laid over an anonymous `seriesPage`: the page the viewer would get
+ * signed in. The server test `the_viewer_overlay_on_an_anonymous_page_is_the_signed_in_page`
+ * applies the same rule.
+ */
+function layViewerOver(page: SeriesPageBundle, viewer: SeriesPageViewerData): SeriesPageBundle {
+	const flags = new Map(viewer.library.map((f) => [f.seriesId, f]));
+	const states = new Map(viewer.chapters.map((c) => [`${c.sourceType}:${c.chapterId}`, c]));
+	const read = new Set((viewer.aggregated ?? []).map((r) => `${r.entryId ?? ''}|${r.key}`));
+	const series = (s: Series | null): Series | null => {
+		const f = s && flags.get(s.id);
+		return s && f
+			? { ...s, isMarked: f.isMarked, libraryStatus: f.libraryStatus, isFavorite: f.isFavorite }
+			: s;
+	};
+	const chapters = (list: Chapter[], sourceType: string): Chapter[] =>
+		list.map((c) => {
+			const state = states.get(`${sourceType}:${c.id}`);
+			return state ? { ...c, read: state.read, lastPageRead: state.lastPageRead } : c;
+		});
+	return {
+		...page,
+		viewerProgress: viewer.viewerProgress,
+		series: series(page.series),
+		spineChapters: chapters(page.spineChapters, 'mangadex'),
+		sources: page.sources.map((s) => ({
+			...s,
+			series: series(s.series),
+			chapters: chapters(s.chapters, 'suwayomi'),
+		})),
+		aggregated: page.aggregated?.map((row) => ({
+			...row,
+			readAnywhere: read.has(`${row.entryId ?? ''}|${row.key}`),
+		})),
+	};
+}
+
+/**
  * A URL string in its WHATWG-normalized form — what `new URL(s).href` produces.
  *
  * This exists for ONE reason, and it is not cosmetic. SvelteKit's SSR serializes each
@@ -224,6 +333,8 @@ interface AuthCell {
 	progressSaves?: Map<Id, Promise<unknown>>;
 	numericEpoch?: Promise<number | null>;
 	staleNumericEpochNotified?: boolean;
+	/** Whether the viewer's catalogue answers are the anonymous ones, and until when. */
+	posture?: { expiresAt: number; anonymous: Promise<boolean> };
 }
 
 const CAPABILITY_ENDPOINT_CAPACITY = 64;
@@ -246,6 +357,13 @@ interface EndpointCapabilities {
 	chapterOriginUnsupported: boolean;
 	mediaRoutesUnsupported: boolean;
 	seriesPageUnsupported: boolean;
+	seriesPageViewerUnsupported: boolean;
+	/** The server predates persisted documents: GETs carry the document text. */
+	persistedUnsupported: boolean;
+	/** Documents the server does not hold as persisted (another build, or stripped). */
+	unknownPersisted: Set<string>;
+	/** The server runs only persisted documents over GET (`KOMIKA_PERSISTED_ONLY`). */
+	fullTextGetRefused: boolean;
 }
 
 const capabilitiesByEndpoint = new Map<string, EndpointCapabilities>();
@@ -273,6 +391,10 @@ function endpointCapabilities(config: BackendConfig): EndpointCapabilities {
 			chapterOriginUnsupported: false,
 			mediaRoutesUnsupported: false,
 			seriesPageUnsupported: false,
+			seriesPageViewerUnsupported: false,
+			persistedUnsupported: false,
+			unknownPersisted: new Set(),
+			fullTextGetRefused: false,
 		};
 	}
 	capabilitiesByEndpoint.delete(key);
@@ -324,6 +446,40 @@ export class GraphQLBackend implements Backend {
 		this.auth.progressRevisions.clear();
 		// Saves still waiting fail their auth check; the new account must not wait on them.
 		this.auth.progressSaves = undefined;
+		this.auth.posture = undefined;
+	}
+
+	/**
+	 * Whether this request is a catalogue read ({@link PUBLIC_READS}) that goes out without
+	 * the token when {@link anonymousPosture} allows. An admin's `includeNsfw: true` is
+	 * answered for the admin only, so it keeps the token.
+	 */
+	private publicCandidate(query: string, variables: Record<string, unknown> | undefined): boolean {
+		return !!this.config.publicReads && PUBLIC_READS.has(query) && variables?.includeNsfw !== true;
+	}
+
+	/**
+	 * Whether the signed-in viewer's catalogue answers are the anonymous ones: no NSFW
+	 * opt-in and no block rule of their own (site rules apply to everyone). Read once per
+	 * sign-in, again after {@link POSTURE_TTL_MS} or a change made here; a failed read
+	 * keeps every read signed in. A change made on another device applies within the TTL.
+	 */
+	private anonymousPosture(authRevision: number): Promise<boolean> {
+		const cell = this.auth;
+		const now = Date.now();
+		if (cell.posture && cell.posture.expiresAt > now) return cell.posture.anonymous;
+		const anonymous = this.gql<{
+			session: { user: { showNsfw: boolean } } | null;
+			myBlockRules: BlockRule[];
+		}>(ops.VIEWER_POSTURE, undefined, false, undefined, authRevision, 'post').then(
+			(d) =>
+				!!d.session &&
+				!d.session.user.showNsfw &&
+				d.myBlockRules.every((rule) => rule.tags.length === 0 && rule.ratings.length === 0),
+			() => false,
+		);
+		cell.posture = { expiresAt: now + POSTURE_TTL_MS, anonymous };
+		return anonymous;
 	}
 
 	/**
@@ -443,15 +599,10 @@ export class GraphQLBackend implements Backend {
 	}
 
 	/**
-	 * Whether this API has told us it doesn't serve `GET /graphql` (P3). Endpoint/schema-scoped
-	 * for the same deploy-order reason as {@link unsupportedFields}: a 404/405 from one
-	 * GET means every GET would fail, so remember it and go straight to POST.
-	 */
-
-	/**
 	 * @param tolerate Response paths this caller can render WITHOUT. A response whose every
 	 *   error sits at or under one of them returns its `data` (those fields null) instead of
 	 *   throwing. See {@link tolerablePartialErrors}; omit it and any error throws, as before.
+	 * @param transport See {@link Transport}.
 	 */
 	private async gql<T>(
 		query: string,
@@ -459,7 +610,7 @@ export class GraphQLBackend implements Backend {
 		retried = false,
 		tolerate?: readonly (readonly PathSegment[])[],
 		authRevision = this.auth.revision,
-		forcePost = false,
+		transport: Transport = 'auto',
 	): Promise<T> {
 		this.assertAuthRevision(authRevision);
 		const token = this.auth.token;
@@ -481,27 +632,47 @@ export class GraphQLBackend implements Backend {
 		}
 		const doFetch = this.config.fetch ?? fetch;
 		const stripped = this.stripUnsupported(query);
+		// Mutations are detected on the document text — `operations.ts` always writes a
+		// top-level `mutation Name(`/`query Name(` (fragments may come first, hence the
+		// newline alternative).
+		const mutation = /(^|\n)\s*mutation[\s(]/.test(stripped);
+		// The token goes only where the answer depends on the viewer: a signed-in
+		// viewer's catalogue read whose answer is the anonymous one goes without it.
+		let sent: string | null = token && transport !== 'public' ? token : null;
+		if (sent && transport === 'auto' && !mutation && this.publicCandidate(query, variables)) {
+			if (await this.anonymousPosture(authRevision)) sent = null;
+			this.assertAuthRevision(authRevision);
+		}
 		// Anonymous READS go over GET so Cloudflare and the browser's HTTP cache can
 		// serve them (the server sends Cache-Control + ETag on anonymous GETs; 304
-		// revalidation is the browser's job, no client code needed). An authed viewer
-		// must NEVER take this path: edge caches key on the URL alone, so a cached
+		// revalidation is the browser's job, no client code needed). A request with the
+		// token must NEVER take this path: edge caches key on the URL alone, so a cached
 		// response carrying viewer-specific fields (isMarked, myReview…) would be
-		// replayed to other users. Mutations are detected on the document text —
-		// `operations.ts` always writes a top-level `mutation Name(`/`query Name(`
-		// (fragments may come first, hence the newline alternative).
-		const useGet =
-			!token &&
-			!forcePost &&
-			!this.capabilities.getUnsupported &&
-			!/(^|\n)\s*mutation[\s(]/.test(stripped);
-		let res: Response;
-		if (useGet) {
+		// replayed to other users.
+		const useGet = !sent && transport !== 'post' && !this.capabilities.getUnsupported && !mutation;
+		// The id of the document the server holds as persisted (`persisted.ts`): the URL
+		// stays short, and the edge's cache keys are the server's fixed set of documents.
+		const persisted =
+			useGet &&
+			!this.capabilities.persistedUnsupported &&
+			!this.capabilities.unknownPersisted.has(stripped)
+				? persistedId(stripped)
+				: null;
+		let res: Response | undefined;
+		if (useGet && (persisted || !this.capabilities.fullTextGetRefused)) {
 			// Single-operation documents, so no `operationName`; `variables` only when
-			// there are any. No Authorization header by construction (no token here).
+			// there are any. No Authorization header by construction.
 			const params =
-				`query=${encodeURIComponent(stripped)}` +
+				(persisted ? `id=${persisted}` : `query=${encodeURIComponent(stripped)}`) +
 				(variables ? `&variables=${encodeURIComponent(JSON.stringify(variables))}` : '');
 			res = await doFetch(canonicalUrl(`${this.config.endpoint}?${params}`));
+			if (res.status === 405 && (await refusalCode(res.clone())) === PERSISTED_REQUIRED) {
+				// The server runs only persisted documents over GET, and this one it does not
+				// hold: re-enter, which lands on POST for every document without an id.
+				this.assertAuthRevision(authRevision);
+				this.capabilities.fullTextGetRefused = true;
+				return this.gql<T>(query, variables, retried, tolerate, authRevision, transport);
+			}
 			if (res.status === 404 || res.status === 405) {
 				this.assertAuthRevision(authRevision);
 				// The server predates GET /graphql — schema-drift fallback, not an outage.
@@ -511,24 +682,41 @@ export class GraphQLBackend implements Backend {
 				// exactly as it does on POST. Force this retry to POST even if the slow
 				// rejection outlived the capability capsule's TTL.
 				this.capabilities.getUnsupported = true;
-				return this.gql<T>(query, variables, retried, tolerate, authRevision, true);
+				return this.gql<T>(query, variables, retried, tolerate, authRevision, 'post');
+			}
+			if (res.status === 400 && persisted) {
+				this.assertAuthRevision(authRevision);
+				// The server does not hold this document (another build, or a stripped
+				// retry) and ran nothing: re-enter, which sends the text.
+				if ((await refusalCode(res)) === PERSISTED_NOT_FOUND) {
+					this.capabilities.unknownPersisted.add(stripped);
+					return this.gql<T>(query, variables, retried, tolerate, authRevision, transport);
+				}
+				throw new Error('Backend error 400');
 			}
 		} else {
 			res = await doFetch(this.config.endpoint, {
 				method: 'POST',
 				headers: {
 					'content-type': 'application/json',
-					...(token ? { authorization: `Bearer ${token}` } : {}),
+					...(sent ? { authorization: `Bearer ${sent}` } : {}),
 				},
 				body: JSON.stringify({ query: stripped, variables }),
 			});
 		}
 		if (!res.ok) throw new Error(`Backend error ${res.status}`);
 		const json = (await res.json()) as { data?: T; errors?: GraphQLErrorLike[] };
+		// A server that predates persisted documents parses the missing `query` as an empty
+		// document (`persisted.rs` keeps the words in a test). Send the text from now on.
+		if (persisted && json.errors?.some((e) => e.message.includes('executable_definition'))) {
+			this.assertAuthRevision(authRevision);
+			this.capabilities.persistedUnsupported = true;
+			return this.gql<T>(query, variables, retried, tolerate, authRevision, transport);
+		}
 		// The token this request carried no longer signs anyone in. Let the auth layer
 		// ask the server, which then signs this client out cleanly.
 		if (
-			token &&
+			sent &&
 			this.auth.revision === authRevision &&
 			json.errors?.some((e) => e.message === NOT_AUTHENTICATED)
 		)
@@ -579,7 +767,7 @@ export class GraphQLBackend implements Backend {
 							this.capabilities.unsupportedArgs.add(a);
 						}
 					}
-					return this.gql<T>(query, variables, true, tolerate, authRevision, forcePost);
+					return this.gql<T>(query, variables, true, tolerate, authRevision, transport);
 				}
 			}
 			throw new GraphQLRequestError(json.errors);
@@ -785,7 +973,7 @@ export class GraphQLBackend implements Backend {
 					false,
 					undefined,
 					this.auth.revision,
-					true,
+					'post',
 				)
 			: await this.gql<{ pages: Page[] }>(ops.PAGES, { chapterId });
 		return d.pages;
@@ -1904,6 +2092,7 @@ export class GraphQLBackend implements Backend {
 	// --- viewer preferences ---
 	async setShowNsfw(value: boolean): Promise<boolean> {
 		const d = await this.gql<{ setShowNsfw: boolean }>(ops.SET_SHOW_NSFW, { value });
+		this.auth.posture = undefined;
 		return d.setShowNsfw;
 	}
 
@@ -1916,6 +2105,7 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ setMyBlockRules: BlockRule[] }>(ops.SET_MY_BLOCK_RULES, {
 			rules: rules.map(blockRuleInput),
 		});
+		this.auth.posture = undefined;
 		return d.setMyBlockRules;
 	}
 
@@ -2069,18 +2259,34 @@ export class GraphQLBackend implements Backend {
 		const authRevision = this.auth.revision;
 		if (this.capabilities.seriesPageUnsupported) return undefined;
 		try {
+			// A signed-in viewer whose catalogue answers are the anonymous ones gets the page
+			// as an anonymous GET an edge cache can keep, and its own part by POST.
+			const split =
+				!!this.config.publicReads &&
+				!!this.auth.token &&
+				!this.capabilities.seriesPageViewerUnsupported &&
+				(await this.anonymousPosture(authRevision));
+			this.assertAuthRevision(authRevision);
 			// The aggregation is an optional enrichment the reader can open a chapter without
 			// (it lists one copy per number instead of every group's), so ITS failure must
 			// not take the series, spine and source lists down with it. The server types the
 			// field nullable for exactly this; here a null from a failure reads as an empty
 			// aggregation — the bundle was ASKED for it, so `undefined` would send the reader
 			// on a pointless second `aggregatedChapters` round trip to the same failing query.
-			const d = await this.gql<{ seriesPage: SeriesPageBundle }>(
-				ops.SERIES_PAGE,
-				{ workId, withAggregated },
-				false,
-				[SERIES_PAGE_AGGREGATED],
-			);
+			const [d, viewer] = await Promise.all([
+				this.gql<{ seriesPage: SeriesPageBundle }>(
+					ops.SERIES_PAGE,
+					{ workId, withAggregated },
+					false,
+					[SERIES_PAGE_AGGREGATED],
+					authRevision,
+					split ? 'public' : 'auto',
+				),
+				split ? this.seriesPageViewer(workId, withAggregated, authRevision) : undefined,
+			]);
+			// The server predates `seriesPageViewer` (now remembered): ask signed in.
+			if (viewer === null) return this.seriesPage(workId, withAggregated);
+			if (viewer && d.seriesPage) d.seriesPage = layViewerOver(d.seriesPage, viewer);
 			// A bundle fetched under a previous sign-in must not seed this account's base
 			// revision; the page itself is handled as before.
 			if (this.auth.revision === authRevision && d.seriesPage?.viewerProgress) {
@@ -2110,6 +2316,32 @@ export class GraphQLBackend implements Backend {
 			// exactly as the old fan-out rendering nothing did. Anything else is a real
 			// failure the caller must surface honestly.
 			if (msg.includes('No such work')) return null;
+			throw e;
+		}
+	}
+
+	/** The viewer's part of {@link seriesPage}, or null when the server predates it. */
+	private async seriesPageViewer(
+		workId: Id,
+		withAggregated: boolean,
+		authRevision: number,
+	): Promise<SeriesPageViewerData | null> {
+		try {
+			const d = await this.gql<{ seriesPageViewer: SeriesPageViewerData }>(
+				ops.SERIES_PAGE_VIEWER,
+				{ workId, withAggregated },
+				false,
+				undefined,
+				authRevision,
+				'post',
+			);
+			return d.seriesPageViewer;
+		} catch (e) {
+			this.assertAuthRevision(authRevision);
+			if (e instanceof Error && e.message.includes('Unknown field "seriesPageViewer"')) {
+				this.capabilities.seriesPageViewerUnsupported = true;
+				return null;
+			}
 			throw e;
 		}
 	}

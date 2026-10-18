@@ -348,6 +348,11 @@ pub struct Config {
     /// Serve the GraphiQL IDE on `GET /graphql` and allow schema introspection.
     /// Off by default so a public deployment exposes neither; enable only in dev.
     pub graphiql_enabled: bool,
+    /// `KOMIKA_PERSISTED_ONLY=on`: a `GET /graphql` (or `/graphql/ssr`) must name a
+    /// persisted document by `id`; one that carries the document text is refused with
+    /// 400. Off by default, so self-hosted servers, older apps and development keep
+    /// sending text. POST always takes full documents. See the `persisted` module.
+    pub persisted_only: bool,
     /// Global request budget for the MangaDex crawl (fleet-wide; shared egress IP).
     /// MangaDex's per-IP ceiling is ~5 req/s.
     pub mangadex_rate_per_sec: f64,
@@ -528,6 +533,12 @@ impl Config {
                 v == "on" || v == "1" || v == "true"
             })
             .unwrap_or(false);
+        let persisted_only = env::var("KOMIKA_PERSISTED_ONLY")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "on" || v == "1" || v == "true"
+            })
+            .unwrap_or(false);
         // `CATALOGUE_SYNC` is not read here any more: `instance::catalogue_crawl` decides
         // the crawl from it (same on/off spelling), and `instance::resolve_mangadex` lets
         // `CATALOGUE_SYNC=on` force MangaDex usage on. Both are resolved in `main`.
@@ -680,6 +691,7 @@ impl Config {
             federated_rate_limit_window_secs,
             session_ttl_secs,
             graphiql_enabled,
+            persisted_only,
             mangadex_rate_per_sec,
             mangadex_athome_per_min,
             mangadex_user_agent,

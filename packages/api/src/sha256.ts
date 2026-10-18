@@ -1,12 +1,18 @@
 /**
  * Synchronous SHA-256 of a string's UTF-8 bytes, as lowercase hex.
  *
- * Exists for exactly one caller: `tagSlug` must produce the SAME tag id the server's
- * `tags::slug` writes, and for a name with no ASCII letters or digits ("恋愛") that id is
- * `"tag-" + first 12 hex chars of SHA-256(name)`. `crypto.subtle.digest` is async and
- * `node:crypto` does not exist in the browser, while URL → filter-state parsing is
- * synchronous (it runs inside `$derived`), so a small FIPS 180-4 implementation is the
- * honest way to keep the two ids identical. Inputs are tag names — bytes, not megabytes.
+ * Two callers must produce exactly the digest the other side computes:
+ *  - the reader's `tagSlug` must produce the SAME tag id the server's `tags::slug` writes,
+ *    and for a name with no ASCII letters or digits ("恋愛") that id is
+ *    `"tag-" + first 12 hex chars of SHA-256(name)`;
+ *  - `persistedId` (`persisted.ts`) names a GraphQL document by the digest the build wrote
+ *    into the server's persisted-document map.
+ *
+ * `crypto.subtle.digest` is async and absent outside secure contexts (a server reached
+ * over plain HTTP on a home network), and `node:crypto` does not exist in the browser,
+ * while URL → filter-state parsing is synchronous (it runs inside `$derived`). So a small
+ * FIPS 180-4 implementation is the honest way to keep the ids identical. Inputs are tag
+ * names and documents — kilobytes, not megabytes.
  */
 
 const K = new Uint32Array([

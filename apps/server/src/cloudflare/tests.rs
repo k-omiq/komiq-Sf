@@ -1298,7 +1298,12 @@ fn cache_rules_match_the_hosted_shape_on_this_host_only() {
         ),
         (
             "komiq_graphql",
-            &["\"/graphql\"", "method eq \"GET\"", "\"authorization\""],
+            &[
+                "\"/graphql\"",
+                "\"/graphql/ssr\"",
+                "method eq \"GET\"",
+                "\"authorization\"",
+            ],
         ),
         ("komiq_pages", &["\"/api/v1/manga/\""]),
         ("komiq_img", &["\"/img\""]),

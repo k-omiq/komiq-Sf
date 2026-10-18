@@ -30,6 +30,13 @@ registerHooks({
 	},
 });
 const { GraphQLBackend } = await import('../../../../packages/api/src/graphql-backend.ts');
+const { operationDocuments } =
+	await import('../../../../packages/api/scripts/persisted-operations.ts');
+const { persistedId } = await import('../../../../packages/api/src/persisted.ts');
+/** A GET names its `operations.ts` document by persisted id. */
+const persisted = new Map<string, string>(
+	operationDocuments().map((doc: string) => [persistedId(doc), doc]),
+);
 
 let endpointId = 0;
 function backend(fetch: typeof globalThis.fetch) {
@@ -53,8 +60,9 @@ function requestDocument(
 ): { query: string; variables: Record<string, unknown> } {
 	if (init?.body) return JSON.parse(init.body as string);
 	const params = new URL(String(url)).searchParams;
+	const id = params.get('id');
 	return {
-		query: params.get('query') ?? '',
+		query: (id === null ? params.get('query') : persisted.get(id)) ?? '',
 		variables: JSON.parse(params.get('variables') ?? '{}'),
 	};
 }

@@ -23,7 +23,9 @@ import { confirmExtensionInstall } from './extension-consent.svelte';
  *                and Rust-fetched-direct on native (Tauri). Components never know
  *                which platform they're on.
  */
-const komikaHosted = createBackend({ endpoint: config.apiEndpoint });
+// `publicReads`: a signed-in reader's catalogue reads go out anonymous when that changes
+// nothing, so an edge cache can serve them (see `BackendConfig.publicReads`).
+const komikaHosted = createBackend({ endpoint: config.apiEndpoint, publicReads: true });
 export const backend =
 	config.backendKind === 'suwayomi'
 		? createSuwayomiBackend({ baseUrl: config.suwayomiUrl })

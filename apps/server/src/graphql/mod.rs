@@ -24,6 +24,9 @@ mod progress_w3b_tests;
 #[cfg(test)]
 mod scanlator_rating_tests;
 #[cfg(test)]
+#[path = "series_page_viewer_tests.rs"]
+mod series_page_viewer_tests;
+#[cfg(test)]
 mod sources_tests;
 
 use std::collections::{BTreeMap, HashMap};
@@ -5734,23 +5737,133 @@ impl SeriesPageBundle {
     /// Widening non-null to nullable is backward compatible for every existing document.
     #[graphql(complexity = "100 * child_complexity")]
     async fn aggregated(&self, ctx: &Context<'_>) -> Result<Option<Vec<AggregatedChapter>>> {
-        let st = state(ctx);
-        let rows = catalog::work_source_chapters(&st.pool, &self.work_id.0)
+        aggregated_with_read_state(state(ctx), &self.work_id.0, &self.read_state)
             .await
-            .map_err(gql_read_err)?;
-        let chapters = aggregated_chapters_with_overrides(&st.pool, &self.work_id.0, rows, false)
+            .map(Some)
+    }
+}
+
+/// A work's aggregated chapter rows with `readAnywhere` from `read_state`: the rows
+/// `seriesPage.aggregated` serves.
+async fn aggregated_with_read_state(
+    st: &AppState,
+    work_id: &str,
+    read_state: &progress::WorkReadState,
+) -> Result<Vec<AggregatedChapter>> {
+    let rows = catalog::work_source_chapters(&st.pool, work_id)
+        .await
+        .map_err(gql_read_err)?;
+    Ok(
+        aggregated_chapters_with_overrides(&st.pool, work_id, rows, false)
             .await
             .into_iter()
             .map(|state| {
                 let mut chapter = state.chapter;
-                chapter.read_anywhere = self.read_state.row_read(
+                chapter.read_anywhere = read_state.row_read(
                     chapter.entry_id.as_ref().map(|id| id.0.as_str()),
                     &chapter.key,
                 );
                 chapter
             })
-            .collect();
-        Ok(Some(chapters))
+            .collect(),
+    )
+}
+
+/// What [`QueryRoot::series_page`] adds for a signed-in viewer, without the page.
+///
+/// A signed-in reader fetches the page as an anonymous GET, which an edge cache can keep,
+/// and this by POST, and lays it over the page. Every value comes from the reads
+/// `seriesPage` makes (`work_read_state`, the progress rows, the stored chapter lists,
+/// `user_library`), so the result is what the signed-in page would carry. It reads no
+/// source metadata, builds no `Series` and never asks a source: it answers from the
+/// database alone.
+#[derive(SimpleObject)]
+#[graphql(complex)]
+pub struct SeriesPageViewer {
+    /// The effective work id, as `seriesPage` answers it.
+    pub work_id: ID,
+    pub viewer_progress: Option<ViewerProgress>,
+    /// The chapter copies the viewer read or has a resume page in. Every other copy is
+    /// unread at page 0, as in the anonymous page.
+    #[graphql(complexity = "100 * child_complexity")]
+    pub chapters: Vec<ChapterViewerState>,
+    #[graphql(skip)]
+    series_ids: Vec<String>,
+    #[graphql(skip)]
+    read_state: progress::WorkReadState,
+}
+
+/// One chapter copy's `read` and `lastPageRead`, as `seriesPage` sets them.
+#[derive(SimpleObject)]
+pub struct ChapterViewerState {
+    /// `mangadex` for a spine chapter, `suwayomi` for a source chapter.
+    pub source_type: String,
+    pub chapter_id: ID,
+    pub read: bool,
+    pub last_page_read: i32,
+}
+
+/// The viewer's library flags on one series of the page.
+#[derive(SimpleObject)]
+pub struct SeriesViewerFlags {
+    pub series_id: ID,
+    pub is_marked: bool,
+    pub library_status: Option<String>,
+    pub is_favorite: bool,
+}
+
+#[ComplexObject]
+impl SeriesPageViewer {
+    /// `isMarked`, `libraryStatus` and `isFavorite` of the work's series and of each
+    /// source series: the `Series` objects `seriesPage` returns.
+    async fn library(&self, ctx: &Context<'_>) -> Result<Vec<SeriesViewerFlags>> {
+        // Asked together, so the request's library cache reads them in one batch.
+        let rows = futures::future::try_join_all(
+            self.series_ids.iter().map(|id| viewer_library_row(ctx, id)),
+        )
+        .await?;
+        Ok(self
+            .series_ids
+            .iter()
+            .zip(rows)
+            .map(|(id, row)| SeriesViewerFlags {
+                series_id: ID(id.clone()),
+                is_marked: row.is_some(),
+                library_status: row.as_ref().and_then(|row| row.status.clone()),
+                is_favorite: row.is_some_and(|row| row.is_favorite),
+            })
+            .collect())
+    }
+
+    /// The `seriesPage.aggregated` rows the viewer read (`readAnywhere`), and only those.
+    #[graphql(complexity = "100 * child_complexity")]
+    async fn aggregated(&self, ctx: &Context<'_>) -> Result<Vec<AggregatedChapter>> {
+        let mut rows =
+            aggregated_with_read_state(state(ctx), &self.work_id.0, &self.read_state).await?;
+        rows.retain(|row| row.read_anywhere);
+        Ok(rows)
+    }
+}
+
+/// Collects [`ChapterViewerState`] for the copies the viewer has state in.
+struct ViewerChapters<'a> {
+    read_state: &'a progress::WorkReadState,
+    chapters: Vec<ChapterViewerState>,
+}
+
+impl ViewerChapters<'_> {
+    /// One copy: `own` is its progress row, `spine_key` its key (empty when not known).
+    fn add(&mut self, source_type: &str, id: String, spine_key: &str, own: Option<(i32, bool)>) {
+        let (last_page_read, read) = own.unwrap_or((0, false));
+        let read = self.read_state.copy_read(source_type, &id, spine_key, read);
+        if read || last_page_read != 0 {
+            self.chapters.push(ChapterViewerState {
+                source_type: source_type.to_string(),
+                chapter_id: ID(id),
+                read,
+                last_page_read,
+            });
+        }
     }
 }
 
@@ -6709,6 +6822,90 @@ impl QueryRoot {
             spine_chapters,
             sources,
             viewer_progress: ViewerProgress::from_state(&read_state),
+            read_state,
+        })
+    }
+
+    /// The viewer's part of [`Self::series_page`] for the same work: read state, resume
+    /// pages, library flags and the progress revision. The same redirect, NSFW gate and
+    /// block gate as `seriesPage`, so it answers where the page answers. Empty for an
+    /// anonymous request: `seriesPage` has no viewer data for it either.
+    async fn series_page_viewer(&self, ctx: &Context<'_>, work_id: ID) -> Result<SeriesPageViewer> {
+        let st = state(ctx);
+        let work = load_work_following_redirect(&st.pool, &work_id.0)
+            .await?
+            .ok_or_else(|| Error::new("No such work"))?;
+        let effective_id = work.work_id.clone();
+        let show_nsfw = viewer_show_nsfw(ctx).await?;
+        if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !show_nsfw {
+            return Err(Error::new("No such work"));
+        }
+        deny_blocked_work(ctx, &work.work_id, "No such work").await?;
+        let Some(user) = current_user(ctx).await? else {
+            return Ok(SeriesPageViewer {
+                work_id: ID(effective_id),
+                viewer_progress: None,
+                chapters: Vec::new(),
+                series_ids: Vec::new(),
+                read_state: progress::WorkReadState::Empty,
+            });
+        };
+        let user_id = Some(user.id.as_str());
+        let read_state = progress::work_read_state(&st.pool, user_id, &effective_id).await;
+        let mut chapters = ViewerChapters {
+            read_state: &read_state,
+            chapters: Vec::new(),
+        };
+        if work.mangadex_id.is_some() {
+            let spine = catalog::load_canonical_chapters(&st.pool, &effective_id)
+                .await
+                .map_err(gql_read_err)?;
+            let progress = canonical_progress_map(&st.pool, user_id, &effective_id).await;
+            for c in spine {
+                let own = progress.get(&c.external_id).copied();
+                let key = canonical_chapter_key(&c);
+                chapters.add("mangadex", c.external_id, &key, own);
+            }
+        }
+        let source_ids: Vec<i64> = load_work_sources(&st.pool, &effective_id, show_nsfw)
+            .await?
+            .iter()
+            .filter(|src| src.source_type != "mangadex")
+            .filter_map(|src| src.source_key.parse().ok())
+            .collect();
+        let mut stored = crate::series_cache::get_chapters_fresh_batch(&st.pool, &source_ids)
+            .await
+            .map_err(gql_read_err)?;
+        let mut progress = suwayomi_progress_batch(&st.pool, user_id, &source_ids).await?;
+        for n in &source_ids {
+            let mut own = progress.remove(n).unwrap_or_default();
+            // The stored list `seriesPage` serves for this source. A list of an earlier
+            // engine is one the page fetches again, so its keys are not used.
+            let list = stored
+                .remove(n)
+                .map(|(rows, _)| rows)
+                .filter(|rows| {
+                    rows.iter()
+                        .all(|c| cache_belongs_to_engine(st, c.engine_generation.as_deref()))
+                })
+                .unwrap_or_default();
+            for c in list {
+                let key = catalog::spine_key_and_label(&catalog::suwayomi_chapter_input(&c)).0;
+                chapters.add("suwayomi", c.id.to_string(), &key, own.remove(&c.id));
+            }
+            // A copy with a progress row the stored list does not hold yet keeps that row.
+            for (id, row) in own {
+                chapters.add("suwayomi", id.to_string(), "", Some(row));
+            }
+        }
+        let chapters = chapters.chapters;
+        let mut series_ids = vec![effective_id.clone()];
+        series_ids.extend(source_ids.iter().map(i64::to_string));
+        Ok(SeriesPageViewer {
+            work_id: ID(effective_id),
+            viewer_progress: ViewerProgress::from_state(&read_state),
+            chapters,
+            series_ids,
             read_state,
         })
     }
@@ -35739,25 +35936,46 @@ mod tests {
         }
     }
 
+    /// Runs validation and the request limits, then stops: nothing executes.
+    struct ValidateOnly;
+    impl async_graphql::extensions::ExtensionFactory for ValidateOnly {
+        fn create(&self) -> std::sync::Arc<dyn async_graphql::extensions::Extension> {
+            std::sync::Arc::new(ValidateOnly)
+        }
+    }
+    #[async_trait::async_trait]
+    impl async_graphql::extensions::Extension for ValidateOnly {
+        async fn execute(
+            &self,
+            _: &async_graphql::extensions::ExtensionContext<'_>,
+            _: Option<&str>,
+            _: async_graphql::extensions::NextExecute<'_>,
+        ) -> async_graphql::Response {
+            async_graphql::Response::default()
+        }
+    }
+
+    /// A GET by persisted id fails only where the same POST would: every stored document
+    /// passes the schema and its limits.
+    #[tokio::test]
+    async fn every_persisted_document_passes_validation() {
+        let (_, _, state, _cover_dir) = setup_with_state(100).await;
+        let schema = schema_builder(state, false)
+            .extension(ValidateOnly)
+            .finish();
+        for document in crate::persisted::documents() {
+            let response = schema.execute(document).await;
+            let errors: Vec<_> = response
+                .errors
+                .iter()
+                .filter(|e| !e.message.contains("not provided"))
+                .collect();
+            assert!(errors.is_empty(), "{document}: {errors:?}");
+        }
+    }
+
     #[tokio::test]
     async fn request_limits_weight_lists_and_accept_shipped_documents() {
-        struct ValidateOnly;
-        impl async_graphql::extensions::ExtensionFactory for ValidateOnly {
-            fn create(&self) -> std::sync::Arc<dyn async_graphql::extensions::Extension> {
-                std::sync::Arc::new(ValidateOnly)
-            }
-        }
-        #[async_trait::async_trait]
-        impl async_graphql::extensions::Extension for ValidateOnly {
-            async fn execute(
-                &self,
-                _: &async_graphql::extensions::ExtensionContext<'_>,
-                _: Option<&str>,
-                _: async_graphql::extensions::NextExecute<'_>,
-            ) -> async_graphql::Response {
-                async_graphql::Response::default()
-            }
-        }
         let (_, _, state, _cover_dir) = setup_with_state(100).await;
         let schema = schema_builder(state, false)
             .extension(ValidateOnly)

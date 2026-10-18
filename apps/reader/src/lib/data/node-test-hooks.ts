@@ -129,3 +129,45 @@ registerHooks({
 		return next(url, context);
 	},
 });
+
+// The persisted documents by id, each as `operations.ts` writes it. Imported after the
+// hooks above, which the client modules' `.js` specifiers need.
+const { operationDocuments } =
+	await import('../../../../../packages/api/scripts/persisted-operations.ts');
+const { persistedId } = await import('../../../../../packages/api/src/persisted.ts');
+const PERSISTED = new Map<string, string>(
+	operationDocuments().map((doc: string) => [persistedId(doc), doc]),
+);
+
+/**
+ * A test server's `fetch` that holds the persisted documents, like
+ * `apps/server/src/persisted.rs`. A GET naming a known `id` reaches `fetch` as the GET of
+ * that document's text (`query=`), so a test reads every GET one way. An unknown id gets the
+ * server's refusal, and the client then sends the text.
+ */
+export function persistedServer(fetch: typeof globalThis.fetch): typeof globalThis.fetch {
+	return async (input, init) => {
+		const url = new URL(input instanceof Request ? input.url : String(input));
+		const id = url.searchParams.get('id');
+		if (id === null) return fetch(input, init);
+		const document = PERSISTED.get(id);
+		if (document === undefined) {
+			return Response.json(
+				{
+					errors: [
+						{
+							message: 'PersistedQueryNotFound',
+							extensions: { code: 'PERSISTED_QUERY_NOT_FOUND' },
+						},
+					],
+				},
+				{ status: 400 },
+			);
+		}
+		const variables = url.searchParams.get('variables');
+		url.search =
+			`query=${encodeURIComponent(document)}` +
+			(variables === null ? '' : `&variables=${encodeURIComponent(variables)}`);
+		return fetch(url.href, init);
+	};
+}

@@ -24,6 +24,8 @@ Anonymous queries can use `GET /graphql` with URL query parameters:
 curl -s "https://komiq.example.com/graphql?query=%7Bdiscovery%7Btitle%7D%7D"
 ```
 
+The apps send `?id=` instead of `?query=`: the SHA-256 of a document they ship, which the server holds in `apps/server/persisted-operations.json`. A server with `KOMIKA_PERSISTED_ONLY=on` takes only that form over GET. Read [Edge rendering and caching](/developers/edge-caching#persisted-documents). The same GET also works at `/graphql/ssr`.
+
 For anonymous GET requests, the server sends an `ETag` and a `Cache-Control` header. Browser caches and reverse proxy caches use these headers to store and revalidate public catalog responses.
 
 The server rejects mutations sent over GET with HTTP 405 Method Not Allowed.
@@ -39,7 +41,7 @@ All mutations and authenticated queries use `POST /graphql` with a JSON payload:
 }
 ```
 
-Set the request `Content-Type` header to `application/json`. Authenticated queries never use GET because edge caches key only on the URL, which would risk serving private user state to another reader.
+Set the request `Content-Type` header to `application/json`. Authenticated queries never use GET because edge caches key only on the URL, which would risk serving private user state to another reader. The reader sends some reads of a signed-in viewer without the token, as GETs, when the answer is the same as the anonymous one. Read [Signed-in readers](/developers/edge-caching#signed-in-readers).
 
 ## Authentication
 
@@ -234,6 +236,8 @@ Starting a new generation advances the epoch to at least the current Unix time i
 ### GET fallback
 
 If an intermediary proxy or older server version returns an HTTP 404 or 405 error on a `GET /graphql` request, `GraphQLBackend` sets an internal flag and retries using `POST /graphql`. Subsequent read queries use POST directly.
+
+A persisted-document GET has three more fallbacks. An unknown id (`400`, `PERSISTED_QUERY_NOT_FOUND`) makes the client send that document's text from then on. A `405` with `PERSISTED_QUERY_REQUIRED` makes it send documents without an id by POST, while ids keep using GET. A server that predates persisted documents answers an id with a parse error, and the client then sends text. Each of these is kept for the endpoint like the other capability flags.
 
 ## Exploring the API locally
 

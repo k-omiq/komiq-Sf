@@ -964,6 +964,9 @@ export interface AggregatedChapter {
 	/** Whether the entry is a special (not marked read by finishing a later chapter);
 	 *  null/absent while the list is not built. */
 	special?: boolean | null;
+	/** The cross-source grouping key. Selected by `seriesPage`, where it names the row
+	 *  together with `entryId`; absent from other documents. */
+	key?: string;
 	number: number;
 	/** What to print (`"45"`, `"10.5"`, `"Oneshot"`). Optional only because older documents
 	 *  did not select it; the server has always provided it. */

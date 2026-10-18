@@ -52,12 +52,23 @@ SvelteKit provides a scoped `fetch` function to universal `load` functions. The 
 
 When an edge worker renders a page:
 
-1. The `load` function issues an anonymous `GET /graphql` query using SvelteKit's `fetch`.
-2. SvelteKit serializes the query response directly into the rendered HTML inside a `<script data-sveltekit-fetched>` tag.
+1. The `load` function issues an anonymous GraphQL GET using SvelteKit's `fetch`. On the edge, the `handleFetch` hook in `apps/reader/src/hooks.server.ts` sends it to `/graphql/ssr` instead of `/graphql`. Read [The /graphql/ssr path](#the-graphql-ssr-path).
+2. SvelteKit serializes the query response directly into the rendered HTML inside a `<script data-sveltekit-fetched>` tag, under the URL the `load` asked for.
 3. The browser downloads the HTML and begins client-side hydration.
 4. During hydration, the universal `load` executes again in the browser. Instead of making another round trip over the network to the GraphQL API, SvelteKit resolves the data immediately from the inlined script tag.
 
-For signed-in users, the browser client sends an authenticated `POST /graphql` request with a bearer token. SvelteKit matches serialized responses by URL and request headers. Because the authenticated request includes authorization headers, it bypasses the serialized anonymous response and fetches personalized library marks and content settings.
+### Signed-in readers
+
+A signed-in reader sends its catalogue reads without its token too, when its answers are the anonymous ones. That is the case when the viewer has not turned on NSFW content and has no block rule of their own. The catalogue reads are the feeds, search, browse lists, tags, chapter page lists and the series page. The reader finds this out with one `ViewerPosture` query after sign-in. It asks again after 5 minutes, or after the viewer changes either setting on this device, so a change made on another device applies within 5 minutes.
+
+On the series page, the reader then sends two requests at once:
+
+- `seriesPage` as an anonymous GET, which the edge can cache.
+- `seriesPageViewer` by POST with the token. It returns only the viewer's part: read marks, resume pages, library flags and the progress revision.
+
+The reader lays the second answer over the first, in `layViewerOver` in `packages/api/src/graphql-backend.ts`. The server answers `seriesPageViewer` from its database, without asking a source. A server without `seriesPageViewer` gets one signed-in `seriesPage` instead.
+
+A viewer with NSFW content turned on or with their own block rules sends every read by `POST` with the token. So do the admin console and an admin's `includeNsfw` search. Anonymous answers carry no viewer data: the server fills library flags and read marks only for a request with a token.
 
 ### Server-side CORS simulation
 
@@ -65,7 +76,7 @@ SvelteKit simulates cross-origin resource sharing checks on server-side `fetch` 
 
 To prevent failed edge renders:
 
-- The komiq API server explicitly sets `Access-Control-Allow-Origin: *` for anonymous `GET /graphql` requests.
+- The komiq API server explicitly sets `Access-Control-Allow-Origin: *` for anonymous `GET /graphql` and `GET /graphql/ssr` requests.
 - Covers, avatars, comment images and `/media/` routes also send `*`, with no `Vary: Origin`, so one URL is one cache entry. `POST /graphql` and signed-in requests keep the origin allowlist.
 - The reader's `guarded` fetch wrapper in `apps/reader/src/lib/data/load-fetch.ts` retries errors beginning with `CORS error` through global `fetch`. Other errors propagate.
 
@@ -83,6 +94,29 @@ The `GET /graphql` pipeline in `apps/server/src/main.rs` enforces three requirem
 1. **Query operations only**: The server inspects the parsed GraphQL document before execution. If the document contains mutations, the request is rejected with HTTP 405 Method Not Allowed.
 2. **Anonymous invariance**: The server checks for bearer tokens. Anonymous responses contain public data, which is invariant across viewers. Error-free anonymous responses without non-cacheable fields receive public cache headers.
 3. **Sensitive field exclusion**: Queries that inspect dynamic server state (such as the `instance` field containing runtime registration settings) are marked `private, no-store` to prevent caching configuration changes.
+
+### Persisted documents
+
+The apps name a GET's document by id instead of sending its text:
+
+```text
+GET /graphql?id=<sha256>&variables=<json>
+```
+
+The id is the SHA-256, in hex, of the document's normalised text: comments and extra spaces removed, string values kept as written. `pnpm --filter @komika/api persisted` hashes every document in `packages/api/src/operations.ts` into `apps/server/persisted-operations.json`, and the server builds that file in. `pnpm --filter @komika/api build` fails when the file is not current. The client computes the same id for the document it sends.
+
+- A known id runs its stored document, with the same cache headers as any other GET.
+- An unknown id answers `400` with the code `PERSISTED_QUERY_NOT_FOUND` and `no-store`. Nothing runs. The client then sends the document text.
+- A GET with the document text works as before. With `KOMIKA_PERSISTED_ONLY=on`, the server refuses it with `405`, the code `PERSISTED_QUERY_REQUIRED` and `no-store`. The client then sends that document by POST. Older apps also fall back to POST on a `405`.
+- POST always takes full documents.
+
+With `KOMIKA_PERSISTED_ONLY=on`, the cacheable GET path runs only the documents the apps ship, so its cache keys are a fixed set. It is off by default. Read [Configuration](/self-host/configuration).
+
+### The /graphql/ssr path
+
+Every server answers `/graphql/ssr` with the same handler and rules as `/graphql`: the same persisted documents, cache headers, entity tags and CORS answers. The web reader's edge renders use it. Every render leaves the edge from the same Workers address, so an edge rule, such as a rate limit for each client address on `/graphql`, can tell renders from browsers by the path.
+
+The browser keeps using `/graphql`. A server without the alias answers `404` or its web app's HTML. The render then reads `/graphql`, and goes there directly for 5 minutes. The cache rules that the server's Cloudflare setup creates cover both paths.
 
 ## Entity tags and 304 revalidation
 
@@ -112,7 +146,8 @@ Komiq applies tailored cache durations across each layer of the architecture:
 | Series URL with unused parameters            | `/series/[slug]?…`                                                                      | `public, max-age=3600, s-maxage=60`                 | `301` redirect to the clean URL.                                                                                                                         |
 | Web reader shell                             | Every other document                                                                    | `no-cache`                                          | The browser checks with Workers Assets before it reuses the shell.                                                                                       |
 | Web reader app files                         | `/_app/immutable/*`                                                                     | `public, max-age=604800, immutable`                 | Browser lifetime: 7 days. A missing file can be cached as `index.html` for up to 7 days, so every release goes through `apps/reader/deploy/release.mjs`. |
-| Cacheable GraphQL query                      | `GET /graphql`                                                                          | `public, max-age=30, s-maxage=60`                   | Shared-cache lifetime: 60 seconds; browser lifetime: 30 seconds, with ETag revalidation.                                                                 |
+| Cacheable GraphQL query                      | `GET /graphql`, `GET /graphql/ssr`                                                      | `public, max-age=30, s-maxage=60`                   | Shared-cache lifetime: 60 seconds; browser lifetime: 30 seconds, with ETag revalidation.                                                                 |
+| Refused persisted-document GET               | `GET /graphql?id=…`, `GET /graphql?query=…`                                             | `no-store`                                          | `400` for an unknown id, `405` for document text with `KOMIKA_PERSISTED_ONLY=on`. Never cached.                                                          |
 | Image proxy Worker (global server)           | `img.komiq.cc/img`                                                                      | `public, max-age=604800, immutable`                 | MangaDex chapter pages: browser lifetime 7 days; the Worker's edge cache keeps them 30 days. Other images: `public, max-age=300, must-revalidate`.       |
 | Server image proxy (self-hosted)             | `/img`                                                                                  | `public, max-age=604800, immutable`                 | Browser or shared caches can store images for 7 days.                                                                                                    |
 | Web app pages (self-hosted)                  | `/`, `/admin`, SPA routes                                                               | `no-cache`                                          | The browser checks with the server before it reuses a page.                                                                                              |
@@ -153,5 +188,11 @@ The server keeps at most 65,536 notes, about 13 MB, and drops the oldest first. 
 - `apps/reader/src/lib/config.ts`: Connected API origin and image proxy selection.
 - `apps/reader/csp.ts`: Connection origins derived from public build settings.
 - `apps/server/src/img_proxy.rs`: Self-hosted image proxy and cache headers.
-- `apps/server/src/main.rs`: Implements `graphql_get_handler`, weak ETag hashing, 304 revalidation, and public asset routes.
+- `apps/server/src/main.rs`: Implements `graphql_get_handler`, the `/graphql/ssr` route, weak ETag hashing, 304 revalidation, and public asset routes.
+- `apps/server/src/persisted.rs`: Persisted document lookup, `KOMIKA_PERSISTED_ONLY` and the refusals.
+- `apps/server/persisted-operations.json`: The generated map of ids to documents.
+- `packages/api/scripts/persisted-operations.ts` and `packages/api/src/persisted.ts`: The map build and the id rule.
+- `packages/api/src/graphql-backend.ts`: Picks GET or POST, sends signed-in catalogue reads anonymously, and lays `seriesPageViewer` over the series page.
+- `apps/reader/src/lib/data/ssr-graphql.ts`: Sends edge render reads to `/graphql/ssr`.
+- `apps/server/src/graphql/mod.rs`: The `seriesPageViewer` resolver.
 - `apps/server/src/page_locator.rs`: Chapter position memo and page fingerprint notes.

@@ -4,7 +4,7 @@ import { registerHooks } from 'node:module';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
-import './node-test-hooks.ts';
+import { persistedServer } from './node-test-hooks.ts';
 
 registerHooks({
 	load(url, context, next) {
@@ -169,14 +169,14 @@ test('field and argument stripping is endpoint scoped', async () => {
 	assert.equal(old.browseFilterSupported(), false);
 	const modern = new GraphQLBackend({
 		endpoint: endpoint(),
-		fetch: async (input) => {
+		fetch: persistedServer(async (input) => {
 			const query = new URL(String(input)).searchParams.get('query')!;
 			assert.match(query, /\n\s*detectedAt\s*\n/);
 			assert.match(query, /filter:\s*\$filter/);
 			return Response.json({
 				data: { search: { items: [], page: 1, hasNextPage: false, total: 0 } },
 			});
-		},
+		}),
 	});
 	await modern.search('fixture');
 	assert.equal(modern.browseFilterSupported(), true);
@@ -312,7 +312,7 @@ test('an older server without Page.media* fields still lists pages', async () =>
 	const page = { index: 0, sourceUrl: 'https://fixture.test/p/0', width: null, height: null };
 	const old = new GraphQLBackend({
 		endpoint: endpoint(),
-		fetch: async (input) => {
+		fetch: persistedServer(async (input) => {
 			const query = new URL(String(input)).searchParams.get('query')!;
 			queries.push(query);
 			return queries.length === 1
@@ -324,7 +324,7 @@ test('an older server without Page.media* fields still lists pages', async () =>
 						),
 					})
 				: Response.json({ data: { pages: [page] } });
-		},
+		}),
 	});
 	assert.deepEqual(await old.pages('9005'), [page]);
 	assert.match(queries[0], /\n\s*mediaPath\s*\n/);
@@ -337,13 +337,13 @@ test('a server that only lacks mediaPackPath retries singles and remembers the f
 	const page = { index: 0, sourceUrl: '/page/0', mediaPath: '/media/v1/o/copy/hash' };
 	const backend = new GraphQLBackend({
 		endpoint: endpoint(),
-		fetch: async (input) => {
+		fetch: persistedServer(async (input) => {
 			const query = new URL(String(input)).searchParams.get('query')!;
 			queries.push(query);
 			return queries.length === 1
 				? unknown('mediaPackPath')
 				: Response.json({ data: { pages: [page] } });
-		},
+		}),
 	});
 	assert.deepEqual(await backend.pages('8'), [page]);
 	assert.deepEqual(await backend.pages('8'), [page]);

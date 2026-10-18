@@ -1980,6 +1980,23 @@ export const MY_BLOCK_RULES = /* GraphQL */ `
 	}
 `;
 
+// Whether a signed-in viewer's catalogue reads are the anonymous ones: no NSFW opt-in and
+// no block rule of their own. Then they go out as anonymous GETs an edge cache can keep
+// (see `GraphQLBackend.publicRead`).
+export const VIEWER_POSTURE = /* GraphQL */ `
+	query ViewerPosture {
+		session {
+			user {
+				showNsfw
+			}
+		}
+		myBlockRules {
+			tags
+			ratings
+		}
+	}
+`;
+
 export const SET_MY_BLOCK_RULES = /* GraphQL */ `
 	mutation SetMyBlockRules($rules: [BlockRuleInput!]!) {
 		setMyBlockRules(rules: $rules) {
@@ -2343,6 +2360,8 @@ export const SERIES_PAGE = /* GraphQL */ `
 			}
 			aggregated @include(if: $withAggregated) {
 				entryId
+				# The row's identity with entryId, for laying \`seriesPageViewer\` over the page.
+				key
 				entryOrder
 				special
 				number
@@ -2363,6 +2382,37 @@ export const SERIES_PAGE = /* GraphQL */ `
 					copyReleasedAt
 					copyExternalUrl
 				}
+			}
+		}
+	}
+`;
+
+// What `seriesPage` adds for a signed-in viewer, without the page. A signed-in reader
+// fetches the page as an anonymous GET an edge cache can keep, and lays this POST over it
+// (see `GraphQLBackend.seriesPage`).
+export const SERIES_PAGE_VIEWER = /* GraphQL */ `
+	query SeriesPageViewer($workId: ID!, $withAggregated: Boolean! = false) {
+		seriesPageViewer(workId: $workId) {
+			workId
+			viewerProgress {
+				revision
+				throughEntryId
+			}
+			library {
+				seriesId
+				isMarked
+				libraryStatus
+				isFavorite
+			}
+			chapters {
+				sourceType
+				chapterId
+				read
+				lastPageRead
+			}
+			aggregated @include(if: $withAggregated) {
+				entryId
+				key
 			}
 		}
 	}

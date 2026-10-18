@@ -47,6 +47,7 @@ type Query {
 	canonicalSeries(workId: ID!, includeFederated: Boolean = false): Series! # [komika] a work as a Series; a work with no MangaDex anchor only with includeFederated (then sourceId is "")
 	canonicalChapters(workId: ID!): [Chapter!]! # [komika] its chapters from the mirror, deduped/ordered
 	seriesPage(workId: ID!, includeFederated: Boolean = false): SeriesPageBundle! # [komika] the series, spine and every source's chapters in one request; workId follows merge redirects
+	seriesPageViewer(workId: ID!): SeriesPageViewer! # [komika] the signed-in viewer's part of seriesPage (read state, resume pages, library flags), laid over an anonymous seriesPage
 	canonicalPages(chapterId: ID!): [Page!]! # [komika] page URLs via MangaDex@Home (chapterId = MangaDex chapter uuid)
 	# native-embedded-Suwayomi source routing — per canonical work, the source
 	# mappings + extension coordinates a native client needs to fetch it directly.
@@ -681,6 +682,29 @@ type SeriesPageSourceEntry {
 	source: WorkSource!
 	chapters: [Chapter!]!
 	series: Series
+}
+
+# Empty for an anonymous viewer. Same not-found, NSFW and block gates as seriesPage.
+type SeriesPageViewer {
+	workId: ID! # effective work id after redirects
+	viewerProgress: ViewerProgress
+	chapters: [ChapterViewerState!]! # only copies the viewer read or has a resume page in
+	library: [SeriesViewerFlags!]! # the work's series and each source series
+	aggregated: [AggregatedChapter!]! # only the rows with readAnywhere
+}
+
+type ChapterViewerState {
+	sourceType: String! # mangadex (spine) or suwayomi (source)
+	chapterId: ID!
+	read: Boolean!
+	lastPageRead: Int!
+}
+
+type SeriesViewerFlags {
+	seriesId: ID!
+	isMarked: Boolean!
+	libraryStatus: String
+	isFavorite: Boolean!
 }
 
 # Upstream image URL; never used directly as <img src> — the client's

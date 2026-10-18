@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { registerHooks } from 'node:module';
 import test from 'node:test';
 
@@ -54,14 +55,21 @@ const series = {
 	credits: [],
 	covers: [],
 };
+/** The documents the API holds by id (`apps/server/src/persisted.rs`). */
+const persisted = JSON.parse(
+	readFileSync(new URL('../../server/persisted-operations.json', import.meta.url), 'utf8'),
+);
+/** How each API request arrived: its path, and `id` when it named a persisted document. */
+const asked = [];
 globalThis.fetch = async (input, init) => {
 	const request = new Request(input, init);
 	assert.ok(request.url.startsWith(API), `unexpected fetch ${request.url}`);
+	const url = new URL(request.url);
+	asked.push(`${request.method} ${url.pathname}${url.searchParams.has('id') ? ' id' : ''}`);
 	const body =
-		request.method === 'POST'
-			? await request.json()
-			: Object.fromEntries(new URL(request.url).searchParams);
-	const operation = body.query.match(/\b(?:query|mutation)\s+(\w+)\s*[({]/)?.[1];
+		request.method === 'POST' ? await request.json() : Object.fromEntries(url.searchParams);
+	const query = body.query ?? persisted[body.id];
+	const operation = query.match(/\b(?:query|mutation)\s+(\w+)\s*[({]/)?.[1];
 	const headers = { 'access-control-allow-origin': '*' };
 	if (operation !== 'SeriesPage') return Response.json({ data: {} }, { headers });
 	const { workId } = JSON.parse(body.variables);
@@ -85,8 +93,15 @@ async function get(path) {
 }
 
 test('a found series is edge-cached for a minute', async () => {
+	asked.length = 0;
 	const response = await get('/series/w_found');
 	assert.equal(response.status, 200);
+	// The render reads the API under its own path, by persisted id.
+	assert.ok(asked.length > 0);
+	assert.ok(
+		asked.every((how) => how === 'GET /graphql/ssr id'),
+		asked.join(', '),
+	);
 	assert.equal(response.headers.get('cache-control'), 'public, max-age=0, s-maxage=60');
 	assert.match(await response.text(), /Found Series/);
 	assert.ok(edge.has('https://komiq.cc/series/w_found'));

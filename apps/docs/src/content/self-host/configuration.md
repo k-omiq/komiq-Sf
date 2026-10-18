@@ -45,6 +45,7 @@ These variables configure network listeners, web applications, and proxy endpoin
 | `CORS_ORIGINS`             | local origins | Comma-separated allowed Cross-Origin Resource Sharing (CORS) origins. The native reader apps need `tauri://localhost,http://tauri.localhost,https://tauri.localhost`; the self-host Docker image and the admin desktop app set these. |
 | `LOG_FORMAT`               | unset         | `json` for structured JSON logs; unset for text, coloured only at a terminal without `NO_COLOR`.                                                                                                                                      |
 | `GRAPHIQL_ENABLED`         | `false`       | Enables interactive GraphiQL query explorer at `/graphql`.                                                                                                                                                                            |
+| `KOMIKA_PERSISTED_ONLY`    | `off`         | `on` makes a GraphQL GET name one of the documents the apps ship, by id. A GET with the document text gets `405`, and the apps send it by POST. Read [Edge rendering and caching](/developers/edge-caching).                          |
 
 ### Fallback listener
 

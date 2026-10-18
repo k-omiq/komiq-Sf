@@ -22,7 +22,7 @@
  * Every mutator returns a NEW normalised state with the page reset to 1: a different
  * filter is a different result set, and page 7 of the old one is meaningless.
  */
-import { sha256Hex } from './sha256.ts';
+import { sha256Hex } from '@komika/api/sha256';
 import type {
 	BrowseFilter,
 	BrowseSort,

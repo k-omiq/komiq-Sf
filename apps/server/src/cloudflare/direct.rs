@@ -284,7 +284,7 @@ const LOCAL_ONLY: &str = "This server is set to \"Only my devices\". It does not
 /// Refuse a request with a sentence for its user.
 fn refuse(request: &Request, message: &str) -> Response {
     // A GraphQL client shows `errors[].message`; it would hide the body of a 403.
-    if request.uri().path() == "/graphql" {
+    if matches!(request.uri().path(), "/graphql" | "/graphql/ssr") {
         return axum::Json(json!({ "data": null, "errors": [{ "message": message }] }))
             .into_response();
     }

@@ -4,7 +4,7 @@ import { registerHooks } from 'node:module';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
-import './node-test-hooks.ts';
+import { persistedServer } from './node-test-hooks.ts';
 
 registerHooks({
 	load(url, context, next) {
@@ -149,14 +149,14 @@ for (const [name, document, key, value, load] of [
 		);
 		const backend = new GraphQLBackend({
 			endpoint: endpoint(),
-			fetch: async (input, init) => {
+			fetch: persistedServer(async (input, init) => {
 				queries.push(request(input, init).query);
 				return queries.length === 1
 					? Response.json({
 							errors: fields.map((field) => ({ message: 'Unknown field "' + field + '"' })),
 						})
 					: Response.json({ data: { [key]: value } });
-			},
+			}),
 		});
 		assert.deepEqual(await load(backend), value);
 		assert.equal(queries.length, 2, 'all unknown fields share one retry');
@@ -173,13 +173,13 @@ for (const [name, document, key, value, load] of [
 test('workChapterList sends the admin document and preserves entries and linked copies', async () => {
 	const backend = new GraphQLBackend({
 		endpoint: endpoint(),
-		fetch: async (input, init) => {
+		fetch: persistedServer(async (input, init) => {
 			assert.deepEqual(request(input, init), {
 				query: ops.WORK_CHAPTER_LIST,
 				variables: { workId },
 			});
 			return Response.json({ data: { workChapterList: list } });
-		},
+		}),
 	});
 	assert.deepEqual(await backend.workChapterList(workId), list);
 });

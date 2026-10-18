@@ -6,7 +6,13 @@
 	"type": "module",
 	"types": "./src/index.ts",
 	"exports": {
-		".": "./src/index.ts"
+		".": "./src/index.ts",
+		"./sha256": "./src/sha256.ts"
+	},
+	"scripts": {
+		"build": "node scripts/persisted-operations.ts --check",
+		"persisted": "node scripts/persisted-operations.ts",
+		"test": "node --test src/*.test.ts test/*.test.ts"
 	},
 	"dependencies": {
 		"@komika/types": "workspace:*",

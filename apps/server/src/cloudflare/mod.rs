@@ -1920,7 +1920,8 @@ fn cache_rules(domain: &str) -> Vec<Value> {
         rule(
             "komiq_graphql",
             "cache anonymous GraphQL reads",
-            "http.request.uri.path eq \"/graphql\" and http.request.method eq \"GET\" and \
+            "http.request.uri.path in {\"/graphql\" \"/graphql/ssr\"} and \
+             http.request.method eq \"GET\" and \
              not any(lower(http.request.headers.names[*])[*] eq \"authorization\")",
             cached(json!({ "cache_key": { "ignore_query_strings_order": true } })),
         ),

@@ -62,6 +62,7 @@ mod notify;
 mod page_locator;
 #[cfg(test)]
 mod page_locator_tests;
+mod persisted;
 mod phase_f;
 mod phash;
 #[cfg(test)]
@@ -104,7 +105,7 @@ use std::sync::Arc;
 use std::net::{IpAddr, SocketAddr};
 
 use async_graphql::http::GraphiQLSource;
-use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
+use async_graphql_axum::GraphQLResponse;
 use axum::{
     extract::{
         ConnectInfo, DefaultBodyLimit, FromRef, Multipart, Path as UrlPath, RawQuery, State,
@@ -470,8 +471,7 @@ async fn graphql_handler(
             let library_cache = RequestLibraryCache::default();
             let response = schema
                 .execute(
-                    req.into_inner()
-                        .data(auth)
+                    req.data(auth)
                         .data(ip)
                         .data(plain)
                         .data(user_cache)
@@ -621,9 +621,8 @@ async fn graphql_get_response(
     peer: SocketAddr,
     plain: graphql::PlainFromInternet,
     headers: HeaderMap,
-    req: GraphQLRequest,
+    inner: async_graphql::Request,
 ) -> axum::response::Response {
-    let inner = req.into_inner();
     // Reject non-query operations BEFORE execution. An unparseable document falls
     // through — execution produces the proper GraphQL error body for it.
     if !get_document_is_query_only(&inner.query) {
@@ -2009,7 +2008,7 @@ async fn public_cors(
 }
 
 fn is_public_cors(method: &Method, path: &str, headers: &HeaderMap) -> bool {
-    if path == "/graphql" {
+    if path == "/graphql" || path == GRAPHQL_SSR_PATH {
         return matches!(*method, Method::GET | Method::HEAD) && bearer(headers).is_none();
     }
     ["/covers/", "/avatars/", "/comment-media/", "/media/"]
@@ -2813,6 +2812,9 @@ fn webp_cover_response(bytes: Vec<u8>, cache_control: &'static str) -> axum::res
 /// The most a `POST /graphql` body may be.
 const GRAPHQL_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
+/// `/graphql` under a second path, for server-side renders (see `public_router`).
+const GRAPHQL_SSR_PATH: &str = "/graphql/ssr";
+
 /// How many uploaded images are decoded at once, over all accounts. Decoding one large
 /// image takes hundreds of megabytes; the per-account upload limit alone would let one
 /// account start twenty at the same moment.
@@ -3240,15 +3242,25 @@ fn public_router(
     // POST is uncacheable by every CDN). Mutations over GET are rejected in the
     // handler. GraphiQL moved to its own GET /graphiql when enabled; introspection
     // stays disabled in the same off state (see build_schema above).
-    let mut app = Router::new().route(
-        "/graphql",
-        get(graphql_get_handler)
-            .post(graphql_handler)
-            // The GraphQL extractor reads the whole body, and a multipart one into a
-            // temporary file, before any resolver checks who is asking. Nothing the
-            // apps send comes near this size; files have their own upload routes.
-            .layer(RequestBodyLimitLayer::new(GRAPHQL_BODY_LIMIT)),
-    );
+    let graphql = get(graphql_get_handler)
+        .post(graphql_handler)
+        // The GraphQL extractor reads the whole body, and a multipart one into a
+        // temporary file, before any resolver checks who is asking. Nothing the
+        // apps send comes near this size; files have their own upload routes.
+        .layer(RequestBodyLimitLayer::new(GRAPHQL_BODY_LIMIT))
+        // `GET ?id=` runs a persisted document; an unknown id is refused here.
+        .layer(axum::middleware::from_fn_with_state(
+            persisted::PersistedOnly(cfg.persisted_only),
+            persisted::resolve_get,
+        ));
+    // `/graphql/ssr` is the same endpoint under a second path, for the web reader's
+    // server-side renders. They all leave from one shared Workers address, so a per-IP
+    // rate limit on `/graphql` would count every visitor's render as one client; the
+    // alias lets an edge rule tell them apart. It exists on every server, so a web reader
+    // can use it against any of them.
+    let mut app = Router::new()
+        .route("/graphql", graphql.clone())
+        .route(GRAPHQL_SSR_PATH, graphql);
     if cfg.graphiql_enabled {
         app = app.route("/graphiql", get(graphiql));
     }
@@ -6398,6 +6410,195 @@ mod tests {
         reserved.0.close().await;
         covers.close().await;
         pool.close().await;
+    }
+
+    /// Through the real router: `GET ?id=` runs the persisted document and keeps the
+    /// public cache headers; an unknown id is a 400 before admission, so nothing runs;
+    /// full-text GET is refused only with `KOMIKA_PERSISTED_ONLY`, and POST still takes
+    /// full documents; `/graphql/ssr` answers exactly like `/graphql`.
+    #[tokio::test]
+    async fn production_router_runs_persisted_documents_on_both_graphql_paths() {
+        use tower::ServiceExt;
+        let tags = persisted::id_for("query Tags ");
+        let chapter_work = persisted::id_for("query ChapterWork(");
+        let logout = persisted::id_for("mutation Logout ");
+        let unknown = "0".repeat(64);
+        async fn answer(
+            response: axum::response::Response,
+        ) -> (
+            StatusCode,
+            Option<String>,
+            Option<String>,
+            serde_json::Value,
+        ) {
+            let header = |name| {
+                response
+                    .headers()
+                    .get(name)
+                    .map(|value: &HeaderValue| value.to_str().unwrap().to_owned())
+            };
+            let (status, cache, etag) = (
+                response.status(),
+                header(header::CACHE_CONTROL),
+                header(header::ETAG),
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, cache, etag, body)
+        }
+        let code = |body: &serde_json::Value| body["errors"][0]["extensions"]["code"].clone();
+        for only in [false, true] {
+            let (_covers_dir, mut cfg, state, cloudflare) = production_router_fixture().await;
+            cfg.persisted_only = only;
+            let (pool, reserved, covers, budgets) = (
+                state.pool.clone(),
+                state.ready_pool.clone(),
+                state.cover_pool.clone(),
+                state.request_budgets.clone(),
+            );
+            let app = public_router(
+                &cfg,
+                state,
+                cloudflare,
+                web_dir::Apps::from_config(&cfg),
+                cfg.img_proxy_enabled,
+            );
+            let send = |method: Method, uri: String, etag: Option<&str>| {
+                let mut request = axum::http::Request::builder()
+                    .method(method.clone())
+                    .uri(uri)
+                    .header(header::ORIGIN, "https://other.example");
+                if let Some(etag) = etag {
+                    request = request.header(header::IF_NONE_MATCH, etag);
+                }
+                let body = if method == Method::POST {
+                    request = request.header(header::CONTENT_TYPE, "application/json");
+                    axum::body::Body::from(r#"{"query":"{ tags { id } }"}"#)
+                } else {
+                    axum::body::Body::empty()
+                };
+                let mut request = request.body(body).unwrap();
+                request
+                    .extensions_mut()
+                    .insert(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
+                app.clone().oneshot(request)
+            };
+            let mut seen = Vec::new();
+            for path in ["/graphql", GRAPHQL_SSR_PATH] {
+                let case = format!("{path} persisted_only={only}");
+                let ran = send(Method::GET, format!("{path}?id={tags}"), None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    ran.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                    "*",
+                    "{case}"
+                );
+                let ran = answer(ran).await;
+                assert_eq!(ran.0, StatusCode::OK, "{case}");
+                assert!(ran.1.as_deref().unwrap().starts_with("public"), "{case}");
+                assert_eq!(
+                    ran.3,
+                    serde_json::json!({ "data": { "tags": [] } }),
+                    "{case}"
+                );
+                let etag = ran.2.clone().expect("an ETag");
+                let revalidated = send(Method::GET, format!("{path}?id={tags}"), Some(&etag))
+                    .await
+                    .unwrap();
+                assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED, "{case}");
+
+                let variables = "%7B%22chapterId%22%3A%22none%22%7D";
+                let with_variables = answer(
+                    send(
+                        Method::GET,
+                        format!("{path}?id={chapter_work}&variables={variables}"),
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+                )
+                .await;
+                assert_eq!(with_variables.0, StatusCode::OK, "{case}");
+                assert!(
+                    with_variables.3["data"].is_object(),
+                    "{case}: {with_variables:?}"
+                );
+
+                for (uri, status, expected) in [
+                    (
+                        format!("{path}?id={unknown}"),
+                        StatusCode::BAD_REQUEST,
+                        Some(persisted::NOT_FOUND),
+                    ),
+                    (
+                        format!("{path}?id={tags}&query=%7Btags%7Bid%7D%7D"),
+                        StatusCode::BAD_REQUEST,
+                        Some("BAD_REQUEST"),
+                    ),
+                    (
+                        format!("{path}?id={chapter_work}&variables=%7Bnot"),
+                        StatusCode::BAD_REQUEST,
+                        Some("BAD_REQUEST"),
+                    ),
+                    (
+                        format!("{path}?id={logout}"),
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        None,
+                    ),
+                ] {
+                    let refused = answer(send(Method::GET, uri.clone(), None).await.unwrap()).await;
+                    assert_eq!(refused.0, status, "{case}: {uri}");
+                    if let Some(expected) = expected {
+                        assert_eq!(code(&refused.3), expected, "{case}: {uri}");
+                        assert_eq!(refused.1.as_deref(), Some("no-store"), "{case}: {uri}");
+                    }
+                }
+
+                let full_text = answer(
+                    send(
+                        Method::GET,
+                        format!("{path}?query=%7Btags%7Bid%7D%7D"),
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+                )
+                .await;
+                if only {
+                    assert_eq!(full_text.0, StatusCode::METHOD_NOT_ALLOWED, "{case}");
+                    assert_eq!(code(&full_text.3), persisted::REQUIRED, "{case}");
+                    assert_eq!(full_text.1.as_deref(), Some("no-store"), "{case}");
+                } else {
+                    assert_eq!(full_text.0, StatusCode::OK, "{case}");
+                    assert_eq!(full_text.3, serde_json::json!({ "data": { "tags": [] } }));
+                }
+                let posted = answer(send(Method::POST, path.into(), None).await.unwrap()).await;
+                assert_eq!(posted.0, StatusCode::OK, "{case}");
+                assert_eq!(posted.3, serde_json::json!({ "data": { "tags": [] } }));
+
+                // Refused before admission: with every GraphQL slot taken, an unknown id
+                // is still a 400, while a known one waits for a slot and is turned away.
+                let held = budgets.exhaust_for_test().await;
+                let refused = send(Method::GET, format!("{path}?id={unknown}"), None)
+                    .await
+                    .unwrap();
+                assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{case}");
+                let busy = send(Method::GET, format!("{path}?id={tags}"), None)
+                    .await
+                    .unwrap();
+                assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+                drop(held);
+
+                seen.push((ran, with_variables, full_text, posted));
+            }
+            assert_eq!(seen[0], seen[1], "/graphql/ssr answers like /graphql");
+            reserved.0.close().await;
+            covers.close().await;
+            pool.close().await;
+        }
     }
 
     #[tokio::test]

@@ -418,7 +418,7 @@ impl Lease {
 /// a slow sender cannot reserve a one-hour maintenance slot. The route's existing
 /// 2MiB body cap also applies during extraction.
 pub(crate) struct AdmittedGraphQLRequest {
-    pub(crate) request: GraphQLRequest,
+    pub(crate) request: async_graphql::Request,
     pub(crate) lease: Lease,
     pub(crate) upstream: Arc<RequestBudgets>,
 }
@@ -430,7 +430,7 @@ where
 {
     type Rejection = Response;
 
-    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request(mut request: Request, state: &S) -> Result<Self, Self::Rejection> {
         let budgets = Arc::<RequestBudgets>::from_ref(state);
         let stats = budgets.stats;
         let Ok(ingress) = budgets.ingress.clone().try_acquire_owned() else {
@@ -439,21 +439,29 @@ where
         };
         // Tuple elements drop in order: the gauge falls before the permit is released.
         let ingress = (stats.lane(Lane::Ingress).admit(), ingress);
-        let request = match tokio::time::timeout(
-            Duration::from_secs(10),
-            <GraphQLRequest as FromRequest<S>>::from_request(request, state),
-        )
-        .await
-        {
-            Ok(Ok(request)) => request,
-            Ok(Err(rejection)) => return Err(rejection.into_response()),
-            Err(_) => {
-                stats.deadline(Deadline::GraphqlBody);
-                return Err(crate::busy_response());
+        // A GET that named a persisted document was resolved by `persisted::resolve_get`.
+        let persisted = request
+            .extensions_mut()
+            .remove::<crate::persisted::PersistedRequest>();
+        let request = if let Some(persisted) = persisted {
+            persisted.into_request()
+        } else {
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                <GraphQLRequest as FromRequest<S>>::from_request(request, state),
+            )
+            .await
+            {
+                Ok(Ok(request)) => request.into_inner(),
+                Ok(Err(rejection)) => return Err(rejection.into_response()),
+                Err(_) => {
+                    stats.deadline(Deadline::GraphqlBody);
+                    return Err(crate::busy_response());
+                }
             }
         };
         let class =
-            classify(&request.0.query, request.0.operation_name.as_deref()).map_err(|error| {
+            classify(&request.query, request.operation_name.as_deref()).map_err(|error| {
                 async_graphql_axum::GraphQLResponse::from(async_graphql::Response::from_errors(
                     vec![error],
                 ))
@@ -889,7 +897,6 @@ mod tests {
             .run(async move {
                 let seconds = request
                     .request
-                    .0
                     .variables
                     .get("seconds")
                     .and_then(|value| match value {
