@@ -37,3 +37,8 @@ directory = ".svelte-kit/cloudflare"
 not_found_handling = "single-page-application"
 # Negative patterns take precedence; an empty slug uses the static shell.
 run_worker_first = ["/series/*", "!/series/"]
+
+# Workers Logs for the series SSR runs, the only requests that invoke this Worker.
+# Default head sampling (every request): traffic here is a few hundred a day.
+[observability]
+enabled = true

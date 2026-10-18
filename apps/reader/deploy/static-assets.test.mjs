@@ -35,10 +35,18 @@ for (const directory of ['../.svelte-kit/cloudflare/', '../build/']) {
 			/Permissions-Policy: camera=\(\), microphone=\(\), geolocation=\(\), payment=\(\), usb=\(\)/,
 		);
 		assert.match(headers, /  Cache-Control: no-cache/);
-		assert.doesNotMatch(headers, /Cache-Control:.*(?:immutable|31536000)/);
+		// The 7-day immutable lifetime belongs to the hashed chunk folder alone.
 		assert.match(
 			headers,
-			/\n\/_app\/immutable\/\*\n  ! Cache-Control\n  Cache-Control: public, max-age=86400\n/,
+			/\n\/_app\/immutable\/\*\n  ! Cache-Control\n  Cache-Control: public, max-age=604800, immutable\n/,
+		);
+		const longLived = headers
+			.trim()
+			.split('\n\n')
+			.filter((rule) => /Cache-Control: .*(?:immutable|max-age=[1-9])/.test(rule));
+		assert.deepEqual(
+			longLived.map((rule) => rule.split('\n')[0]),
+			['/_app/immutable/*'],
 		);
 	});
 }

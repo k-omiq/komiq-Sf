@@ -29,6 +29,9 @@ The [reader app](/developers/reader-app) runs on `komiq.cc` and `www.komiq.cc`. 
 - Serves static assets, including styles, bundled scripts, icons, and fonts, through Cloudflare Workers Static Assets.
 - Inlines public configuration like the API endpoint and image proxy URL during build time.
 - Requires no edge secrets because public page rendering only accesses unauthenticated catalog data.
+- Turns on Workers Logs (`[observability]`) for these series requests.
+
+A series page is cached at the edge for 60 seconds only when the series is found. An unknown series answers `404` with `Cache-Control: no-store`. When the API cannot be reached, the page shows its retry state with `no-store`. A series URL with query parameters the page does not read moves with a `301` redirect to its clean form, so stray parameters cannot create extra cache copies. The page reads only `order=oldest` and `cpage`, the chapter list page.
 
 The web build's Workers configuration is:
 
@@ -44,16 +47,33 @@ The adapter generates the shell from the SPA fallback setting. `_routes.json` ap
 
 The split has been checked offline against the bundled router and generated output. Production invocation counts have not been measured. No deployment or billing result follows from the local check.
 
-For a pure static alternative, build with `KOMIKA_TARGET=static pnpm -C apps/reader build`. `apps/reader/wrangler.static.toml` serves `build` without a script, including series routes. It uses the separate name `komika-reader-static`, has no routes and disables `workers_dev`. An operator adds a test hostname when ready. Both builds generate `_headers` with exact inline-script CSP hashes, `Cache-Control: no-cache` for HTML and `public, max-age=86400` for `/_app/immutable/*`. The bundled asset worker can return the SPA shell for a missing chunk, even without `Sec-Fetch-Mode: navigate`. Since `_headers` matches the requested URL, an immutable rule would cache that HTML under the missing chunk URL for a year. One day bounds it, and missing assets never receive an immutable cache policy.
+For a pure static alternative, build with `KOMIKA_TARGET=static pnpm -C apps/reader build`. `apps/reader/wrangler.static.toml` serves `build` without a script, including series routes. It uses the separate name `komika-reader-static`, has no routes and disables `workers_dev`. An operator adds a test hostname when ready. Both builds generate `_headers` with exact inline-script CSP hashes, `Cache-Control: no-cache` for HTML and `public, max-age=604800, immutable` for `/_app/immutable/*`. Browsers then keep the hashed app files for 7 days without asking again. The bundled asset worker returns the SPA shell for a missing chunk, even without `Sec-Fetch-Mode: navigate`. Since `_headers` matches the requested URL, a missing app file can be cached as `index.html` for up to 7 days under its URL. So a release must never remove a chunk, and every release goes through `apps/reader/deploy/release.mjs`.
 
-Before releasing either build, copy the previous output's immutable files into the new output:
+### Releasing the reader
+
+Release either build with the release script. Arguments after `--` go to `wrangler deploy`:
 
 ```sh
-node apps/reader/deploy/retain-assets.mjs /path/to/previous-build apps/reader/.svelte-kit/cloudflare
-# For the static target, use apps/reader/build as the second path.
+node apps/reader/deploy/release.mjs -- --dry-run
+node apps/reader/deploy/release.mjs
+# The static target:
+node apps/reader/deploy/release.mjs --static
 ```
 
-The script copies only `_app/immutable`, preserves current files and refuses same-name files with different bytes. It never copies old HTML or headers. Keep a snapshot of each release output before the next build clears that directory. When starting without a previous release, omit this copy step. The page reloads once on a failed bootstrap import or Vite preload, then offers a manual Reload button. A successful root mount clears the guard so a later failure can recover again.
+The script:
+
+1. Builds the target. The web build ignores a `KOMIKA_TARGET` set in your shell.
+2. Copies every chunk of the last release into the new output with `apps/reader/deploy/retain-assets.mjs`. That script copies only `_app/immutable`, keeps current files and refuses same-name files with different bytes. It never copies old HTML or headers.
+3. Runs `wrangler deploy` with the target's configuration.
+4. After a real deploy, records the new output's chunks as the last release. A dry run does not change the record.
+
+The record lives in the git common directory, in `komika-reader-release/`. The main checkout and every worktree share it, so a release from any checkout keeps the chunks of the one before it. Each release carries all earlier chunks, so a tab opened before several releases still finds its files.
+
+The script refuses to run when there is no record. For the first release with the script, pass `--previous DIR` with the output of the release that is live now, or `--no-previous` when nothing was released before.
+
+To roll back, release the older commit with the script. It keeps every chunk. `wrangler rollback` brings back an older version without the newer chunks, so an open tab that asks for one of those chunks can keep the shell under that URL for up to 7 days.
+
+The page reloads once on a failed bootstrap import or Vite preload, then offers a manual Reload button. The guard is stored per build in the tab's `sessionStorage` and is never cleared, because a deferred import can still fail after the root mounts. A new build has its own guard, so it can reload once again.
 
 ### The admin app's console Worker
 
@@ -189,7 +209,9 @@ Production cutover, restore rehearsal and desktop installer validation are plann
 - `apps/reader/wrangler.toml`: Worker routing, build output paths, and domain bindings for the reader app.
 - `apps/reader/wrangler.static.toml`: Pure static alternative with no script.
 - `apps/reader/deploy/static-assets.mjs` and `deploy/static-csp.mjs`: Shell headers and exact inline-script hashing.
-- `apps/reader/deploy/retain-assets.mjs`: Previous-release chunk retention.
+- `apps/reader/deploy/release.mjs`: Build, chunk retention, deploy and the release record.
+- `apps/reader/deploy/retain-assets.mjs`: Copies earlier chunks into a release output.
+- `apps/reader/src/hooks.server.ts` and `apps/reader/src/lib/series-url.ts`: The clean-URL redirect for series pages.
 - `apps/admin/wrangler.toml`: Static asset configuration and custom domain setup for the admin console.
 - `apps/worker/wrangler.toml`: Host allowlists, hotlink restrictions, and rate limiter bindings for the image proxy.
 - `apps/docs/wrangler.toml`: Static documentation site routing on Cloudflare Workers.

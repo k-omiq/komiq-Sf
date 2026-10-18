@@ -27,6 +27,7 @@ test('Workers config selects nonempty series and static config contains no scrip
 	assert.equal(staticConfig.assets.binding, undefined);
 	assert.equal(staticConfig.assets.run_worker_first, undefined);
 	assert.equal(staticConfig.assets.not_found_handling, 'single-page-application');
+	assert.equal(config.observability?.enabled, true);
 });
 
 test('static deployment is isolated from production and has no public routes', () => {
@@ -166,18 +167,20 @@ test('bundled router excludes slugless series while keeping series SSR', async (
 });
 
 for (const settings of [config, staticConfig]) {
-	test(`${settings.name}: missing chunks never receive immutable headers or invoke a User Worker`, async () => {
+	test(`${settings.name}: chunks are kept 7 days and never invoke a User Worker`, async () => {
 		const router = await routerFor(settings);
 		for (const path of ['/_app/missing.js', '/_app/immutable/missing.js']) {
 			for (const mode of [undefined, 'navigate', 'cors', 'same-origin']) {
 				const response = await router.fetch(path, mode ? { 'Sec-Fetch-Mode': mode } : {});
-				// The bundled worker's fetch path applies SPA fallback for every mode.
+				// The bundled worker's fetch path applies SPA fallback for every mode, and
+				// _headers matches the requested URL, so a missing chunk would get the shell
+				// under the 7-day chunk header. That is why deploy/release.mjs never drops
+				// a chunk: every release carries all earlier releases' chunks.
 				assert.equal(response.status, 200);
 				assert.equal(await response.text(), router.shell);
-				// A fallback under a chunk URL is bounded to one day, never immutable.
 				assert.equal(
 					response.headers.get('Cache-Control'),
-					path.startsWith('/_app/immutable/') ? 'public, max-age=86400' : 'no-cache',
+					path.startsWith('/_app/immutable/') ? 'public, max-age=604800, immutable' : 'no-cache',
 				);
 				assert.equal(response.headers.get('X-Robots-Tag'), 'noindex');
 				assert.equal(router.invocations, 0);
@@ -187,7 +190,7 @@ for (const settings of [config, staticConfig]) {
 		const existing = await router.fetch(entry, { 'Sec-Fetch-Mode': 'cors' });
 		assert.equal(existing.status, 200);
 		assert.equal(existing.headers.get('Content-Type'), 'text/javascript');
-		assert.equal(existing.headers.get('Cache-Control'), 'public, max-age=86400');
+		assert.equal(existing.headers.get('Cache-Control'), 'public, max-age=604800, immutable');
 		assert.notEqual(await existing.text(), router.shell);
 		assert.equal(router.invocations, 0);
 	});

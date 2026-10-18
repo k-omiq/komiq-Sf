@@ -12,7 +12,7 @@ The web reader is built with SvelteKit and `@sveltejs/adapter-cloudflare`. The b
 When deployed to Cloudflare:
 
 - Static assets in `_app/immutable/` are served directly by Cloudflare Workers Assets.
-- Dynamic route requests execute inside the edge worker according to the generated `_routes.json` routing configuration.
+- Only `/series/*` requests run the edge Worker (`run_worker_first` in `apps/reader/wrangler.toml`). Every other path gets the static SPA shell from Workers Assets.
 
 Embedded self-hosted readers and native desktop and mobile builds use `@sveltejs/adapter-static` instead. In those builds, `__KOMIKA_SSR__` is false, and SvelteKit generates a single-page application with an `index.html` fallback. The web build enables edge rendering specifically for public pages so their content appears in the HTML.
 
@@ -34,13 +34,15 @@ import { SSR_PUBLIC } from '$lib/ssr';
 export const ssr = SSR_PUBLIC;
 ```
 
-The public routes that render at the edge include:
+The public routes that opt in are the home page (`/`), the series page (`/series/[slug]`), `/updates`, `/browse`, `/about` and `/support`. Only the series page reaches the edge Worker, so it is the only page rendered and cached at the edge. The others get the static shell and load their data in the browser.
 
-- Home page (`/`)
-- Series details page (`/series/[slug]`)
-- Catalog updates feed (`/updates`)
-- Catalog browse page (`/browse`); grid rows load client-side.
-- Static information pages (`/about` and `/support`)
+The series page sets its cache header after its data loads:
+
+- A found series gets `public, max-age=0, s-maxage=60`.
+- An unknown series answers `404` with `no-store`.
+- When the API cannot be reached, the page shows its retry state with `no-store`.
+
+The adapter's Worker keeps a response in its edge cache only when the status is below 400 and the header allows it, so the last two are never cached. A series URL with query parameters the page does not read gets a `301` redirect to its clean form. The page reads `order=oldest` and `cpage`. The redirect is kept for an hour in the browser and for 60 seconds at the edge.
 
 Interactive and authenticated routes remain client-only. The library (`/library`), user profile, login screen, and the chapter reader run entirely in the browser.
 
@@ -103,24 +105,24 @@ Covers, avatars, comment images, chapter pages and exact media objects carry a s
 
 Komiq applies tailored cache durations across each layer of the architecture:
 
-| Surface                                      | Path or Route                                                                           | Cache-Control Header                                | Lifetime and Behavior                                                                                                                              |
-| -------------------------------------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Home SSR                                     | `/`                                                                                     | `public, max-age=0, s-maxage=60`                    | Shared-cache lifetime: 60 seconds; browser lifetime: 0 seconds.                                                                                    |
-| Series SSR                                   | `/series/[slug]`                                                                        | `public, max-age=0, s-maxage=60`                    | Shared-cache lifetime: 60 seconds; browser lifetime: 0 seconds.                                                                                    |
-| Updates SSR                                  | `/updates`                                                                              | `public, max-age=0, s-maxage=30`                    | Shared-cache lifetime: 30 seconds; browser lifetime: 0 seconds.                                                                                    |
-| Browse SSR                                   | `/browse`                                                                               | `public, max-age=0, s-maxage=300`                   | Shared-cache lifetime: 5 minutes; browser lifetime: 0 seconds.                                                                                     |
-| Static SSR                                   | `/about`, `/support`                                                                    | `public, max-age=0, s-maxage=600`                   | Shared-cache lifetime: 10 minutes; browser lifetime: 0 seconds.                                                                                    |
-| Cacheable GraphQL query                      | `GET /graphql`                                                                          | `public, max-age=30, s-maxage=60`                   | Shared-cache lifetime: 60 seconds; browser lifetime: 30 seconds, with ETag revalidation.                                                           |
-| Image proxy Worker (global server)           | `img.komiq.cc/img`                                                                      | `public, max-age=604800, immutable`                 | MangaDex chapter pages: browser lifetime 7 days; the Worker's edge cache keeps them 30 days. Other images: `public, max-age=300, must-revalidate`. |
-| Server image proxy (self-hosted)             | `/img`                                                                                  | `public, max-age=604800, immutable`                 | Browser or shared caches can store images for 7 days.                                                                                              |
-| Web app pages (self-hosted)                  | `/`, `/admin`, SPA routes                                                               | `no-cache`                                          | The browser checks with the server before it reuses a page.                                                                                        |
-| Cached covers, current version               | `/covers/{work_id}.webp?v={version}`                                                    | `public, max-age=31536000, immutable, s-maxage=600` | Browser lifetime: 1 year; shared-cache lifetime: one media policy lease (10 minutes).                                                              |
-| Avatars, current version                     | `/avatars/{user_id}.webp?v={version}`                                                   | `public, max-age=31536000, immutable, s-maxage=600` | Browser lifetime: 1 year; shared-cache lifetime: 10 minutes.                                                                                       |
-| Covers and avatars, newer requested version  | `/covers/{work_id}.webp?v={version}`, `/avatars/{user_id}.webp?v={version}`             | `no-store`                                          | Serve the stored bytes; never redirect backward.                                                                                                   |
-| Covers and avatars, older or invalid version | Same versioned paths                                                                    | `no-store`                                          | 307 redirect forward to the current version.                                                                                                       |
-| Generation chapter pages                     | `/media/v1/c/{epoch}/{chapterId}/{page}`                                                | `public, max-age=86400, s-maxage=600`               | Browser lifetime: 1 day; shared-cache lifetime: 10 minutes, then revalidation with the ETag.                                                       |
-| Engine chapter pages                         | `/media/v1/c/{chapterId}/{page}`, `/api/v1/manga/{mangaId}/chapter/{index}/page/{page}` | `public, max-age=300, must-revalidate`              | Revalidate after 5 minutes.                                                                                                                        |
-| Extension icons                              | `/ext-icons/{pkg}.png`                                                                  | `public, max-age=86400, must-revalidate`            | Revalidate after 1 day with a strong ETag; a matching `If-None-Match` returns 304 without a body.                                                  |
+| Surface                                      | Path or Route                                                                           | Cache-Control Header                                | Lifetime and Behavior                                                                                                                                    |
+| -------------------------------------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Series SSR, found                            | `/series/[slug]`                                                                        | `public, max-age=0, s-maxage=60`                    | Shared-cache lifetime: 60 seconds; browser lifetime: 0 seconds.                                                                                          |
+| Series SSR, unknown or API error             | `/series/[slug]`                                                                        | `no-store`                                          | Never cached. An unknown series answers `404`.                                                                                                           |
+| Series URL with unused parameters            | `/series/[slug]?…`                                                                      | `public, max-age=3600, s-maxage=60`                 | `301` redirect to the clean URL.                                                                                                                         |
+| Web reader shell                             | Every other document                                                                    | `no-cache`                                          | The browser checks with Workers Assets before it reuses the shell.                                                                                       |
+| Web reader app files                         | `/_app/immutable/*`                                                                     | `public, max-age=604800, immutable`                 | Browser lifetime: 7 days. A missing file can be cached as `index.html` for up to 7 days, so every release goes through `apps/reader/deploy/release.mjs`. |
+| Cacheable GraphQL query                      | `GET /graphql`                                                                          | `public, max-age=30, s-maxage=60`                   | Shared-cache lifetime: 60 seconds; browser lifetime: 30 seconds, with ETag revalidation.                                                                 |
+| Image proxy Worker (global server)           | `img.komiq.cc/img`                                                                      | `public, max-age=604800, immutable`                 | MangaDex chapter pages: browser lifetime 7 days; the Worker's edge cache keeps them 30 days. Other images: `public, max-age=300, must-revalidate`.       |
+| Server image proxy (self-hosted)             | `/img`                                                                                  | `public, max-age=604800, immutable`                 | Browser or shared caches can store images for 7 days.                                                                                                    |
+| Web app pages (self-hosted)                  | `/`, `/admin`, SPA routes                                                               | `no-cache`                                          | The browser checks with the server before it reuses a page.                                                                                              |
+| Cached covers, current version               | `/covers/{work_id}.webp?v={version}`                                                    | `public, max-age=31536000, immutable, s-maxage=600` | Browser lifetime: 1 year; shared-cache lifetime: one media policy lease (10 minutes).                                                                    |
+| Avatars, current version                     | `/avatars/{user_id}.webp?v={version}`                                                   | `public, max-age=31536000, immutable, s-maxage=600` | Browser lifetime: 1 year; shared-cache lifetime: 10 minutes.                                                                                             |
+| Covers and avatars, newer requested version  | `/covers/{work_id}.webp?v={version}`, `/avatars/{user_id}.webp?v={version}`             | `no-store`                                          | Serve the stored bytes; never redirect backward.                                                                                                         |
+| Covers and avatars, older or invalid version | Same versioned paths                                                                    | `no-store`                                          | 307 redirect forward to the current version.                                                                                                             |
+| Generation chapter pages                     | `/media/v1/c/{epoch}/{chapterId}/{page}`                                                | `public, max-age=86400, s-maxage=600`               | Browser lifetime: 1 day; shared-cache lifetime: 10 minutes, then revalidation with the ETag.                                                             |
+| Engine chapter pages                         | `/media/v1/c/{chapterId}/{page}`, `/api/v1/manga/{mangaId}/chapter/{index}/page/{page}` | `public, max-age=300, must-revalidate`              | Revalidate after 5 minutes.                                                                                                                              |
+| Extension icons                              | `/ext-icons/{pkg}.png`                                                                  | `public, max-age=86400, must-revalidate`            | Revalidate after 1 day with a strong ETag; a matching `If-None-Match` returns 304 without a body.                                                        |
 
 Cover and avatar URLs with an older or invalid version return a 307 redirect to the current version with `Cache-Control: no-store`. A requested version newer than the stored version serves the stored bytes with `no-store`. It never redirects backward or uses immutable caching. URLs without `v` redirect to the current version with `public, max-age=300`. Cover redirects keep an allowlisted `w` width. Avatar uploads always increase the version, even within one millisecond.
 
@@ -142,8 +144,9 @@ The server keeps at most 65,536 notes, about 13 MB, and drops the oldest first. 
 
 - `apps/reader/src/routes/+layout.ts`: Declares the default client-side SPA rendering mode.
 - `apps/reader/src/lib/ssr.ts`: Defines the `SSR_PUBLIC` constant derived from Vite build flags.
-- `apps/reader/src/routes/(app)/+page.ts`: Sets edge SSR cache headers for the home page.
-- `apps/reader/src/routes/(app)/series/[slug]/+page.ts`: Sets edge SSR cache headers for series pages.
+- `apps/reader/src/routes/(app)/series/[slug]/+page.ts`: Sets the series cache header after the data loads.
+- `apps/reader/src/hooks.server.ts` and `apps/reader/src/lib/series-url.ts`: Redirects series URLs to their clean query string.
+- `apps/reader/deploy/static-assets.mjs`: Writes the shell and app file headers.
 - `apps/reader/src/lib/data/load-fetch.ts`: Connects SvelteKit edge fetch data serialization to GraphQL backend calls.
 - `apps/reader/wrangler.toml`: Configures the Cloudflare Worker deployment and static asset binding for the web reader.
 - `apps/reader/vite.config.ts`: Configures adapter selection, stylesheet inlining thresholds, and Content Security Policy directives.

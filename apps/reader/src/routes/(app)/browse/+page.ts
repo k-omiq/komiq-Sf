@@ -2,7 +2,9 @@ import type { PageLoad } from './$types';
 import { getBrowseSources, getBrowseTags } from '$lib/data/source';
 import { SSR_PUBLIC } from '$lib/ssr';
 
-// Public browse — server-rendered at the edge on the web build. See $lib/ssr.
+// Public browse — server-rendered on the web build. See $lib/ssr.
+// The hosted Worker runs only on /series/* (apps/reader/wrangler.toml), so the hosted
+// site serves this route as the static shell: no edge cache time is set here.
 export const ssr = SSR_PUBLIC;
 
 // Load the tag vocabulary for the filter panel's tag picker (Browse v2). Row fetching
@@ -27,10 +29,7 @@ export const ssr = SSR_PUBLIC;
 // `page.url`. Don't "fix" this.
 // `fetch` is threaded into the data layer so the SSR response is inlined in the HTML and
 // the hydration re-run replays it instead of refetching — see $lib/data/load-fetch.
-export const load: PageLoad = ({ fetch, setHeaders }) => {
-	// The vocabulary changes rarely; cache it longer than the feed pages. Rows are fetched
-	// client-side, so only this payload is edge-cached.
-	setHeaders({ 'cache-control': 'public, max-age=0, s-maxage=300' });
+export const load: PageLoad = ({ fetch }) => {
 	// Two promises, neither awaited: the page resolves each on its own, so a slow source
 	// list cannot hold back the tags (or the first paint).
 	return { tags: getBrowseTags(fetch), sources: getBrowseSources(fetch) };

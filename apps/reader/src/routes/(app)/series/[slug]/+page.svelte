@@ -157,7 +157,10 @@
 	);
 	const orderHref = (order: string) => {
 		const url = new URL(page.url);
-		url.searchParams.set('order', order);
+		// The default order is left out of the URL: the server redirects `?order=newest`
+		// to the bare page so both spellings share one edge cache entry ($lib/series-url).
+		if (order === 'oldest') url.searchParams.set('order', order);
+		else url.searchParams.delete('order');
 		// A new order starts from its first page of chapters.
 		url.searchParams.delete('cpage');
 		return url.pathname + url.search + '#chapters';
