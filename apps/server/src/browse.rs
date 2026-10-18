@@ -4048,7 +4048,7 @@ mod tests {
             ("w_4".into(), "Kaizen Notes".into(), "seinen", 1, 1),
         ];
         // More than one page of works for one joined query.
-        for n in 10..42 {
+        for n in 10..52 {
             works.push((format!("e_{n}"), format!("Ember Fall {n}"), "josei", n, 0));
         }
         for (id, title, demo, follows, ch) in &works {
@@ -4147,7 +4147,7 @@ mod tests {
         // Pages: one total, every work once, nothing past the end.
         for sort in [SortKey::Relevance, SortKey::MostFollows] {
             let mut seen = std::collections::BTreeSet::new();
-            for (page, rows) in [(1, 30), (2, 2), (3, 0)] {
+            for (page, rows) in [(1, 40), (2, 2), (3, 0)] {
                 let (t, titles, retried) = search("emberfall", &|q| {
                     q.sort = Sort::desc(sort);
                     q.page = page;
@@ -4155,12 +4155,12 @@ mod tests {
                 .await;
                 assert_eq!(
                     (t, titles.len(), retried),
-                    (32, rows, true),
+                    (42, rows, true),
                     "{sort:?} {page}"
                 );
                 seen.extend(titles);
             }
-            assert_eq!(seen.len(), 32, "{sort:?}");
+            assert_eq!(seen.len(), 42, "{sort:?}");
         }
         pool.close().await;
     }
@@ -4550,8 +4550,8 @@ mod tests {
         let shapes: Vec<(&str, BrowseQuery<'_>)> = vec![
             ("quill", relevance(1)),
             ("quill", relevance(2)),
-            ("quill", relevance(17)),
-            ("quill", relevance(18)),
+            ("quill", relevance(13)),
+            ("quill", relevance(14)),
             (
                 "quill",
                 BrowseQuery {
@@ -4575,8 +4575,8 @@ mod tests {
             ("zzyzx", relevance(1)),
             ("quill", follows(1)),
             ("quill", follows(9)),
-            ("quill", follows(18)),
-            ("quill", follows(19)),
+            ("quill", follows(14)),
+            ("quill", follows(15)),
             ("quill", shape(SortKey::MostFollows, false, 1)),
             (
                 "quill",
@@ -4653,7 +4653,7 @@ mod tests {
             "the window caps the total"
         );
         assert_eq!(
-            total("quill", relevance(17)).await.1.len(),
+            total("quill", relevance(13)).await.1.len(),
             20,
             "the last page of the cap"
         );
