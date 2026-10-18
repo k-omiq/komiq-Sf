@@ -1,3 +1,4 @@
+import { error } from '@sveltejs/kit';
 import type { PageLoad } from './$types';
 import { getSeries } from '$lib/data/source';
 import { SSR_PUBLIC } from '$lib/ssr';
@@ -23,15 +24,20 @@ export const ssr = SSR_PUBLIC;
 // client-side navigations, where a skeleton is the right thing to show.
 // `fetch` is threaded into the data layer so the SSR responses are inlined in the HTML and
 // the hydration re-run replays them instead of refetching — see $lib/data/load-fetch.
+//
+// The cache header is decided AFTER the data: the edge (the adapter's `caches.default`)
+// keeps any response under 400 that is not `no-store` for its s-maxage, so a header set
+// up front cached outage pages and unknown ids as normal pages for a minute. Only a
+// found series is cacheable. An unknown id is a real 404; an outage keeps this page's
+// own retry state. `setHeaders` does nothing in the browser.
 export const load: PageLoad = async ({ params, fetch, setHeaders }) => {
-	setHeaders({ 'cache-control': 'public, max-age=0, s-maxage=60' });
-	const series = getSeries(params.slug, fetch);
-	return {
-		slug: params.slug,
-		series: shouldStream() ? series : await series,
-		// Tells the root layout to skip its generic <title>/og:*/twitter:* defaults —
-		// this page emits its own, and two sets in one <head> means a crawler reads
-		// whichever it happens to hit first. See routes/+layout.svelte.
-		ownsMeta: true,
-	};
+	const pending = getSeries(params.slug, fetch);
+	// Tells the root layout to skip its generic <title>/og:*/twitter:* defaults —
+	// this page emits its own, and two sets in one <head> means a crawler reads
+	// whichever it happens to hit first. See routes/+layout.svelte.
+	if (shouldStream()) return { slug: params.slug, series: pending, ownsMeta: true };
+	const series = await pending;
+	setHeaders({ 'cache-control': series.view ? 'public, max-age=0, s-maxage=60' : 'no-store' });
+	if (!series.view && !series.error) error(404, 'Series not found');
+	return { slug: params.slug, series, ownsMeta: true };
 };

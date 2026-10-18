@@ -49,17 +49,16 @@ The root layout in `apps/reader/src/routes/+layout.ts` sets `ssr = false` and `p
 
 Public catalog pages retain their `export const ssr = SSR_PUBLIC` options. The constant `SSR_PUBLIC` in `apps/reader/src/lib/ssr.ts` reflects `__KOMIKA_SSR__`. Workers Assets routes only `/series/*` to the server in web builds, with `!/series/` excluding an empty slug. All other paths receive the static SPA shell without a User Worker invocation, including unknown paths, which the client router handles. In static, Tauri and embedded builds, `SSR_PUBLIC` is false for every route.
 
-The adapter wrapper generates `_headers` after the shell is built. Its Content Security Policy (CSP) hashes the exact inline script text using `deploy/static-csp.mjs`. Security headers come from `apps/reader/_headers`. HTML uses `Cache-Control: no-cache` and `/_app/immutable/*` uses `public, max-age=86400`. Workers Assets can serve the SPA shell at missing chunk URLs, including non-navigation requests, so a path-based immutable policy would also cache fallback HTML for a year. The one-day lifetime bounds that, and missing chunks never receive immutable caching. SvelteKit supplies the dynamic series response's own CSP.
+The adapter wrapper generates `_headers` after the shell is built. Its Content Security Policy (CSP) hashes the exact inline script text using `deploy/static-csp.mjs`. Security headers come from `apps/reader/_headers`. HTML uses `Cache-Control: no-cache` and `/_app/immutable/*` uses `public, max-age=31536000, immutable`. Workers Assets can serve the SPA shell at missing chunk URLs, including non-navigation requests, and that shell would get the same year-long header. So every release keeps all earlier chunks; see [Deployment](/developers/deployment). SvelteKit supplies the dynamic series response's own CSP.
 
-The template registers `vite:preloadError` and a startup-only `unhandledrejection` listener before app imports run. Bare bootstrap entry imports reject without emitting Vite's preload event; both failures use the same `sessionStorage` guard to reload once, then show an error and a Reload button. When the root layout mounts successfully, it clears the guard and removes the bootstrap rejection listener. A failure during startup keeps the guard even if an error layout mounts afterward. If storage is unavailable, recovery shows the button immediately. Release preparation can retain the previous build's immutable chunks; see [Deployment](/developers/deployment).
+The template registers `vite:preloadError` and a startup-only `unhandledrejection` listener before app imports run. Bare bootstrap entry imports reject without emitting Vite's preload event; both failures use the same `sessionStorage` guard to reload once, then show an error and a Reload button. The guard is kept per build and is never cleared, because a deferred import can still fail after the root mounts. When the root layout mounts, it removes only the bootstrap rejection listener. A new build has its own guard. If storage is unavailable, recovery shows the button immediately.
 
 Universal `load` functions coordinate data hydration through `apps/reader/src/lib/stream.ts`. SvelteKit server-side rendering only outputs the pending branch of an `{#await}` block. If the server returned an unresolved promise, edge HTML would contain only loading skeletons.
 
 To solve this, public loads await data during server-side rendering and initial client hydration. Once the root layout completes mounting and calls `markHydrated()`, subsequent client navigations stream the data unawaited. This displays skeleton placeholders while new routes load:
 
 ```ts
-export const load: PageLoad = async ({ fetch, setHeaders }) => {
-	setHeaders({ 'cache-control': 'public, max-age=0, s-maxage=60' });
+export const load: PageLoad = async ({ fetch }) => {
 	const home = getHome(fetch);
 	return { home: shouldStream() ? home : await home };
 };
@@ -130,7 +129,7 @@ The rating row is one touch target, allowing a slide to correct a selection. Pag
 - `apps/reader/vite.config.ts`: Target selection, adapter configuration, style inlining thresholds, and Content Security Policy definitions.
 - `apps/reader/wrangler.toml` and `apps/reader/wrangler.static.toml`: Series-only Worker routing and the script-free alternative.
 - `apps/reader/deploy/static-assets.mjs` and `apps/reader/src/app.html`: Generated shell headers and early preload recovery.
-- `apps/reader/deploy/retain-assets.mjs`: Copies previous immutable chunks into a release.
+- `apps/reader/deploy/release.mjs` and `apps/reader/deploy/retain-assets.mjs`: Releases a build with every earlier chunk.
 - `apps/reader/src/lib/config.ts`: Build-time environment variable bindings, server address persistence, and runtime target flags.
 - `apps/reader/src/lib/server-connect.svelte.ts`: Address normalization, server checks and switching servers.
 - `apps/reader/src/lib/components/ConnectServer.svelte`: Connect screen and QR scanning on supported phones.
