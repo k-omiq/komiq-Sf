@@ -736,10 +736,12 @@ impl SuwayomiClient {
     /// A page's `/media/v1/c` locator URL, relative to the API origin. Only this server
     /// answers that route, so the URL is never built on the image base, which may be a
     /// public Suwayomi host. Every reader resolves it against the server it talks to.
+    /// `epoch` is the engine's numeric epoch (`engine_generation::numeric_epoch`): the
+    /// server refuses the URL once a new engine generation can reuse the chapter id.
     /// `None` while image URLs point at the engine itself: those pages keep the engine's
     /// URLs.
-    pub fn page_locator_url(&self, chapter_id: i64, index: usize) -> Option<String> {
-        (!self.images_on_engine).then(|| format!("/media/v1/c/{chapter_id}/{index}"))
+    pub fn page_locator_url(&self, epoch: i64, chapter_id: i64, index: usize) -> Option<String> {
+        (!self.images_on_engine).then(|| format!("/media/v1/c/{epoch}/{chapter_id}/{index}"))
     }
 
     /// Fetch a cover thumbnail's raw bytes for server-side pHash (dedup signal,

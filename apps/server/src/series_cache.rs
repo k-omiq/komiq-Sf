@@ -4,7 +4,7 @@
 //! to live-fetch from Suwayomi on every request (each of which fetches the upstream
 //! source over the network — the latency the user hit). These helpers persist the
 //! raw Suwayomi shapes into `suwayomi_series` / `suwayomi_chapter` on scan + ingest,
-//! and read them back, so subsequent loads are served from SQLite. Only the cover
+//! and read them back, so subsequent loads are served from PostgreSQL. Only the cover
 //! REFERENCE is stored (Worker-proxied) — never cover bytes (memory posture).
 
 use crate::db::Database;
@@ -195,7 +195,7 @@ static CHAPTER_FETCH_MEMO: std::sync::LazyLock<
 const CHAPTER_FETCH_MEMO_CAP: usize = 32_768;
 
 /// Rows per multi-row INSERT when a chapter list really changed. 12 binds per row, so
-/// 100 rows is 1,200 parameters — an order of magnitude under SQLite's limit, while
+/// 100 rows is 1,200 parameters — far under PostgreSQL's 65,535 bind limit, while
 /// covering the whole list in one statement for all but the longest series.
 const CHAPTER_INSERT_CHUNK: usize = 100;
 
@@ -588,7 +588,7 @@ async fn put_chapters_attempt(
             .bind(manga_id)
             .execute(&mut *tx)
             .await?;
-        // Twelve binds per row; keep well below SQLite's variable limit.
+        // Twelve binds per row; keep well below PostgreSQL's bind limit.
         for chunk in chapters.chunks(CHAPTER_INSERT_CHUNK) {
             let values = crate::sql_params::placeholders(1, chunk.len() * 12)
                 .split(", ")

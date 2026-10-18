@@ -8,7 +8,9 @@
 //!    connector, point the domain at the tunnel; **Public IP**: get an Origin CA
 //!    certificate and serve HTTPS with it, set SSL to Full (strict), point the domain
 //!    at the server's address,
-//! 4. cache rules for covers, page images, proxied images and static files,
+//! 4. cache rules for chapter pages, media objects, covers and other images, anonymous
+//!    GraphQL reads, legacy page images, proxied images and static files, plus a
+//!    bypass for health checks and the media policy,
 //! 5. make the zone respect the server's own cache headers,
 //! 6. fetch `https://<domain>/health`.
 //!
@@ -381,7 +383,7 @@ impl Step {
             Step::Ssl => "Set SSL to Full (strict)".into(),
             Step::Dns => format!("Point {domain} at this server"),
             Step::ClientIp => "Read visitor addresses from Cloudflare".into(),
-            Step::CacheRules => "Create cache rules for images and static files".into(),
+            Step::CacheRules => "Create cache rules for images, pages and GraphQL reads".into(),
             Step::CacheHeaders => "Respect the server's cache headers".into(),
             Step::Health => format!("Test https://{domain}/health"),
             Step::DeleteDns => format!("Delete the DNS record for {domain}"),
@@ -1686,6 +1688,31 @@ impl Manager {
             save_stored(&self.pool, Some(s)).await?;
         }
         let mut current = ruleset.rules;
+        // Our own rules this setup no longer makes (an earlier version's) go first, which
+        // also frees their slots: ours are recorded, or carry our host in the expression.
+        let host = format!("http.host eq \"{}\"", s.domain);
+        let obsolete: Vec<String> = current
+            .iter()
+            .filter(|x| {
+                (s.rule_ids.contains(&x.id)
+                    || (x.reference.starts_with("komiq_") && x.expression.contains(&host)))
+                    && !refs.iter().any(|reference| {
+                        *reference == x.reference
+                            || reference
+                                .rsplit_once('_')
+                                .is_some_and(|(old, _)| old == x.reference)
+                    })
+            })
+            .map(|x| x.id.clone())
+            .collect();
+        for id in &obsolete {
+            gone_ok(api.delete_rule(&zone, &ruleset.id, id).await)?;
+            current.retain(|x| x.id != *id);
+            if s.rule_ids.contains(id) {
+                s.rule_ids.retain(|x| x != id);
+                save_stored(&self.pool, Some(s)).await?;
+            }
+        }
         let mut added = 0;
         for rule in wanted {
             let r#ref = rule["ref"].as_str().unwrap_or_default().to_string();
@@ -1693,7 +1720,6 @@ impl Manager {
                 .rsplit_once('_')
                 .map(|(old, _)| old)
                 .unwrap_or_default();
-            let host = format!("http.host eq \"{}\"", s.domain);
             let owned = |x: &&api::Rule| {
                 x.reference == r#ref || (x.reference == old_ref && x.expression.contains(&host))
             };
@@ -1715,7 +1741,6 @@ impl Manager {
                 }
             }
         }
-        let host = format!("http.host eq \"{}\"", s.domain);
         s.rule_ids.retain(|id| {
             current.iter().any(|x| {
                 &x.id == id
@@ -1728,10 +1753,10 @@ impl Manager {
                     })
             })
         });
-        Ok(Some(if added == 0 {
-            "Cache rules already in place.".into()
-        } else {
-            format!("{added} rules created.")
+        Ok(Some(match (added, obsolete.len()) {
+            (0, 0) => "Cache rules already in place.".into(),
+            (added, 0) => format!("{added} rules created."),
+            (added, removed) => format!("{added} rules created, {removed} old rules removed."),
         }))
     }
 
@@ -1823,48 +1848,108 @@ async fn find_zone(api: &Client, domain: &str) -> Result<api::Zone, String> {
 }
 
 /// The cache rules setup adds, scoped to the komiq hostname so other sites on the
-/// zone are untouched. Each makes matching responses cacheable and keeps the
-/// server's own `Cache-Control` for both edge and browser (covers, pages and hashed
-/// assets are `immutable`; `/img` passes its upstream's lifetime).
+/// zone are untouched. The same shape as the hosted zone's rules: chapter pages, exact
+/// media objects and packs, covers and other stored images, anonymous `GET /graphql`,
+/// the legacy engine image paths, and a bypass for probes and the signed media policy.
+/// Then the image proxy and the static files this server can also serve. Each cached
+/// rule keeps the server's own `Cache-Control` for both edge and browser. A rule whose
+/// content changes takes a new `ref`: setup deletes its own rules it no longer wants.
 fn cache_rules(domain: &str) -> Vec<Value> {
     let suffix = hex::encode(Sha256::digest(domain.as_bytes()));
     let suffix = &suffix[..8];
     let host = format!("http.host eq \"{domain}\"");
-    let rule = |r#ref: &str, what: &str, paths: &str| {
+    let rule = |r#ref: &str, what: &str, paths: &str, settings: Value| {
         json!({
             "ref": format!("{}_{suffix}", r#ref),
-            "description": format!("komiq: cache {what}"),
+            "description": format!("komiq: {what}"),
             "expression": format!("({host} and ({paths}))"),
             "action": "set_cache_settings",
-            "action_parameters": {
-                "cache": true,
-                "edge_ttl": { "mode": "respect_origin" },
-                "browser_ttl": { "mode": "respect_origin" }
-            },
+            "action_parameters": settings,
             "enabled": true
         })
     };
+    let cached = |extra: Value| {
+        let mut settings = json!({
+            "cache": true,
+            "edge_ttl": { "mode": "respect_origin" },
+            "browser_ttl": { "mode": "respect_origin" }
+        });
+        if let (Some(settings), Value::Object(extra)) = (settings.as_object_mut(), extra) {
+            settings.extend(extra);
+        }
+        settings
+    };
+    // A page or object is named by its path alone; a query string would only split the
+    // cache. Strong ETags make a lease expiry a 304 instead of a refetch.
+    let media = || {
+        cached(json!({
+            "cache_key": { "custom_key": { "query_string": { "exclude": { "all": true } } } },
+            "respect_strong_etags": true,
+            "serve_stale": { "disable_stale_while_updating": false }
+        }))
+    };
     vec![
         rule(
-            "komiq_covers",
-            "covers",
-            "starts_with(http.request.uri.path, \"/covers/\")",
+            "komiq_media_pages",
+            "cache chapter pages",
+            "starts_with(http.request.uri.path, \"/media/v1/c/\")",
+            media(),
+        ),
+        rule(
+            "komiq_media_objects",
+            "cache exact media objects",
+            "starts_with(http.request.uri.path, \"/media/v1/o/\") or \
+             starts_with(http.request.uri.path, \"/media/v1/p/\")",
+            media(),
+        ),
+        // Covers and avatars name their version in `?v=` (stray parameters are redirected
+        // by the server), so the query string stays in the key, sorted.
+        rule(
+            "komiq_images",
+            "cache covers, avatars and comment images",
+            "starts_with(http.request.uri.path, \"/covers/\") or \
+             starts_with(http.request.uri.path, \"/avatars/\") or \
+             starts_with(http.request.uri.path, \"/comment-media/\")",
+            cached(json!({
+                "cache_key": { "ignore_query_strings_order": true },
+                "respect_strong_etags": true
+            })),
+        ),
+        // Only anonymous reads: the server marks a signed-in answer `private, no-store`,
+        // and a request with any Authorization header never enters the cache.
+        rule(
+            "komiq_graphql",
+            "cache anonymous GraphQL reads",
+            "http.request.uri.path eq \"/graphql\" and http.request.method eq \"GET\" and \
+             not any(lower(http.request.headers.names[*])[*] eq \"authorization\")",
+            cached(json!({ "cache_key": { "ignore_query_strings_order": true } })),
         ),
         rule(
             "komiq_pages",
-            "page images",
+            "cache legacy page images",
             "starts_with(http.request.uri.path, \"/api/v1/manga/\")",
+            cached(json!({})),
         ),
         rule(
             "komiq_img",
-            "proxied images",
+            "cache proxied images",
             "http.request.uri.path eq \"/img\"",
+            cached(json!({})),
         ),
         rule(
             "komiq_static",
-            "static files",
+            "cache static files",
             "starts_with(http.request.uri.path, \"/_app/immutable/\") or \
              starts_with(http.request.uri.path, \"/admin/_app/immutable/\")",
+            cached(json!({})),
+        ),
+        rule(
+            "komiq_bypass",
+            "never cache health checks and the media policy",
+            "starts_with(http.request.uri.path, \"/health\") or \
+             http.request.uri.path in {\"/media/v1/ready\" \"/media/v1/policy\" \
+             \"/media/v1/keys\"}",
+            json!({ "cache": false }),
         ),
     ]
 }

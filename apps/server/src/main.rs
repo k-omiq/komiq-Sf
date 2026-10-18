@@ -536,9 +536,9 @@ fn database_error_response(
     }
 }
 
-/// Browser cache lifetime for anonymous GET /graphql responses. Matches the lower
-/// bound of the in-process feed memo (30–60 s), so an edge/browser hit is never
-/// staler than what the origin would have served from its own cache anyway.
+/// Browser cache lifetime for anonymous GET /graphql responses. Below the in-process
+/// feed memo's 45 s (`graphql::FEED_TTL`), so a browser hit is never staler than what the
+/// origin would have served from its own cache anyway.
 const GRAPHQL_GET_MAX_AGE_SECS: u32 = 30;
 /// Cloudflare edge lifetime for the same responses (s-maxage).
 const GRAPHQL_GET_S_MAXAGE_SECS: u32 = 60;
@@ -570,28 +570,24 @@ async fn graphql_get_handler(
         lease,
         upstream,
     } = req;
-    let anonymous = bearer(&headers).is_none();
     let plain = plain_from_internet(tls, peer, &trusted.current(), &headers);
-    let mut res = lease
+    // Its CORS answer (`*` when anonymous) is set by `public_cors`, outside `CorsLayer`.
+    lease
         .run(upstream.scope_upstream(
             resolve_client_ip(&headers, peer, &trusted.current()),
             graphql_get_response(schema, trusted, peer, plain, headers, req),
         ))
-        .await;
-    if anonymous {
-        allow_any_origin(res.headers_mut());
-    }
-    res
+        .await
 }
 
-/// Answer an ANONYMOUS `GET /graphql` with `Access-Control-Allow-Origin: *`, replacing the
+/// Answer a public request with `Access-Control-Allow-Origin: *`, replacing the
 /// allowlisted echo `CorsLayer` would otherwise put there.
 ///
-/// WHAT THIS DOES AND DOES NOT WIDEN. It applies to one method on one route, and only when
-/// the request carries no bearer token — the same condition that already makes the
-/// response publicly cacheable (`cacheable` below). The bytes behind it are the anonymous
-/// public catalogue, viewer-invariant by construction and served from a shared edge cache
-/// to anyone who asks. `*` also FORBIDS credentialed requests, and this layer never sets
+/// WHAT THIS DOES AND DOES NOT WIDEN. For `GET /graphql` it applies only when the request
+/// carries no bearer token — the same condition that already makes the response publicly
+/// cacheable (`cacheable` below). The bytes behind it are the anonymous public catalogue,
+/// viewer-invariant by construction and served from a shared edge cache to anyone who
+/// asks. `*` also FORBIDS credentialed requests, and `public_cors` drops
 /// `Access-Control-Allow-Credentials`, so no cookie or authenticated read becomes readable
 /// by another site: authenticated reads carry a token, take the POST path, and keep the
 /// strict allowlist untouched.
@@ -743,9 +739,69 @@ fn weak_etag(body: &[u8]) -> String {
     format!("W/\"{:016x}\"", std::hash::Hasher::finish(&h))
 }
 
-/// RFC 9110 If-None-Match: a comma-separated list of entity tags (or `*`).
+/// RFC 9110 If-None-Match: a comma-separated list of entity tags (or `*`), compared
+/// weakly, as GET and HEAD require even for a strong validator.
 fn if_none_match_matches(header: Option<&str>, etag: &str) -> bool {
-    header.is_some_and(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"))
+    let opaque = |tag: &str| tag.strip_prefix("W/").unwrap_or(tag).to_owned();
+    let etag = opaque(etag.trim());
+    header.is_some_and(|v| {
+        v.split(',')
+            .map(str::trim)
+            .any(|t| t == "*" || opaque(t) == etag)
+    })
+}
+
+/// Strong validator of stored bytes: `"<sha256 hex>"`. With "respect strong ETags" on
+/// the zone's cache rules, a lease expiry at the edge revalidates with a 304 instead of
+/// refetching the whole image.
+fn strong_etag(bytes: &[u8]) -> HeaderValue {
+    use sha2::{Digest, Sha256};
+    sha256_etag(&hex::encode(Sha256::digest(bytes)))
+}
+
+/// [`strong_etag`] for bytes whose SHA-256 hex is already known.
+fn sha256_etag(hex: &str) -> HeaderValue {
+    HeaderValue::from_str(&format!("\"{hex}\"")).expect("a hex digest is a header value")
+}
+
+/// Route layer for media whose handler sets an `ETag`: a GET or HEAD whose
+/// `If-None-Match` matches gets 304 with the same headers (Cache-Control and ETag
+/// included) and no body. Inside the route's `telemetry::MediaLayer`, so a 304 counts
+/// as one, without the bytes it did not send.
+async fn not_modified(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let tags: Vec<HeaderValue> = if matches!(*request.method(), Method::GET | Method::HEAD) {
+        request
+            .headers()
+            .get_all(header::IF_NONE_MATCH)
+            .iter()
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let response = next.run(request).await;
+    if tags.is_empty() {
+        return response;
+    }
+    let matches = response.status() == StatusCode::OK
+        && response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|etag| etag.to_str().ok())
+            .is_some_and(|etag| {
+                tags.iter()
+                    .any(|tag| if_none_match_matches(tag.to_str().ok(), etag))
+            });
+    if !matches {
+        return response;
+    }
+    let (mut parts, _body) = response.into_parts();
+    parts.status = StatusCode::NOT_MODIFIED;
+    parts.headers.remove(header::CONTENT_LENGTH);
+    axum::response::Response::from_parts(parts, axum::body::Body::empty())
 }
 
 async fn graphiql() -> impl IntoResponse {
@@ -1122,7 +1178,8 @@ fn png_icon_response(bytes: Vec<u8>, headers: &HeaderMap) -> axum::response::Res
 }
 
 /// `GET /avatars/{file}` — serve the current `?v=` with immutable caching.
-/// Older versions and unversioned URLs redirect forward; newer versions get no-store. `{file}`
+/// Older versions and unversioned URLs redirect forward; newer versions get no-store. Stray
+/// query parameters redirect to the canonical URL (`noncanonical_image_query`). `{file}`
 /// is `<user_id>.webp`; bad shapes and missing avatars return uncacheable 404s.
 async fn serve_avatar(
     State(pool): State<crate::db::Database>,
@@ -1135,6 +1192,9 @@ async fn serve_avatar(
     let Ok(user_id) = crate::db_types::uuid(user_id) else {
         return media_not_found();
     };
+    if let Some(canonical) = noncanonical_image_query(query.as_deref(), false) {
+        return canonical_image_redirect(&format!("/avatars/{user_id}.webp"), &canonical, &query);
+    }
     let stored: Option<(Vec<u8>, i64)> =
         match sqlx::query_as("SELECT webp, version FROM user_avatars WHERE user_id = $1")
             .bind(user_id)
@@ -1170,7 +1230,8 @@ async fn serve_avatar(
 
 /// `GET /covers/{work_id}.webp` — public serve of a stored work cover.
 /// Current `?v=` URLs serve immutable bytes from one master/derivative snapshot;
-/// older versions and unversioned URLs redirect forward; newer versions get no-store. On a blob
+/// older versions, unversioned URLs and stray query parameters redirect forward; newer
+/// versions get no-store. On a blob
 /// miss, MangaDex-anchored works keep the lazy fetch, mutable response and CDN
 /// fallback. Coverless works and misses with MangaDex disabled return no-store 404s.
 async fn serve_cover(
@@ -1182,6 +1243,18 @@ async fn serve_cover(
     let Some(work_id) = file.strip_suffix(".webp") else {
         return media_not_found();
     };
+    if let Some(canonical) = noncanonical_image_query(query.as_deref(), true) {
+        // Work ids are plain ASCII (`w_…`); anything else names no cover, and must not
+        // be written back into a `Location`.
+        if work_id.is_empty()
+            || !work_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return media_not_found();
+        }
+        return canonical_image_redirect(&format!("/covers/{work_id}.webp"), &canonical, &query);
+    }
     // A taken-down work (or an old id that redirects to one) has no cover, before any
     // stored blob or lazy fill.
     match current_policy(&app).await {
@@ -1504,14 +1577,20 @@ async fn current_policy(
 ) -> Result<Arc<media_policy::Snapshot>, axum::response::Response> {
     app.policy.current(&app.pool).await.map_err(|e| {
         tracing::warn!(error = %e, "media policy unreadable");
-        let mut response =
-            database_error_response(db::observed_read_database_error(e), "Internal error");
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store, must-revalidate"),
-        );
-        response
+        media_read_error(e)
     })
+}
+
+/// A failed read on a media request: 503 when the pool is exhausted, else 500, and
+/// never cached.
+fn media_read_error(error: anyhow::Error) -> axum::response::Response {
+    let mut response =
+        database_error_response(db::observed_read_database_error(error), "Internal error");
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, must-revalidate"),
+    );
+    response
 }
 
 async fn fetch_suwayomi_page(
@@ -1555,6 +1634,9 @@ async fn fetch_suwayomi_page(
 /// id, not by its index. The index (`sourceOrder`) moves when a source re-orders its
 /// chapters, so it is looked up per request (30 s memo, `page_locator`), and bytes fetched
 /// while the server refreshed that series are dropped, never served under this URL.
+///
+/// Kept for clients holding page lists from before [`serve_generation_page`]: a chapter
+/// id here may belong to another engine generation, so it is kept for 300 s only.
 async fn serve_chapter_page(
     State(app): State<Arc<graphql::AppState>>,
     path: Result<UrlPath<(String, String)>, axum::extract::rejection::PathRejection>,
@@ -1562,18 +1644,62 @@ async fn serve_chapter_page(
     let Ok(UrlPath((chapter, page))) = path else {
         return image_failure_response(StatusCode::NOT_FOUND);
     };
+    serve_page(&app, None, &chapter, &page).await
+}
+
+/// `GET /media/v1/c/{epoch}/{chapterId}/{page}` — what `pages` hands out: the chapter
+/// page above, under the engine's numeric epoch (`numericEpoch`). A new engine generation
+/// reuses chapter ids for other chapters and raises the epoch, so a URL of an older
+/// epoch is refused (404, `no-store`) instead of answering with another chapter's page.
+/// That makes the URL safe to keep for a day (`GENERATION_PAGE_CACHE`).
+async fn serve_generation_page(
+    State(app): State<Arc<graphql::AppState>>,
+    path: Result<UrlPath<(String, String, String)>, axum::extract::rejection::PathRejection>,
+) -> axum::response::Response {
+    let Ok(UrlPath((epoch, chapter, page))) = path else {
+        return image_failure_response(StatusCode::NOT_FOUND);
+    };
+    serve_page(&app, Some(&epoch), &chapter, &page).await
+}
+
+async fn serve_page(
+    app: &graphql::AppState,
+    epoch: Option<&str>,
+    chapter: &str,
+    page: &str,
+) -> axum::response::Response {
     let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    if !numeric(&chapter) || !numeric(&page) {
+    if !numeric(chapter) || !numeric(page) || epoch.is_some_and(|e| !numeric(e)) {
         return image_failure_response(StatusCode::NOT_FOUND);
     }
     let Ok(chapter_id) = chapter.parse::<i64>() else {
         return image_failure_response(StatusCode::NOT_FOUND);
     };
+    let epoch = match epoch.map(str::parse::<i64>) {
+        None => None,
+        Some(Ok(epoch)) => Some(epoch),
+        Some(Err(_)) => return image_failure_response(StatusCode::NOT_FOUND),
+    };
     if app.suwayomi.wait_for_generation().await.is_err() {
         return page_busy_response();
     }
     let generation = app.suwayomi.read_generation();
-    let response = serve_chapter_page_inner(&app, chapter_id, &page).await;
+    // Checked before the fetch: under a newer epoch this chapter id may name another
+    // chapter, which must not be fetched at all. A change after this check also changes
+    // the generation, which the check below refuses.
+    if let Some(epoch) = epoch {
+        match crate::engine_generation::numeric_epoch(&app.pool).await {
+            Ok(current) if current == epoch => {}
+            Ok(_) => return image_failure_response(StatusCode::NOT_FOUND),
+            Err(error) => return media_read_error(error),
+        }
+    }
+    let cache = if epoch.is_some() {
+        image_delivery::GENERATION_PAGE_CACHE
+    } else {
+        image_delivery::MUTABLE_CACHE
+    };
+    let response = serve_chapter_page_inner(app, chapter_id, page, cache).await;
     if app
         .suwayomi
         .validate_read_generation(generation)
@@ -1642,17 +1768,20 @@ async fn serve_chapter_page_inner(
     app: &graphql::AppState,
     chapter_id: i64,
     page: &str,
+    cache: &'static str,
 ) -> axum::response::Response {
     match fetch_chapter_page(app, chapter_id, page).await {
-        Ok((bytes, mime, cacheable)) => raw_image_response_with_cache(
-            mime,
-            bytes,
-            if cacheable {
-                image_delivery::MUTABLE_CACHE
-            } else {
-                "no-store"
-            },
-        ),
+        Ok((bytes, mime, cacheable)) => {
+            // Hashed once per fetch: an edge revalidation of unchanged bytes is a 304.
+            let etag = strong_etag(&bytes);
+            let mut response = raw_image_response_with_cache(
+                mime,
+                bytes,
+                if cacheable { cache } else { "no-store" },
+            );
+            response.headers_mut().insert(header::ETAG, etag);
+            response
+        }
         Err(response) => response,
     }
 }
@@ -1736,26 +1865,59 @@ fn manifest_store_error(error: anyhow::Error) -> axum::response::Response {
     image_failure_response(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// Public immutable object bytes use no cookies: the reader fetches with credentials
-/// omitted and verifies SHA-256. Run outside CorsLayer, which would otherwise echo
-/// allowlisted origins instead of the wildcard these fetches need.
-async fn media_object_cors(
+/// Public, edge-cacheable responses answer every origin alike: `*`, no credentials, and
+/// no `Vary` on the CORS request headers. Runs outside `CorsLayer`, which would otherwise
+/// echo an allowlisted origin and add `Vary: Origin`, so one URL would be cached once per
+/// origin (and once more for no origin). Exact media objects and packs are fetched with
+/// credentials omitted and verified by SHA-256; covers, avatars, comment images and pages
+/// carry no viewer data; an anonymous `GET /graphql` is the public catalogue (see
+/// [`allow_any_origin`]). POST and signed-in calls keep the allowlist.
+async fn public_cors(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    // Chapter packs (`/media/v1/p/`) are fetched the same way and verified per object.
-    let path = request.uri().path();
-    let object_path = path.starts_with("/media/v1/o/") || path.starts_with("/media/v1/p/");
+    let public = is_public_cors(request.method(), request.uri().path(), request.headers());
     let mut response = next.run(request).await;
-    if object_path {
+    if public {
         let headers = response.headers_mut();
-        headers.insert(
-            header::ACCESS_CONTROL_ALLOW_ORIGIN,
-            HeaderValue::from_static("*"),
-        );
+        allow_any_origin(headers);
         headers.remove(header::ACCESS_CONTROL_ALLOW_CREDENTIALS);
+        let kept: Vec<String> = headers
+            .get_all(header::VARY)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .filter(|name| {
+                !name.is_empty()
+                    && ![
+                        "origin",
+                        "access-control-request-method",
+                        "access-control-request-headers",
+                    ]
+                    .iter()
+                    .any(|cors| name.eq_ignore_ascii_case(cors))
+            })
+            .map(str::to_owned)
+            .collect();
+        headers.remove(header::VARY);
+        if let Some(value) = (!kept.is_empty())
+            .then(|| HeaderValue::from_str(&kept.join(", ")).ok())
+            .flatten()
+        {
+            headers.insert(header::VARY, value);
+        }
     }
     response
+}
+
+fn is_public_cors(method: &Method, path: &str, headers: &HeaderMap) -> bool {
+    if path == "/graphql" {
+        return matches!(*method, Method::GET | Method::HEAD) && bearer(headers).is_none();
+    }
+    ["/covers/", "/avatars/", "/comment-media/", "/media/"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
 }
 
 /// The owner's response compression. The default predicate leaves image/* and
@@ -1868,6 +2030,10 @@ async fn serve_media_object_inner(
             "public, max-age=31536000, immutable, s-maxage={s_maxage}"
         ))?,
     );
+    // The bytes were just checked against this hash, so it is their strong validator.
+    response
+        .headers_mut()
+        .insert(header::ETAG, sha256_etag(hash));
     Ok(response)
 }
 
@@ -1917,7 +2083,11 @@ async fn serve_media_manifest(
     match manifest {
         Ok(Some(manifest)) if rev.is_some() || !manifest.stale => {
             match media.signed(manifest.body).await {
-                Ok(bytes) => signed_media_response(bytes),
+                // A revision never changes: its URL may be kept like an exact object.
+                Ok(bytes) if rev.is_some() => {
+                    signed_media_response(bytes, "public, max-age=31536000, immutable")
+                }
+                Ok(bytes) => signed_media_response(bytes, SIGNED_MEDIA_CACHE),
                 Err(error) => manifest_store_error(error),
             }
         }
@@ -1926,11 +2096,14 @@ async fn serve_media_manifest(
     }
 }
 
-fn signed_media_response(bytes: Vec<u8>) -> axum::response::Response {
+/// The latest manifest, the signing keys and the policy lease move: a minute at most.
+const SIGNED_MEDIA_CACHE: &str = "public, max-age=60";
+
+fn signed_media_response(bytes: Vec<u8>, cache: &'static str) -> axum::response::Response {
     (
         [
             (header::CONTENT_TYPE, "application/json"),
-            (header::CACHE_CONTROL, "public, max-age=60"),
+            (header::CACHE_CONTROL, cache),
         ],
         bytes,
     )
@@ -1939,7 +2112,7 @@ fn signed_media_response(bytes: Vec<u8>) -> axum::response::Response {
 
 async fn serve_media_keys(State(app): State<Arc<AppState>>) -> axum::response::Response {
     match &app.media_manifests {
-        Some(media) => signed_media_response(media.keys.clone()),
+        Some(media) => signed_media_response(media.keys.clone(), SIGNED_MEDIA_CACHE),
         None => image_failure_response(StatusCode::NOT_FOUND),
     }
 }
@@ -1956,7 +2129,7 @@ async fn serve_media_policy(State(app): State<Arc<AppState>>) -> axum::response:
     };
     let now = chrono::Utc::now().timestamp();
     match app.policy.signed_lease(&policy, &media.signer, now) {
-        Ok(bytes) => signed_media_response(bytes.as_ref().clone()),
+        Ok(bytes) => signed_media_response(bytes.as_ref().clone(), SIGNED_MEDIA_CACHE),
         Err(error) => manifest_store_error(error),
     }
 }
@@ -2273,6 +2446,69 @@ fn query_param<'a>(raw: &'a Option<String>, key: &str) -> Option<&'a str> {
         .map(|(_, v)| v)
 }
 
+/// The reader's one-time browser-cache rollout key, on every own-origin image URL it
+/// builds (`CACHE_POLICY_REVISION` in `packages/api/src/image-provider.ts`). Keep the two
+/// in step: a revision this server does not know is redirected away.
+const READER_CACHE_POLICY: &str = "2";
+
+/// The canonical query for a cover (`widths`) or avatar URL whose query is not already
+/// canonical, else `None`. Canonical is `v` (a version number), `cache_policy` (the
+/// reader's revision) and, for covers, `w` in [`cover::VARIANT_WIDTHS`], each at most
+/// once and written plainly. Anything else would mint another edge cache entry for the
+/// same bytes (a Free-plan cache rule can sort a query string, not allowlist one), so
+/// the caller redirects to the URL without it. The result is canonical by construction:
+/// following it never redirects here again.
+fn noncanonical_image_query(raw: Option<&str>, widths: bool) -> Option<String> {
+    let raw = raw?;
+    let (mut version, mut policy, mut width) = (None, false, None);
+    let mut canonical = true;
+    for pair in raw.split('&') {
+        let kept = match pair.split_once('=') {
+            Some(("v", value)) if version.is_none() => {
+                version = value.parse::<i64>().ok();
+                version.is_some_and(|v| v.to_string() == value)
+            }
+            Some(("cache_policy", READER_CACHE_POLICY)) if !policy => {
+                policy = true;
+                true
+            }
+            Some(("w", value)) if widths && width.is_none() => {
+                width = cover::variant_width(Some(value));
+                width.is_some_and(|w| w.to_string() == value)
+            }
+            _ => false,
+        };
+        canonical &= kept;
+    }
+    if canonical {
+        return None;
+    }
+    let query: Vec<String> = [
+        version.map(|v| format!("v={v}")),
+        policy.then(|| format!("cache_policy={READER_CACHE_POLICY}")),
+        width.map(|w| format!("w={w}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    Some(query.join("&"))
+}
+
+/// Redirect a cover or avatar URL with stray query parameters to its canonical form.
+/// `path` holds only URL-safe characters.
+fn canonical_image_redirect(
+    path: &str,
+    canonical: &str,
+    raw: &Option<String>,
+) -> axum::response::Response {
+    let location = if canonical.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{canonical}")
+    };
+    image_redirect(&location, query_param(raw, "v").is_some())
+}
+
 fn media_not_found() -> axum::response::Response {
     (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response()
 }
@@ -2288,18 +2524,22 @@ fn version_redirect(
     {
         return None;
     }
-    let cache = if requested.is_some() {
+    Some(image_redirect(path, requested.is_some()))
+}
+
+/// A 307 to another cover or avatar URL. A redirect from a URL that named a version is
+/// not stored; an unversioned one may be kept for five minutes.
+fn image_redirect(location: &str, versioned: bool) -> axum::response::Response {
+    let cache = if versioned {
         "no-store"
     } else {
         "public, max-age=300"
     };
-    Some(
-        (
-            [(header::CACHE_CONTROL, cache)],
-            axum::response::Redirect::temporary(path),
-        )
-            .into_response(),
+    (
+        [(header::CACHE_CONTROL, cache)],
+        axum::response::Redirect::temporary(location),
     )
+        .into_response()
 }
 
 fn version_cache_control(requested: Option<&str>, current: i64) -> &'static str {
@@ -2456,6 +2696,8 @@ fn resize_cover_variant<T: Send + 'static>(
     })
 }
 
+/// Covers and avatars, with a strong ETag of the exact bytes served (the master or a
+/// width derivative), so a revalidation of the same bytes is a 304 (`not_modified`).
 fn webp_cover_response(bytes: Vec<u8>, cache_control: &'static str) -> axum::response::Response {
     (
         [
@@ -2464,6 +2706,7 @@ fn webp_cover_response(bytes: Vec<u8>, cache_control: &'static str) -> axum::res
                 header::CACHE_CONTROL,
                 HeaderValue::from_static(cache_control),
             ),
+            (header::ETAG, strong_etag(&bytes)),
         ],
         bytes,
     )
@@ -2661,7 +2904,9 @@ async fn upload_comment_media(
 }
 
 /// `GET /comment-media/{file}` — serve a stored comment image from `comment_media`.
-/// Immutable + long-cache: the id is a random uuid, so the bytes never change.
+/// Immutable + long-cache in browsers: the id is a random uuid, so the bytes never change.
+/// A shared cache keeps it for one media policy lease (`IMMUTABLE_CACHE`), so removing
+/// an image in moderation reaches the edge within that lease.
 /// `{file}` is `<id>.webp`; the id is looked up as a bind param (no injection
 /// surface), returning 404 for a bad shape or unknown id.
 async fn serve_comment_media(
@@ -2692,8 +2937,12 @@ async fn serve_comment_media(
     match webp {
         Some(bytes) => (
             [
-                (header::CONTENT_TYPE, "image/webp"),
-                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+                (header::CONTENT_TYPE, HeaderValue::from_static("image/webp")),
+                (
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static(image_delivery::IMMUTABLE_CACHE),
+                ),
+                (header::ETAG, strong_etag(&bytes)),
             ],
             bytes,
         )
@@ -2703,9 +2952,10 @@ async fn serve_comment_media(
 }
 
 /// Liveness: cheap, dependency-free — used by the container HEALTHCHECK. A blip
-/// in the DB must not flap this (that would trigger restart loops).
-async fn health() -> &'static str {
-    "ok"
+/// in the DB must not flap this (that would trigger restart loops). Never cached: a
+/// probe must reach this process.
+async fn health() -> impl IntoResponse {
+    ([(header::CACHE_CONTROL, "no-store")], "ok")
 }
 
 /// Prometheus-format operational gauges, scraped on demand.
@@ -2850,11 +3100,19 @@ async fn ready(State(ReadyDb(pool)): State<ReadyDb>) -> impl IntoResponse {
         .fetch_one(&pool)
         .await
     {
-        Ok(_) => (axum::http::StatusCode::OK, "ready"),
+        Ok(_) => (
+            axum::http::StatusCode::OK,
+            [(header::CACHE_CONTROL, "no-store")],
+            "ready",
+        ),
         Err(e) => {
             db::record_read_database_error(&e);
             tracing::warn!(error = %e, "readiness check failed");
-            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                [(header::CACHE_CONTROL, "no-store")],
+                "not ready",
+            )
         }
     }
 }
@@ -2920,9 +3178,11 @@ fn public_router(
         )
         .route(
             "/avatars/{file}",
-            get(serve_avatar).layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
-                telemetry::MediaRoute::Avatar,
-            )),
+            get(serve_avatar)
+                .layer(axum::middleware::from_fn(not_modified))
+                .layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                    telemetry::MediaRoute::Avatar,
+                )),
         )
         // Public serve of stored work covers.
         // Lets the web reader load covers from our own origin instead of the CF
@@ -2931,6 +3191,7 @@ fn public_router(
         .route(
             "/covers/{file}",
             get(serve_cover)
+                .layer(axum::middleware::from_fn(not_modified))
                 .layer(axum::middleware::from_fn_with_state(
                     std::time::Duration::from_secs(120),
                     request_budget::limit_image_time,
@@ -2986,6 +3247,19 @@ fn public_router(
         .route(
             "/media/v1/c/{chapterId}/{page}",
             get(serve_chapter_page)
+                .layer(axum::middleware::from_fn(not_modified))
+                .layer(axum::middleware::from_fn_with_state(
+                    std::time::Duration::from_secs(60),
+                    request_budget::limit_image_time,
+                ))
+                .layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                    telemetry::MediaRoute::Page,
+                )),
+        )
+        .route(
+            "/media/v1/c/{epoch}/{chapterId}/{page}",
+            get(serve_generation_page)
+                .layer(axum::middleware::from_fn(not_modified))
                 .layer(axum::middleware::from_fn_with_state(
                     std::time::Duration::from_secs(60),
                     request_budget::limit_image_time,
@@ -2997,6 +3271,7 @@ fn public_router(
         .route(
             "/media/v1/o/{copy_id}/{sha256}",
             get(serve_media_object)
+                .layer(axum::middleware::from_fn(not_modified))
                 .layer(axum::middleware::from_fn_with_state(
                     std::time::Duration::from_secs(60),
                     request_budget::limit_image_time,
@@ -3063,9 +3338,11 @@ fn public_router(
         )
         .route(
             "/comment-media/{file}",
-            get(serve_comment_media).layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
-                telemetry::MediaRoute::CommentMedia,
-            )),
+            get(serve_comment_media)
+                .layer(axum::middleware::from_fn(not_modified))
+                .layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                    telemetry::MediaRoute::CommentMedia,
+                )),
         );
     // Self-host: the server's own image proxy (`img_proxy`), the stand-in for the
     // `img.komiq.cc` Worker. Mounted only where it is wanted — a server that serves
@@ -3146,7 +3423,7 @@ fn public_router(
                 .layer(PropagateRequestIdLayer::x_request_id()),
         )
         .layer(cors)
-        .layer(axum::middleware::from_fn(media_object_cors))
+        .layer(axum::middleware::from_fn(public_cors))
         .layer(SetResponseHeaderLayer::overriding(
             header::HeaderName::from_static("x-content-type-options"),
             HeaderValue::from_static("nosniff"),
@@ -4163,6 +4440,37 @@ mod tests {
         }
     }
 
+    /// Only `v`, the reader's `cache_policy` and (covers) an allowlisted `w` keep a URL;
+    /// the canonical form never redirects again.
+    #[test]
+    fn image_queries_canonicalize_to_a_fixed_point() {
+        for (raw, widths, expected) in [
+            (None, true, None),
+            (Some("v=7"), true, None),
+            (Some("v=7&w=320"), true, None),
+            (Some("w=192&v=7"), true, None),
+            (Some("v=7&cache_policy=2&w=192"), true, None),
+            (Some("v=7&w=192"), false, Some("v=7")),
+            (Some("v=7&w=999"), true, Some("v=7")),
+            (Some("v=7&x"), true, Some("v=7")),
+            (Some("v=+7"), true, Some("v=7")),
+            (Some("v=abc&w=192"), true, Some("w=192")),
+            (
+                Some("cache_policy=2&cache_policy=2"),
+                false,
+                Some("cache_policy=2"),
+            ),
+            (Some("x=1&w=320&v=3"), true, Some("v=3&w=320")),
+            (Some("&"), true, Some("")),
+        ] {
+            let canonical = noncanonical_image_query(raw, widths);
+            assert_eq!(canonical.as_deref(), expected, "{raw:?}");
+            if let Some(canonical) = canonical.filter(|c| !c.is_empty()) {
+                assert_eq!(noncanonical_image_query(Some(&canonical), widths), None);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn own_origin_cover_versions_redirect_or_serve_exact_bytes() {
         let (_dir, app) = own_origin_media_state().await;
@@ -4173,18 +4481,22 @@ mod tests {
             ("v=7&w=192", b"derivative"),
             ("v=9", b"master"),
             ("v=9&w=192", b"derivative"),
+            // The reader's own shape: its rollout key, in any order.
+            ("v=7&cache_policy=2&w=192", b"derivative"),
+            ("w=192&cache_policy=2&v=7", b"derivative"),
         ] {
             let response = exact_cover_get(&app, Some(query)).await;
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(
                 response.headers()[header::CACHE_CONTROL],
-                if query.starts_with("v=7") {
+                if query.contains("v=7") {
                     image_delivery::IMMUTABLE_CACHE
                 } else {
                     "no-store"
                 }
             );
             assert!(!response.headers().contains_key(header::LOCATION));
+            assert_eq!(response.headers()[header::ETAG], strong_etag(expected));
             assert_eq!(
                 axum::body::to_bytes(response.into_body(), 4096)
                     .await
@@ -4199,14 +4511,36 @@ mod tests {
                 "/covers/w_exact.webp?v=7&w=192",
                 "no-store",
             ),
-            (Some("v=6&w=999"), "/covers/w_exact.webp?v=7", "no-store"),
-            (Some("v"), "/covers/w_exact.webp?v=7", "no-store"),
             (None, "/covers/w_exact.webp?v=7", "public, max-age=300"),
             (
                 Some("w=192"),
                 "/covers/w_exact.webp?v=7&w=192",
                 "public, max-age=300",
             ),
+            // Stray parameters go first, before any store read; a stale version is then
+            // moved forward by the next hop.
+            (Some("v=6&w=999"), "/covers/w_exact.webp?v=6", "no-store"),
+            (Some("v"), "/covers/w_exact.webp", "no-store"),
+            (Some("v=7&x=1"), "/covers/w_exact.webp?v=7", "no-store"),
+            (Some("v=7&w=999"), "/covers/w_exact.webp?v=7", "no-store"),
+            (
+                Some("v=7&w=0192"),
+                "/covers/w_exact.webp?v=7&w=192",
+                "no-store",
+            ),
+            (Some("v=07"), "/covers/w_exact.webp?v=7", "no-store"),
+            (Some("v=7&v=7"), "/covers/w_exact.webp?v=7", "no-store"),
+            (
+                Some("v=7&cache_policy=3&w=192"),
+                "/covers/w_exact.webp?v=7&w=192",
+                "no-store",
+            ),
+            (
+                Some("cache_policy=2&x=1"),
+                "/covers/w_exact.webp?cache_policy=2",
+                "public, max-age=300",
+            ),
+            (Some(""), "/covers/w_exact.webp", "public, max-age=300"),
         ] {
             let response = exact_cover_get(&app, query).await;
             assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
@@ -4817,10 +5151,15 @@ mod tests {
                 .as_ref(),
             b"avatar"
         );
-        for (query, cache) in [
-            (Some("v=6"), "no-store"),
-            (Some("v=bogus"), "no-store"),
-            (None, "public, max-age=300"),
+        let current = avatar::avatar_url(&user.to_string(), 7);
+        let bare = format!("/avatars/{user}.webp");
+        for (query, location, cache) in [
+            (Some("v=6"), current.as_str(), "no-store"),
+            (None, &current, "public, max-age=300"),
+            // Stray parameters, and a `w` avatars do not have, are dropped first.
+            (Some("v=bogus"), &bare, "no-store"),
+            (Some("v=7&w=192"), &current, "no-store"),
+            (Some("x=1"), &bare, "public, max-age=300"),
         ] {
             let response = serve_avatar(
                 State(pool.clone()),
@@ -4829,12 +5168,17 @@ mod tests {
             )
             .await;
             assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-            assert_eq!(
-                response.headers()[header::LOCATION],
-                avatar::avatar_url(&user.to_string(), 7)
-            );
+            assert_eq!(response.headers()[header::LOCATION], location);
             assert_eq!(response.headers()[header::CACHE_CONTROL], cache);
         }
+        let response = serve_avatar(
+            State(pool.clone()),
+            UrlPath(file.clone()),
+            RawQuery(Some("v=7&cache_policy=2".into())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::ETAG], strong_etag(b"avatar"));
     }
 
     #[tokio::test]
@@ -4893,6 +5237,43 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    /// A comment image is immutable in browsers, but the edge keeps it one policy lease,
+    /// so removing it in moderation reaches every colo; the lease ends in a 304.
+    #[tokio::test]
+    async fn own_origin_comment_media_keeps_a_moderation_lease_at_the_edge() {
+        let (_dir, app) = own_origin_media_state().await;
+        let (user, media) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, is_admin, created_at) \
+             VALUES ($1, 'poster', 'poster@example.com', 'h', FALSE, '2020-01-01T00:00:00Z')",
+        )
+        .bind(user)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO comment_media (id, comment_id, user_id, webp, width, height, created_at) \
+             VALUES ($1, NULL, $2, $3, 1, 1, now())",
+        )
+        .bind(media)
+        .bind(user)
+        .bind(b"comment image".as_slice())
+        .execute(&app.pool)
+        .await
+        .unwrap();
+        let response =
+            serve_comment_media(State(app.pool.clone()), UrlPath(format!("{media}.webp"))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable, s-maxage=600"
+        );
+        assert_eq!(
+            response.headers()[header::ETAG],
+            strong_etag(b"comment image")
+        );
     }
 
     #[test]
@@ -5789,6 +6170,139 @@ mod tests {
         assert_eq!(trusted.raw(), ["172.17.0.0/16"]);
     }
 
+    /// Through the real router and all its layers: public reads answer every origin with
+    /// `*` and no `Vary: Origin`, POST and signed-in calls keep the allowlist echo, a
+    /// stray cover parameter is a 307 to the canonical URL, a cover revalidates with a
+    /// 304, and health probes are never cached.
+    #[tokio::test]
+    async fn production_router_public_reads_are_one_cache_entry_for_every_origin() {
+        use tower::ServiceExt;
+        let (_covers_dir, mut cfg, state, cloudflare) = production_router_fixture().await;
+        cfg.cors_origins = vec!["https://komiq.cc".into()];
+        let (pool, reserved, covers) = (
+            state.pool.clone(),
+            state.ready_pool.clone(),
+            state.cover_pool.clone(),
+        );
+        let app = public_router(
+            &cfg,
+            state,
+            cloudflare,
+            web_dir::Apps::from_config(&cfg),
+            cfg.img_proxy_enabled,
+        );
+        let send = |method: Method, path: &str, headers: &[(header::HeaderName, &str)]| {
+            let mut request = axum::http::Request::builder()
+                .method(method.clone())
+                .uri(path)
+                .header(header::ORIGIN, "https://komiq.cc");
+            for (name, value) in headers {
+                request = request.header(name, *value);
+            }
+            let body = if method == Method::POST {
+                request = request.header(header::CONTENT_TYPE, "application/json");
+                axum::body::Body::from(r#"{"query":"{ __typename }"}"#)
+            } else {
+                axum::body::Body::empty()
+            };
+            let mut request = request.body(body).unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
+            app.clone().oneshot(request)
+        };
+        let acao = |response: &axum::response::Response| {
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(|value| value.to_str().unwrap().to_owned())
+        };
+        let graphql = "/graphql?query=%7B__typename%7D";
+        // The page fails (no engine here): errors are public answers too.
+        for (path, status) in [
+            (graphql, Some(StatusCode::OK)),
+            ("/covers/cached.webp?v=1", Some(StatusCode::OK)),
+            ("/avatars/missing.webp", Some(StatusCode::NOT_FOUND)),
+            ("/comment-media/missing.webp", Some(StatusCode::NOT_FOUND)),
+            ("/media/v1/c/0/8/0", None),
+        ] {
+            let response = send(Method::GET, path, &[]).await.unwrap();
+            if let Some(status) = status {
+                assert_eq!(response.status(), status, "{path}");
+            }
+            assert_eq!(acao(&response).as_deref(), Some("*"), "{path}");
+            assert!(!vary_has_origin(response.headers()), "{path}");
+        }
+        let anonymous = send(Method::GET, graphql, &[]).await.unwrap();
+        assert!(anonymous.headers()[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .starts_with("public"));
+        for response in [
+            send(Method::POST, "/graphql", &[]).await.unwrap(),
+            send(
+                Method::GET,
+                graphql,
+                &[(header::AUTHORIZATION, "Bearer not-a-session")],
+            )
+            .await
+            .unwrap(),
+        ] {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(acao(&response).as_deref(), Some("https://komiq.cc"));
+            assert!(vary_has_origin(response.headers()));
+        }
+
+        let cover = send(Method::GET, "/covers/cached.webp?v=1", &[])
+            .await
+            .unwrap();
+        let etag = cover.headers()[header::ETAG].clone();
+        assert_eq!(etag, strong_etag(&[1, 2]));
+        let cache = cover.headers()[header::CACHE_CONTROL].clone();
+        let revalidated = send(
+            Method::GET,
+            "/covers/cached.webp?v=1",
+            &[(header::IF_NONE_MATCH, etag.to_str().unwrap())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(revalidated.headers()[header::CACHE_CONTROL], cache);
+        assert_eq!(revalidated.headers()[header::ETAG], etag);
+        assert_eq!(acao(&revalidated).as_deref(), Some("*"));
+        assert!(axum::body::to_bytes(revalidated.into_body(), 1024)
+            .await
+            .unwrap()
+            .is_empty());
+        let changed = send(
+            Method::GET,
+            "/covers/cached.webp?v=1",
+            &[(header::IF_NONE_MATCH, "\"0000\"")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed.status(), StatusCode::OK);
+
+        let stray = send(Method::GET, "/covers/cached.webp?v=1&utm=x", &[])
+            .await
+            .unwrap();
+        assert_eq!(stray.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(stray.headers()[header::LOCATION], "/covers/cached.webp?v=1");
+
+        for path in ["/health", "/health/ready"] {
+            let response = send(Method::GET, path, &[]).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "no-store",
+                "{path}"
+            );
+        }
+        reserved.0.close().await;
+        covers.close().await;
+        pool.close().await;
+    }
+
     #[tokio::test]
     async fn production_router_keeps_health_and_images_outside_graphql_admission() {
         use tower::ServiceExt;
@@ -6238,9 +6752,12 @@ mod tests {
         Router::new()
             .route("/media/v1/o/{a}/{b}", media())
             .route("/media/v1/p/{a}/{b}", media())
-            .route("/graphql", get(|| async { StatusCode::OK }))
+            .route(
+                "/graphql",
+                get(|| async { StatusCode::OK }).post(|| async { StatusCode::OK }),
+            )
             .layer(cors)
-            .layer(axum::middleware::from_fn(media_object_cors))
+            .layer(axum::middleware::from_fn(public_cors))
     }
 
     #[tokio::test(start_paused = true)]
@@ -6285,40 +6802,75 @@ mod tests {
                 );
                 assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
                 assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS));
+                assert!(!vary_has_origin(headers), "{path}, {origin:?}");
             }
         }
     }
 
+    /// POST and signed-in GETs keep the allowlist echo; an anonymous GET is `*` for
+    /// every origin.
     #[tokio::test]
-    async fn media_object_cors_preserves_graphql_cors() {
+    async fn public_cors_keeps_the_allowlist_for_post_and_signed_in_graphql() {
         use axum::{body::Body, http::Request};
         use tower::ServiceExt;
         let app = media_object_cors_test_router();
-        for (origin, expected) in [
-            ("https://reader.example", Some("https://reader.example")),
-            ("https://other.example", None),
+        for (method, bearer, origin, expected) in [
+            (
+                Method::POST,
+                false,
+                "https://reader.example",
+                Some("https://reader.example"),
+            ),
+            (Method::POST, false, "https://other.example", None),
+            (
+                Method::GET,
+                true,
+                "https://reader.example",
+                Some("https://reader.example"),
+            ),
+            (Method::GET, true, "https://other.example", None),
+            (Method::GET, false, "https://reader.example", Some("*")),
+            (Method::GET, false, "https://other.example", Some("*")),
         ] {
+            let mut request = Request::builder()
+                .method(method.clone())
+                .uri("/graphql")
+                .header(header::ORIGIN, origin);
+            if bearer {
+                request = request.header(header::AUTHORIZATION, "Bearer token");
+            }
             let response = app
                 .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri("/graphql")
-                        .header(header::ORIGIN, origin)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+                .oneshot(request.body(Body::empty()).unwrap())
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             let headers = response.headers();
+            let case = format!("{method} bearer={bearer} {origin}");
             assert_eq!(
                 headers
                     .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
                     .and_then(|value| value.to_str().ok()),
-                expected
+                expected,
+                "{case}"
             );
-            assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_CREDENTIALS], "true");
+            let public = expected == Some("*");
+            assert_eq!(
+                headers.contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+                !public,
+                "{case}"
+            );
+            assert_eq!(vary_has_origin(headers), !public, "{case}");
         }
+    }
+
+    fn vary_has_origin(headers: &HeaderMap) -> bool {
+        headers
+            .get_all(header::VARY)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|name| name.trim().eq_ignore_ascii_case("origin"))
     }
 
     /// The reader's edge SSR reaches this endpoint through SvelteKit's `load({ fetch })`,
@@ -6439,6 +6991,12 @@ mod tests {
         assert!(if_none_match_matches(Some("*"), &a));
         assert!(!if_none_match_matches(Some("W/\"deadbeef\""), &a));
         assert!(!if_none_match_matches(None, &a));
+        // Weak comparison: an intermediary that weakened a strong tag still matches it.
+        let strong = strong_etag(b"bytes");
+        let strong = strong.to_str().unwrap();
+        assert!(if_none_match_matches(Some(&format!("W/{strong}")), strong));
+        assert!(if_none_match_matches(Some(strong), &format!("W/{strong}")));
+        assert!(!if_none_match_matches(Some("\"other\""), strong));
     }
 
     #[test]

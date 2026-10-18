@@ -1132,6 +1132,7 @@ pub(crate) async fn page_urls(
     owner: &SuwayomiClient,
     pool: &Database,
     chapter_id: i64,
+    epoch: i64,
 ) -> Result<Option<Vec<String>>> {
     if !owner.regional.any_route() {
         return Ok(None);
@@ -1181,11 +1182,13 @@ pub(crate) async fn page_urls(
     Ok(Some(
         (0..chapter.pages.len())
             .map(|i| {
-                owner.page_locator_url(chapter_id, i).unwrap_or_else(|| {
-                    owner.abs(Some(&format!(
-                        "/api/v1/manga/{manga}/chapter/{order}/page/{i}"
-                    )))
-                })
+                owner
+                    .page_locator_url(epoch, chapter_id, i)
+                    .unwrap_or_else(|| {
+                        owner.abs(Some(&format!(
+                            "/api/v1/manga/{manga}/chapter/{order}/page/{i}"
+                        )))
+                    })
             })
             .collect(),
     ))

@@ -403,6 +403,11 @@ async fn object_mismatch_marks_stale_and_pages_stop_exact_paths() {
         (1..=media_policy::LEASE_SECS).contains(&s_maxage),
         "{cache}"
     );
+    // The object's own hash is its strong validator.
+    assert_eq!(
+        response.headers()[header::ETAG],
+        format!("\"{}\"", path.rsplit('/').next().unwrap()).as_str()
+    );
     assert_eq!(body(response).await, engine.pages.lock().unwrap()[0]);
     engine.pages.lock().unwrap()[0] = image_bytes(9);
     let response = get_media(&app, path).await;
@@ -494,6 +499,15 @@ async fn signed_manifest_keys_superseded_records_and_pruning() {
     let first = body(response).await;
     assert_eq!(verify_manifest(&first, &pins(&app)).unwrap().revision, 1);
     assert_eq!(body(get_media(&app, &path).await).await, first);
+    // A revision never changes; the keys and the latest manifest do.
+    assert_eq!(
+        get_media(&app, &format!("{path}?rev=1")).await.headers()[header::CACHE_CONTROL],
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(
+        get_media(&app, "/media/v1/keys").await.headers()[header::CACHE_CONTROL],
+        "public, max-age=60"
+    );
     let keyset = body(get_media(&app, "/media/v1/keys").await).await;
     assert_eq!(verify_key_set(&keyset, &pins(&app)).unwrap().len(), 1);
     engine.pages.lock().unwrap()[0] = image_bytes(5);
@@ -888,7 +902,7 @@ async fn regional_locator_legacy_graphql_ingest_objects_and_cover_keep_owner_ids
     let listed = pages(&app).await;
     assert_eq!(listed.as_array().unwrap().len(), 3);
     for i in 0..3 {
-        assert_eq!(listed[i]["sourceUrl"], format!("/media/v1/c/8/{i}"));
+        assert_eq!(listed[i]["sourceUrl"], format!("/media/v1/c/0/8/{i}"));
     }
     assert_eq!(owner.page_lists.load(SeqCst), 0);
     assert_eq!(ingest_chapter(&app, 8).await.unwrap(), Some(1));

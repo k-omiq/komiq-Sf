@@ -783,7 +783,7 @@ async fn tunnel_setup_then_remove_deletes_exactly_what_it_created() {
         assert_eq!(ours[0].1["content"], format!("{tunnel}.cfargotunnel.com"));
         let (rs, rules) = m.ruleset.as_ref().unwrap();
         assert_eq!(rs, "rs-existing");
-        assert_eq!(rules.len(), 5);
+        assert_eq!(rules.len(), 1 + rule_count());
         for r in &rules[1..] {
             assert!(r["ref"].as_str().unwrap().starts_with("komiq_"));
             assert!(r["expression"]
@@ -791,7 +791,6 @@ async fn tunnel_setup_then_remove_deletes_exactly_what_it_created() {
                 .unwrap()
                 .contains("http.host eq \"read.example.com\""));
             assert_eq!(r["action"], "set_cache_settings");
-            assert_eq!(r["action_parameters"]["edge_ttl"]["mode"], "respect_origin");
         }
         assert_eq!(m.settings["browser_cache_ttl"], json!(0));
         assert_eq!(
@@ -801,7 +800,7 @@ async fn tunnel_setup_then_remove_deletes_exactly_what_it_created() {
         );
         assert!(m.certs.is_empty());
     }
-    assert_eq!(stored.rule_ids.len(), 4);
+    assert_eq!(stored.rule_ids.len(), rule_count());
     assert!(!stored.ruleset_created);
 
     // Visitor addresses: loopback (the connector), stored and live.
@@ -904,7 +903,7 @@ async fn public_ip_setup_serves_https_and_remove_restores_the_zone() {
         assert_eq!(ours[0].1["content"], "203.0.113.7");
         assert_eq!(m.settings["ssl"], json!("strict"));
         assert_eq!(m.certs.len(), 1);
-        assert_eq!(m.ruleset.as_ref().unwrap().1.len(), 4);
+        assert_eq!(m.ruleset.as_ref().unwrap().1.len(), rule_count());
     }
     assert_eq!(
         trusted.raw(),
@@ -1020,8 +1019,8 @@ async fn a_failure_at_any_step_is_retried_and_remove_leaves_nothing() {
             let theirs = usize::from(had_ruleset);
             assert_eq!(
                 rules.len(),
-                4 + theirs,
-                "{op}: four rules of ours, no duplicates"
+                rule_count() + theirs,
+                "{op}: one set of rules of ours, no duplicates"
             );
         }
 
@@ -1257,27 +1256,100 @@ fn domains_are_normalized_and_checked() {
     );
 }
 
+/// How many rules setup makes for one hostname.
+fn rule_count() -> usize {
+    cache_rules("read.example.com").len()
+}
+
 #[test]
-fn cache_rules_cover_images_and_static_files_on_this_host_only() {
+fn cache_rules_match_the_hosted_shape_on_this_host_only() {
     let rules = cache_rules("read.example.com");
     let refs: Vec<_> = rules.iter().map(|r| r["ref"].as_str().unwrap()).collect();
     assert_eq!(
         refs,
-        ["komiq_covers", "komiq_pages", "komiq_img", "komiq_static"]
-            .map(|reference| format!("{reference}_097e34e8"))
+        [
+            "komiq_media_pages",
+            "komiq_media_objects",
+            "komiq_images",
+            "komiq_graphql",
+            "komiq_pages",
+            "komiq_img",
+            "komiq_static",
+            "komiq_bypass",
+        ]
+        .map(|reference| format!("{reference}_097e34e8"))
     );
-    let all: String = rules
-        .iter()
-        .map(|r| r["expression"].as_str().unwrap())
-        .collect();
-    for path in [
-        "/covers/",
-        "/api/v1/manga/",
-        "\"/img\"",
-        "/_app/immutable/",
-        "/admin/_app/immutable/",
+    let rule = |name: &str| {
+        rules
+            .iter()
+            .find(|r| r["ref"].as_str().unwrap().starts_with(&format!("{name}_")))
+            .unwrap()
+    };
+    let expression = |name: &str| rule(name)["expression"].as_str().unwrap().to_owned();
+    for (name, paths) in [
+        ("komiq_media_pages", &["\"/media/v1/c/\""][..]),
+        (
+            "komiq_media_objects",
+            &["\"/media/v1/o/\"", "\"/media/v1/p/\""],
+        ),
+        (
+            "komiq_images",
+            &["\"/covers/\"", "\"/avatars/\"", "\"/comment-media/\""],
+        ),
+        (
+            "komiq_graphql",
+            &["\"/graphql\"", "method eq \"GET\"", "\"authorization\""],
+        ),
+        ("komiq_pages", &["\"/api/v1/manga/\""]),
+        ("komiq_img", &["\"/img\""]),
+        (
+            "komiq_static",
+            &["\"/_app/immutable/\"", "\"/admin/_app/immutable/\""],
+        ),
+        (
+            "komiq_bypass",
+            &[
+                "\"/health\"",
+                "\"/media/v1/ready\"",
+                "\"/media/v1/policy\"",
+                "\"/media/v1/keys\"",
+            ],
+        ),
     ] {
-        assert!(all.contains(path), "{path}");
+        for path in paths {
+            assert!(expression(name).contains(path), "{name}: {path}");
+        }
+    }
+    assert!(expression("komiq_graphql").contains("not any("));
+    // Pages and objects are named by their path: the query string is not in the key.
+    for name in ["komiq_media_pages", "komiq_media_objects"] {
+        let settings = &rule(name)["action_parameters"];
+        assert_eq!(
+            settings["cache_key"]["custom_key"]["query_string"]["exclude"]["all"],
+            true
+        );
+        assert_eq!(settings["respect_strong_etags"], true);
+    }
+    let images = &rule("komiq_images")["action_parameters"];
+    assert_eq!(images["cache_key"]["ignore_query_strings_order"], true);
+    assert_eq!(images["respect_strong_etags"], true);
+    assert_eq!(
+        rule("komiq_graphql")["action_parameters"]["cache_key"]["ignore_query_strings_order"],
+        true
+    );
+    assert_eq!(
+        rule("komiq_bypass")["action_parameters"],
+        json!({ "cache": false })
+    );
+    for r in rules
+        .iter()
+        .filter(|r| r["action_parameters"]["cache"] == true)
+    {
+        assert_eq!(r["action_parameters"]["edge_ttl"]["mode"], "respect_origin");
+        assert_eq!(
+            r["action_parameters"]["browser_ttl"]["mode"],
+            "respect_origin"
+        );
     }
     assert!(rules.iter().all(|r| r["expression"]
         .as_str()
@@ -1784,7 +1856,10 @@ async fn cache_rules_for_two_servers_are_owned_separately() {
     }
     let first = &servers[0].1;
     let second = &servers[1].1;
-    assert_eq!(mock.lock().unwrap().ruleset.as_ref().unwrap().1.len(), 9);
+    assert_eq!(
+        mock.lock().unwrap().ruleset.as_ref().unwrap().1.len(),
+        1 + 2 * rule_count()
+    );
     assert!(first
         .rule_ids
         .iter()
@@ -1794,7 +1869,7 @@ async fn cache_rules_for_two_servers_are_owned_separately() {
     {
         let m = mock.lock().unwrap();
         let rules = &m.ruleset.as_ref().unwrap().1;
-        assert_eq!(rules.len(), 5);
+        assert_eq!(rules.len(), 1 + rule_count());
         for id in &second.rule_ids {
             assert!(rules.iter().any(|r| r["id"] == *id));
         }
@@ -1804,13 +1879,21 @@ async fn cache_rules_for_two_servers_are_owned_separately() {
     assert_clean(&mock.lock().unwrap(), true);
 }
 
+/// Rules an earlier version made are adopted when still wanted and deleted when not,
+/// but only this host's: another server's rules on the zone stay.
 #[tokio::test]
-async fn legacy_cache_rules_are_adopted_only_for_their_host() {
+async fn legacy_cache_rules_are_adopted_or_retired_only_for_their_host() {
     let mut mock = base_mock();
     mock.ruleset.as_mut().unwrap().1.extend([
-        json!({"id": "old-ours", "ref": "komiq_covers",
+        json!({"id": "old-ours", "ref": "komiq_pages",
+            "expression": "(http.host eq \"read.example.com\" and true)"}),
+        json!({"id": "retired-unsuffixed", "ref": "komiq_covers",
+            "expression": "(http.host eq \"read.example.com\" and true)"}),
+        json!({"id": "retired-recorded", "ref": "komiq_covers_097e34e8",
             "expression": "(http.host eq \"read.example.com\" and true)"}),
         json!({"id": "old-theirs", "ref": "komiq_pages",
+            "expression": "(http.host eq \"other.example.com\" and true)"}),
+        json!({"id": "retired-theirs", "ref": "komiq_covers",
             "expression": "(http.host eq \"other.example.com\" and true)"}),
     ]);
     let (api, mock) = start_mock(mock).await;
@@ -1825,29 +1908,42 @@ async fn legacy_cache_rules_are_adopted_only_for_their_host() {
     let mut stored = Stored {
         domain: "read.example.com".into(),
         zone_id: Some("zone1".into()),
+        rule_ids: vec!["retired-recorded".into()],
         ..Stored::default()
     };
     mgr.step_cache_rules(&client, &mut stored).await.unwrap();
-    assert_eq!(stored.rule_ids.len(), 4);
+    assert_eq!(stored.rule_ids.len(), rule_count());
     assert!(stored.rule_ids.contains(&"old-ours".into()));
-    assert!(!stored.rule_ids.contains(&"old-theirs".into()));
+    for id in ["old-theirs", "retired-unsuffixed", "retired-recorded"] {
+        assert!(!stored.rule_ids.contains(&id.into()), "{id}");
+    }
     mgr.step_cache_rules(&client, &mut stored).await.unwrap();
-    assert_eq!(
-        mock.lock()
+    {
+        let m = mock.lock().unwrap();
+        let count = |op: &str| m.calls.iter().filter(|call| *call == op).count();
+        assert_eq!(count("rule_add"), rule_count() - 1);
+        assert_eq!(count("rule_delete"), 2);
+        let ids: Vec<_> = m
+            .ruleset
+            .as_ref()
             .unwrap()
-            .calls
+            .1
             .iter()
-            .filter(|op| *op == "rule_add")
-            .count(),
-        3
-    );
+            .map(|r| r["id"].clone())
+            .collect();
+        for id in ["retired-unsuffixed", "retired-recorded"] {
+            assert!(!ids.contains(&json!(id)), "{id}");
+        }
+    }
     mgr.step(Step::DeleteCacheRules, &client, &mut stored)
         .await
         .unwrap();
     let m = mock.lock().unwrap();
     let rules = &m.ruleset.as_ref().unwrap().1;
-    assert_eq!(rules.len(), 2);
-    assert!(rules.iter().any(|r| r["id"] == "old-theirs"));
+    assert_eq!(rules.len(), 3);
+    for id in ["old-theirs", "retired-theirs"] {
+        assert!(rules.iter().any(|r| r["id"] == id), "{id}");
+    }
 }
 
 #[tokio::test]

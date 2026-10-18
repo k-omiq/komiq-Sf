@@ -13,6 +13,11 @@ use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit};
 use crate::telemetry::{BodyCheck, BodySource, MEDIA};
 
 pub(crate) const MUTABLE_CACHE: &str = "public, max-age=300, must-revalidate";
+/// Chapter pages under `/media/v1/c/{epoch}/…`. The engine generation is in the URL, so a
+/// chapter id that a later generation reuses is never answered from this entry. A source
+/// can still re-upload a chapter's pages: one day bounds that, and the strong ETag makes
+/// revalidating it a 304.
+pub(crate) const GENERATION_PAGE_CACHE: &str = "public, max-age=86400, s-maxage=86400";
 /// Current cover and avatar versions. Browsers keep them for a year; a shared cache
 /// keeps them no longer than a media policy lease, so a takedown reaches the edge
 /// within one lease. The `s-maxage` below must equal `media_policy::LEASE_SECS`.

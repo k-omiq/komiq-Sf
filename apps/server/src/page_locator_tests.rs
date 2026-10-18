@@ -237,6 +237,19 @@ fn router(app: Arc<AppState>) -> Router {
         .route(
             "/media/v1/c/{chapterId}/{page}",
             get(serve_chapter_page)
+                .layer(axum::middleware::from_fn(not_modified))
+                .layer(axum::middleware::from_fn_with_state(
+                    Duration::from_secs(60),
+                    request_budget::limit_image_time,
+                ))
+                .layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                    telemetry::MediaRoute::Page,
+                )),
+        )
+        .route(
+            "/media/v1/c/{epoch}/{chapterId}/{page}",
+            get(serve_generation_page)
+                .layer(axum::middleware::from_fn(not_modified))
                 .layer(axum::middleware::from_fn_with_state(
                     Duration::from_secs(60),
                     request_budget::limit_image_time,
@@ -294,6 +307,73 @@ fn assert_busy(response: &axum::response::Response) {
         .unwrap()
         .contains("no-store"));
     assert!(response.headers().contains_key(header::RETRY_AFTER));
+}
+
+/// `pages` hands out `/media/v1/c/{epoch}/…`: the same bytes as the old path, kept a day
+/// with a strong ETag, and refused, before any fetch, once a new engine generation has
+/// raised the epoch and may have reused the chapter id.
+#[tokio::test]
+async fn generation_page_urls_serve_the_same_bytes_until_the_epoch_moves() {
+    let (engine, app, _cover_dir) = fixture().await;
+    let old = get_page(app.clone(), "/media/v1/c/8/0").await;
+    let etag = old.headers()[header::ETAG].clone();
+    assert_eq!(etag, strong_etag(&page_bytes(8)));
+    assert_page(old, 8).await;
+    let new = get_page(app.clone(), "/media/v1/c/0/8/0").await;
+    assert_eq!(new.headers()[header::ETAG], etag);
+    assert_page_with_cache(new, 8, image_delivery::GENERATION_PAGE_CACHE).await;
+    let revalidated = router(app.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/media/v1/c/0/8/0")
+                .header(header::IF_NONE_MATCH, etag.clone())
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        revalidated.headers()[header::CACHE_CONTROL],
+        image_delivery::GENERATION_PAGE_CACHE
+    );
+    assert_eq!(revalidated.headers()[header::ETAG], etag);
+
+    // A new engine generation raises the numeric epoch.
+    sqlx::query(
+        "INSERT INTO engine_numeric_state (singleton, epoch, changed_at) VALUES (true, 5, now())",
+    )
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    let fetched = engine.calls.pages.load(Ordering::SeqCst);
+    for path in [
+        "/media/v1/c/0/8/0",
+        "/media/v1/c/4/8/0",
+        "/media/v1/c/6/8/0",
+        "/media/v1/c/x/8/0",
+        "/media/v1/c/-5/8/0",
+        "/media/v1/c/99999999999999999999/8/0",
+    ] {
+        let refused = get_page(app.clone(), path).await;
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND, "{path}");
+        assert!(
+            refused.headers()[header::CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .contains("no-store"),
+            "{path}"
+        );
+    }
+    assert_eq!(engine.calls.pages.load(Ordering::SeqCst), fetched);
+    assert_page_with_cache(
+        get_page(app.clone(), "/media/v1/c/5/8/0").await,
+        8,
+        image_delivery::GENERATION_PAGE_CACHE,
+    )
+    .await;
+    // Old clients' locator URLs keep their short lifetime.
+    assert_page(get_page(app, "/media/v1/c/8/0").await, 8).await;
 }
 
 #[tokio::test]
@@ -529,7 +609,7 @@ async fn pages_use_locator_only_for_active_generation_keys() {
         assert_eq!(data["pages"].as_array().unwrap().len(), 2);
         for index in 0..2 {
             let path = if mode == "active" {
-                format!("/media/v1/c/8/{index}")
+                format!("/media/v1/c/0/8/{index}")
             } else {
                 format!("/api/v1/manga/7/chapter/0/page/{index}")
             };
@@ -587,13 +667,20 @@ async fn locator_urls_never_use_a_public_engine_host() {
     let generation = engine_keys::adopt(&app.pool).await.unwrap();
     sqlx::query("INSERT INTO engine_chapter_key(generation,chapter_id,manga_id,source_order,chapter_key,updated_at) VALUES($1,8,7,0,'/chapter/8',now())")
         .bind(generation).execute(&app.pool).await.unwrap();
+    // The URL names the engine's current numeric epoch.
+    sqlx::query(
+        "INSERT INTO engine_numeric_state(singleton,epoch,changed_at) VALUES(true,5,now())",
+    )
+    .execute(&app.pool)
+    .await
+    .unwrap();
     let result = graphql::build_schema(app.clone(), false)
         .execute("{ pages(chapterId: \"8\") { sourceUrl } }")
         .await;
     assert!(result.errors.is_empty(), "{:?}", result.errors);
     assert_eq!(
         result.data.into_json().unwrap()["pages"][1]["sourceUrl"],
-        "/media/v1/c/8/1"
+        "/media/v1/c/5/8/1"
     );
     let owner = media_routes::MediaRoutes::parse(Some(
         r#"[{"id":"main","kind":"owner","base":"https://komiq.example/"}]"#,
@@ -607,7 +694,7 @@ async fn locator_urls_never_use_a_public_engine_host() {
     assert!(result.errors.is_empty(), "{:?}", result.errors);
     assert_eq!(
         result.data.into_json().unwrap()["pages"][1]["sourceUrl"],
-        "/media/v1/c/8/1"
+        "/media/v1/c/5/8/1"
     );
 }
 

@@ -258,8 +258,12 @@ fn store_feed<T>(cache: &FeedCache<T>, key: bool, value: T) {
 /// (`startSourceIngest` / `startExtensionIngest`) are also left alone: they are the
 /// per-series crawl described above, and the feed catches up within one `FEED_TTL`.
 ///
-/// One NON-admin caller: `cover_recompress`, once per batch. It changes no rows the feed
-/// selects on — only `work.cover_cached_version`, i.e. the `?v=` in every memoized
+/// `splitSourceSeries` busts too: unlike a merge, the split reprojects both works' feed
+/// and browse rows (`reproject_work_caches_on`), so a memo minted before it is stale.
+///
+/// NON-admin callers: `catalog::refresh_browse_catalogue`, after each rebuild of the rows
+/// `tags`, `genreFacets` and `browseSources` read, and `cover_recompress`, once per
+/// batch. The recompress changes no rows the feed selects on — only `work.cover_cached_version`, i.e. the `?v=` in every memoized
 /// `coverUrl`. A memo entry minted before the rewrite keeps handing out the OLD versioned
 /// URL, which the browser and the edge already hold under a one-year `immutable` entry, so
 /// until it expires the viewer keeps downloading the fat pre-recompress bytes we just
@@ -3429,7 +3433,7 @@ fn updates_count_key(show_nsfw: bool, blocks: &str) -> String {
 /// A STALE TOTAL IS ACCEPTABLE HERE, a wrong one is not. The number only moves when a series
 /// enters or leaves the library or is re-flagged NSFW, and it is bounded by `COUNT_TTL`
 /// (60 s) plus `browse::clear_count_cache`, which `catalog::refresh_browse_catalogue` calls
-/// at the end of every rebuild — i.e. the same event that changes it. The cost of being one
+/// (through `clear_feed_caches`) at the end of every rebuild — i.e. the same event that changes it. The cost of being one
 /// minute behind is a pager that briefly under- or over-promises by a row or two; the cost
 /// of not memoizing is 53 ms of CPU on every home-page load.
 ///
@@ -7987,6 +7991,12 @@ impl QueryRoot {
         let n = chapter_id.0.parse::<i64>().map_err(gql_err)?;
         // The owner, list, locator decision and key rows must share one generation.
         let generation = st.suwayomi.read_generation();
+        // Page URLs carry the engine's numeric epoch: once a new generation reuses this
+        // chapter id, the server refuses them instead of serving another chapter's page.
+        // A change after this read also changes `generation`, refused at the end.
+        let epoch = crate::engine_generation::numeric_epoch(&st.pool)
+            .await
+            .map_err(gql_read_err)?;
         // The NSFW flag lives on the owning series/work, not the chapter, and Suwayomi
         // chapters aren't mirrored locally — so resolve the manga id from the source and
         // gate the page images exactly like `series`/`chapters` (N2). An unknown chapter
@@ -8012,7 +8022,7 @@ impl QueryRoot {
         if policy.denies_chapter(n) {
             return Err(Error::new("No such chapter"));
         }
-        let urls = match crate::engine_route::page_urls(&st.suwayomi, &st.pool, n).await {
+        let urls = match crate::engine_route::page_urls(&st.suwayomi, &st.pool, n, epoch).await {
             Ok(Some(urls)) => Ok(urls),
             Ok(None) => st.suwayomi.pages(n).await,
             Err(error) => Err(error),
@@ -8101,7 +8111,7 @@ impl QueryRoot {
                 index: index as i32,
                 source_url: st
                     .suwayomi
-                    .page_locator_url(n, index)
+                    .page_locator_url(epoch, n, index)
                     .filter(|_| use_locator)
                     .unwrap_or(source_url),
                 width: None,
@@ -15619,6 +15629,8 @@ impl MutationRoot {
         let outcome = catalog::split_source_series(&st.pool, &work_id.0, &ids, Some(&admin.id))
             .await
             .map_err(gql_err)?;
+        // The split reprojects both works' feed and browse rows; drop memos built before.
+        clear_feed_caches();
         tracing::info!(
             from = %work_id.0, to = %outcome.new_work_id, moved = outcome.moved_sources,
             progress_readers_moved = outcome.progress_readers_moved,
@@ -34749,6 +34761,67 @@ mod tests {
         assert!(!progress::work_read_state(&pool, Some(BOB), &work)
             .await
             .copy_read("mangadex", "split-progress-read", "100", false));
+    }
+
+    /// A split reprojects both works' feed rows, and a Browse rebuild replaces the rows
+    /// `tags`, `genreFacets` and `browseSources` are built from: each drops the memos.
+    #[tokio::test]
+    async fn split_and_browse_rebuild_drop_the_feed_memos() {
+        fn fill<T>(cache: &FeedCache<T>, value: impl Fn() -> T) -> Vec<std::sync::Arc<T>> {
+            [feed_cache_key(false), feed_cache_key(true)]
+                .into_iter()
+                .map(|key| {
+                    store_feed(cache, key, value());
+                    cached_feed(cache, key, Duration::from_secs(60)).unwrap()
+                })
+                .collect()
+        }
+        fn dropped<T>(cache: &FeedCache<T>, before: &[std::sync::Arc<T>]) -> bool {
+            [feed_cache_key(false), feed_cache_key(true)]
+                .into_iter()
+                .zip(before)
+                .all(|(key, before)| {
+                    cached_feed(cache, key, Duration::from_secs(60))
+                        .is_none_or(|now| !std::sync::Arc::ptr_eq(&now, before))
+                })
+        }
+        let (schema, pool) = setup_full(100).await;
+        let work = catalog::create_work(
+            &pool,
+            &catalog::WorkInput {
+                primary_title: Some("Split memo".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for key in ["memo-keep", "memo-move"] {
+            catalog::upsert_source_series(&pool, &work, "mangadex", "mangadex", key, None, false)
+                .await
+                .unwrap();
+        }
+        let moved: String = crate::db_types::query_scalar(
+            "SELECT id FROM source_series WHERE source_key = 'memo-move'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let tags = fill(&TAGS_CACHE, Vec::new);
+        let facets = fill(&GENRE_FACETS_CACHE, Vec::new);
+        let sources = fill(&BROWSE_SOURCES_CACHE, Vec::new);
+        catalog::refresh_browse_catalogue(&pool).await.unwrap();
+        assert!(dropped(&TAGS_CACHE, &tags), "tags");
+        assert!(dropped(&GENRE_FACETS_CACHE, &facets), "genreFacets");
+        assert!(dropped(&BROWSE_SOURCES_CACHE, &sources), "browseSources");
+
+        let rails = fill(&DISCOVERY_CACHE, Vec::new);
+        let query = format!(
+            r#"mutation {{ splitSourceSeries(workId: "{work}", sourceSeriesIds: ["{moved}"]) {{ newWorkId }} }}"#
+        );
+        let split = exec(&schema, &query, Some("admintok"), "split-memo").await;
+        assert!(split.errors.is_empty(), "{:?}", split.errors);
+        assert!(dropped(&DISCOVERY_CACHE, &rails), "discovery");
     }
 
     #[tokio::test]

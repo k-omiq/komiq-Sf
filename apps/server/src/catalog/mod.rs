@@ -2570,8 +2570,10 @@ pub async fn refresh_browse_catalogue(pool: &Database) -> Result<u64> {
     // Browse's `total` is memoized for up to `browse::COUNT_TTL`, and we have just rewritten
     // the table those totals counted. A surviving entry would promise a page that no longer
     // exists — `hasNextPage: true` on the last page, or a pager rendering
-    // "showing 115,531-115,560 of 115,530". One `HashMap::clear`, twice a day.
-    crate::browse::clear_count_cache();
+    // "showing 115,531-115,560 of 115,530". The `tags`, `genreFacets` and `browseSources`
+    // memos were built from the `tag` and `feed_genre_facet` rows just replaced too, so all
+    // feed memos go together. A few `HashMap::clear`s, twice a day.
+    crate::graphql::clear_feed_caches();
 
     // The centralized bounded ANALYZE pass owns statistics for both catalogue tables.
     let total = crate::db_types::query_scalar::<i64>("SELECT COUNT(*) FROM browse_catalogue")
