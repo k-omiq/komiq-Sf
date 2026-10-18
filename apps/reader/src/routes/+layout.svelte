@@ -9,7 +9,7 @@
 	import { onMount } from 'svelte';
 	import { isTauri, onStaleNumericEpoch, onProgressConflict } from '@komika/api';
 	import { dropWorkProgressState } from '$lib/data/source';
-	import { auth, initAuth } from '$lib/auth.svelte';
+	import { auth, initAuth, watchSession } from '$lib/auth.svelte';
 	import { initTheme } from '$lib/theme.svelte';
 	import { markHydrated } from '$lib/stream';
 	import { config, needsServer, target } from '$lib/config';
@@ -50,10 +50,12 @@
 		markHydrated();
 	});
 
-	// Restore + validate any persisted session once, client-side.
+	// Restore + validate any persisted session once, client-side, then keep it in
+	// step with the server (retries, focus, network return, refused requests).
 	$effect(() => {
 		void initAuth();
 	});
+	onMount(() => watchSession());
 	// Restore the theme preference + track OS changes.
 	$effect(() => {
 		initTheme();

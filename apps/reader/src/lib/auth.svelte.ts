@@ -10,12 +10,15 @@
  * (its `login`/`register` throw and it omits `setToken`), so the login screen
  * surfaces those errors gracefully.
  */
-import type { RegisterInput, Session } from '@komika/api';
+import { createSessionKeeper, type RegisterInput, type Session } from '@komika/api';
 import { backend } from './context';
 import { viewerCacheChanged } from './viewer-cache.svelte';
 
 /** Where the session token is kept on this device. */
 export const TOKEN_KEY = 'komika-token';
+/** The last user the server confirmed for the stored token. Shown on start-up until
+ *  the server answers, so a failed check never looks like a sign-out. */
+export const USER_KEY = 'komika-user';
 
 type User = Session['user'];
 
@@ -33,6 +36,8 @@ export const auth = $state<{ user: User | null; ready: boolean }>({
 let temporaryPassword: string | null = null;
 /** Auth intent/token transitions only; content preference changes do not supersede logout. */
 let authOperation = 0;
+/** The token this tab's backend sends. Another tab can store a different one. */
+let tabToken: string | null = null;
 
 /** Whether the forced password screen still needs the current password typed. */
 export function needsCurrentPassword(): boolean {
@@ -47,51 +52,110 @@ function readToken(): string | null {
 	}
 }
 
+function useToken(token: string | null): void {
+	tabToken = token;
+	backend.setToken?.(token);
+}
+
+function readRememberedUser(): User | null {
+	try {
+		const saved = localStorage.getItem(USER_KEY);
+		return saved ? (JSON.parse(saved) as User) : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Save the confirmed user for the stored token. `persist` drops it with the token. */
+function remember(user: User): void {
+	// A tab still on an older token must not pair its user with another tab's token.
+	if (readToken() !== tabToken) return;
+	try {
+		localStorage.setItem(USER_KEY, JSON.stringify(user));
+	} catch {
+		/* private mode / quota — start-up just waits for the server */
+	}
+}
+
 function persist(token: string | null): void {
 	authOperation += 1;
 	try {
+		// The saved user belongs to the old token; whoever sets a new one saves its user.
+		localStorage.removeItem(USER_KEY);
 		if (token) localStorage.setItem(TOKEN_KEY, token);
 		else localStorage.removeItem(TOKEN_KEY);
 	} catch {
 		/* private mode / quota — token just won't survive reload */
 	}
-	backend.setToken?.(token);
+	useToken(token);
 	viewerCacheChanged();
 }
 
-/** Restore + validate a persisted session. Safe to call more than once. */
+/** Asks the server about the stored token: on start-up, after failures, on focus. */
+const keeper = createSessionKeeper({
+	session: () => {
+		// Ask about the stored token, which another tab may have replaced.
+		useToken(readToken());
+		return backend.session();
+	},
+	readToken,
+	operation: () => authOperation,
+	apply(session) {
+		const previous = auth.user;
+		auth.user = session?.user ?? null;
+		// Bind the offline write-queue to this identity (C1) once validated.
+		backend.setCurrentUser?.(auth.user?.id ?? null);
+		if (!session) {
+			persist(null); // token was expired/revoked
+			return;
+		}
+		remember(session.user);
+		if (
+			previous?.id !== session.user.id ||
+			previous?.showNsfw !== session.user.showNsfw ||
+			previous?.isAdmin !== session.user.isAdmin
+		)
+			viewerCacheChanged();
+	},
+	cleared() {
+		if (!auth.user) return;
+		auth.user = null;
+		backend.setCurrentUser?.(null);
+		persist(null);
+	},
+});
+
+/**
+ * Restore + validate a persisted session. Safe to call more than once.
+ *
+ * The last user the server confirmed for this token is shown at once. Only the
+ * server's answer that the session is gone signs the user out: when the check gets
+ * no answer (outage, deploy, bad network) the user stays signed in and the keeper
+ * asks again (see {@link watchSession}).
+ */
 export async function initAuth(): Promise<void> {
 	if (auth.ready) return;
-	const operation = authOperation;
 	const token = readToken();
 	if (token) {
-		backend.setToken?.(token);
-		try {
-			const session = await backend.session();
-			// A concurrent login/logout may have swapped the token while session()
-			// was in flight; if so, don't clobber that newer state with this stale
-			// validation result.
-			if (readToken() === token && authOperation === operation) {
-				const previous = auth.user;
-				auth.user = session?.user ?? null;
-				// Bind the offline write-queue to this identity (C1) once validated.
-				backend.setCurrentUser?.(auth.user?.id ?? null);
-				if (!session)
-					persist(null); // token was stale/revoked
-				else if (
-					previous?.id !== auth.user?.id ||
-					previous?.showNsfw !== auth.user?.showNsfw ||
-					previous?.isAdmin !== auth.user?.isAdmin
-				)
-					viewerCacheChanged();
-			}
-		} catch {
-			// backend unreachable — stay logged out, keep token. Only null the user
-			// if the token we validated is still the current one.
-			if (readToken() === token && authOperation === operation) auth.user = null;
+		useToken(token);
+		const remembered = auth.user ? null : readRememberedUser();
+		if (remembered) {
+			auth.user = remembered;
+			backend.setCurrentUser?.(remembered.id);
+			viewerCacheChanged();
 		}
+		await keeper.check();
 	}
 	auth.ready = true;
+}
+
+/**
+ * Re-check the session after a failed start-up check (backing off), when the window
+ * comes back into view or online, and when the server refuses a request as not signed
+ * in. Returns the function that stops it. Call once from the root layout.
+ */
+export function watchSession(): () => void {
+	return keeper.watch();
 }
 
 /**
@@ -103,34 +167,8 @@ export async function initAuth(): Promise<void> {
  * per-user fetch comes back empty for a supposedly signed-in viewer).
  */
 export async function revalidateSession(): Promise<User | null> {
-	const operation = authOperation;
-	const token = readToken();
-	if (!token) {
-		auth.user = null;
-		backend.setCurrentUser?.(null);
-		persist(null);
-		return null;
-	}
-	try {
-		const session = await backend.session();
-		// A concurrent login/logout may have swapped the token mid-flight; don't
-		// clobber that newer state with this stale validation result.
-		if (readToken() !== token || authOperation !== operation) return auth.user;
-		const previous = auth.user;
-		auth.user = session?.user ?? null;
-		backend.setCurrentUser?.(auth.user?.id ?? null); // (C1) re-bind offline queue
-		if (!session)
-			persist(null); // token was stale/revoked
-		else if (
-			previous?.id !== auth.user?.id ||
-			previous?.showNsfw !== auth.user?.showNsfw ||
-			previous?.isAdmin !== auth.user?.isAdmin
-		)
-			viewerCacheChanged();
-		return auth.user;
-	} catch {
-		return auth.user; // backend unreachable — keep the current state
-	}
+	await keeper.check();
+	return auth.user;
 }
 
 export async function login(username: string, password: string): Promise<void> {
@@ -138,6 +176,7 @@ export async function login(username: string, password: string): Promise<void> {
 	const session = await backend.login(username, password);
 	if (authOperation !== operation) return;
 	persist(session.token);
+	remember(session.user);
 	temporaryPassword = session.user.mustChangePassword ? password : null;
 	auth.user = session.user;
 	// Bind the offline write-queue to this identity (C1) before any write can enqueue.
@@ -155,7 +194,10 @@ export async function changeOwnPassword(newPassword: string, current?: string): 
 	if (currentPassword === null) throw new Error('Enter your current password.');
 	const user = await backend.changePassword(currentPassword, newPassword);
 	temporaryPassword = null;
-	if (auth.user) auth.user = { ...auth.user, ...user, mustChangePassword: false };
+	if (auth.user) {
+		auth.user = { ...auth.user, ...user, mustChangePassword: false };
+		remember(auth.user);
+	}
 }
 
 export async function register(input: RegisterInput): Promise<void> {
@@ -163,6 +205,7 @@ export async function register(input: RegisterInput): Promise<void> {
 	const session = await backend.register(input);
 	if (authOperation !== operation) return;
 	persist(session.token);
+	remember(session.user);
 	auth.user = session.user;
 	backend.setCurrentUser?.(session.user.id); // (C1) bind offline queue
 }
@@ -206,6 +249,7 @@ export async function saveShowNsfw(show: boolean): Promise<boolean | null> {
 	if (!auth.user || auth.user.id !== owner) return null;
 	if (auth.user.showNsfw !== saved) {
 		auth.user.showNsfw = saved;
+		remember(auth.user);
 		viewerCacheChanged();
 	}
 	return saved;

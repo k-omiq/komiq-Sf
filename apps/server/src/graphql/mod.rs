@@ -1190,12 +1190,18 @@ async fn current_user(ctx: &Context<'_>) -> Result<Option<User>> {
 /// anonymous while another field in the same request remains authenticated.
 async fn session_user(ctx: &Context<'_>) -> Result<Option<User>> {
     let lookup = || async {
-        match token(ctx) {
-            Some(tok) => auth::session_user_for_token(&state(ctx).pool, &tok)
-                .await
-                .map_err(gql_read_err),
-            None => Ok(None),
+        let Some(tok) = token(ctx) else {
+            return Ok(None);
+        };
+        let st = state(ctx);
+        let user = auth::session_user_for_token(&st.pool, &tok)
+            .await
+            .map_err(gql_read_err)?;
+        // Admin sessions end after a short idle time; using one keeps it alive.
+        if user.as_ref().is_some_and(|u| u.is_admin != 0) {
+            auth::slide_admin_session(&st.pool, &tok, st.session_ttl_secs).await;
         }
+        Ok(user)
     };
     if let Some(cache) = ctx.data_opt::<RequestUserCache>() {
         return cache.0.get_or_init(lookup).await.clone();
@@ -17038,7 +17044,7 @@ async fn new_session_checked(
             return Err(MutationValidation("Invalid username or password").into());
         }
         let lifetime = if admin != 0 {
-            ttl_secs.min(8 * 60 * 60)
+            ttl_secs.min(auth::ADMIN_IDLE_SECS)
         } else {
             ttl_secs
         };
@@ -23922,6 +23928,97 @@ mod tests {
             assert!(elapsed.num_milliseconds() <= expected * 1000);
             assert!(elapsed.num_milliseconds() > (expected - 1) * 1000);
         }
+    }
+
+    #[tokio::test]
+    async fn admin_session_slides_on_use_up_to_its_upper_limit() {
+        let (schema, pool) = setup_full(100).await;
+        seed_user(&pool, "slide-admin", "slide-admin", 1, 0).await;
+        seed_user(&pool, "slide-reader", "slide-reader", 0, 0).await;
+        let ttl = 30 * 24 * 60 * 60;
+        let admin = new_session(
+            &pool,
+            &crate::db_types::test_uuid("slide-admin").to_string(),
+            ttl,
+        )
+        .await
+        .unwrap();
+        let reader = new_session(
+            &pool,
+            &crate::db_types::test_uuid("slide-reader").to_string(),
+            ttl,
+        )
+        .await
+        .unwrap();
+        // Seconds from now to the session's end, after one request with its token.
+        let remaining_after_use = |token: String, signed_in_ago: i64, ends_in: i64| {
+            let (schema, pool) = (&schema, &pool);
+            async move {
+                sqlx::query(
+                    "UPDATE sessions SET created_at = now() - make_interval(secs => $2), \
+                     expires_at = now() + make_interval(secs => $3) WHERE token = $1",
+                )
+                .bind(auth::hash_token(&token))
+                .bind(signed_in_ago as f64)
+                .bind(ends_in as f64)
+                .execute(pool)
+                .await
+                .unwrap();
+                let r = exec(
+                    schema,
+                    "{ session { user { username } } }",
+                    Some(&token),
+                    "198.51.100.7",
+                )
+                .await;
+                assert!(r.errors.is_empty(), "{:?}", r.errors);
+                let left: f64 = crate::db_types::query_scalar(
+                    "SELECT EXTRACT(EPOCH FROM expires_at - now())::float8 FROM sessions WHERE token = $1",
+                )
+                .bind(auth::hash_token(&token))
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                left as i64
+            }
+        };
+        let idle = auth::ADMIN_IDLE_SECS;
+        // Used an hour before its end: the end moves to a full idle period from now.
+        let left = remaining_after_use(admin.clone(), 7 * 3600, 3600).await;
+        assert!((idle - 5..=idle).contains(&left), "slid to {left}s");
+        // Used again right away: no write, the end stays where it is.
+        let left = remaining_after_use(admin.clone(), 7 * 3600, idle - 60).await;
+        assert!(
+            (idle - 65..=idle - 55).contains(&left),
+            "rewrote to {left}s"
+        );
+        // Near the upper limit: the end stops at sign-in plus the limit.
+        let left = remaining_after_use(admin.clone(), auth::ADMIN_MAX_SECS - 1800, 600).await;
+        assert!((1795..=1800).contains(&left), "capped at {left}s");
+        // A reader's session does not slide.
+        let left = remaining_after_use(reader, 3600, 3600).await;
+        assert!((3595..=3600).contains(&left), "reader moved to {left}s");
+        // An expired admin session is not revived.
+        let r = {
+            sqlx::query(
+                "UPDATE sessions SET expires_at = now() - interval '1 second' WHERE token = $1",
+            )
+            .bind(auth::hash_token(&admin))
+            .execute(&pool)
+            .await
+            .unwrap();
+            exec(
+                &schema,
+                "{ session { user { username } } }",
+                Some(&admin),
+                "198.51.100.7",
+            )
+            .await
+        };
+        assert_eq!(
+            r.data.into_json().unwrap()["session"],
+            serde_json::Value::Null
+        );
     }
 
     #[tokio::test]

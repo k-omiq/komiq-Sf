@@ -18,6 +18,13 @@ registerHooks({
 				shortCircuit: true,
 			};
 		}
+		// The auth store's runtime import from the shared client is the session keeper.
+		if (specifier === '@komika/api' && /\/auth\.svelte\.ts$/.test(context.parentURL ?? '')) {
+			return {
+				url: new URL('../../../../../packages/api/src/session-keeper.ts', import.meta.url).href,
+				shortCircuit: true,
+			};
+		}
 		return next(specifier, context);
 	},
 	load(url, context, next) {
@@ -46,7 +53,7 @@ Object.defineProperty(globalThis, 'localStorage', {
 });
 
 const { viewerCache, refreshViewerLoads } = await import('../viewer-cache.svelte.ts');
-const { auth, initAuth, login, logout, revalidateSession, saveShowNsfw, TOKEN_KEY } =
+const { auth, initAuth, login, logout, revalidateSession, saveShowNsfw, TOKEN_KEY, USER_KEY } =
 	await import('../auth.svelte.ts');
 const { blockRulesChanged, saveBlockRules } = await import('../block-rules.svelte.ts');
 const { setPreferredTranslator, clearPreferredTranslators } =
@@ -123,6 +130,63 @@ test('a restored token the server revoked clears the session on startup', async 
 	assert.equal(auth.user, null);
 	assert.equal(storage.has(TOKEN_KEY), false);
 	assert.ok(viewerCache.generation > generation);
+});
+
+test('a start-up check with no answer keeps the last confirmed user signed in', async () => {
+	await login('A', 'password');
+	auth.user = null;
+	auth.ready = false;
+	g.backend.session = async () => {
+		throw new Error('Backend error 504');
+	};
+	await initAuth();
+	assert.equal(auth.ready, true);
+	// `auth.user` was set to null above; TypeScript cannot see initAuth change it.
+	assert.equal((auth.user as { id: string } | null)?.id, 'A', 'the remembered user is shown');
+	assert.equal(storage.get(TOKEN_KEY), 'A');
+	g.backend.session = async () => null;
+	await revalidateSession();
+	assert.equal(auth.user, null, 'only the server ends the session');
+	assert.equal(storage.has(TOKEN_KEY), false);
+	assert.equal(storage.has(USER_KEY), false, 'the remembered user goes with the token');
+});
+
+test('a token another tab stored during the start-up check is checked in its place', async () => {
+	storage.set(TOKEN_KEY, 'A');
+	let finish!: (value: ReturnType<typeof session>) => void;
+	const calls: string[] = [];
+	// Like the real backend, the session query sends the token held in memory.
+	let sent: string | null = null;
+	g.backend.setToken = (token: string | null) => (sent = token);
+	g.backend.session = () => {
+		const token = sent!;
+		calls.push(token);
+		return token === 'A'
+			? new Promise<ReturnType<typeof session>>((resolve) => (finish = resolve))
+			: Promise.resolve(session('B'));
+	};
+	const pending = initAuth();
+	storage.set(TOKEN_KEY, 'B');
+	finish(session('A'));
+	await pending;
+	assert.deepEqual(calls, ['A', 'B']);
+	assert.equal(auth.user?.id, 'B');
+});
+
+test('a tab still on an older token checks the stored one and keeps the pairing', async () => {
+	let sent: string | null = null;
+	g.backend.setToken = (token: string | null) => (sent = token);
+	g.backend.session = async () => (sent === 'B' ? session('B') : null);
+	await login('A', 'password');
+	storage.set(TOKEN_KEY, 'B'); // Another tab signed out of A and in as B.
+	storage.delete(USER_KEY);
+	g.backend.setShowNsfw = async () => true;
+	await saveShowNsfw(true);
+	assert.equal(storage.has(USER_KEY), false, "A is never saved as B's user");
+	await revalidateSession();
+	assert.equal(auth.user?.id, 'B');
+	assert.equal(storage.get(TOKEN_KEY), 'B', "B's token survives the check");
+	assert.equal(JSON.parse(storage.get(USER_KEY)!).id, 'B');
 });
 
 test('same-token admin demotion invalidates completed viewer results', async () => {

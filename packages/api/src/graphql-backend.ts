@@ -115,6 +115,7 @@ import {
 	notifyStaleNumericEpoch,
 } from './numeric-epoch.js';
 import { notifyProgressConflict } from './progress-conflict.js';
+import { NOT_AUTHENTICATED, notifyAuthRejected } from './session-keeper.js';
 import { failedOnlyAt, GraphQLRequestError, tolerablePartialErrors } from './partial-errors.js';
 import type { GraphQLErrorLike, PathSegment } from './partial-errors.js';
 
@@ -524,6 +525,14 @@ export class GraphQLBackend implements Backend {
 		}
 		if (!res.ok) throw new Error(`Backend error ${res.status}`);
 		const json = (await res.json()) as { data?: T; errors?: GraphQLErrorLike[] };
+		// The token this request carried no longer signs anyone in. Let the auth layer
+		// ask the server, which then signs this client out cleanly.
+		if (
+			token &&
+			this.auth.revision === authRevision &&
+			json.errors?.some((e) => e.message === NOT_AUTHENTICATED)
+		)
+			notifyAuthRejected();
 		if (json.errors?.length) this.assertAuthRevision(authRevision);
 		if (tolerablePartialErrors(json.data, json.errors, tolerate)) {
 			// A partial result the caller opted into: the named fields came back null and

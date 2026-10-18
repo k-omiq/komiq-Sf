@@ -96,6 +96,63 @@ pub fn format_ts(t: DateTime<Utc>) -> String {
     crate::db_types::format_date(t.with_nanosecond(0).unwrap())
 }
 
+/// How long an admin session lives without use. Each use moves its end this far
+/// ahead again (see [`slide_admin_session`]), so an admin who keeps working stays in.
+pub const ADMIN_IDLE_SECS: i64 = 8 * 60 * 60;
+/// The longest an admin session lives after sign-in, however often it is used.
+pub const ADMIN_MAX_SECS: i64 = 7 * 24 * 60 * 60;
+/// A slide writes at most once per this many seconds of use, not on every request.
+const ADMIN_SLIDE_STEP_SECS: i64 = 10 * 60;
+
+/// Move a live admin session's end to [`ADMIN_IDLE_SECS`] from now, never past
+/// [`ADMIN_MAX_SECS`] after sign-in. A shorter configured `ttl_secs` bounds both, as
+/// it bounds the lifetime `new_session` gives. An expired session is never revived,
+/// and a session is never shortened.
+///
+/// Reads on the query lane and takes the writer only when the end is due to move.
+/// Best-effort: the request it rides on has already been authenticated, so a failure
+/// is counted, logged and dropped, and the next request tries again.
+pub async fn slide_admin_session(pool: &Database, token: &str, ttl_secs: i64) {
+    let token_hash = hash_token(token);
+    let row = crate::db_types::query_tuple::<(DateTime<Utc>, DateTime<Utc>)>(
+        "SELECT created_at, expires_at FROM sessions WHERE token = $1",
+    )
+    .bind(&token_hash)
+    .fetch_optional(pool)
+    .await;
+    let (created, expires) = match row {
+        Ok(Some(row)) => row,
+        Ok(None) => return,
+        Err(error) => {
+            crate::db::record_database_error(&error);
+            tracing::warn!(%error, "admin session slide skipped: lookup failed");
+            return;
+        }
+    };
+    let now = Utc::now();
+    let end = (now + chrono::Duration::seconds(ttl_secs.min(ADMIN_IDLE_SECS)))
+        .min(created + chrono::Duration::seconds(ttl_secs.min(ADMIN_MAX_SECS)));
+    if expires <= now || expires >= end - chrono::Duration::seconds(ADMIN_SLIDE_STEP_SECS) {
+        return;
+    }
+    let Ok(end) = crate::db_types::date(&format_ts(end)) else {
+        tracing::warn!("admin session slide skipped: clock value did not parse");
+        return;
+    };
+    // Only the row as it was read: a revoke or another slide in between wins.
+    if let Err(error) =
+        sqlx::query("UPDATE sessions SET expires_at = $2 WHERE token = $1 AND expires_at = $3")
+            .bind(&token_hash)
+            .bind(end)
+            .bind(expires)
+            .execute(pool)
+            .await
+    {
+        crate::db::record_database_error(&error);
+        tracing::warn!(%error, "admin session slide failed; the next request retries it");
+    }
+}
+
 /// Resolve the user a session token may ACT as: [`session_user_for_token`], minus
 /// accounts that still hold a temporary password. Those are anonymous to everything
 /// until they choose their own, so this is the lookup every handler uses.

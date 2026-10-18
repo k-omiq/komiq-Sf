@@ -10,4 +10,5 @@ export * from './local-suwayomi-backend.js';
 export * from './offline-queue.js';
 export * from './numeric-epoch.js';
 export * from './progress-conflict.js';
+export * from './session-keeper.js';
 export * from './pack.js';

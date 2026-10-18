@@ -7,7 +7,7 @@
 	import '@komika/ui/console.css';
 	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { auth, initAuth, logout } from '$lib/auth.svelte';
+	import { auth, initAuth, logout, watchSession } from '$lib/auth.svelte';
 	import { needsServer, target } from '$lib/config';
 	import { instance, loadInstance } from '$lib/instance.svelte';
 	import { settleConfirm } from '$lib/confirm.svelte';
@@ -40,6 +40,8 @@
 	$effect(() => {
 		void initAuth();
 	});
+	// Keep the session in step with the server: retries, focus, refused requests.
+	$effect(() => watchSession());
 	$effect(() => {
 		initTheme();
 	});
@@ -139,6 +141,8 @@
 			items: [
 				{ href: '/sources/extensions', label: 'Extensions', icon: 'package' },
 				{ href: '/sources/browse', label: 'Browse & add', icon: 'compass' },
+				// One title across every installed source at once.
+				{ href: '/sources/search', label: 'Search all', icon: 'search' },
 				{
 					href: '/sources/health',
 					label: 'Health',
