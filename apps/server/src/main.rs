@@ -1651,7 +1651,8 @@ async fn serve_chapter_page(
 /// page above, under the engine's numeric epoch (`numericEpoch`). A new engine generation
 /// reuses chapter ids for other chapters and raises the epoch, so a URL of an older
 /// epoch is refused (404, `no-store`) instead of answering with another chapter's page.
-/// That makes the URL safe to keep for a day (`GENERATION_PAGE_CACHE`).
+/// That makes the URL safe for a browser to keep for a day; a shared cache keeps it for
+/// one media policy lease (`GENERATION_PAGE_CACHE`).
 async fn serve_generation_page(
     State(app): State<Arc<graphql::AppState>>,
     path: Result<UrlPath<(String, String, String)>, axum::extract::rejection::PathRejection>,

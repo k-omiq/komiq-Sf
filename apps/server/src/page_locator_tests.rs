@@ -310,8 +310,9 @@ fn assert_busy(response: &axum::response::Response) {
 }
 
 /// `pages` hands out `/media/v1/c/{epoch}/…`: the same bytes as the old path, kept a day
-/// with a strong ETag, and refused, before any fetch, once a new engine generation has
-/// raised the epoch and may have reused the chapter id.
+/// by browsers and one media policy lease at the edge, with a strong ETag, and refused,
+/// before any fetch, once a new engine generation has raised the epoch and may have
+/// reused the chapter id.
 #[tokio::test]
 async fn generation_page_urls_serve_the_same_bytes_until_the_epoch_moves() {
     let (engine, app, _cover_dir) = fixture().await;
