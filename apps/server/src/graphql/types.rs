@@ -303,11 +303,13 @@ pub struct ScanlatorTag {
 /// One row of the admin scanlator list (`scanlators`).
 #[derive(SimpleObject, Clone, Debug)]
 pub struct Scanlator {
-    /// The credit as chapters carry it (the most common spelling).
+    /// The credit as chapters carry it (the spelling the scanlator index keeps).
     pub name: String,
-    /// Chapter copies credited to this name; on the filtered source when one is given.
+    /// Always 0: the list no longer counts chapters. Kept for admin apps built before.
+    #[graphql(deprecation = "Always 0. The scanlator list no longer counts chapters.")]
     pub chapter_count: i32,
-    /// Series with at least one such chapter.
+    /// Series credited to this name, joint releases included; on the filtered source when
+    /// one is given.
     pub series_count: i32,
     /// The tag stored for exactly this name; null when it has none.
     pub ai: Option<ScanlatorAi>,
@@ -550,14 +552,15 @@ impl From<ScanlatorKind> for crate::scanlators::Kind {
 }
 
 /// The order of the readers' scanlator list (`scanlatorRatings`). Equal rows order by
-/// chapters, then series, then name.
+/// name.
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
 pub enum ScanlatorSort {
     /// Ranked scanlators by `rank`, then the rest by number of scores.
     Top,
     /// Most scores first.
     Votes,
-    /// Most chapters first. A site has no chapter count and reads as 0.
+    /// Kept for older clients: nothing counts chapters any more, so it orders by name.
+    #[graphql(deprecation = "Orders by name, like NAME. Chapters are no longer counted.")]
     Chapters,
     /// By name.
     Name,
@@ -578,11 +581,11 @@ pub struct RatedScanlator {
     /// A site's own logo: its extension's icon, served from this server's origin like
     /// `Translator.extensionIconUrl`. Null for a group, and for a site with no known icon.
     pub logo_url: Option<String>,
-    /// Series it released. For a group this includes its joint releases, and a series it
-    /// released both alone and jointly counts twice.
+    /// Always 0: the list no longer counts series. Kept for older clients.
+    #[graphql(deprecation = "Always 0. The scanlator list no longer counts series.")]
     pub series_count: i32,
-    /// Chapter copies credited to the group, joint releases included. Null for a site:
-    /// the server keeps no count of a source's chapters.
+    /// Always null: the list no longer counts chapters. Kept for older clients.
+    #[graphql(deprecation = "Always null. The scanlator list no longer counts chapters.")]
     pub chapter_count: Option<i32>,
     /// The AI tag that applies: a site's own; a group's own, else the strongest among the
     /// members of its name when it is a joint credit. Null when untagged.

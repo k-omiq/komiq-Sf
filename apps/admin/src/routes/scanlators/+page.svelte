@@ -134,7 +134,7 @@
 
 	/**
 	 * Monotonic request token, as on Reports. The filters stay usable while a fetch is in
-	 * flight, and the first load can take seconds, so two fetches can overlap and land out
+	 * flight, so two fetches can overlap and land out
 	 * of order. Only the newest request is allowed to write state.
 	 */
 	let loadSeq = 0;
@@ -422,7 +422,7 @@
 			loading={loading && rows.length === 0}
 			error={loadError}
 			empty={rows.length === 0}
-			loadingLabel="Loading scanlators. The first load can take a few seconds."
+			loadingLabel="Loading scanlators."
 			emptyIcon={filtered ? 'search' : 'globe'}
 			emptyTitle={filtered
 				? 'No scanlators match'
@@ -439,7 +439,6 @@
 			<div class="k-table" class:is-dim={loading} role="table" aria-label="Scanlators">
 				<div class="k-tr k-tr--head" role="row">
 					<span role="columnheader">Name</span>
-					<span role="columnheader">Chapters</span>
 					<span role="columnheader">Series</span>
 					<span role="columnheader" class="k-td--end">AI tag</span>
 				</div>
@@ -453,9 +452,6 @@
 							{#if !pending && row.ai === null && row.effectiveAi}
 								<span class="k-hint">{TAG_LABEL[row.effectiveAi]}, from a member group</span>
 							{/if}
-						</span>
-						<span class="k-num" role="cell" data-label="Chapters">
-							{row.chapterCount.toLocaleString()}
 						</span>
 						<span class="k-num" role="cell" data-label="Series">
 							{row.seriesCount.toLocaleString()}
@@ -492,9 +488,6 @@
 
 <style>
 	.k-table {
-		--cols: minmax(0, 2.4fr) minmax(0, 0.7fr) minmax(0, 0.7fr) minmax(200px, 1.5fr);
-	}
-	.k-table.sites {
 		--cols: minmax(0, 2.4fr) minmax(0, 0.7fr) minmax(200px, 1.5fr);
 	}
 	/* A grid row would stretch the switch across the page. */

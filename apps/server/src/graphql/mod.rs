@@ -7688,15 +7688,12 @@ impl QueryRoot {
             .collect())
     }
 
-    /// Admin: the scanlator list. Every credit chapters carry, most chapters first, with
+    /// Admin: the scanlator list. Every credit chapters carry, most series first, with
     /// the AI tag stored for it and the one that applies. `search` matches part of the
     /// name; `ai` filters by the tag that applies; `source` ("mangadex" or a source id,
-    /// as `browseSources` lists them) keeps the credits with chapters on that source and
-    /// counts that source only. 50 per page.
-    ///
-    /// The counts come from one scan of the chapter table that the server reuses for ten
-    /// minutes (`scanlators::group_stats`), so a credit that arrived a moment ago can be
-    /// missing; the tags are always current.
+    /// as `browseSources` lists them) keeps the credits with series on that source and
+    /// counts that source only. 50 per page. Read from the scanlator index
+    /// (`scanlators::admin_groups`), which a chapter write keeps current.
     async fn scanlators(
         &self,
         ctx: &Context<'_>,
@@ -7708,7 +7705,6 @@ impl QueryRoot {
         use crate::scanlators::{self as sc, AiFilter};
         require_admin(ctx).await?;
         let st = state(ctx);
-        let stats = sc::group_stats(&st.pool).await.map_err(gql_read_err)?;
         let tags = sc::list_tags(&st.pool).await.map_err(gql_read_err)?;
         let page = page.max(1);
         let query = sc::ListQuery {
@@ -7731,15 +7727,22 @@ impl QueryRoot {
                 }),
             page: page as usize,
         };
-        let (rows, total) = sc::page(&stats, &tags, &query);
+        let groups = sc::admin_groups(
+            &st.pool,
+            query.source.as_deref(),
+            query.folded_search().as_deref(),
+        )
+        .await
+        .map_err(gql_read_err)?;
+        let (rows, total) = sc::page(&groups, &tags, &query);
         let count = |n: i64| n.min(i64::from(i32::MAX)) as i32;
         Ok(ScanlatorPage {
             items: rows
                 .into_iter()
                 .map(|r| Scanlator {
                     name: r.name,
-                    chapter_count: count(r.chapters),
-                    series_count: count(r.works),
+                    chapter_count: 0,
+                    series_count: count(r.series),
                     ai: r.own.map(Into::into),
                     effective_ai: r.effective.map(Into::into),
                 })
@@ -7758,12 +7761,11 @@ impl QueryRoot {
     /// A site is a source `browseSources` lists for the viewer, so a viewer who does not
     /// see adult content does not see a source that has only such series. MangaDex is
     /// not a site: it credits its groups, and they are listed. A joint credit ("A & B")
-    /// whose members are all groups on their own is not listed: its chapters and series
-    /// count for each member.
+    /// whose members are all groups on their own is not listed.
     ///
-    /// The groups and their counts come from the scan the server reuses for ten minutes
-    /// (`scanlators::group_stats`), so a group that arrived a moment ago can be missing;
-    /// the scores are always current.
+    /// The groups come from the scanlator index, which a chapter write keeps current;
+    /// one query filters, orders and pages them (`scanlators::public_page`). Nothing is
+    /// counted: `seriesCount` and `chapterCount` are kept for older clients only.
     async fn scanlator_ratings(
         &self,
         ctx: &Context<'_>,
@@ -7783,14 +7785,32 @@ impl QueryRoot {
             sort: match sort.unwrap_or(ScanlatorSort::Top) {
                 ScanlatorSort::Top => PublicSort::Top,
                 ScanlatorSort::Votes => PublicSort::Votes,
-                ScanlatorSort::Chapters => PublicSort::Chapters,
-                ScanlatorSort::Name => PublicSort::Name,
+                // Nothing counts chapters any more: an older client's choice reads A to Z.
+                ScanlatorSort::Chapters | ScanlatorSort::Name => PublicSort::Name,
             },
             page: page as usize,
         };
-        let (rows, total) = sc::public_page(board.rows(), &query);
+        let st = state(ctx);
+        let sites: Vec<sc::Site<'_>> = board
+            .sites
+            .iter()
+            .map(|s| sc::Site {
+                id: &s.id,
+                name: &s.name,
+            })
+            .collect();
+        let (rows, total) = sc::public_page(
+            &st.pool,
+            &sites,
+            &board.ratings,
+            &board.mine,
+            board.show_nsfw,
+            &query,
+        )
+        .await
+        .map_err(gql_read_err)?;
         Ok(RatedScanlatorPage {
-            items: rated_scanlators(state(ctx), &rows).await?,
+            items: rated_scanlators(st, &board, &rows).await?,
             page,
             has_next_page: (page as usize).saturating_mul(sc::PUBLIC_PAGE_SIZE) < total,
             total: total.min(i32::MAX as usize) as i32,
@@ -10250,66 +10270,28 @@ async fn scanlator_sites(st: &AppState, show_nsfw: bool) -> Result<Vec<BrowseSou
     Ok(sites)
 }
 
-/// Everything the readers' scanlator list is built from, read once for a request: the
-/// viewer's NSFW posture and the sites it shows them, the memoized group counts, the
-/// scores of every scanlator that exists (one grouped read) and the viewer's own.
+/// Everything a page of the readers' scanlator list is built from, read once for a
+/// request: the viewer's NSFW posture and the sites it shows them, the scores of every
+/// scanlator that exists (one grouped read) and the viewer's own.
 struct ScanlatorBoard {
     show_nsfw: bool,
     sites: Vec<BrowseSource>,
-    stats: std::sync::Arc<Vec<crate::scanlators::GroupStat>>,
     ratings: crate::scanlators::Ratings,
     mine: crate::scanlators::Scores,
 }
 
-impl ScanlatorBoard {
-    /// Every scanlator the viewer is shown, unfiltered and unordered.
-    fn rows(&self) -> Vec<crate::scanlators::PublicRow<'_>> {
-        use crate::scanlators::{self as sc, PublicRow};
-        let mut rows: Vec<PublicRow<'_>> = self
-            .sites
-            .iter()
-            .map(|s| {
-                PublicRow::site(
-                    &s.id,
-                    &s.name,
-                    s.lang.as_deref(),
-                    s.logo_url.as_deref(),
-                    i64::from(s.count),
-                    &self.ratings,
-                    &self.mine,
-                )
-            })
-            .collect();
-        // A group follows the posture the sites follow: without the opt-in, a group
-        // whose chapters are all on adult works is not shown.
-        rows.extend(
-            sc::public_groups(&self.stats)
-                .iter()
-                .filter(|g| g.visible(self.show_nsfw))
-                .map(|g| PublicRow::group(g, self.show_nsfw, &self.ratings, &self.mine)),
-        );
-        rows
-    }
-}
-
 async fn scanlator_board(ctx: &Context<'_>) -> Result<ScanlatorBoard> {
-    use crate::scanlators::{self as sc, Kind};
+    use crate::scanlators as sc;
     let st = state(ctx);
     let show_nsfw = viewer_show_nsfw(ctx).await?;
     // Every site that exists, whatever this viewer is shown: what the rank is over.
     let every_site = scanlator_sites(st, true).await?;
-    let stats = sc::group_stats(&st.pool).await.map_err(gql_read_err)?;
     let ratings = {
         let sites: std::collections::HashSet<&str> =
             every_site.iter().map(|s| s.id.as_str()).collect();
-        let groups: std::collections::HashSet<&str> =
-            sc::public_groups(&stats).iter().map(|g| g.key).collect();
-        sc::ratings(&st.pool, |id| match id.kind {
-            Kind::Site => sites.contains(id.key.as_str()),
-            Kind::Group => groups.contains(id.key.as_str()),
-        })
-        .await
-        .map_err(gql_read_err)?
+        sc::ratings(&st.pool, |site| sites.contains(site))
+            .await
+            .map_err(gql_read_err)?
     };
     let sites = if show_nsfw {
         every_site
@@ -10325,17 +10307,18 @@ async fn scanlator_board(ctx: &Context<'_>) -> Result<ScanlatorBoard> {
     Ok(ScanlatorBoard {
         show_nsfw,
         sites,
-        stats,
         ratings,
         mine,
     })
 }
 
-/// Finish a page of the readers' list: the AI tag that applies to each row and its
-/// comment count. Two small tag reads and ONE comment count for the whole page.
+/// Finish a page of the readers' list: a site's language and logo, the scores, the AI
+/// tag that applies to each row and its comment count. Two small tag reads and ONE
+/// comment count for the whole page.
 async fn rated_scanlators(
     st: &AppState,
-    rows: &[crate::scanlators::PublicRow<'_>],
+    board: &ScanlatorBoard,
+    rows: &[crate::scanlators::PublicRow],
 ) -> Result<Vec<RatedScanlator>> {
     use crate::scanlators::{self as sc, Kind};
     if rows.is_empty() {
@@ -10372,31 +10355,67 @@ async fn rated_scanlators(
         .iter()
         .zip(ids)
         .map(|(row, id)| {
-            let ai = match row.kind {
-                Kind::Site => site_tags.get(row.key).copied(),
-                Kind::Group => sc::effective_level(row.name, &group_tags),
+            let site = match row.kind {
+                Kind::Site => board.sites.iter().find(|s| s.id == row.key),
+                Kind::Group => None,
             };
+            let ai = match row.kind {
+                Kind::Site => site_tags.get(&row.key).copied(),
+                Kind::Group => sc::effective_level(&row.name, &group_tags),
+            };
+            let rating = board.ratings.get(row.kind, &row.key);
             RatedScanlator {
                 comment_count: count(comments.get(&id).copied().unwrap_or(0)),
                 id: ID(id),
                 kind: row.kind.into(),
-                name: row.name.to_string(),
-                lang: row.lang.map(str::to_string),
-                logo_url: row.logo.map(str::to_string),
-                series_count: count(row.works),
-                chapter_count: row.chapters.map(count),
+                name: row.name.clone(),
+                lang: site.and_then(|s| s.lang.clone()),
+                logo_url: site.and_then(|s| s.logo_url.clone()),
+                series_count: 0,
+                chapter_count: None,
                 ai: ai.map(Into::into),
-                rating: row.rating.and_then(sc::Rating::average),
-                rating_count: row.rating.map_or(0, |r| count(r.count)),
-                rank: row.rating.and_then(|r| r.rank).map(count),
-                distribution: row.rating.map_or_else(
+                rating: rating.and_then(sc::Rating::average),
+                rating_count: rating.map_or(0, |r| count(r.count)),
+                rank: rating.and_then(|r| r.rank).map(count),
+                distribution: rating.map_or_else(
                     || vec![0; 10],
                     |r| r.distribution.iter().map(|&n| count(n)).collect(),
                 ),
-                my_score: row.my_score,
+                my_score: board.mine.get(row.kind, &row.key).copied(),
             }
         })
         .collect())
+}
+
+/// The row of the readers' list for `id` as this viewer is shown it, if they are: a site
+/// `browseSources` lists for them, a group of the index they are shown
+/// (`scanlators::listed_groups`).
+async fn shown_scanlator(
+    st: &AppState,
+    sites: &[BrowseSource],
+    show_nsfw: bool,
+    id: &crate::scanlators::ScanlatorId,
+) -> Result<Option<crate::scanlators::PublicRow>> {
+    use crate::scanlators::{self as sc, Kind};
+    Ok(match id.kind {
+        Kind::Site => sites
+            .iter()
+            .find(|s| s.id == id.key)
+            .map(|s| sc::PublicRow {
+                kind: Kind::Site,
+                key: s.id.clone(),
+                name: s.name.clone(),
+            }),
+        Kind::Group => sc::listed_groups(&st.pool, std::slice::from_ref(&id.key), show_nsfw)
+            .await
+            .map_err(gql_read_err)?
+            .pop()
+            .map(|(key, name)| sc::PublicRow {
+                kind: Kind::Group,
+                key,
+                name,
+            }),
+    })
 }
 
 /// One scanlator of the readers' list as the viewer sees it; `None` when the list does
@@ -10405,39 +10424,26 @@ async fn rated_scanlator_by_id(
     ctx: &Context<'_>,
     id: &crate::scanlators::ScanlatorId,
 ) -> Result<Option<RatedScanlator>> {
+    let st = state(ctx);
     let board = scanlator_board(ctx).await?;
-    let row: Vec<_> = board
-        .rows()
-        .into_iter()
-        .filter(|row| row.kind == id.kind && row.key == id.key)
-        .take(1)
-        .collect();
-    Ok(rated_scanlators(state(ctx), &row).await?.pop())
+    let Some(row) = shown_scanlator(st, &board.sites, board.show_nsfw, id).await? else {
+        return Ok(None);
+    };
+    Ok(rated_scanlators(st, &board, &[row]).await?.pop())
 }
 
 /// Read a scanlator id a client sent and check that the readers' list shows the viewer
 /// such a scanlator. A joint credit that is counted with its members is not one, and
 /// neither is a site or a group hidden from a viewer who does not see adult content.
 async fn known_scanlator(ctx: &Context<'_>, id: &str) -> Result<crate::scanlators::ScanlatorId> {
-    use crate::scanlators::{self as sc, Kind};
     let missing = || Error::new(NO_SUCH_SCANLATOR);
-    let id = sc::ScanlatorId::parse(id).ok_or_else(missing)?;
+    let id = crate::scanlators::ScanlatorId::parse(id).ok_or_else(missing)?;
     let st = state(ctx);
     let show_nsfw = viewer_show_nsfw(ctx).await?;
-    let known = match id.kind {
-        Kind::Site => scanlator_sites(st, show_nsfw)
-            .await?
-            .iter()
-            .any(|s| s.id == id.key),
-        Kind::Group => {
-            let stats = sc::group_stats(&st.pool).await.map_err(gql_read_err)?;
-            sc::public_group(&stats, &id.key).is_some_and(|g| g.visible(show_nsfw))
-        }
-    };
-    if known {
-        Ok(id)
-    } else {
-        Err(missing())
+    let sites = scanlator_sites(st, show_nsfw).await?;
+    match shown_scanlator(st, &sites, show_nsfw, &id).await? {
+        Some(_) => Ok(id),
+        None => Err(missing()),
     }
 }
 
@@ -10447,7 +10453,6 @@ async fn known_scanlator(ctx: &Context<'_>, id: &str) -> Result<crate::scanlator
 /// is now counted with its members) or be hidden from this viewer, and this row must
 /// not tell the two apart.
 fn unlisted_scanlator(id: &crate::scanlators::ScanlatorId) -> RatedScanlator {
-    use crate::scanlators::Kind;
     RatedScanlator {
         id: ID(id.text()),
         kind: id.kind.into(),
@@ -10455,10 +10460,7 @@ fn unlisted_scanlator(id: &crate::scanlators::ScanlatorId) -> RatedScanlator {
         lang: None,
         logo_url: None,
         series_count: 0,
-        chapter_count: match id.kind {
-            Kind::Site => None,
-            Kind::Group => Some(0),
-        },
+        chapter_count: None,
         ai: None,
         rating: None,
         rating_count: 0,

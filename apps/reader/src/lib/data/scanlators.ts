@@ -39,12 +39,11 @@ export const SHOW_LABEL: Record<ScanlatorShow, string> = {
 export const SORT_LABEL: Record<ScanlatorSort, string> = {
 	TOP: 'Top rated',
 	VOTES: 'Most ratings',
-	CHAPTERS: 'Most chapters',
 	NAME: 'A to Z',
 };
 
 const SHOWS: readonly ScanlatorShow[] = ['all', 'site', 'group', 'mine'];
-const SORTS: readonly ScanlatorSort[] = ['TOP', 'VOTES', 'CHAPTERS', 'NAME'];
+const SORTS: readonly ScanlatorSort[] = ['TOP', 'VOTES', 'NAME'];
 
 /**
  * The page's state from its address. Anything unknown is the default rather than an
@@ -97,7 +96,7 @@ export function kindLabel(s: Pick<RatedScanlator, 'kind' | 'lang'>): string {
 	return s.lang ? `Site · ${s.lang.toUpperCase()}` : 'Site';
 }
 
-/** "1 series", "1,204 chapters". */
+/** "1 rating", "1,204 ratings". */
 export function countLabel(n: number, one: string, many: string): string {
 	return `${n.toLocaleString('en-US')} ${n === 1 ? one : many}`;
 }

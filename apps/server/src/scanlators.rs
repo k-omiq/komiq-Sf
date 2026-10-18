@@ -1,6 +1,6 @@
 //! Scanlators and the admin's AI tags on them (migrations 0116 and 0117).
 //!
-//! A scanlator is one of two things, and neither is a row anywhere:
+//! A scanlator is one of two things:
 //!
 //! * a GROUP: the free-text `chapter.scanlator` credit of one chapter copy. MangaDex
 //!   credits every chapter; most other sources credit none.
@@ -9,31 +9,25 @@
 //!
 //! A chapter copy takes the stronger of the tag on its credit and the tag on its source.
 //!
-//! For groups this module owns the three things built on the credit text:
+//! For groups this module owns the things built on the credit text:
 //!
 //! 1. [`name_key`] / [`effective_level`] — the identity of a credit and the tag that
 //!    applies to it. A joint credit ("A & B") with no tag of its own takes the strongest
 //!    tag of its members.
 //! 2. [`list_tags`] / [`set_tag`] — the `scanlator_tag` table.
-//! 3. [`group_stats`] / [`page`] — the admin's scanlator list: every credit with its
-//!    chapter and series counts, per source.
-//!
-//! 4. [`public_groups`] / [`public_page`] / [`ratings`] — the readers' list: every
+//! 3. [`admin_groups`] / [`page`] — the admin's scanlator list: every credit with the
+//!    number of series it is credited on.
+//! 4. [`public_page`] / [`listed_groups`] / [`ratings`] — the readers' list: every
 //!    scanlator (sites and groups) with the 1 to 10 scores readers gave it
 //!    (`scanlator_rating`, PostgreSQL migration 0004).
 //!
-//! THE LIST IS COUNTED IN ONE SCAN AND MEMOIZED. There is no index on `chapter.scanlator`
-//! and no materialized table, so the counts are a full scan of `chapter` joined to
-//! `source_series` and, for the adult-content gate of the readers' list, to
-//! `browse_catalogue` (about 2 s for 560k chapters before that third join, which adds
-//! one lookup per chapter and a second distinct count). It runs at most once per
-//! [`STATS_TTL`], for the admin console and the readers' list alike; search, the filters
-//! and paging then work on the memoized rows in memory (some 13k credits).
+//! THE GROUPS ARE AN INDEX, NOT A SCAN. `scanlator_group` (one row per credit) and
+//! `scanlator_series` (the series each credit is on) are kept current by a trigger on
+//! `chapter` (PostgreSQL migration 0018). Nothing here reads the chapter table. The
+//! readers' list is filtered, ordered and paged by one query over those two tables and
+//! counts no chapters and no series.
 
-use std::borrow::Cow;
-use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::db::Database;
@@ -53,17 +47,6 @@ pub const PAGE_SIZE: usize = 50;
 /// The filter id of the MangaDex mirror. A Suwayomi source is filtered by its source id.
 /// Same vocabulary as `browse::parse_source`.
 pub const MANGADEX_SOURCE: &str = "mangadex";
-
-/// How long one count of the chapter table is reused. Credits appear slowly (a new group
-/// starts a series), so a list that is ten minutes old is still the right list. Tags are
-/// NOT part of the memo: they are read fresh on every request.
-///
-/// Zero under test, like `browse::COUNT_TTL`: the memo is process-wide and every test has
-/// its own database.
-#[cfg(not(test))]
-const STATS_TTL: Duration = Duration::from_secs(600);
-#[cfg(test)]
-const STATS_TTL: Duration = Duration::ZERO;
 
 /// What an admin says about a scanlator. Ordered weakest to strongest, which is what
 /// [`effective_level`] takes the maximum over.
@@ -224,156 +207,43 @@ pub async fn set_source_tag(
     Ok(res.rows_affected() > 0)
 }
 
-/// What one source carries of a credit.
+/// One credit of the admin list.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SourceStat {
-    /// [`MANGADEX_SOURCE`], or a Suwayomi source id ('' when the mapping has none).
-    pub source: String,
-    pub chapters: i64,
-    pub works: i64,
-    /// Those of `chapters` on a work that is not adult: one Browse lists without the
-    /// viewer's opt-in (`browse_catalogue.is_nsfw = FALSE`, the gate `browseSources`
-    /// counts under). A work Browse does not list at all is not counted here.
-    pub safe_chapters: i64,
-    /// Those of `works` that are not adult.
-    pub safe_works: i64,
-}
-
-/// One credit and where its chapters are.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GroupStat {
-    /// The most common spelling of the credit.
+pub struct AdminGroup {
+    /// The spelling the index keeps for the credit.
     pub name: String,
     pub key: String,
-    pub sources: Vec<SourceStat>,
+    /// Series the credit is on, joint releases included.
+    pub series: i64,
 }
 
-impl GroupStat {
-    /// Chapter and series counts: on one source, or on all of them. A series that two
-    /// sources carry from the same credit counts once per source in the all-sources
-    /// number; that is rare and the count is a size hint, not a key.
-    fn counts(&self, source: Option<&str>) -> (i64, i64) {
-        self.sources
-            .iter()
-            .filter(|s| source.is_none_or(|want| s.source == want))
-            .fold((0, 0), |(c, w), s| (c + s.chapters, w + s.works))
-    }
-
-    /// [`Self::counts`] on all sources, over the works that are not adult.
-    fn safe_counts(&self) -> (i64, i64) {
-        self.sources
-            .iter()
-            .fold((0, 0), |(c, w), s| (c + s.safe_chapters, w + s.safe_works))
-    }
-}
-
-/// Count every credit in `chapter`, per source. The one slow query of this module; see
-/// the module header. "No Group" and the backfill's empty string are not credits.
-async fn count_groups(pool: &Database) -> Result<Vec<GroupStat>> {
-    // Grouped by the folded name so two spellings on one series count the series once.
-    // SQLite folds ASCII only; the loop below folds the rest. `MIN` picks the spelling
-    // that sorts first, which is the capitalized one ("Robo Scans" before "robo scans").
-    //
-    // The two FILTER counts are the same numbers over the works that are not adult, for
-    // the readers' list ([`PublicGroup::visible`]). `browse_catalogue` has one row per
-    // work, so the LEFT JOIN adds no row and the first two counts are what they were.
-    let rows: Vec<(String, String, String, i64, i64, i64, i64)> = crate::db_types::query_tuple(
-        "SELECT MIN(c.scanlator), ss.source_type, COALESCE(ss.source_id, ''), \
-                COUNT(*), COUNT(DISTINCT ss.work_id), \
-                COUNT(*) FILTER (WHERE f.is_nsfw = FALSE), \
-                COUNT(DISTINCT ss.work_id) FILTER (WHERE f.is_nsfw = FALSE) \
-           FROM chapter c \
-           JOIN source_series ss ON ss.id = c.source_series_id \
-           LEFT JOIN browse_catalogue f ON f.work_id = ss.work_id \
-          WHERE c.scanlator IS NOT NULL AND c.scanlator != '' AND c.scanlator != $1 \
-          GROUP BY translate(trim(c.scanlator), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), ss.source_type, ss.source_id",
+/// Every credit with a series on `source` (or on any source), whose key contains
+/// `search` (already folded with [`name_key`]), with its series count there. One grouped
+/// read of the index; admin only.
+pub async fn admin_groups(
+    pool: &Database,
+    source: Option<&str>,
+    search: Option<&str>,
+) -> Result<Vec<AdminGroup>> {
+    let rows: Vec<(String, String, i64)> = crate::db_types::query_tuple(
+        "SELECT g.name, g.key, COUNT(*) \
+           FROM scanlator_group g \
+           JOIN scanlator_series l ON l.key = g.key \
+           JOIN source_series s ON s.id = l.source_series_id \
+          WHERE ($1::text IS NULL OR CASE WHEN s.source_type = $3 THEN $3 \
+                                          ELSE COALESCE(s.source_id, '') END = $1) \
+            AND ($2::text IS NULL OR strpos(g.key, $2) > 0) \
+          GROUP BY g.key, g.name",
     )
-    .bind(crate::mangadex::NO_GROUP)
+    .bind(source)
+    .bind(search)
+    .bind(MANGADEX_SOURCE)
     .fetch_all(pool)
     .await?;
-
-    // One credit per key, named by the spelling of its biggest source.
-    struct Acc {
-        name: String,
-        name_chapters: i64,
-        /// (chapters, works, safe chapters, safe works) per source.
-        sources: HashMap<String, [i64; 4]>,
-    }
-    let mut by_key: HashMap<String, Acc> = HashMap::new();
-    for (name, source_type, source_id, chapters, works, safe_chapters, safe_works) in rows {
-        let key = name_key(&name);
-        if key.is_empty() {
-            continue;
-        }
-        let source = if source_type == MANGADEX_SOURCE {
-            MANGADEX_SOURCE.to_string()
-        } else {
-            source_id
-        };
-        let acc = by_key.entry(key).or_insert_with(|| Acc {
-            name: name.trim().to_string(),
-            name_chapters: 0,
-            sources: HashMap::new(),
-        });
-        if chapters > acc.name_chapters {
-            acc.name = name.trim().to_string();
-            acc.name_chapters = chapters;
-        }
-        let slot = acc.sources.entry(source).or_insert([0; 4]);
-        for (sum, n) in slot
-            .iter_mut()
-            .zip([chapters, works, safe_chapters, safe_works])
-        {
-            *sum += n;
-        }
-    }
-    Ok(by_key
+    Ok(rows
         .into_iter()
-        .map(|(key, acc)| GroupStat {
-            name: acc.name,
-            key,
-            sources: acc
-                .sources
-                .into_iter()
-                .map(
-                    |(source, [chapters, works, safe_chapters, safe_works])| SourceStat {
-                        source,
-                        chapters,
-                        works,
-                        safe_chapters,
-                        safe_works,
-                    },
-                )
-                .collect(),
-        })
+        .map(|(name, key, series)| AdminGroup { name, key, series })
         .collect())
-}
-
-static STATS: std::sync::Mutex<Option<(Arc<Vec<GroupStat>>, Instant)>> =
-    std::sync::Mutex::new(None);
-/// Single-flight: two admins opening the page together run one scan.
-static STATS_REFILL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-fn cached_stats() -> Option<Arc<Vec<GroupStat>>> {
-    let memo = STATS.lock().ok()?;
-    let (stats, at) = memo.as_ref()?;
-    (at.elapsed() < STATS_TTL).then(|| stats.clone())
-}
-
-/// Every credit with its counts: memoized for [`STATS_TTL`], counted otherwise.
-pub async fn group_stats(pool: &Database) -> Result<Arc<Vec<GroupStat>>> {
-    if let Some(hit) = cached_stats() {
-        return Ok(hit);
-    }
-    let _guard = STATS_REFILL.lock().await;
-    if let Some(hit) = cached_stats() {
-        return Ok(hit);
-    }
-    let stats = Arc::new(count_groups(pool).await?);
-    if let Ok(mut memo) = STATS.lock() {
-        *memo = Some((stats.clone(), Instant::now()));
-    }
-    Ok(stats)
 }
 
 /// Which credits the list shows, by the tag that applies to them.
@@ -392,60 +262,62 @@ pub struct ListQuery {
     /// Case-insensitive part of the name.
     pub search: Option<String>,
     pub ai: Option<AiFilter>,
-    /// Only credits with chapters on this source ([`MANGADEX_SOURCE`] or a source id).
+    /// Only credits with series on this source ([`MANGADEX_SOURCE`] or a source id).
     /// The counts are then that source's.
     pub source: Option<String>,
     /// 1-based.
     pub page: usize,
 }
 
+impl ListQuery {
+    /// The search as the index stores keys; `None` when it is blank.
+    pub fn folded_search(&self) -> Option<String> {
+        self.search
+            .as_deref()
+            .map(name_key)
+            .filter(|s| !s.is_empty())
+    }
+}
+
 /// One row of the admin list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListRow {
     pub name: String,
-    pub chapters: i64,
-    pub works: i64,
+    pub series: i64,
     /// The tag stored for exactly this name.
     pub own: Option<AiLevel>,
     /// The tag that applies ([`effective_level`]).
     pub effective: Option<AiLevel>,
 }
 
-/// Filter, order and page the list. Returns the page's rows and the filtered total.
+/// Tag, filter, order and page the credits [`admin_groups`] read for `q`. Returns the
+/// page's rows and the filtered total.
 ///
-/// Order: most chapters first, then by name. A tagged name that no chapter carries any
-/// more is still listed (with zero counts), so the admin can find and remove the tag; it
-/// is left out under a source filter, where it has nothing to show.
-pub fn page(stats: &[GroupStat], tags: &[Tag], q: &ListQuery) -> (Vec<ListRow>, usize) {
+/// Order: most series first, then by name. A tagged name that no series carries any more
+/// is still listed (with zero series), so the admin can find and remove the tag; it is
+/// left out under a source filter, where it has nothing to show.
+pub fn page(groups: &[AdminGroup], tags: &[Tag], q: &ListQuery) -> (Vec<ListRow>, usize) {
     let index = tag_index(tags);
-    let search = q.search.as_deref().map(name_key).filter(|s| !s.is_empty());
-    let source = q.source.as_deref();
+    let search = q.folded_search();
 
-    let mut rows: Vec<ListRow> = stats
+    let mut rows: Vec<ListRow> = groups
         .iter()
-        .filter(|g| search.as_deref().is_none_or(|s| g.key.contains(s)))
-        .filter_map(|g| {
-            let (chapters, works) = g.counts(source);
-            (chapters > 0).then(|| ListRow {
-                name: g.name.clone(),
-                chapters,
-                works,
-                own: index.get(&g.key).copied(),
-                effective: effective_level(&g.name, &index),
-            })
+        .map(|g| ListRow {
+            name: g.name.clone(),
+            series: g.series,
+            own: index.get(&g.key).copied(),
+            effective: effective_level(&g.name, &index),
         })
         .collect();
-    if source.is_none() {
-        let counted: std::collections::HashSet<&str> =
-            stats.iter().map(|g| g.key.as_str()).collect();
+    if q.source.is_none() {
+        let listed: std::collections::HashSet<&str> =
+            groups.iter().map(|g| g.key.as_str()).collect();
         rows.extend(tags.iter().filter_map(|t| {
             let key = name_key(&t.name);
-            let listed = counted.contains(key.as_str());
             let matches = search.as_deref().is_none_or(|s| key.contains(s));
-            (!listed && matches).then(|| ListRow {
+            (!listed.contains(key.as_str()) && matches).then(|| ListRow {
                 name: t.name.clone(),
-                chapters: 0,
-                works: 0,
+                series: 0,
                 own: Some(t.level),
                 effective: Some(t.level),
             })
@@ -459,8 +331,8 @@ pub fn page(stats: &[GroupStat], tags: &[Tag], q: &ListQuery) -> (Vec<ListRow>, 
         Some(AiFilter::Untagged) => r.effective.is_none(),
     });
     rows.sort_by(|a, b| {
-        b.chapters
-            .cmp(&a.chapters)
+        b.series
+            .cmp(&a.series)
             .then_with(|| name_key(&a.name).cmp(&name_key(&b.name)))
     });
 
@@ -532,112 +404,6 @@ pub fn id_text(kind: Kind, key: &str) -> String {
     }
 }
 
-/// One group of the readers' list.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PublicGroup<'a> {
-    pub name: &'a str,
-    pub key: &'a str,
-    /// Its own chapters, plus those of the joint credits folded into it.
-    pub chapters: i64,
-    /// Its own series, plus those of the joint credits folded into it. A series it also
-    /// released alone counts twice; like [`GroupStat::counts`] this is a size hint.
-    pub works: i64,
-    /// Those of `chapters` on a work that is not adult ([`SourceStat::safe_chapters`]).
-    pub safe_chapters: i64,
-    /// Those of `works` that are not adult.
-    pub safe_works: i64,
-}
-
-impl PublicGroup<'_> {
-    /// Whether a viewer is shown the group. Without the adult-content opt-in, only a
-    /// group with at least one chapter on a work that is not adult: the same posture
-    /// `browseSources` takes for a source. The group EXISTS either way (its scores count
-    /// and it keeps its rank); this only decides who sees it.
-    pub fn visible(&self, show_nsfw: bool) -> bool {
-        show_nsfw || self.safe_chapters > 0
-    }
-
-    /// (chapters, series) as that viewer counts them: without the opt-in, only those on
-    /// works that are not adult, as a source's `count` is.
-    pub fn counts(&self, show_nsfw: bool) -> (i64, i64) {
-        if show_nsfw {
-            (self.chapters, self.works)
-        } else {
-            (self.safe_chapters, self.safe_works)
-        }
-    }
-}
-
-/// Whether the readers' list leaves a credit out as a joint release: it holds
-/// [`JOINT_SEPARATOR`] and EVERY member is a credit on its own (`exists`, by name key).
-/// When one member is not, the whole text is probably one group's real name.
-fn is_joint_of_known_groups(key: &str, exists: impl Fn(&str) -> bool) -> bool {
-    key.contains(JOINT_SEPARATOR)
-        && key
-            .split(JOINT_SEPARATOR)
-            .all(|member| exists(member.trim()))
-}
-
-/// The groups of the readers' list. A joint credit ("A & B") whose members are all
-/// credits on their own is not a scanlator of its own here: it is left out, and its
-/// chapter and series counts are added to each member. The admin list ([`page`]) keeps
-/// every credit as it is written, because a tag can name a joint credit.
-pub fn public_groups(stats: &[GroupStat]) -> Vec<PublicGroup<'_>> {
-    let index: HashMap<&str, usize> = stats
-        .iter()
-        .enumerate()
-        .map(|(i, g)| (g.key.as_str(), i))
-        .collect();
-    let mut groups: Vec<Option<PublicGroup<'_>>> = stats
-        .iter()
-        .map(|g| {
-            let (chapters, works) = g.counts(None);
-            let (safe_chapters, safe_works) = g.safe_counts();
-            Some(PublicGroup {
-                name: &g.name,
-                key: &g.key,
-                chapters,
-                works,
-                safe_chapters,
-                safe_works,
-            })
-        })
-        .collect();
-    for (i, joint) in stats.iter().enumerate() {
-        if !is_joint_of_known_groups(&joint.key, |member| index.contains_key(member)) {
-            continue;
-        }
-        let (chapters, works) = joint.counts(None);
-        let (safe_chapters, safe_works) = joint.safe_counts();
-        // "A & A" adds to A once.
-        let mut members: Vec<usize> = joint
-            .key
-            .split(JOINT_SEPARATOR)
-            .filter_map(|member| index.get(member.trim()).copied())
-            .collect();
-        members.sort_unstable();
-        members.dedup();
-        for member in members {
-            if let Some(group) = groups[member].as_mut() {
-                group.chapters += chapters;
-                group.works += works;
-                group.safe_chapters += safe_chapters;
-                group.safe_works += safe_works;
-            }
-        }
-        groups[i] = None;
-    }
-    groups.into_iter().flatten().collect()
-}
-
-/// The group of [`public_groups`] with this name key. `None` for a name no chapter
-/// carries and for a joint credit that is counted with its members. The whole list is
-/// built for it: a joint credit anywhere in it can add to this group's counts, and
-/// those decide whether a viewer is shown the group ([`PublicGroup::visible`]).
-pub fn public_group<'a>(stats: &'a [GroupStat], key: &str) -> Option<PublicGroup<'a>> {
-    public_groups(stats).into_iter().find(|g| g.key == key)
-}
-
 /// The scores readers gave one scanlator.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Rating {
@@ -687,6 +453,16 @@ impl<T> ById<T> {
             Kind::Site => self.sites.get(key),
             Kind::Group => self.groups.get(key),
         }
+    }
+
+    /// Every entry, by id text.
+    pub fn iter(&self) -> impl Iterator<Item = (String, &T)> {
+        let sites = self.sites.iter().map(|(k, v)| (id_text(Kind::Site, k), v));
+        let groups = self
+            .groups
+            .iter()
+            .map(|(k, v)| (id_text(Kind::Group, k), v));
+        sites.chain(groups)
     }
 
     fn insert(&mut self, id: ScanlatorId, value: T) {
@@ -765,19 +541,121 @@ pub fn fold_ratings(
     ratings
 }
 
-/// The scores of every scanlator that `exists` ([`fold_ratings`]), in one grouped read.
-/// The table is small (one row per reader and scanlator they rated), so it is read on
-/// every request, like the tags.
+/// How long the flags `scanlator_group_refresh()` sets are reused. A group the trigger
+/// adds is shown to viewers with the adult-content opt-in at once; the flags only decide
+/// when a viewer without it sees a new group, when a joint credit folds into its members
+/// and when a group whose series are all gone leaves. Ten minutes old is still right.
+///
+/// Zero under test, like `browse::COUNT_TTL`: the memo is process-wide and every test has
+/// its own database.
+#[cfg(not(test))]
+const FLAGS_TTL: Duration = Duration::from_secs(600);
+#[cfg(test)]
+const FLAGS_TTL: Duration = Duration::ZERO;
+
+static FLAGS_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+/// Single-flight: while one request refreshes, the others read the flags as they are.
+static FLAGS_REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn flags_fresh() -> bool {
+    FLAGS_AT
+        .lock()
+        .ok()
+        .and_then(|at| *at)
+        .is_some_and(|at| at.elapsed() < FLAGS_TTL)
+}
+
+/// Run `scanlator_group_refresh()` when the flags are older than [`FLAGS_TTL`]. It reads
+/// the index, never `chapter`, and writes only the rows that change. A failure is logged
+/// and the list is served from the flags as they are.
+async fn refresh_flags(pool: &Database) {
+    if flags_fresh() {
+        return;
+    }
+    let Ok(_guard) = FLAGS_REFRESH.try_lock() else {
+        return;
+    };
+    if flags_fresh() {
+        return;
+    }
+    // `execute` takes the write lane: the function updates rows.
+    match sqlx::query("SELECT scanlator_group_refresh()")
+        .execute(pool)
+        .await
+    {
+        Ok(_) => {
+            if let Ok(mut at) = FLAGS_AT.lock() {
+                *at = Some(Instant::now());
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "scanlator flags refresh failed"),
+    }
+}
+
+/// Whether a viewer is shown a group (`g`), with `$show` their adult-content opt-in. A
+/// joint credit whose members are all groups of their own is never shown: the members
+/// are. Then a series credited to the group (its joint releases included), and without
+/// the opt-in one on a work Browse lists as not adult (`browse_catalogue.is_nsfw =
+/// FALSE`), the posture `browseSources` takes for a source. A group hidden from one
+/// viewer still exists: its scores count and it keeps its rank.
+fn shown(show: &str) -> String {
+    format!("g.listed AND CASE WHEN {show} THEN g.any_series ELSE g.safe_series END")
+}
+
+/// The groups among `keys` that the readers' list shows a viewer with this opt-in, as
+/// (key, name), by key. `show_nsfw: true` is every group that EXISTS, whoever asks.
+pub async fn listed_groups(
+    pool: &Database,
+    keys: &[String],
+    show_nsfw: bool,
+) -> Result<Vec<(String, String)>> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    refresh_flags(pool).await;
+    let sql = format!(
+        "SELECT g.key, g.name FROM scanlator_group g \
+          WHERE g.key = ANY($1) AND {} \
+          ORDER BY g.key",
+        shown("$2")
+    );
+    Ok(crate::db_types::query_tuple(&sql)
+        .bind(keys)
+        .bind(show_nsfw)
+        .fetch_all(pool)
+        .await?)
+}
+
+/// The scores of every scanlator that exists ([`fold_ratings`]): a site when `site`
+/// says so, a group when [`listed_groups`] has it. One grouped read of the scores, which
+/// are few (one row per reader and scanlator they rated), and one lookup of the rated
+/// groups.
 ///
 /// A banned reader's score still counts, as their series rating does (`reviews`): a ban
 /// hides what an account wrote, not the numbers it left.
-pub async fn ratings(pool: &Database, exists: impl Fn(&ScanlatorId) -> bool) -> Result<Ratings> {
+pub async fn ratings(pool: &Database, site: impl Fn(&str) -> bool) -> Result<Ratings> {
     let rows: Vec<(String, i64, i64)> = crate::db_types::query_tuple(
         "SELECT scanlator_id, score, COUNT(*) FROM scanlator_rating GROUP BY scanlator_id, score",
     )
     .fetch_all(pool)
     .await?;
-    Ok(fold_ratings(rows, exists))
+    let mut rated: Vec<String> = rows
+        .iter()
+        .filter_map(|(id, _, _)| ScanlatorId::parse(id))
+        .filter(|id| id.kind == Kind::Group)
+        .map(|id| id.key)
+        .collect();
+    rated.sort_unstable();
+    rated.dedup();
+    let groups: std::collections::HashSet<String> = listed_groups(pool, &rated, true)
+        .await?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    Ok(fold_ratings(rows, |id| match id.kind {
+        Kind::Site => site(&id.key),
+        Kind::Group => groups.contains(&id.key),
+    }))
 }
 
 /// The scores one reader gave.
@@ -797,87 +675,6 @@ pub async fn user_scores(pool: &Database, user_id: uuid::Uuid) -> Result<Scores>
     Ok(scores)
 }
 
-/// One row of the readers' list, before paging. It borrows from the memoized counts and
-/// from the ratings read for the request, so building 13k of them copies no text.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PublicRow<'a> {
-    pub kind: Kind,
-    /// The source id of a site, the name key of a group.
-    pub key: &'a str,
-    pub name: &'a str,
-    /// The name as search and the name order read it ([`name_key`]).
-    pub folded_name: Cow<'a, str>,
-    /// Sites only.
-    pub lang: Option<&'a str>,
-    /// Sites only: the site's own logo, as `BrowseSource::logo_url` gives it.
-    pub logo: Option<&'a str>,
-    pub works: i64,
-    /// `None` for a site: nothing counts a source's chapters without a scan.
-    pub chapters: Option<i64>,
-    pub rating: Option<&'a Rating>,
-    pub my_score: Option<i32>,
-}
-
-impl<'a> PublicRow<'a> {
-    pub fn site(
-        id: &'a str,
-        name: &'a str,
-        lang: Option<&'a str>,
-        logo: Option<&'a str>,
-        works: i64,
-        ratings: &'a Ratings,
-        mine: &Scores,
-    ) -> Self {
-        Self {
-            kind: Kind::Site,
-            key: id,
-            name,
-            folded_name: Cow::Owned(name_key(name)),
-            lang,
-            logo,
-            works,
-            chapters: None,
-            rating: ratings.get(Kind::Site, id),
-            my_score: mine.get(Kind::Site, id).copied(),
-        }
-    }
-
-    /// A group as a viewer with this adult-content posture counts it. The caller leaves
-    /// out a group that viewer is not shown ([`PublicGroup::visible`]).
-    pub fn group(
-        group: &PublicGroup<'a>,
-        show_nsfw: bool,
-        ratings: &'a Ratings,
-        mine: &Scores,
-    ) -> Self {
-        let (chapters, works) = group.counts(show_nsfw);
-        Self {
-            kind: Kind::Group,
-            key: group.key,
-            name: group.name,
-            folded_name: Cow::Borrowed(group.key),
-            lang: None,
-            logo: None,
-            works,
-            chapters: Some(chapters),
-            rating: ratings.get(Kind::Group, group.key),
-            my_score: mine.get(Kind::Group, group.key).copied(),
-        }
-    }
-
-    pub fn id(&self) -> String {
-        id_text(self.kind, self.key)
-    }
-
-    fn votes(&self) -> i64 {
-        self.rating.map_or(0, |r| r.count)
-    }
-
-    fn rank(&self) -> Option<i64> {
-        self.rating.and_then(|r| r.rank)
-    }
-}
-
 /// The order of the readers' list.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PublicSort {
@@ -886,8 +683,6 @@ pub enum PublicSort {
     Top,
     /// Most scores first.
     Votes,
-    /// Most chapters first.
-    Chapters,
     /// By name.
     Name,
 }
@@ -905,62 +700,132 @@ pub struct PublicQuery {
     pub page: usize,
 }
 
-/// Biggest first: chapters (a site has none counted, so it reads as 0), then series.
-fn by_size(a: &PublicRow<'_>, b: &PublicRow<'_>) -> Ordering {
-    b.chapters
-        .unwrap_or(0)
-        .cmp(&a.chapters.unwrap_or(0))
-        .then_with(|| b.works.cmp(&a.works))
+/// A site of the readers' list: a source `browseSources` lists, by id and display name.
+#[derive(Clone, Copy, Debug)]
+pub struct Site<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
 }
 
-/// By name; kind and key make it a total order when a site and a group share a name.
-fn by_name(a: &PublicRow<'_>, b: &PublicRow<'_>) -> Ordering {
-    a.folded_name
-        .cmp(&b.folded_name)
-        .then_with(|| a.kind.cmp(&b.kind))
-        .then_with(|| a.key.cmp(b.key))
+/// One row of a page of the readers' list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicRow {
+    pub kind: Kind,
+    /// The source id of a site, the name key of a group.
+    pub key: String,
+    pub name: String,
 }
 
-/// Filter, order and page the readers' list. Returns the page's rows and the filtered
-/// total. Every order ends in size, then name, so equal rows keep one place across pages.
-pub fn public_page<'a>(
-    mut rows: Vec<PublicRow<'a>>,
+impl PublicRow {
+    pub fn id(&self) -> String {
+        id_text(self.kind, &self.key)
+    }
+}
+
+/// One page of the readers' list, and the filtered total: `sites` and the groups shown
+/// a viewer with this opt-in, filtered by `q`, ordered and paged in one query.
+///
+/// TOP puts the ranked first by rank, then the rest by number of scores; VOTES orders by
+/// number of scores; every order ends in the name (then kind and key), so equal rows
+/// keep one place across pages. The ranks come from `ratings`, which is global, so a
+/// filter never moves them.
+pub async fn public_page(
+    pool: &Database,
+    sites: &[Site<'_>],
+    ratings: &Ratings,
+    mine: &Scores,
+    show_nsfw: bool,
     q: &PublicQuery,
-) -> (Vec<PublicRow<'a>>, usize) {
+) -> Result<(Vec<PublicRow>, usize)> {
+    refresh_flags(pool).await;
+    let site_ids: Vec<&str> = sites.iter().map(|s| s.id).collect();
+    let site_names: Vec<&str> = sites.iter().map(|s| s.name).collect();
+    let site_folded: Vec<String> = sites.iter().map(|s| name_key(s.name)).collect();
+    let (mut rated_ids, mut ranks, mut votes) = (Vec::new(), Vec::new(), Vec::new());
+    for (id, rating) in ratings.iter() {
+        rated_ids.push(id);
+        ranks.push(rating.rank);
+        votes.push(rating.count);
+    }
+    let mine: Option<Vec<String>> = q.mine.then(|| mine.iter().map(|(id, _)| id).collect());
+    let kind: Option<i64> = q.kind.map(|kind| match kind {
+        Kind::Site => 0,
+        Kind::Group => 1,
+    });
     let search = q.search.as_deref().map(name_key).filter(|s| !s.is_empty());
-    rows.retain(|r| {
-        q.kind.is_none_or(|kind| r.kind == kind)
-            && (!q.mine || r.my_score.is_some())
-            && search.as_deref().is_none_or(|s| r.folded_name.contains(s))
-    });
-    rows.sort_by(|a, b| {
-        let first = match q.sort {
-            PublicSort::Top => match (a.rank(), b.rank()) {
-                (Some(a), Some(b)) => a.cmp(&b),
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => b.votes().cmp(&a.votes()),
-            },
-            PublicSort::Votes => b.votes().cmp(&a.votes()),
-            PublicSort::Chapters => Ordering::Equal,
-            PublicSort::Name => by_name(a, b),
-        };
-        first
-            .then_with(|| by_size(a, b))
-            .then_with(|| by_name(a, b))
-    });
-    let total = rows.len();
-    let start = q
+    let sort = match q.sort {
+        PublicSort::Top => "top",
+        PublicSort::Votes => "votes",
+        PublicSort::Name => "name",
+    };
+    let offset = q
         .page
         .max(1)
         .saturating_sub(1)
-        .saturating_mul(PUBLIC_PAGE_SIZE);
-    let rows = rows
+        .saturating_mul(PUBLIC_PAGE_SIZE) as i64;
+
+    // `hits` is used twice, so it is computed once: its count is the total, a page past
+    // the end still has it, and its row number is the order the page is cut from.
+    let sql = format!(
+        "WITH board AS ( \
+             SELECT 0::int8 AS kind, s.key, s.name, s.folded \
+               FROM unnest($1::text[], $2::text[], $3::text[]) AS s(key, name, folded) \
+             UNION ALL \
+             SELECT 1::int8, g.key, g.name, g.key \
+               FROM scanlator_group g \
+              WHERE {shown} \
+         ), rated AS ( \
+             SELECT * FROM unnest($5::text[], $6::int8[], $7::int8[]) AS r(id, rank, votes) \
+         ), hits AS ( \
+             SELECT b.kind, b.key, b.name, \
+                    row_number() OVER (ORDER BY \
+                        CASE WHEN $11 = 'top' THEN r.rank END ASC NULLS LAST, \
+                        CASE WHEN $11 <> 'name' THEN COALESCE(r.votes, 0) END DESC, \
+                        b.folded, b.kind, b.key) AS ord \
+               FROM board b \
+               LEFT JOIN rated r \
+                 ON r.id = CASE b.kind WHEN 0 THEN 'site:' ELSE 'group:' END || b.key \
+              WHERE ($8::int8 IS NULL OR b.kind = $8) \
+                AND ($9::text[] IS NULL \
+                     OR CASE b.kind WHEN 0 THEN 'site:' ELSE 'group:' END || b.key = ANY($9)) \
+                AND ($10::text IS NULL OR strpos(b.folded, $10) > 0) \
+         ) \
+         SELECT t.total, p.kind, p.key, p.name \
+           FROM (SELECT COUNT(*) AS total FROM hits) AS t \
+           LEFT JOIN hits p ON p.ord > $12 AND p.ord <= $12 + $13 \
+          ORDER BY p.ord",
+        shown = shown("$4"),
+    );
+    // (total, kind, key, name); the last three are null on a page past the end.
+    type Hit = (i64, Option<i64>, Option<String>, Option<String>);
+    let rows: Vec<Hit> = crate::db_types::query_tuple(&sql)
+        .bind(&site_ids)
+        .bind(&site_names)
+        .bind(&site_folded)
+        .bind(show_nsfw)
+        .bind(&rated_ids)
+        .bind(&ranks)
+        .bind(&votes)
+        .bind(kind)
+        .bind(mine)
+        .bind(search)
+        .bind(sort)
+        .bind(offset)
+        .bind(PUBLIC_PAGE_SIZE as i64)
+        .fetch_all(pool)
+        .await?;
+    let total = rows.first().map_or(0, |row| row.0.max(0) as usize);
+    let page = rows
         .into_iter()
-        .skip(start)
-        .take(PUBLIC_PAGE_SIZE)
+        .filter_map(|(_, kind, key, name)| {
+            Some(PublicRow {
+                kind: if kind? == 0 { Kind::Site } else { Kind::Group },
+                key: key?,
+                name: name?,
+            })
+        })
         .collect();
-    (rows, total)
+    Ok((page, total))
 }
 
 #[cfg(test)]
@@ -1141,150 +1006,6 @@ mod tests {
         }
     }
 
-    fn names(rows: &[ListRow]) -> Vec<&str> {
-        rows.iter().map(|r| r.name.as_str()).collect()
-    }
-
-    #[tokio::test]
-    async fn the_scan_counts_the_chapters_on_works_that_are_not_adult() {
-        let pool = pool().await;
-        seed(&pool).await;
-        // (chapters, series, safe chapters, safe series) of a credit on MangaDex.
-        let robo = |stats: &[GroupStat]| {
-            let g = stats.iter().find(|g| g.key == "robo scans").unwrap();
-            let s = g
-                .sources
-                .iter()
-                .find(|s| s.source == MANGADEX_SOURCE)
-                .unwrap();
-            (s.chapters, s.works, s.safe_chapters, s.safe_works)
-        };
-        // Browse lists neither work yet: nothing is known to be safe, and the counts
-        // the admin list shows are not touched by that.
-        assert_eq!(robo(&count_groups(&pool).await.unwrap()), (4, 2, 0, 0));
-
-        // `w1` is listed as safe, `w2` as adult.
-        sqlx::query(
-            "INSERT INTO browse_catalogue (work_id, reader_id, title, is_nsfw, created_at) VALUES \
-               ('w1', 'w1', 'One', FALSE, '2020-01-01T00:00:00Z'), \
-               ('w2', 'w2', 'Two', TRUE, '2020-01-01T00:00:00Z')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        let stats = count_groups(&pool).await.unwrap();
-        assert_eq!(robo(&stats), (4, 2, 3, 1));
-        let groups = public_groups(&stats);
-        let human = groups.iter().find(|g| g.key == "human scans").unwrap();
-        // Its own chapter on source 77 and the joint one on MangaDex, both on `w1`.
-        assert_eq!((human.counts(true), human.counts(false)), ((2, 2), (2, 2)));
-        let robo = groups.iter().find(|g| g.key == "robo scans").unwrap();
-        assert_eq!((robo.counts(true), robo.counts(false)), ((5, 3), (4, 2)));
-        assert!(groups.iter().all(|g| g.visible(false)));
-    }
-
-    #[tokio::test]
-    async fn the_list_counts_credits_per_source_and_applies_tags() {
-        let pool = pool().await;
-        seed(&pool).await;
-        let stats = group_stats(&pool).await.unwrap();
-
-        // Untagged: three credits, most chapters first, spellings folded.
-        let (rows, total) = page(&stats, &[], &ListQuery::default());
-        assert_eq!(total, 3);
-        assert_eq!(
-            rows[0],
-            ListRow {
-                name: "Robo Scans".into(),
-                chapters: 4,
-                works: 2,
-                own: None,
-                effective: None,
-            }
-        );
-        assert_eq!(
-            names(&rows),
-            ["Robo Scans", "Human Scans", "Human Scans & Robo Scans"]
-        );
-
-        // Tag one group: the joint credit takes it; a tag on a name no chapter carries
-        // is listed too.
-        let tagged = tags(&[
-            ("robo scans", AiLevel::Ai),
-            ("Gone Scans", AiLevel::Partial),
-        ]);
-        let (rows, total) = page(&stats, &tagged, &ListQuery::default());
-        assert_eq!(total, 4);
-        let by_name = |n: &str| rows.iter().find(|r| r.name == n).unwrap().clone();
-        assert_eq!(by_name("Robo Scans").own, Some(AiLevel::Ai));
-        let joint = by_name("Human Scans & Robo Scans");
-        assert_eq!((joint.own, joint.effective), (None, Some(AiLevel::Ai)));
-        assert_eq!(by_name("Gone Scans").chapters, 0);
-
-        let filtered = |ai| {
-            let q = ListQuery {
-                ai: Some(ai),
-                ..ListQuery::default()
-            };
-            let (rows, _) = page(&stats, &tagged, &q);
-            rows.into_iter().map(|r| r.name).collect::<Vec<_>>()
-        };
-        assert_eq!(
-            filtered(AiFilter::Ai),
-            ["Robo Scans", "Human Scans & Robo Scans"]
-        );
-        assert_eq!(filtered(AiFilter::Partial), ["Gone Scans"]);
-        assert_eq!(filtered(AiFilter::Untagged), ["Human Scans"]);
-        assert_eq!(filtered(AiFilter::Tagged).len(), 3);
-
-        // Source filter: that source's credits and counts only.
-        let q = ListQuery {
-            source: Some("77".into()),
-            ..ListQuery::default()
-        };
-        let (rows, total) = page(&stats, &tagged, &q);
-        assert_eq!((total, names(&rows)), (1, vec!["Human Scans"]));
-        let q = ListQuery {
-            source: Some(MANGADEX_SOURCE.into()),
-            search: Some("ROBO".into()),
-            ..ListQuery::default()
-        };
-        let (rows, _) = page(&stats, &tagged, &q);
-        assert_eq!(names(&rows), ["Robo Scans", "Human Scans & Robo Scans"]);
-
-        // Paging past the end is an empty page with the real total.
-        let q = ListQuery {
-            page: 9,
-            ..ListQuery::default()
-        };
-        let (rows, total) = page(&stats, &tagged, &q);
-        assert!(rows.is_empty());
-        assert_eq!(total, 4);
-    }
-
-    /// One credit on MangaDex with these counts.
-    fn stat(name: &str, chapters: i64, works: i64) -> GroupStat {
-        GroupStat {
-            name: name.to_string(),
-            key: name_key(name),
-            sources: vec![SourceStat {
-                source: MANGADEX_SOURCE.to_string(),
-                chapters,
-                works,
-                safe_chapters: chapters,
-                safe_works: works,
-            }],
-        }
-    }
-
-    /// [`stat`] with only `safe` of its chapters and series on works that are not adult.
-    fn stat_with_safe(name: &str, all: (i64, i64), safe: (i64, i64)) -> GroupStat {
-        let mut stat = stat(name, all.0, all.1);
-        stat.sources[0].safe_chapters = safe.0;
-        stat.sources[0].safe_works = safe.1;
-        stat
-    }
-
     #[test]
     fn a_scanlator_id_is_a_site_or_a_group_and_nothing_else() {
         let site = ScanlatorId::parse("site:6247824327199706550").unwrap();
@@ -1313,95 +1034,6 @@ mod tests {
         ] {
             assert_eq!(ScanlatorId::parse(bad), None, "{bad:?}");
         }
-    }
-
-    #[test]
-    fn a_joint_credit_folds_into_its_members_when_every_member_is_a_credit() {
-        let stats = [
-            stat("Robo Scans", 10, 2),
-            stat("Human Scans", 5, 1),
-            stat("Third Scans", 1, 1),
-            // Both members are credits: folded into each of them.
-            stat("Human Scans & Robo Scans", 3, 2),
-            // Three members, any spacing and case, one of them twice.
-            stat("robo scans &  THIRD SCANS & Robo Scans", 4, 1),
-            // "Strawberry" is not a credit: this is one group's own name.
-            stat("Robo Scans & Strawberry", 7, 3),
-            // No separator (no spaces around the "&"): an ordinary name.
-            stat("Salt&Pepper", 2, 1),
-        ];
-        let groups = public_groups(&stats);
-        let row = |name: &str| {
-            let g = groups
-                .iter()
-                .find(|g| g.name == name)
-                .unwrap_or_else(|| panic!("no group {name}"));
-            (g.chapters, g.works)
-        };
-        assert_eq!(groups.len(), 5);
-        assert_eq!(row("Robo Scans"), (10 + 3 + 4, 2 + 2 + 1));
-        assert_eq!(row("Human Scans"), (5 + 3, 1 + 2));
-        assert_eq!(row("Third Scans"), (1 + 4, 1 + 1));
-        assert_eq!(row("Robo Scans & Strawberry"), (7, 3));
-        assert_eq!(row("Salt&Pepper"), (2, 1));
-
-        // The same answer for one key.
-        for (key, listed) in [
-            ("robo scans", true),
-            ("robo scans & strawberry", true),
-            ("salt&pepper", true),
-            ("human scans & robo scans", false),
-            ("robo scans &  third scans & robo scans", false),
-            // Never a credit at all.
-            ("gone scans", false),
-            ("gone scans & robo scans", false),
-        ] {
-            assert_eq!(public_group(&stats, key).is_some(), listed, "{key}");
-        }
-        assert_eq!(public_group(&stats, "human scans").unwrap().chapters, 5 + 3);
-        // A list without joint credits is unchanged.
-        assert_eq!(public_groups(&stats[..3]).len(), 3);
-        assert!(public_groups(&[]).is_empty());
-    }
-
-    #[test]
-    fn a_group_with_only_adult_chapters_is_hidden_without_the_opt_in() {
-        let stats = [
-            // Half of it is on adult works.
-            stat_with_safe("Mixed Scans", (10, 4), (6, 2)),
-            // All of it is.
-            stat_with_safe("Lewd Scans", (8, 3), (0, 0)),
-            // Adult on its own, but one joint release is not: that release is its too.
-            stat_with_safe("Joint Scans", (5, 2), (0, 0)),
-            stat_with_safe("Joint Scans & Mixed Scans", (3, 2), (1, 1)),
-        ];
-        let groups = public_groups(&stats);
-        let group = |name: &str| groups.iter().find(|g| g.name == name).unwrap();
-        assert_eq!(groups.len(), 3);
-
-        let mixed = group("Mixed Scans");
-        assert!(mixed.visible(false) && mixed.visible(true));
-        // Each viewer's counts are the works they may see, the joint release included.
-        assert_eq!(mixed.counts(true), (10 + 3, 4 + 2));
-        assert_eq!(mixed.counts(false), (6 + 1, 2 + 1));
-
-        let lewd = group("Lewd Scans");
-        assert!(!lewd.visible(false) && lewd.visible(true));
-        assert_eq!(lewd.counts(true), (8, 3));
-
-        let joint = group("Joint Scans");
-        assert!(joint.visible(false));
-        assert_eq!(joint.counts(false), (1, 1));
-        assert_eq!(joint.counts(true), (5 + 3, 2 + 2));
-
-        // A row carries the viewer's counts.
-        let (ratings, mine) = (Ratings::default(), Scores::default());
-        let row = PublicRow::group(mixed, false, &ratings, &mine);
-        assert_eq!((row.chapters, row.works), (Some(7), 3));
-        let row = PublicRow::group(mixed, true, &ratings, &mine);
-        assert_eq!((row.chapters, row.works), (Some(13), 6));
-        // Hidden or not, the group exists: it is found by key either way.
-        assert!(!public_group(&stats, "lewd scans").unwrap().visible(false));
     }
 
     /// `votes` scores of `score` for one scanlator, as the grouped read returns them.
@@ -1505,15 +1137,270 @@ mod tests {
         assert_eq!(all.get(Kind::Group, "here").unwrap().rank, Some(3));
     }
 
-    #[test]
-    fn the_readers_list_filters_orders_and_pages() {
-        let stats = [
-            stat("Big Scans", 900, 40),
-            stat("Rated Scans", 10, 2),
-            stat("Alpha Scans", 10, 2),
-            stat("Fresh Scans", 1, 1),
-        ];
-        let groups = public_groups(&stats);
+    fn names(rows: &[ListRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    async fn admin(pool: &Database, tags: &[Tag], q: &ListQuery) -> (Vec<ListRow>, usize) {
+        let groups = admin_groups(pool, q.source.as_deref(), q.folded_search().as_deref())
+            .await
+            .unwrap();
+        page(&groups, tags, q)
+    }
+
+    #[tokio::test]
+    async fn the_admin_list_counts_series_per_source_and_applies_tags() {
+        let pool = pool().await;
+        seed(&pool).await;
+
+        // Untagged: three credits, most series first, spellings folded. A member of a
+        // joint credit counts the joint release's series too.
+        let (rows, total) = admin(&pool, &[], &ListQuery::default()).await;
+        assert_eq!(total, 3);
+        assert_eq!(
+            rows[1],
+            ListRow {
+                name: "Robo Scans".into(),
+                series: 2,
+                own: None,
+                effective: None,
+            }
+        );
+        assert_eq!(
+            names(&rows),
+            ["Human Scans", "Robo Scans", "Human Scans & Robo Scans"]
+        );
+
+        // Tag one group: the joint credit takes it; a tag on a name no series carries
+        // is listed too.
+        let tagged = tags(&[
+            ("robo scans", AiLevel::Ai),
+            ("Gone Scans", AiLevel::Partial),
+        ]);
+        let (rows, total) = admin(&pool, &tagged, &ListQuery::default()).await;
+        assert_eq!(total, 4);
+        let by_name = |n: &str| rows.iter().find(|r| r.name == n).unwrap().clone();
+        assert_eq!(by_name("Robo Scans").own, Some(AiLevel::Ai));
+        let joint = by_name("Human Scans & Robo Scans");
+        assert_eq!((joint.own, joint.effective), (None, Some(AiLevel::Ai)));
+        assert_eq!(by_name("Gone Scans").series, 0);
+
+        for (ai, want) in [
+            (AiFilter::Ai, vec!["Robo Scans", "Human Scans & Robo Scans"]),
+            (AiFilter::Partial, vec!["Gone Scans"]),
+            (AiFilter::Untagged, vec!["Human Scans"]),
+        ] {
+            let q = ListQuery {
+                ai: Some(ai),
+                ..ListQuery::default()
+            };
+            assert_eq!(names(&admin(&pool, &tagged, &q).await.0), want, "{ai:?}");
+        }
+
+        // Source filter: that source's credits and counts only.
+        let q = ListQuery {
+            source: Some("77".into()),
+            ..ListQuery::default()
+        };
+        let (rows, total) = admin(&pool, &tagged, &q).await;
+        assert_eq!((total, names(&rows)), (1, vec!["Human Scans"]));
+        assert_eq!(rows[0].series, 1);
+        let q = ListQuery {
+            source: Some(MANGADEX_SOURCE.into()),
+            search: Some("ROBO".into()),
+            ..ListQuery::default()
+        };
+        let (rows, _) = admin(&pool, &tagged, &q).await;
+        assert_eq!(names(&rows), ["Robo Scans", "Human Scans & Robo Scans"]);
+
+        // Paging past the end is an empty page with the real total.
+        let q = ListQuery {
+            page: 9,
+            ..ListQuery::default()
+        };
+        let (rows, total) = admin(&pool, &tagged, &q).await;
+        assert!(rows.is_empty());
+        assert_eq!(total, 4);
+    }
+
+    /// The (key, series) pairs of the index.
+    async fn index(pool: &Database) -> Vec<(String, String)> {
+        crate::db_types::query_tuple(
+            "SELECT key, source_series_id FROM scanlator_series ORDER BY key, source_series_id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(k, s)| (k.to_string(), s.to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_trigger_keeps_the_index_current() {
+        let pool = pool().await;
+        seed(&pool).await;
+        let groups: Vec<(String, String)> =
+            crate::db_types::query_tuple("SELECT key, name FROM scanlator_group ORDER BY key")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        // "No Group", '' and NULL are not credits; the first spelling names the group.
+        assert_eq!(
+            groups,
+            pairs(&[
+                ("human scans", "Human Scans"),
+                ("human scans & robo scans", "Human Scans & Robo Scans"),
+                ("robo scans", "Robo Scans"),
+            ])
+        );
+        assert_eq!(
+            index(&pool).await,
+            pairs(&[
+                ("human scans", "md1"),
+                ("human scans", "sy1"),
+                ("human scans & robo scans", "md1"),
+                ("robo scans", "md1"),
+                ("robo scans", "md2"),
+            ])
+        );
+
+        // A credit that changes adds the new pair; a chapter that gains a credit too.
+        sqlx::query("UPDATE chapter SET scanlator = '  New Scans ' WHERE id = 'c5'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE chapter SET scanlator = 'Late Scans' WHERE id = 'c8'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let listed = listed_groups(
+            &pool,
+            &["new scans".to_string(), "late scans".to_string()],
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            listed,
+            pairs(&[("late scans", "Late Scans"), ("new scans", "New Scans")])
+        );
+
+        // Removing a series removes its pairs, and a group with none left is not listed.
+        sqlx::query("DELETE FROM source_series WHERE id = 'sy1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!index(&pool).await.iter().any(|(_, s)| s == "sy1"));
+        let keys = ["new scans".to_string(), "human scans".to_string()];
+        let listed = listed_groups(&pool, &keys, true).await.unwrap();
+        // Human Scans keeps its joint release on md1.
+        assert_eq!(listed, pairs(&[("human scans", "Human Scans")]));
+    }
+
+    /// One more work `work`, adult or not as Browse lists it, on MangaDex as series
+    /// `series`, with one chapter for each credit.
+    async fn work(pool: &Database, work: &str, nsfw: bool, credits: &[&str]) {
+        sqlx::query(
+            "INSERT INTO work (id, primary_title, created_at, updated_at) \
+             VALUES ($1, $1, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+        )
+        .bind(work)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO browse_catalogue (work_id, reader_id, title, is_nsfw, created_at) \
+             VALUES ($1, $1, $1, $2, '2020-01-01T00:00:00Z')",
+        )
+        .bind(work)
+        .bind(nsfw)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
+             VALUES ($1, $1, 'mangadex', 'mangadex', $1, '2020-01-01T00:00:00Z')",
+        )
+        .bind(work)
+        .execute(pool)
+        .await
+        .unwrap();
+        for (n, credit) in credits.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO chapter (id, source_series_id, external_id, scanlator, created_at) \
+                 VALUES ($1, $2, $1, $3, '2020-01-01T00:00:00Z')",
+            )
+            .bind(format!("{work}-{n}"))
+            .bind(work)
+            .bind(credit)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_group_with_only_adult_chapters_is_hidden_without_the_opt_in() {
+        let pool = pool().await;
+        work(
+            &pool,
+            "safe",
+            false,
+            &["Mixed Scans", "Joint Scans & Mixed Scans"],
+        )
+        .await;
+        work(
+            &pool,
+            "adult",
+            true,
+            &["Mixed Scans", "Lewd Scans", "Joint Scans"],
+        )
+        .await;
+        // Not in Browse at all: not known to be safe.
+        sqlx::query("DELETE FROM browse_catalogue WHERE work_id = 'adult'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let keys: Vec<String> = [
+            "mixed scans",
+            "lewd scans",
+            "joint scans",
+            "joint scans & mixed scans",
+        ]
+        .map(String::from)
+        .to_vec();
+        let shown = |listed: Vec<(String, String)>| {
+            listed.into_iter().map(|(key, _)| key).collect::<Vec<_>>()
+        };
+        // Joint Scans is adult on its own, but its joint release is not. The joint credit
+        // itself is not a group of the list: both members are.
+        assert_eq!(
+            shown(listed_groups(&pool, &keys, false).await.unwrap()),
+            ["joint scans", "mixed scans"]
+        );
+        assert_eq!(
+            shown(listed_groups(&pool, &keys, true).await.unwrap()),
+            ["joint scans", "lewd scans", "mixed scans"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_readers_list_filters_orders_and_pages() {
+        let pool = pool().await;
+        work(&pool, "w1", false, &["Big Scans", "Rated Scans"]).await;
+        work(
+            &pool,
+            "w2",
+            false,
+            &["Alpha Scans", "Fresh Scans", "Big Scans"],
+        )
+        .await;
+        // Only on an adult work: listed with the opt-in only.
+        work(&pool, "w3", true, &["Lewd Scans"]).await;
         let ratings = fold_ratings(
             [
                 scores("group:rated scans", 8, 6),
@@ -1526,67 +1413,60 @@ mod tests {
         let mut mine = Scores::default();
         mine.insert(ScanlatorId::parse("group:fresh scans").unwrap(), 10);
         mine.insert(ScanlatorId::parse("site:77").unwrap(), 9);
-        let rows = || {
-            let mut rows = vec![
-                PublicRow::site("77", "Zed Site", Some("en"), None, 300, &ratings, &mine),
-                PublicRow::site("88", "alpha site", None, None, 5, &ratings, &mine),
-            ];
-            rows.extend(
-                groups
-                    .iter()
-                    .map(|g| PublicRow::group(g, true, &ratings, &mine)),
-            );
-            rows
-        };
-        let ids = |q: PublicQuery| {
-            let (rows, total) = public_page(rows(), &q);
-            (rows.iter().map(PublicRow::id).collect::<Vec<_>>(), total)
+        let sites = [
+            Site {
+                id: "77",
+                name: "Zed Site",
+            },
+            Site {
+                id: "88",
+                name: "alpha site",
+            },
+        ];
+        let list = |q: PublicQuery, nsfw: bool| {
+            let (pool, ratings, mine, sites) = (&pool, &ratings, &mine, &sites);
+            async move {
+                let (rows, total) = public_page(pool, sites, ratings, mine, nsfw, &q)
+                    .await
+                    .unwrap();
+                (rows.iter().map(PublicRow::id).collect::<Vec<_>>(), total)
+            }
         };
         let sorted = |sort| {
-            ids(PublicQuery {
-                sort,
-                ..PublicQuery::default()
-            })
-            .0
+            list(
+                PublicQuery {
+                    sort,
+                    ..PublicQuery::default()
+                },
+                false,
+            )
         };
 
-        // TOP: the ranked by rank, then by number of scores, then by size, then by name.
+        // TOP: the ranked by rank, then by number of scores, then by name.
         assert_eq!(
-            sorted(PublicSort::Top),
+            sorted(PublicSort::Top).await.0,
             [
                 "site:77",
                 "group:rated scans",
                 "group:fresh scans",
                 "group:alpha scans",
-                "group:big scans",
                 "site:88",
+                "group:big scans",
             ]
         );
         assert_eq!(
-            sorted(PublicSort::Votes),
+            sorted(PublicSort::Votes).await.0,
             [
                 "group:rated scans",
                 "site:77",
                 "group:fresh scans",
                 "group:alpha scans",
-                "group:big scans",
                 "site:88",
-            ]
-        );
-        // A site has no chapter count: it reads as 0 and orders by its series.
-        assert_eq!(
-            sorted(PublicSort::Chapters),
-            [
                 "group:big scans",
-                "group:alpha scans",
-                "group:rated scans",
-                "group:fresh scans",
-                "site:77",
-                "site:88",
             ]
         );
         assert_eq!(
-            sorted(PublicSort::Name),
+            sorted(PublicSort::Name).await.0,
             [
                 "group:alpha scans",
                 "site:88",
@@ -1595,6 +1475,12 @@ mod tests {
                 "group:rated scans",
                 "site:77",
             ]
+        );
+        // The opt-in shows the adult-only group too.
+        let all = list(PublicQuery::default(), true).await;
+        assert_eq!(
+            (all.1, all.0.contains(&"group:lewd scans".into())),
+            (7, true)
         );
 
         // Filters: kind, part of the name in any case, and the viewer's own.
@@ -1603,32 +1489,83 @@ mod tests {
             ..PublicQuery::default()
         };
         assert_eq!(
-            ids(q),
+            list(q, false).await,
             (vec!["site:77".to_string(), "site:88".to_string()], 2)
         );
         let q = PublicQuery {
             search: Some(" ALPHA ".into()),
             ..PublicQuery::default()
         };
-        assert_eq!(ids(q).0, ["group:alpha scans", "site:88"]);
+        assert_eq!(list(q, false).await.0, ["group:alpha scans", "site:88"]);
         let q = PublicQuery {
             mine: true,
             ..PublicQuery::default()
         };
-        assert_eq!(ids(q).0, ["site:77", "group:fresh scans"]);
-        // The rank does not move with a filter: the second of the server stays second.
-        let q = PublicQuery {
-            kind: Some(Kind::Group),
-            ..PublicQuery::default()
-        };
-        let (rows, _) = public_page(rows(), &q);
-        assert_eq!(rows[0].rating.unwrap().rank, Some(2));
+        assert_eq!(list(q, false).await.0, ["site:77", "group:fresh scans"]);
+        // Signed out, "mine" is empty.
+        let (rows, total) = public_page(
+            &pool,
+            &sites,
+            &ratings,
+            &Scores::default(),
+            false,
+            &PublicQuery {
+                mine: true,
+                ..PublicQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((rows.len(), total), (0, 0));
 
         // Paging past the end is an empty page with the real total.
         let q = PublicQuery {
             page: 2,
             ..PublicQuery::default()
         };
-        assert_eq!(ids(q), (vec![], 6));
+        assert_eq!(list(q, false).await, (vec![], 6));
+    }
+
+    #[tokio::test]
+    async fn only_a_rated_group_that_exists_counts() {
+        let pool = pool().await;
+        work(
+            &pool,
+            "w1",
+            true,
+            &["Here Scans", "Here Scans & Other Scans", "Other Scans"],
+        )
+        .await;
+        let user = crate::db_types::test_uuid("rater");
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, created_at) \
+             VALUES ($1, 'rater', 'rater@example.com', 'x', '2020-01-01T00:00:00Z')",
+        )
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+        for id in [
+            "group:here scans",
+            "group:here scans & other scans",
+            "group:gone",
+            "site:77",
+            "site:99",
+        ] {
+            sqlx::query(
+                "INSERT INTO scanlator_rating (scanlator_id, user_id, score, created_at, updated_at) \
+                 VALUES ($1, $2, 7, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(user)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Adult-only groups still exist; a folded joint credit and an unknown name do not.
+        let ratings = ratings(&pool, |site| site == "77").await.unwrap();
+        let mut ids: Vec<String> = ratings.iter().map(|(id, _)| id).collect();
+        ids.sort();
+        assert_eq!(ids, ["group:here scans", "site:77"]);
     }
 }

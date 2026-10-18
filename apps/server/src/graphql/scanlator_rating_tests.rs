@@ -102,8 +102,8 @@ async fn the_list_shows_sites_and_groups_with_the_shape_readers_use() {
         ok(run(&s, q, Some("admintok")).await);
     }
 
-    // Signed out, nothing rated: biggest first, then by name. The joint credit of two
-    // known groups is not a row; MangaDex is not a site; the adult-only source is hidden.
+    // Signed out, nothing rated: by name. The joint credit of two known groups is not a
+    // row; MangaDex is not a site; the adult-only source is hidden.
     let page = list(&s, "", None).await;
     assert_eq!(
         (&page["total"], &page["page"], &page["hasNextPage"]),
@@ -112,37 +112,34 @@ async fn the_list_shows_sites_and_groups_with_the_shape_readers_use() {
     assert_eq!(
         ids(&page),
         [
+            "site:77",
             "group:human scans",
             "group:robo scans",
             "group:robo scans & strawberry",
-            "site:77",
         ]
     );
     let none = json!([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    // A group: its own chapter and series plus the joint release's.
+    // A group. Nothing is counted: the deprecated counts are 0 and null.
     assert_eq!(
-        page["items"][1],
+        page["items"][2],
         json!({
             "id": "group:robo scans", "kind": "GROUP", "name": "Robo Scans", "lang": null,
-            "logoUrl": null, "seriesCount": 2, "chapterCount": 2, "ai": "AI", "rating": null,
+            "logoUrl": null, "seriesCount": 0, "chapterCount": null, "ai": "AI", "rating": null,
             "ratingCount": 0, "rank": null, "distribution": none, "myScore": null,
             "commentCount": 0,
         })
     );
-    assert_eq!(page["items"][0]["chapterCount"], 2);
-    assert_eq!(page["items"][0]["ai"], json!(null));
+    assert_eq!(page["items"][1]["ai"], json!(null));
     // A name that only looks joint is one scanlator, and takes its member's tag.
-    assert_eq!(page["items"][2]["chapterCount"], 1);
-    assert_eq!(page["items"][2]["ai"], "AI");
+    assert_eq!(page["items"][3]["ai"], "AI");
     // A site: named by its package here (the mock engine lists no sources), its
-    // extension's icon from this server's origin, no chapter count, and the tag on the
-    // source.
+    // extension's icon from this server's origin, and the tag on the source.
     assert_eq!(
-        page["items"][3],
+        page["items"][0],
         json!({
             "id": "site:77", "kind": "SITE", "name": "example", "lang": "en",
             "logoUrl": st.suwayomi.abs(Some("/ext-icons/ext.en.example.png")),
-            "seriesCount": 1, "chapterCount": null, "ai": "PARTIAL", "rating": null,
+            "seriesCount": 0, "chapterCount": null, "ai": "PARTIAL", "rating": null,
             "ratingCount": 0, "rank": null, "distribution": none, "myScore": null,
             "commentCount": 0,
         })
@@ -168,7 +165,7 @@ async fn the_list_shows_sites_and_groups_with_the_shape_readers_use() {
     assert_eq!(one(&s, "site:88", Some("bobtok")).await["lang"], "all");
     assert_eq!(one(&s, "site:88", None).await, json!(null));
 
-    // Filters, orders and paging.
+    // Filters, orders and paging. An older client's CHAPTERS orders by name.
     assert_eq!(
         ids(&list(&s, r#"(search: " ROBO ", sort: NAME)"#, None).await),
         ["group:robo scans", "group:robo scans & strawberry"]
@@ -629,10 +626,10 @@ async fn stored_scores(st: &AppState, id: &str) -> i64 {
 }
 
 /// The bare row `rateScanlator` answers with after a removal on an unlisted id.
-fn bare(id: &str, kind: &str, name: &str, chapters: serde_json::Value) -> serde_json::Value {
+fn bare(id: &str, kind: &str, name: &str) -> serde_json::Value {
     json!({
         "id": id, "kind": kind, "name": name, "lang": null, "logoUrl": null, "seriesCount": 0,
-        "chapterCount": chapters, "ai": null, "rating": null, "ratingCount": 0,
+        "chapterCount": null, "ai": null, "rating": null, "ratingCount": 0,
         "rank": null, "distribution": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "myScore": null,
         "commentCount": 0,
     })
@@ -693,7 +690,7 @@ async fn only_a_scanlator_that_exists_ranks_and_a_score_can_always_be_removed() 
     for _ in 0..2 {
         assert_eq!(
             rate(&s, "site:88", None, "bobtok").await,
-            bare("site:88", "SITE", "88", json!(null))
+            bare("site:88", "SITE", "88")
         );
     }
     assert_eq!(stored_scores(&st, "site:88").await, 4);
@@ -704,24 +701,24 @@ async fn only_a_scanlator_that_exists_ranks_and_a_score_can_always_be_removed() 
     // gone, in any case of the name: only the viewer's own row goes.
     assert_eq!(
         rate(&s, "group:Human Scans & Robo Scans", None, "bobtok").await,
-        bare(FOLDED, "GROUP", "human scans & robo scans", json!(0))
+        bare(FOLDED, "GROUP", "human scans & robo scans")
     );
     assert_eq!(stored_scores(&st, FOLDED).await, 4);
     assert_eq!(
         rate(&s, GONE, None, "r1tok").await,
-        bare(GONE, "GROUP", "nobody", json!(0))
+        bare(GONE, "GROUP", "nobody")
     );
     assert_eq!(stored_scores(&st, GONE).await, 4);
     // A removal with nothing stored is the same answer.
     assert_eq!(
         rate(&s, "site:999", None, "bobtok").await,
-        bare("site:999", "SITE", "999", json!(null))
+        bare("site:999", "SITE", "999")
     );
     // A listed scanlator still answers with its full row.
     let row = rate(&s, ROBO, None, "bobtok").await;
     assert_eq!(
-        (&row["name"], &row["ratingCount"], &row["chapterCount"]),
-        (&json!("Robo Scans"), &json!(4), &json!(2))
+        (&row["name"], &row["ratingCount"]),
+        (&json!("Robo Scans"), &json!(4))
     );
 
     // An id of the wrong form is refused, and removal stays signed-in only.
@@ -763,8 +760,7 @@ async fn a_group_with_only_adult_chapters_is_hidden_without_the_opt_in() {
         format!(r#"{{ comments(targetType: "scanlator", targetId: "{target}") {{ total }} }}"#)
     };
 
-    // Signed out, and signed in without the opt-in: the adult-only group is no row, and
-    // the other group is counted by what this viewer can open.
+    // Signed out, and signed in without the opt-in: the adult-only group is no row.
     for token in [None, Some("bobtok")] {
         let page = list(&s, "(sort: NAME)", token).await;
         assert_eq!(
@@ -776,13 +772,6 @@ async fn a_group_with_only_adult_chapters_is_hidden_without_the_opt_in() {
                 "group:robo scans & strawberry",
             ],
             "{token:?}"
-        );
-        assert_eq!(
-            (
-                &page["items"][2]["chapterCount"],
-                &page["items"][2]["seriesCount"]
-            ),
-            (&json!(2), &json!(2))
         );
         assert_eq!(one(&s, LEWD, token).await, json!(null));
         assert_eq!(ids(&list(&s, r#"(search: "lewd")"#, token).await).len(), 0);
@@ -800,7 +789,7 @@ async fn a_group_with_only_adult_chapters_is_hidden_without_the_opt_in() {
     }
     assert_eq!(stored_scores(&st, LEWD).await, 0);
 
-    // With the opt-in: it is a scanlator like any other, and every chapter counts.
+    // With the opt-in: it is a scanlator like any other.
     let page = list(&s, "(sort: NAME)", Some("r1tok")).await;
     assert_eq!(
         ids(&page),
@@ -813,21 +802,7 @@ async fn a_group_with_only_adult_chapters_is_hidden_without_the_opt_in() {
             "group:robo scans & strawberry",
         ]
     );
-    assert_eq!(
-        (
-            &page["items"][3]["name"],
-            &page["items"][3]["chapterCount"],
-            &page["items"][3]["seriesCount"]
-        ),
-        (&json!("Lewd Scans"), &json!(1), &json!(1))
-    );
-    assert_eq!(
-        (
-            &page["items"][4]["chapterCount"],
-            &page["items"][4]["seriesCount"]
-        ),
-        (&json!(3), &json!(3))
-    );
+    assert_eq!(page["items"][3]["name"], "Lewd Scans");
     assert_eq!(rate(&s, LEWD, Some(8), "r1tok").await["myScore"], 8);
     assert_eq!(
         ok(run(&s, &post_q(LEWD), Some("r1tok")).await)["postComment"]["targetId"],
@@ -849,7 +824,7 @@ async fn a_group_with_only_adult_chapters_is_hidden_without_the_opt_in() {
         0
     );
 
-    // The admin list does not follow a viewer: every credit as written, every chapter.
+    // The admin list does not follow a viewer: every credit as written.
     let admin = ok(run(
         &s,
         r#"{ scanlators(search: "scans") { total } }"#,
@@ -893,11 +868,11 @@ async fn the_schema_exposes_the_scanlator_rating_contract() {
     let sdl = s.sdl();
     for part in [
         "enum ScanlatorKind {\n\tSITE\n\tGROUP\n}",
-        "enum ScanlatorSort {\n\tTOP\n\tVOTES\n\tCHAPTERS\n\tNAME\n}",
+        "enum ScanlatorSort {\n\tTOP\n\tVOTES\n\tCHAPTERS @deprecated(reason: \"Orders by name, like NAME. Chapters are no longer counted.\")\n\tNAME\n}",
         "scanlatorRatings(search: String, kind: ScanlatorKind, mine: Boolean, sort: ScanlatorSort, page: Int = 1): RatedScanlatorPage!",
         "ratedScanlator(id: ID!): RatedScanlator",
         "rateScanlator(id: ID!, score: Int): RatedScanlator!",
-        "\tid: ID!\n\tkind: ScanlatorKind!\n\tname: String!\n\tlang: String\n\tlogoUrl: String\n\tseriesCount: Int!\n\tchapterCount: Int\n\tai: ScanlatorAi\n\trating: Float\n\tratingCount: Int!\n\trank: Int\n\tdistribution: [Int!]!\n\tmyScore: Int\n\tcommentCount: Int!\n",
+        "\tid: ID!\n\tkind: ScanlatorKind!\n\tname: String!\n\tlang: String\n\tlogoUrl: String\n\tseriesCount: Int! @deprecated(reason: \"Always 0. The scanlator list no longer counts series.\")\n\tchapterCount: Int @deprecated(reason: \"Always null. The scanlator list no longer counts chapters.\")\n\tai: ScanlatorAi\n\trating: Float\n\tratingCount: Int!\n\trank: Int\n\tdistribution: [Int!]!\n\tmyScore: Int\n\tcommentCount: Int!\n",
         "\titems: [RatedScanlator!]!\n\tpage: Int!\n\thasNextPage: Boolean!\n\ttotal: Int!\n",
     ] {
         assert!(strip_descriptions(&sdl).contains(part), "missing from the schema: {part}");

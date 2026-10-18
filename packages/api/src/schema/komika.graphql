@@ -84,9 +84,9 @@ type Query {
 	engineGenerationState: [EngineGeneration!]! # [komika] admin — every source-engine generation, oldest first; at most one active or quarantined (requires isAdmin)
 	mangadexSetting: MangadexSetting! # [komika] admin — the MangaDex usage switch and whether the server environment pins it (requires isAdmin)
 	sourceRateLimits: [SourceRateLimit!]! # [komika] admin — every per-source scan rate limit in force: the server's SCAN_SOURCE_RATE_LIMITS defaults (fromEnv) and the ones an admin set, which win (requires isAdmin)
-	scanlators(search: String, ai: ScanlatorAiFilter, source: String, page: Int = 1): ScanlatorPage! # [komika] admin scanlator list — every credit chapters carry, most chapters first, 50 per page, with its AI tag. `search` matches part of the name; `ai` filters by the tag that APPLIES; `source` (a BrowseSource.id) keeps credits with chapters on that source and counts that source only. Counts come from a scan the server reuses for ten minutes; tags are always current (requires isAdmin)
+	scanlators(search: String, ai: ScanlatorAiFilter, source: String, page: Int = 1): ScanlatorPage! # [komika] admin scanlator list — every credit chapters carry, most series first, 50 per page, with its AI tag. `search` matches part of the name; `ai` filters by the tag that APPLIES; `source` (a BrowseSource.id) keeps credits with series on that source and counts that source only. Read from the scanlator index a chapter write keeps current (requires isAdmin)
 	scanlatorSites: [ScanlatorSite!]! # [komika] admin site list — every source with a series in the catalogue (never "mangadex": MangaDex credits groups), biggest first, with its AI tag; a tagged source with no series left is still listed so the tag can be removed (requires isAdmin)
-	scanlatorRatings(search: String, kind: ScanlatorKind, mine: Boolean, sort: ScanlatorSort, page: Int = 1): RatedScanlatorPage! # [komika] the readers' scanlator list — every site and every group with the rating this server's readers gave it, 30 per page, public. `search` matches part of the name; `mine` keeps what the viewer rated (empty when signed out); default sort TOP. A joint credit ("A & B") whose members all exist on their own is not listed: its counts go to each member
+	scanlatorRatings(search: String, kind: ScanlatorKind, mine: Boolean, sort: ScanlatorSort, page: Int = 1): RatedScanlatorPage! # [komika] the readers' scanlator list — every site and every group with the rating this server's readers gave it, 30 per page, public. `search` matches part of the name; `mine` keeps what the viewer rated (empty when signed out); default sort TOP. A joint credit ("A & B") whose members all exist on their own is not listed. Nothing is counted: one indexed query filters, orders and pages
 	ratedScanlator(id: ID!): RatedScanlator # [komika] one scanlator by id, null when there is none — public
 	siteBlockRules: [BlockRule!]! # [komika] admin — the site-wide content block rules, in saved order (requires isAdmin)
 	myBlockRules: [BlockRule!]! # [komika] the viewer's own content block rules, in saved order (requires auth)
@@ -330,8 +330,8 @@ type ScanlatorTag {
 # [komika] One row of the admin scanlator list.
 type Scanlator {
 	name: String! # the credit as chapters carry it
-	chapterCount: Int! # chapter copies credited to the name (on the filtered source, when one is given)
-	seriesCount: Int!
+	chapterCount: Int! @deprecated(reason: "Always 0. The scanlator list no longer counts chapters.")
+	seriesCount: Int! # series credited to the name, joint releases included (on the filtered source, when one is given)
 	ai: ScanlatorAi # the tag stored for exactly this name
 	effectiveAi: ScanlatorAi # the tag that applies: `ai`, else one a joint credit takes from a member
 }
@@ -432,7 +432,7 @@ enum ScanlatorKind {
 enum ScanlatorSort {
 	TOP # ranked scanlators by rank, then the rest by number of ratings
 	VOTES
-	CHAPTERS
+	CHAPTERS @deprecated(reason: "Orders by name, like NAME. Chapters are no longer counted.")
 	NAME
 }
 # [komika] One row of the readers' scanlator list.
@@ -442,8 +442,8 @@ type RatedScanlator {
 	name: String!
 	lang: String # sites only
 	logoUrl: String # sites only: the extension's icon, served from this server's origin; null when it has none
-	seriesCount: Int!
-	chapterCount: Int # null for a site: the server has no cheap count
+	seriesCount: Int! @deprecated(reason: "Always 0. The scanlator list no longer counts series.")
+	chapterCount: Int @deprecated(reason: "Always null. The scanlator list no longer counts chapters.")
 	ai: ScanlatorAi # the tag that applies
 	rating: Float # plain average of the scores, null when nobody rated it
 	ratingCount: Int!

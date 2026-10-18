@@ -1711,7 +1711,6 @@ export const SCANLATORS = /* GraphQL */ `
 		scanlators(search: $search, ai: $ai, source: $source, page: $page) {
 			items {
 				name
-				chapterCount
 				seriesCount
 				ai
 				effectiveAi
@@ -1731,8 +1730,6 @@ const RATED_SCANLATOR_FIELDS = /* GraphQL */ `
 	name
 	lang
 	logoUrl
-	seriesCount
-	chapterCount
 	ai
 	rating
 	ratingCount

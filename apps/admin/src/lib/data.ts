@@ -782,9 +782,8 @@ export const STATUS_OPTIONS: SeriesStatus[] = [
 // ---- scanlators ---------------------------------------------------------------
 
 /**
- * One page of the scanlator list (50 rows, most chapters first), each with its AI tag.
- * The server counts the list with one slow scan and reuses it for ten minutes, so the
- * first call can take a few seconds.
+ * One page of the scanlator list (50 rows, most series first), each with its AI tag.
+ * The server reads it from its scanlator index, which chapter writes keep current.
  */
 export async function loadScanlators(query: ScanlatorQuery = {}): Promise<ScanlatorPage> {
 	if (!backend.scanlators) throw new Error('Scanlator tags are unavailable on this backend.');

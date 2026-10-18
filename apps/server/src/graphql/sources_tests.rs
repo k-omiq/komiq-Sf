@@ -559,7 +559,7 @@ async fn scanlator_tags_are_admin_written_public_to_read_and_sources_are_listed(
     .unwrap();
 
     const LIST_Q: &str =
-        "{ scanlators { total hasNextPage items { name chapterCount seriesCount ai effectiveAi } } }";
+        "{ scanlators { total hasNextPage items { name seriesCount ai effectiveAi } } }";
     const TAG_Q: &str = "mutation { setScanlatorAi(name: \"robo scans\", ai: AI) }";
     const TAGS_Q: &str = "{ scanlatorTags { name ai } }";
 
@@ -616,7 +616,7 @@ async fn scanlator_tags_are_admin_written_public_to_read_and_sources_are_listed(
     };
     assert_eq!(
         row("Robo Scans"),
-        serde_json::json!({ "name": "Robo Scans", "chapterCount": 1, "seriesCount": 1,
+        serde_json::json!({ "name": "Robo Scans", "seriesCount": 1,
                             "ai": "AI", "effectiveAi": "AI" })
     );
     assert_eq!(
@@ -649,7 +649,8 @@ async fn scanlator_tags_are_admin_written_public_to_read_and_sources_are_listed(
     );
     assert_eq!(
         names("{ scanlators(source: \"MangaDex\", search: \"human\") { items { name } } }").await,
-        ["Human Scans & Robo Scans"]
+        // A member of a joint credit is on the joint release's series too.
+        ["Human Scans", "Human Scans & Robo Scans"]
     );
 
     // Browse's source list: the mirror, and the source under its package's last part

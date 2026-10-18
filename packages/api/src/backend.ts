@@ -1067,7 +1067,7 @@ export interface ScanlatorQuery {
 	/** Part of the name, any case. */
 	search?: string;
 	ai?: ScanlatorAiFilter;
-	/** A {@link BrowseSource.id}: only credits with chapters on that source, counted
+	/** A {@link BrowseSource.id}: only credits with series on that source, counted
 	 *  on that source. */
 	source?: string;
 	page?: number;
@@ -1076,7 +1076,7 @@ export interface ScanlatorQuery {
 /** One row of the admin scanlator list. */
 export interface Scanlator {
 	name: string;
-	chapterCount: number;
+	/** Series credited to the name, joint releases included. */
 	seriesCount: number;
 	/** The tag stored for exactly this name. */
 	ai: ScanlatorAi | null;
@@ -1095,9 +1095,9 @@ export interface ScanlatorPage {
  *  credit. MangaDex is not a site: its groups are the scanlators. */
 export type ScanlatorKind = 'SITE' | 'GROUP';
 
-/** `TOP`: ranked scanlators first, by rank. `VOTES`: most ratings first. `CHAPTERS`:
- *  most chapters first. `NAME`: A to Z. */
-export type ScanlatorSort = 'TOP' | 'VOTES' | 'CHAPTERS' | 'NAME';
+/** `TOP`: ranked scanlators first, by rank. `VOTES`: most ratings first. `NAME`: A to
+ *  Z. The server still accepts a deprecated `CHAPTERS`, as `NAME`. */
+export type ScanlatorSort = 'TOP' | 'VOTES' | 'NAME';
 
 export interface ScanlatorRatingQuery {
 	/** Part of the name, any case. */
@@ -1120,9 +1120,6 @@ export interface RatedScanlator {
 	lang: string | null;
 	/** Sites only: the site's own logo. Absent from a server that predates it. */
 	logoUrl?: string | null;
-	seriesCount: number;
-	/** Null when the server has no count for it. */
-	chapterCount: number | null;
 	/** The AI tag that applies; null when it has none. */
 	ai: ScanlatorAi | null;
 	/** The plain average of the scores, 1 to 10; null when nobody rated it. */

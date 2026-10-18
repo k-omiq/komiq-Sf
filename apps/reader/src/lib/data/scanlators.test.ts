@@ -24,8 +24,6 @@ function scanlator(over: Partial<RatedScanlator> = {}): RatedScanlator {
 		kind: 'GROUP',
 		name: 'Quiet Harbor',
 		lang: null,
-		seriesCount: 3,
-		chapterCount: 40,
 		ai: null,
 		rating: 8,
 		ratingCount: 2,

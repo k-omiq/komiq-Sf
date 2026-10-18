@@ -135,7 +135,7 @@ Troubled sources show diagnostic details below their rows:
 
 The Scanlators page lists who translates the chapters on your server. Use it to tell readers which scanlators translate with AI. The `List` control at the top switches between two lists:
 
-- `Groups`: The scanlation groups that chapters credit, with the most chapters first. MangaDex chapters name their group.
+- `Groups`: The scanlation groups that chapters credit, with the most series first. MangaDex chapters name their group.
 - `Sites`: The sources that translate their own series. Their chapters credit no group, so you tag the whole source.
 
 Both lists share these controls:
@@ -146,11 +146,11 @@ Both lists share these controls:
 
 ### Groups
 
-The `Source` dropdown menu shows only groups with chapters on one source. The chapter and series counts then cover that source only.
+The `Source` dropdown menu shows only groups with series on one source. The series count then covers that source only. A group's count includes the series of its joint releases.
 
 A tag is kept by group name. It applies to every chapter credited to that group, on every source, including chapters added later. A joint credit such as "A & B" takes the strongest tag of its members unless you give it its own tag. The row then shows where its tag comes from.
 
-Your server counts the group list at most once every ten minutes. The first load can take a few seconds, and a new group can take ten minutes to appear.
+Your server keeps the group list up to date as chapters arrive, so a new group appears at once.
 
 ### Sites
 

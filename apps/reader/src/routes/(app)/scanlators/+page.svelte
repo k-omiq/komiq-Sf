@@ -195,9 +195,9 @@
 	}
 
 	const SHOWS: ScanlatorShow[] = ['all', 'site', 'group', 'mine'];
-	const SORTS: DropdownOption<ScanlatorSort>[] = (
-		['TOP', 'VOTES', 'CHAPTERS', 'NAME'] as const
-	).map((value) => ({ value, label: SORT_LABEL[value] }));
+	const SORTS: DropdownOption<ScanlatorSort>[] = (['TOP', 'VOTES', 'NAME'] as const).map(
+		(value) => ({ value, label: SORT_LABEL[value] }),
+	);
 	function sortBy(sort: ScanlatorSort): void {
 		void goto(scanlatorsHref({ ...applied, sort, page: 1 }), options);
 	}
@@ -248,15 +248,7 @@
 						<span class="name-t">{s.name}</span>
 						<AiBadge group={s.kind === 'GROUP' ? s.name : null} sourceId={siteSourceId(s)} />
 					</span>
-					<span class="meta">
-						{kindLabel(s)} · {countLabel(
-							s.seriesCount,
-							'series',
-							'series',
-						)}{#if s.chapterCount != null}<span class="wide"
-								>{` · ${countLabel(s.chapterCount, 'chapter', 'chapters')}`}</span
-							>{/if}
-					</span>
+					<span class="meta">{kindLabel(s)}</span>
 				</span>
 				<span class="score">
 					{#if s.rank != null}
