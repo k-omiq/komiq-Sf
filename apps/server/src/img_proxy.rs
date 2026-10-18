@@ -303,6 +303,7 @@ pub fn is_image_content_type(content_type: &str) -> bool {
     matches!(
         t.as_str(),
         "image/jpeg"
+            | "image/jpg"
             | "image/png"
             | "image/webp"
             | "image/gif"
@@ -465,6 +466,8 @@ mod tests {
     fn content_type_and_host_rules_match_the_worker() {
         assert!(is_image_content_type("image/jpeg"));
         assert!(is_image_content_type("Image/PNG; charset=binary"));
+        // `image/jpg` passes here; `validate` then serves the body as `image/jpeg`.
+        assert!(is_image_content_type("image/jpg"));
         assert!(!is_image_content_type("image/svg+xml"));
         assert!(!is_image_content_type("text/html"));
         assert!(!is_image_content_type(""));

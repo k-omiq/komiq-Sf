@@ -314,6 +314,9 @@ fn declared_matches(content_type: &str, mime: &str) -> bool {
         || declared == "application/octet-stream"
         || declared == mime
         || (mime == "image/x-icon" && declared == "image/vnd.microsoft.icon")
+        // Suwayomi labels a JPEG page `image/jpg` when it serves it from its own page
+        // cache (and some source CDNs send it too).
+        || (mime == "image/jpeg" && declared == "image/jpg")
 }
 
 fn le_u32(bytes: &[u8], offset: usize) -> Result<usize> {
@@ -470,6 +473,19 @@ mod tests {
             validate(&jpeg, "IMAGE/JPEG; charset=binary").unwrap(),
             "image/jpeg"
         );
+    }
+
+    #[test]
+    fn image_jpg_label_is_accepted_for_jpeg_bodies_only() {
+        let jpeg = crate::suwayomi::testsrv::jpeg(10, 12);
+        assert_eq!(validate(&jpeg, "image/jpg").unwrap(), "image/jpeg");
+        assert_eq!(validate(&jpeg, "Image/JPG").unwrap(), "image/jpeg");
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2, 3)
+            .write_to(&mut png, ImageFormat::Png)
+            .unwrap();
+        assert!(validate(png.get_ref(), "image/jpg").is_err());
+        assert!(validate(b"<html>challenge</html>", "image/jpg").is_err());
     }
 
     #[test]

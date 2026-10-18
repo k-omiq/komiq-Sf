@@ -233,6 +233,23 @@ test('proxy rejects active and unknown image media types', () => {
 	}
 });
 
+test('image/jpg is read as image/jpeg for JPEG bodies only', async () => {
+	const jpeg = rasterFixtures.find(([type]) => type === 'image/jpeg')[1];
+	const png = rasterFixtures.find(([type]) => type === 'image/png')[1];
+	assert.equal(worker.isImageContentType('image/jpg'), true);
+	assert.equal(worker.imageMediaType('Image/JPG; charset=binary'), 'image/jpeg');
+	assert.equal(worker.validateImageBody(jpeg, 'image/jpg'), true);
+	assert.equal(worker.validateImageBody(png, 'image/jpg'), false);
+
+	const result = await sourceResponse(
+		new Response(jpeg, { headers: { 'Content-Type': 'image/jpg' } }),
+	);
+	assert.equal(result.response.status, 200);
+	assert.equal(result.response.headers.get('Content-Type'), 'image/jpeg');
+	assert.deepEqual(result.body, jpeg);
+	assert.equal(result.writes.length, 1);
+});
+
 test('upstream URL guard rejects credentials and service ports on every hop', () => {
 	for (const url of [
 		'https://alice:secret@cdn.example/a.jpg',

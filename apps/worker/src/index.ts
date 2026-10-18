@@ -185,7 +185,8 @@ export default {
 		// permissive CORS + a shared cache (content laundering / cache
 		// poisoning) — see I3. Accept only recognized raster media types.
 		const contentType = originResp.headers.get('Content-Type') ?? '';
-		if (!isImageContentType(contentType)) {
+		const type = imageMediaType(contentType);
+		if (!type) {
 			console.error(`img proxy: non-image Content-Type "${contentType}" for ${upstream.origin}`);
 			return errorResponse(502, 'Upstream is not an image');
 		}
@@ -208,7 +209,7 @@ export default {
 			if (isTimeout(err)) return errorResponse(504, 'Upstream timed out');
 			return errorResponse(502, 'Upstream image is incomplete or too large');
 		}
-		if (!validateImageBody(bytes, contentType)) {
+		if (!validateImageBody(bytes, type)) {
 			return errorResponse(502, 'Upstream image is invalid or incomplete');
 		}
 		// The content key is shared by every MangaDex@Home node, so one bad node
@@ -217,7 +218,7 @@ export default {
 			console.error(`img proxy: content hash mismatch for ${upstream.origin}`);
 			return errorResponse(502, 'Upstream image does not match its content hash');
 		}
-		const res = finalizeImage(bytes, contentType, page ? PAGE_EDGE_CACHE : MUTABLE_IMAGE_CACHE);
+		const res = finalizeImage(bytes, type, page ? PAGE_EDGE_CACHE : MUTABLE_IMAGE_CACHE);
 		// A HEAD miss answers with headers only and stores nothing.
 		if (request.method !== 'HEAD') ctx.waitUntil(edge.put(cacheKey, res.clone()));
 		return served(res, browserCache, request.method);
@@ -373,7 +374,7 @@ async function readBoundedImage(source: Response): Promise<Uint8Array> {
 
 /** Raster container validation, without image decoding or transformations. */
 export function validateImageBody(bytes: Uint8Array, contentType: string): boolean {
-	const type = contentType.split(';', 1)[0].trim().toLowerCase();
+	const type = imageMediaType(contentType);
 	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 	const tag = (at: number, text: string) =>
 		at + text.length <= bytes.length &&
@@ -560,13 +561,15 @@ function errorResponse(
 }
 
 /**
- * True when the (possibly parameterized) Content-Type is a raster `image/*`
- * type. SVG is rejected: it is an active document (can carry `<script>` /
- * event handlers) and re-serving it under our permissive-CORS origin is a stored
- * XSS vector, so it must never be laundered through the proxy.
+ * The raster `image/*` type a (possibly parameterized) Content-Type names, in its
+ * canonical spelling, or null. `image/jpg` is read as `image/jpeg`: some source CDNs
+ * send it. SVG is rejected: it is an active document (can carry `<script>` / event
+ * handlers) and re-serving it under our permissive-CORS origin is a stored XSS
+ * vector, so it must never be laundered through the proxy.
  */
-export function isImageContentType(contentType: string): boolean {
+export function imageMediaType(contentType: string): string | null {
 	const type = contentType.split(';', 1)[0].trim().toLowerCase();
+	if (type === 'image/jpg') return 'image/jpeg';
 	return [
 		'image/jpeg',
 		'image/png',
@@ -576,7 +579,14 @@ export function isImageContentType(contentType: string): boolean {
 		'image/bmp',
 		'image/x-icon',
 		'image/vnd.microsoft.icon',
-	].includes(type);
+	].includes(type)
+		? type
+		: null;
+}
+
+/** True when the Content-Type is a raster image type the proxy re-serves. */
+export function isImageContentType(contentType: string): boolean {
+	return imageMediaType(contentType) !== null;
 }
 
 /** Restrict source URLs to the public web service of an allowed host. */
