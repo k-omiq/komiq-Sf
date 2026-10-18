@@ -1135,36 +1135,6 @@ export function sourceLabels(sources: readonly BrowseSource[]): Map<string, stri
 	return new Map(sourceOptions(sources).map((o) => [o.value, o.label]));
 }
 
-// ---- federated rows --------------------------------------------------------------
-
-/**
- * Client-side filtering for the FEDERATED (external sources) rows, which come from live
- * extension searches that take no filter arguments. Only the facets those rows actually
- * carry can be honoured — tags by name, format, status; everything else (the catalogue
- * `source` included: these rows are not catalogue rows) is reported by the page as not
- * applying rather than pretended.
- */
-export function matchesFederated(
-	row: { genres: readonly string[]; type: string; status: string },
-	state: BrowseState,
-	names: (id: string) => string | undefined,
-): boolean {
-	const s = normalize(state);
-	const have = new Set(row.genres.map((g) => tagSlug(g)));
-	const want = (id: string) => have.has(id) || have.has(tagSlug(tagLabel(id, names)));
-	if (s.includedTags.length) {
-		const ok = s.inclMode === 'AND' ? s.includedTags.every(want) : s.includedTags.some(want);
-		if (!ok) return false;
-	}
-	if (s.excludedTags.length) {
-		const hit = s.exclMode === 'OR' ? s.excludedTags.some(want) : s.excludedTags.every(want);
-		if (hit) return false;
-	}
-	if (s.types.length && !s.types.some((t) => TYPE_LABEL[t] === row.type)) return false;
-	if (s.status.length && !s.status.some((v) => v.toLowerCase() === row.status)) return false;
-	return true;
-}
-
 // ---- debounce ----------------------------------------------------------------------
 
 export interface Debounced<A extends unknown[]> {

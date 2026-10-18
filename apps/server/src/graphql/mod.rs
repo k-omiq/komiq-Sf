@@ -47,6 +47,11 @@ use crate::suwayomi::{FetchType, SuwayomiChapter, SuwayomiClient, SuwayomiManga}
 use types::*;
 
 const PAGE_SIZE: i64 = 20;
+/// Rows per page of the reader's merged Updates feed (`updatesFeed`) only. Separate from
+/// [`PAGE_SIZE`], which ~24 unrelated sites share; mirrored by the reader's
+/// `UPDATES_PAGE_SIZE` (`apps/reader/src/lib/data/paging.ts`), which must move with it.
+/// 42 fills whole rows of the card grid at 2, 3, 6 and 7 columns.
+const UPDATES_FEED_PAGE_SIZE: i64 = 42;
 
 /// The `postComment` limiter: 20 comments a minute per account. A person in a lively
 /// thread stays far below it; a script that fills threads does not.
@@ -4197,8 +4202,8 @@ struct BrowseWorkExtras {
 ///
 /// WHY NOT `map_canonical_series`. That function costs 7-10 STRICTLY SERIAL queries per
 /// work (`load_canonical_work` alone is 3, plus chapters, plus
-/// `latest_english_chapter_at`, plus genres, plus the rating). At `BROWSE_PAGE_SIZE` = 30
-/// that is 210-300 serial round trips for one page; the FTS path, which does exactly that,
+/// `latest_english_chapter_at`, plus genres, plus the rating). At `BROWSE_PAGE_SIZE` = 40
+/// that is 280-400 serial round trips for one page; the FTS path, which does exactly that,
 /// measured 0.83-8.5 s cold. Migration 0064 exists precisely so a feed page does not have to
 /// re-derive per row, 0068 finished the job for the two columns Browse sorts and filters on,
 /// and 0069 extended the same row shape to the whole catalogue. So: 1 page scan + 1 memoized
@@ -6100,7 +6105,7 @@ impl QueryRoot {
         let st = state(ctx);
         let show_nsfw = viewer_show_nsfw(ctx).await?;
         let page = page.max(1);
-        let offset = (page as i64 - 1) * PAGE_SIZE;
+        let offset = (page as i64 - 1) * UPDATES_FEED_PAGE_SIZE;
         // Collapse to the three stored words. Asking for WEBTOON returns the manhwa set
         // rather than nothing, which is the useful reading of the request — the refresh
         // stores the collapsed word precisely so the filter is one indexed equality.
@@ -6176,7 +6181,7 @@ impl QueryRoot {
             q = q.bind(w);
         }
         let rows = q
-            .bind(PAGE_SIZE)
+            .bind(UPDATES_FEED_PAGE_SIZE)
             .bind(offset)
             .fetch_all(&st.pool)
             .await
@@ -6282,9 +6287,9 @@ impl QueryRoot {
         Ok(UpdateFeedPage {
             items,
             page,
-            // From `total`, not from a short page: the LIMIT is exactly PAGE_SIZE here
+            // From `total`, not from a short page: the LIMIT is exactly UPDATES_FEED_PAGE_SIZE here
             // (no +1 probe row), and the count shares the page query's WHERE.
-            has_next_page: (page as i64) * PAGE_SIZE < total,
+            has_next_page: (page as i64) * UPDATES_FEED_PAGE_SIZE < total,
             total: Some(total as i32),
         })
     }
@@ -7846,10 +7851,10 @@ impl QueryRoot {
         query: String,
         #[graphql(default = 1)] page: i32,
     ) -> Result<FederatedSearchPage> {
-        // C1: authenticated only — this endpoint fans out to many sources AND
-        // persists (library enrollment + dedup writes), so anonymous callers are
-        // rejected outright (no anonymous writes).
-        let user = require_user(ctx).await?;
+        // Admin only — this endpoint fans out to every installed source AND persists
+        // (library enrollment + dedup writes). It is an admin-console tool; the reader
+        // searches the catalogue only.
+        let user = require_admin(ctx).await?;
         let trimmed = query.trim().to_string();
         if trimmed.is_empty() {
             return Err(Error::new("query must not be empty"));
@@ -25075,11 +25080,13 @@ mod tests {
     #[tokio::test]
     async fn updates_feed_pages_are_disjoint_and_total_matches_a_full_walk() {
         let (s, pool) = setup_full(100).await;
-        // 25 works split across the two halves, every one with a DISTINCT release time.
-        // The mirror rows land on 2026-07-01..13 and the scanner rows on 2026-07-04..15, so
+        // One full page plus 5 works, split across the two halves. The mirror rows land on
+        // 2026-07-01..24 and the scanner rows on 2026-07-04..26, so
         // the two halves genuinely INTERLEAVE — the merged order is not "all of one half
         // then all of the other", which is what makes the disjointness assertion meaningful.
-        for i in 1..=13 {
+        let total = UPDATES_FEED_PAGE_SIZE + 5;
+        let (mirror_n, scanner_n) = ((total + 1) / 2, total / 2);
+        for i in 1..=mirror_n {
             seed_canonical(
                 &pool,
                 &format!("md-{i}"),
@@ -25096,7 +25103,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        for i in 1..=12 {
+        for i in 1..=scanner_n {
             let w = crate::catalog::create_work(
                 &pool,
                 &crate::catalog::WorkInput {
@@ -25106,12 +25113,12 @@ mod tests {
             )
             .await
             .unwrap();
-            // 2026-07-04 .. 2026-07-15, interleaved with the mirror rows above.
-            let ms = 1_783_036_800_000_i64 + (i as i64) * 86_400_000;
+            // 2026-07-04 .. 2026-07-26, interleaved with the mirror rows above.
+            let ms = 1_783_036_800_000_i64 + i * 86_400_000;
             seed_suwayomi_half(
                 &pool,
                 &w,
-                100 + i as i64,
+                100 + i,
                 &format!("Scanner {i}"),
                 Some(&ms.to_string()),
                 Some("2026-07-26T00:00:00.000000+00:00"),
@@ -25134,14 +25141,18 @@ mod tests {
         };
         let p1 = fetch(1).await;
         let p2 = fetch(2).await;
-        assert_eq!(p1["total"], serde_json::json!(25));
-        assert_eq!(p2["total"], serde_json::json!(25), "total must be stable");
+        assert_eq!(p1["total"], serde_json::json!(total));
+        assert_eq!(
+            p2["total"],
+            serde_json::json!(total),
+            "total must be stable"
+        );
         assert_eq!(p1["page"], serde_json::json!(1), "the page is echoed back");
         assert_eq!(p1["hasNextPage"], serde_json::json!(true));
         assert_eq!(
             p2["hasNextPage"],
             serde_json::json!(false),
-            "25 rows at 20/page is exactly two pages"
+            "one page plus 5 rows is exactly two pages"
         );
 
         let ids = |v: &serde_json::Value| -> Vec<String> {
@@ -25161,12 +25172,16 @@ mod tests {
                 .collect()
         };
         let (i1, i2) = (ids(&p1), ids(&p2));
-        assert_eq!(i1.len(), 20, "a full page must be full");
+        assert_eq!(
+            i1.len() as i64,
+            UPDATES_FEED_PAGE_SIZE,
+            "a full page must be full"
+        );
         assert_eq!(i2.len(), 5);
         let walked: std::collections::HashSet<&String> = i1.iter().chain(i2.iter()).collect();
         assert_eq!(
-            walked.len(),
-            25,
+            walked.len() as i64,
+            total,
             "walking every page must yield exactly `total` DISTINCT rows — no row skipped, \
              none emitted twice"
         );
@@ -25187,8 +25202,10 @@ mod tests {
     #[tokio::test]
     async fn updates_feed_tiebreaks_on_work_id_across_a_page_boundary() {
         let (s, pool) = setup_full(100).await;
-        // 21 works, ALL released at the same instant → the only order is the tiebreaker.
-        for i in 1..=21 {
+        // One page plus one work, ALL released at the same instant → the only order is the
+        // tiebreaker.
+        let n = UPDATES_FEED_PAGE_SIZE + 1;
+        for i in 1..=n {
             let w = crate::catalog::create_work(
                 &pool,
                 &crate::catalog::WorkInput {
@@ -25201,7 +25218,7 @@ mod tests {
             seed_suwayomi_half(
                 &pool,
                 &w,
-                200 + i as i64,
+                200 + i,
                 &format!("Tied {i}"),
                 Some("1784937600000"),
                 Some("2026-07-26T00:00:00.000000+00:00"),
@@ -25222,11 +25239,15 @@ mod tests {
                 seen.push(it["workId"].as_str().unwrap().to_string());
             }
         }
-        assert_eq!(seen.len(), 21, "both pages together must return every row");
+        assert_eq!(
+            seen.len() as i64,
+            n,
+            "both pages together must return every row"
+        );
         let distinct: std::collections::HashSet<&String> = seen.iter().collect();
         assert_eq!(
-            distinct.len(),
-            21,
+            distinct.len() as i64,
+            n,
             "a tie without a tiebreaker repeats or drops rows across the boundary: {seen:?}"
         );
         // `work_id DESC`, matching canonical_updates, so the order is a refinement of it.
@@ -25794,8 +25815,8 @@ mod tests {
         work_id
     }
 
-    /// PAGE SIZE. Browse pages at 30 while the rest of the API stays at 20 — the two are
-    /// separate constants because `PAGE_SIZE` is shared by ~24 unrelated sites (and asserted
+    /// PAGE SIZE. Browse pages at 40 and `updatesFeed` at 42 while the rest of the API stays
+    /// at 20 — they are separate constants because `PAGE_SIZE` is shared by ~24 unrelated sites (and asserted
     /// as 20 by their own tests). The grid needs a page that fills a wide viewport; the
     /// admin lists and social feeds do not.
     ///
@@ -25804,11 +25825,13 @@ mod tests {
     /// number — if they diverged, page 2 of a text search would start 10 rows past where
     /// page 1 ended.
     #[tokio::test]
-    async fn browse_pages_at_thirty_while_the_rest_of_the_api_stays_at_twenty() {
-        assert_eq!(BROWSE_PAGE_SIZE, 30);
+    async fn browse_and_updates_feed_page_sizes_are_separate_from_the_shared_twenty() {
+        assert_eq!(BROWSE_PAGE_SIZE, 40);
+        assert_eq!(UPDATES_FEED_PAGE_SIZE, 42);
         assert_eq!(PAGE_SIZE, 20, "shared page size must not move");
         let (s, pool) = setup_full(100).await;
-        let n = BROWSE_PAGE_SIZE + 5;
+        // Enough rows to fill one page of EITHER feed, so both sizes are checked.
+        let n = BROWSE_PAGE_SIZE.max(UPDATES_FEED_PAGE_SIZE) + 5;
         for i in 0..n {
             seed_canonical(
                 &pool,
@@ -25869,7 +25892,7 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len() as i64, total, "a work appeared on both pages");
 
-        // The `updatesFeed` page size is untouched at PAGE_SIZE.
+        // The `updatesFeed` pages at its own size.
         let r = exec(
             &s,
             r#"{ updatesFeed { items { id } } }"#,
@@ -25882,7 +25905,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len() as i64,
-            PAGE_SIZE
+            UPDATES_FEED_PAGE_SIZE
         );
     }
 

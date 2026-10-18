@@ -6,7 +6,7 @@
 	import CardRowSkeleton from '$lib/components/CardRowSkeleton.svelte';
 	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
 	import Pager from '$lib/components/Pager.svelte';
-	import { FEED_PAGE_SIZE, lastPage, withPage } from '$lib/data/paging';
+	import { UPDATES_PAGE_SIZE, lastPage, withPage } from '$lib/data/paging';
 	// The card's visible label is the CHAPTER RELEASE time; our detection time (when
 	// the backend reports it) goes in the hover title — see cardTimeTooltip.
 	import {
@@ -81,7 +81,7 @@
 
 	const updates = $derived.by(() => {
 		// "New" arrives already filtered, deduped, ordered and PAGED by the server, so
-		// there is nothing left to do to it here — filtering a 20-row page client-side is
+		// there is nothing left to do to it here — filtering a 42-row page client-side is
 		// exactly the dishonesty the server `type` argument exists to avoid.
 		if (tab !== 'hot') return newUpdates;
 		// "Hot" is different on purpose: it is a curated top-N slice of the discovery
@@ -128,7 +128,7 @@
 	$effect(() => {
 		if (loading || pageNum === 1 || newUpdates.length > 0) return;
 		if (tab === 'hot' || total == null || total === 0) return;
-		const last = lastPage(total, FEED_PAGE_SIZE);
+		const last = lastPage(total, UPDATES_PAGE_SIZE);
 		if (pageNum > last) {
 			void goto(withPage(pageState.url, last), {
 				replaceState: true,
@@ -228,7 +228,7 @@
 		     STREAMS (see +page.ts), so SvelteKit restores the scroll position against
 		     whatever is on screen at that moment. A skeleton grid the same height as the
 		     real page keeps that restoration close instead of clamping it to a short page. -->
-		<CardGridSkeleton count={FEED_PAGE_SIZE} min={150} />
+		<CardGridSkeleton count={UPDATES_PAGE_SIZE} min={150} />
 	{:else if updates.length}
 		<div class="grid">
 			<!-- Key on the id, falling back to the title. The "New" list's ids are unique
@@ -286,7 +286,7 @@
 			page={pageNum}
 			{hasNext}
 			{total}
-			pageSize={FEED_PAGE_SIZE}
+			pageSize={UPDATES_PAGE_SIZE}
 			count={updates.length}
 			{loading}
 			href={(p) => withPage(pageState.url, p)}

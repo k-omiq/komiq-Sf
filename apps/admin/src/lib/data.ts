@@ -9,6 +9,7 @@ import type {
 	CanonicalUpdate,
 	Chapter,
 	ExtensionInfo,
+	FederatedSearchPage,
 	Id,
 	MatchResult,
 	MergeCandidate,
@@ -125,6 +126,16 @@ const ADMIN_INCLUDE_NSFW = true;
  */
 export async function loadCatalog(query: string, page = 1): Promise<Paginated<Series>> {
 	return backend.search(query.trim(), page, undefined, ADMIN_INCLUDE_NSFW);
+}
+
+/**
+ * Search every installed source at once (`searchAllSources`). Admin-only on the server,
+ * because each search writes source mappings into the catalogue. Uses the admin's own
+ * NSFW setting — the server takes no override here.
+ */
+export async function searchAllSources(query: string, page = 1): Promise<FederatedSearchPage> {
+	if (!backend.searchAllSources) throw new Error('This server cannot search all sources.');
+	return backend.searchAllSources(query.trim(), page);
 }
 
 /** Persist per-series overrides (whole-state) and return the recomputed series. */

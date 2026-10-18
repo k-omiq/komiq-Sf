@@ -9,7 +9,6 @@
 		// nothing — an entry only has to restore the rows and scroll FOR that page.
 		hasNext: boolean;
 		totalCount: number | null;
-		rowsAreFederated: boolean;
 		filterApplied: boolean;
 		scrollY: number;
 		resultsScrollTop: number;
@@ -19,7 +18,7 @@
 	// returning to Browse rehydrates instantly with scroll intact instead of
 	// re-running the whole search. Keyed by the canonical query string (filters, sort
 	// AND page) plus the viewer; small FIFO cap so it can't grow unbounded across a long
-	// session. 12 × ≤30 view objects is trivial memory.
+	// session. 12 × ≤40 view objects is trivial memory.
 	const browseCache = new Map<string, BrowseCacheEntry>();
 	const BROWSE_CACHE_MAX = 12;
 	function putBrowseCache(sig: string, entry: BrowseCacheEntry) {
@@ -44,7 +43,7 @@
 	import Pager from '$lib/components/Pager.svelte';
 	import { STATUS_META } from '$lib/data/types';
 	import { BROWSE_PAGE_SIZE, lastPage, withPage } from '$lib/data/paging';
-	import { getBrowseSearch, getFederatedSearch } from '$lib/data/source';
+	import { getBrowseSearch } from '$lib/data/source';
 	import {
 		activeChips,
 		applicableState,
@@ -57,7 +56,6 @@
 		effectiveSort,
 		filtersOnlySig,
 		legacyUnapplied,
-		matchesFederated,
 		parseBrowseUrl,
 		sortOptions,
 		sourceLabels,
@@ -241,30 +239,17 @@
 
 	// ---- rows -------------------------------------------------------------------------
 	// Text and filters go to the public v2 search for everyone (filters now apply WITH a
-	// query, so there is no longer a browse-only subset to disclose). Signed-in viewers can
-	// additionally opt into the FEDERATED fan-out across every installed extension for one
-	// query, to discover titles not yet in the catalogue; those rows are live extension
-	// results with no filter arguments, narrowed client-side (`matchesFederated`).
+	// query, so there is no longer a browse-only subset to disclose). Searching every
+	// installed source for titles not yet in the catalogue is an admin-app tool, not a
+	// reader one.
 	let rows = $state<FederatedResultView[]>([]);
 	let rowsLoading = $state(true);
 	let rowsError = $state(false);
-	let rowsAreFederated = $state(false);
 	/** False when the server predates `search(filter:)` — see `getBrowseSearch`. */
 	let filterApplied = $state(true);
-	let searchNotice = $state<string | null>(null);
 	let reloadKey = $state(0);
 	let hasNext = $state(false);
 	let totalCount = $state<number | null>(null);
-
-	// The federated opt-in is stored as THE QUERY IT WAS GRANTED FOR, not as a boolean, so
-	// a new search term automatically returns to the fast local path — as a boolean it
-	// once made every later keystroke-batch fan out to 24 sources and trip the rate limit.
-	let federatedFor = $state<string | null>(null);
-	const federatedRequested = $derived(federatedFor !== null && federatedFor === applied.q);
-	const federatedPending = $derived(!!applied.q && !!auth.user && federatedRequested);
-	const canSearchExternal = $derived(
-		!!applied.q && !!auth.user && !rowsAreFederated && !federatedRequested,
-	);
 
 	// Signature of the currently-displayed result set, for the back-nav cache.
 	let lastSig: string | null = null;
@@ -287,15 +272,13 @@
 		const s = applied;
 		const q = s.q;
 		const rk = reloadKey;
-		const isFederated = !!q && !!auth.user && federatedRequested;
 		// The key must capture EVERY input that changes the result set across a remount:
-		// federated results are per-user, native ones are NSFW-gated per viewer, and both
-		// survive login/logout in SPA memory. The native key is the canonical query string
-		// (every filter, the sort and the page); the federated one is the query only — its
-		// filters apply client-side and it has no pager. The viewer's block rules change the
-		// set too, and only their version says so (see $lib/block-rules.svelte).
+		// results are NSFW-gated per viewer and survive login/logout in SPA memory, so the
+		// key is the viewer plus the canonical query string (every filter, the sort and the
+		// page). The viewer's block rules change the set too, and only their version says so
+		// (see $lib/block-rules.svelte).
 		const idTag = `${auth.user?.id ?? 'anon'}:${auth.user?.showNsfw ? 1 : 0}:${blockRulesVersion.n}`;
-		const sig = isFederated ? `fed:${idTag}:${q}` : `nat:${idTag}:${toSearchParams(s)}`;
+		const sig = `${idTag}:${toSearchParams(s)}`;
 
 		const mayRestore = !didInitFromCache || restoreOnPop;
 		didInitFromCache = true;
@@ -306,10 +289,8 @@
 				rows = cached.rows;
 				hasNext = cached.hasNext;
 				totalCount = cached.totalCount;
-				rowsAreFederated = cached.rowsAreFederated;
 				filterApplied = cached.filterApplied;
 				rowsError = false;
-				searchNotice = null;
 				rowsLoading = false;
 				lastSig = sig;
 				lastReloadKey = rk;
@@ -325,7 +306,7 @@
 		}
 
 		// Nothing about the result set changed (auth resolving to the same identity, the
-		// tag vocabulary landing, the federated opt-in released after a rate limit) — keep
+		// tag vocabulary landing) — keep
 		// what is on screen rather than paying a round trip and a skeleton flash.
 		if (sig === lastSig && rk === lastReloadKey && !rowsError) {
 			rowsLoading = false;
@@ -336,9 +317,6 @@
 		// A new search/page starts at the top of the desktop results column. Its
 		// previous position was saved before navigation for a browser-Back restore.
 		untrack(() => resultsElement?.scrollTo(0, 0));
-		// The rate-limit branch KEEPS the previous rows on screen, so it must put the
-		// previous pager envelope back with them.
-		const prevPager = { hasNext, total: totalCount };
 		hasNext = false;
 		totalCount = null;
 		let cancelled = false;
@@ -346,61 +324,15 @@
 		const t = setTimeout(
 			async () => {
 				try {
-					if (isFederated) {
-						const outcome = await getFederatedSearch(q);
-						if (cancelled) return;
-						if (outcome.kind === 'ok') {
-							rows = outcome.rows;
-							rowsAreFederated = true;
-							rowsError = false;
-							filterApplied = true;
-							searchNotice = null;
-							hasNext = false; // one deduped page, no server pager
-							lastSig = sig;
-							lastReloadKey = rk;
-						} else if (outcome.kind === 'rateLimited') {
-							searchNotice =
-								outcome.retryAfter != null
-									? `Too many searches — try again in ${outcome.retryAfter}s.`
-									: 'Too many searches — try again in a moment.';
-							hasNext = prevPager.hasNext;
-							totalCount = prevPager.total;
-							// Release the opt-in so the "Search external sources" button comes back
-							// (it is the only way to retry). The re-run this triggers short-circuits on
-							// the unchanged signature, so the prior rows and this notice survive.
-							federatedFor = null;
-						} else {
-							// Not authenticated / error → the public search. Page 1 by construction:
-							// the federated key has no page, so fetching another page here would cache
-							// it under a page-free key.
-							const r = await getBrowseSearch(withPageNum(s, 1), nameOf);
-							if (cancelled) return;
-							rows = r.items;
-							rowsAreFederated = false;
-							rowsError = r.error;
-							filterApplied = r.filterApplied;
-							hasNext = r.hasNext;
-							totalCount = r.total;
-							searchNotice =
-								outcome.kind === 'error'
-									? 'Live search had a problem — showing catalogue results.'
-									: null;
-							lastSig = sig;
-							lastReloadKey = rk;
-						}
-					} else {
-						const r = await getBrowseSearch(s, nameOf);
-						if (cancelled) return;
-						rows = r.items;
-						rowsAreFederated = false;
-						rowsError = r.error;
-						filterApplied = r.filterApplied;
-						hasNext = r.hasNext;
-						totalCount = r.total;
-						searchNotice = null;
-						lastSig = sig;
-						lastReloadKey = rk;
-					}
+					const r = await getBrowseSearch(s, nameOf);
+					if (cancelled) return;
+					rows = r.items;
+					rowsError = r.error;
+					filterApplied = r.filterApplied;
+					hasNext = r.hasNext;
+					totalCount = r.total;
+					lastSig = sig;
+					lastReloadKey = rk;
 				} finally {
 					if (!cancelled) rowsLoading = false;
 				}
@@ -425,7 +357,6 @@
 				rows,
 				hasNext,
 				totalCount,
-				rowsAreFederated,
 				filterApplied,
 				scrollY: window.scrollY,
 				resultsScrollTop: resultsElement?.scrollTop ?? 0,
@@ -437,9 +368,9 @@
 	// A shared, edited or stale link can name a page past the end (the server ECHOES the
 	// requested page rather than clamping), which would render "No matches" over a
 	// catalogue of thousands. Land on the last real page instead, with replaceState so
-	// Back doesn't bounce onto the bad page again. BROWSE_PAGE_SIZE (30), not the feed's 20.
+	// Back doesn't bounce onto the bad page again. BROWSE_PAGE_SIZE (40), not the feed's 20.
 	$effect(() => {
-		if (rowsLoading || rowsError || rowsAreFederated) return;
+		if (rowsLoading || rowsError) return;
 		if (rows.length > 0 || applied.page === 1) return;
 		if (totalCount == null || totalCount === 0) return;
 		const last = lastPage(totalCount, BROWSE_PAGE_SIZE);
@@ -450,46 +381,21 @@
 		reloadKey++;
 	}
 
-	// Opt into the federated fan-out for the current query (signed-in only).
-	function requestFederated() {
-		if (!auth.user || federatedRequested) return;
-		federatedFor = applied.q;
-		// Federated results are one deduped page with no pager, so a lingering `?page=5`
-		// would describe a pager that isn't rendered.
-		if (applied.page !== 1) navigate(withPageNum(applied, 1), true);
-	}
-
-	// NATIVE rows are exactly what the server ordered and filtered. FEDERATED rows are
-	// narrowed here by the facets they carry (tags by name, format, status).
-	const results = $derived(
-		rowsAreFederated ? rows.filter((r) => matchesFederated(r, applied, tagName)) : rows,
-	);
-
 	// The CATALOGUE-WIDE count (the per-page range lives in the Pager). Falls back to the
-	// approximate "N+" form only when the total is genuinely unknown — a federated page,
-	// an adapter that reports none, or a failed request.
+	// approximate "N+" form only when the total is genuinely unknown — an adapter that reports none, or a failed request.
 	const countLabel = $derived.by(() => {
-		if (rowsLoading)
-			return applied.q ? (federatedPending ? 'Searching all sources…' : 'Searching…') : 'Loading…';
+		if (rowsLoading) return applied.q ? 'Searching…' : 'Loading…';
 		// A failed request has no count — "0 results" over an error state reads as an
 		// honest empty catalogue, which is exactly the confusion the error state prevents.
 		if (rowsError) return '';
 		if (totalCount != null)
 			return `${totalCount.toLocaleString()} ${totalCount === 1 ? 'result' : 'results'}`;
-		return `${results.length}${hasNext ? '+' : ''} ${results.length === 1 && !hasNext ? 'result' : 'results'}`;
+		return `${rows.length}${hasNext ? '+' : ''} ${rows.length === 1 && !hasNext ? 'result' : 'results'}`;
 	});
 
 	// Against a server that predates the v2 filter only the legacy subset applied; name
 	// the rest rather than present a wider result set under active chips.
-	const unapplied = $derived(
-		!rowsLoading && !rowsAreFederated && !filterApplied ? legacyUnapplied(applied) : [],
-	);
-	// External-source rows can only be narrowed by what they carry. Any other chip, a
-	// catalogue source included, shows the note that says so.
-	const federatedIgnores = $derived(
-		rowsAreFederated && chips.some((c) => !/^(tag[+-]|type|status):/.test(c.key)),
-	);
-
+	const unapplied = $derived(!rowsLoading && !filterApplied ? legacyUnapplied(applied) : []);
 	/**
 	 * The card's second line. `m.ch` (how many chapters we hold) and `m.latestCh` (what
 	 * the newest one is CALLED, pre-formatted, '' when unknown) are two different facts and
@@ -599,12 +505,6 @@
 
 			<ActiveFilters {chips} onapply={go} onclear={() => go(clearFilters(applied))} />
 
-			{#if searchNotice}
-				<div class="notice" role="status">
-					<Icon name="alert" size={16} />
-					<span>{searchNotice}</span>
-				</div>
-			{/if}
 			{#if unapplied.length}
 				<div class="notice" role="status">
 					<Icon name="alert" size={16} />
@@ -614,12 +514,6 @@
 						)}.</span
 					>
 				</div>
-			{/if}
-			{#if federatedIgnores}
-				<p class="scope-note">
-					External-source results are matched live: only tags, format and status narrow them, and
-					they keep the sources' own order.
-				</p>
 			{/if}
 
 			{#if rowsLoading}
@@ -633,9 +527,9 @@
 					</p>
 					<button type="button" class="empty-btn k-hit" onclick={retryRows}>Retry</button>
 				</div>
-			{:else if results.length}
+			{:else if rows.length}
 				<div class="grid">
-					{#each results as m (m.id ?? m.title)}
+					{#each rows as m (m.id ?? m.title)}
 						<MangaCard
 							title={m.title}
 							sub={cardSub(m)}
@@ -649,15 +543,7 @@
 						/>
 					{/each}
 				</div>
-				{#if canSearchExternal}
-					<div class="ext-search">
-						<span class="ext-hint">Not finding it in the catalogue?</span>
-						<button type="button" class="ext-btn k-hit" onclick={requestFederated}>
-							<Icon name="search" size={15} />Search external sources
-						</button>
-					</div>
-				{/if}
-			{:else if !searchNotice}
+			{:else}
 				<!-- Honest empties: with every filter resolved server-side, an empty page means the
 			     filtered catalogue is genuinely empty — so say WHICH thing emptied it and offer
 			     the one action that widens it. -->
@@ -676,28 +562,12 @@
 								class="empty-btn k-hit"
 								onclick={() => go(clearFilters(applied))}>Clear filters</button
 							>
-							{#if canSearchExternal}
-								<button type="button" class="empty-btn k-hit secondary" onclick={requestFederated}
-									>Search external sources</button
-								>
-							{/if}
 						</div>
 					{:else if applied.q}
 						<h3 class="empty-title">No matches for “{applied.q}”</h3>
-						<p class="empty-desc">
-							{canSearchExternal
-								? 'Nothing in the catalogue matches. Try searching external sources.'
-								: 'Check the spelling, or try a shorter or alternative title.'}
-						</p>
-						{#if canSearchExternal}
-							<button type="button" class="empty-btn k-hit" onclick={requestFederated}
-								>Search external sources</button
-							>
-						{:else}
-							<button type="button" class="empty-btn k-hit" onclick={clearSearch}
-								>Clear search</button
-							>
-						{/if}
+						<p class="empty-desc">Check the spelling, or try a shorter or alternative title.</p>
+						<button type="button" class="empty-btn k-hit" onclick={clearSearch}>Clear search</button
+						>
 					{:else}
 						<h3 class="empty-title">Nothing to browse yet</h3>
 						<p class="empty-desc">The catalogue is empty right now. Check back soon.</p>
@@ -705,24 +575,21 @@
 				</div>
 			{/if}
 
-			<!-- Native path only: the federated fan-out returns one deduped page with no server
-		     pager. `Pager` hides itself on page 1 with no next page; past page 1 it stays
+			<!-- `Pager` hides itself on page 1 with no next page; past page 1 it stays
 		     through a load (inert links) so the landmark and live region survive the click
 		     that triggered it. `aria-controls` is deliberately not passed: the only candidate
 		     region is `.results`, which CONTAINS this pager. -->
-			{#if !rowsAreFederated}
-				<Pager
-					page={applied.page}
-					{hasNext}
-					total={totalCount}
-					pageSize={BROWSE_PAGE_SIZE}
-					count={results.length}
-					loading={rowsLoading}
-					href={(p) => withPage(page.url, p)}
-					label="Browse results pages"
-					scrollTarget="browse-results-top"
-				/>
-			{/if}
+			<Pager
+				page={applied.page}
+				{hasNext}
+				total={totalCount}
+				pageSize={BROWSE_PAGE_SIZE}
+				count={rows.length}
+				loading={rowsLoading}
+				href={(p) => withPage(page.url, p)}
+				label="Browse results pages"
+				scrollTarget="browse-results-top"
+			/>
 		</section>
 	</div>
 </div>
@@ -888,45 +755,10 @@
 		margin-top: 1px;
 		color: var(--k-hiatus);
 	}
-	.scope-note {
-		margin: 0;
-		font-size: 12.5px;
-		line-height: 1.45;
-		color: var(--k-text-faint);
-	}
 	.grid {
 		display: grid;
 		grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
 		gap: 28px 20px;
-	}
-	.ext-search {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 8px;
-		padding: 22px 0 4px;
-	}
-	.ext-hint {
-		font-size: 12.5px;
-		color: var(--k-text-faint);
-	}
-	.ext-btn {
-		display: inline-flex;
-		align-items: center;
-		gap: 8px;
-		height: 40px;
-		padding: 0 20px;
-		border-radius: var(--k-radius-pill);
-		background: var(--k-surface-2);
-		border: 1px solid var(--k-border-3);
-		color: var(--k-text);
-		font-weight: 700;
-		font-size: 13px;
-		cursor: pointer;
-		transition: border-color 0.15s;
-	}
-	.ext-btn:hover {
-		border-color: var(--k-border-strong);
 	}
 	.empty {
 		display: flex;
@@ -983,11 +815,6 @@
 		font-weight: 700;
 		font-size: 13.5px;
 		cursor: pointer;
-	}
-	.empty-btn.secondary {
-		background: transparent;
-		border-color: var(--k-border-3);
-		color: var(--k-text);
 	}
 
 	@media (min-width: 960px) {

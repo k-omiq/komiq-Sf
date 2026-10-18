@@ -3,7 +3,7 @@ title: Extensions and source health
 description: Manage your server’s extensions, browse sources for new titles, choose field sources, and monitor source health.
 ---
 
-The Sources section in the admin app connects your server to comic sources. It contains five pages: Extensions, Browse & add, Health, Metadata, and Scanlators. Learn each page’s controls.
+The Sources section in the admin app connects your server to comic sources. It contains six pages: Extensions, Browse & add, Search all, Health, Metadata, and Scanlators. Learn each page’s controls.
 
 ## Why NSFW settings gate source tools
 
@@ -72,6 +72,16 @@ The grid shows each title returned by the source:
 Selecting titles displays a sticky bottom bar showing the count, a `Clear` button, and `Add selected to catalogue`. Submitting sends the batch to the deduplication pipeline.
 
 When complete, `Result of the last add` shows the outcome for each series: merged into an existing work, added as a new work, sent to [Duplicates](/admin/duplicates) for review, already present, or failed.
+
+## Search all
+
+Search all looks for one title on every installed source at once. The reader app does not have this search. It only searches the catalogue.
+
+- Enter a title and select `Search`. Each result is one catalogue work, with the sources that have it.
+- Searching writes to the catalogue. Results that match a catalogue work are linked to it. The top results that are not in the catalogue yet are added as new works.
+- Sources flagged NSFW are skipped if your account has NSFW content off.
+- Each account can run about 20 searches a minute. If you search too often, the page shows when you can search again.
+- From the Catalog page, a search shows a `Search all sources for it` link that opens this page with the same title.
 
 ## Metadata
 

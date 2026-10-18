@@ -9,7 +9,7 @@
  */
 
 /**
- * Rows per page for every server-paginated feed EXCEPT Browse. Mirrors the
+ * Rows per page for every server-paginated feed EXCEPT Browse and Updates. Mirrors the
  * server's `PAGE_SIZE` (`apps/server/src/graphql/mod.rs`) — the reader has no way
  * to ask for it, so it is duplicated here, the same way
  * `apps/admin/src/routes/updates/+page.svelte` duplicates it.
@@ -23,14 +23,21 @@ export const FEED_PAGE_SIZE = 20;
 
 /**
  * Rows per page for BROWSE ONLY. Mirrors a DIFFERENT server constant —
- * `BROWSE_PAGE_SIZE` (`apps/server/src/browse.rs`) — which was raised to 30 while
+ * `BROWSE_PAGE_SIZE` (`apps/server/src/browse.rs`) — which was raised to 40 while
  * the rest of the API stayed at 20. They are two independent numbers that happen
  * to live in the same shape of arithmetic, so they get two constants: reusing
  * {@link FEED_PAGE_SIZE} for Browse made `lastPage(total, 20)` report 1.5× the
  * real page count and the over-range repair land the viewer on an empty page.
  * Each mirrors its own server constant and must move in lockstep with it.
  */
-export const BROWSE_PAGE_SIZE = 30;
+export const BROWSE_PAGE_SIZE = 40;
+
+/**
+ * Rows per page for the Updates feed ONLY. Mirrors the server's
+ * `UPDATES_FEED_PAGE_SIZE` (`apps/server/src/graphql/mod.rs`), a third independent
+ * constant, and must move in lockstep with it for the same reason as the two above.
+ */
+export const UPDATES_PAGE_SIZE = 42;
 
 /**
  * The 1-based page from a URL search param.

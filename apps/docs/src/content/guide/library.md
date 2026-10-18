@@ -74,7 +74,7 @@ The library toolbar allows you to filter and sort your titles:
 The updates page at `/updates` shows series with newly available chapters across the connected server’s catalogue.
 
 - Trending rail: The top section displays trending series.
-- Latest chapters: The main feed includes two viewing options. The New tab lists series with newly available chapters in reverse chronological order with page navigation. The Hot tab lists popular trending series.
+- Latest chapters: The main feed includes two viewing options. The New tab lists series with newly available chapters in reverse chronological order, 42 per page, with page navigation. The Hot tab lists popular trending series.
 - Format filters: Use the format chips to limit updates to Manga, Manhwa, or Manhua.
 - Release timestamps: Cards display relative timestamps such as 4h or 2d when available. Move your pointer over the chapter details to see whether the time reflects the upstream chapter release or when komiq first had it available.
 

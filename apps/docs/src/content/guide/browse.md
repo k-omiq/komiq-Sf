@@ -1,9 +1,9 @@
 ---
 title: Browse and search
-description: Explore the connected server’s catalogue, search its sources, filter titles, and sort results.
+description: Explore the connected server’s catalogue, search it, filter titles, and sort results.
 ---
 
-Use the reader app’s home screen and browse page to explore manga, manhwa, and manhua on the server it is connected to. This guide covers the home screen, catalogue and external source searches, filters, and sorting.
+Use the reader app’s home screen and browse page to explore manga, manhwa, and manhua on the server it is connected to. This guide covers the home screen, catalogue search, filters, and sorting.
 
 ## Home screen
 
@@ -46,17 +46,11 @@ At `/browse`, use the persistent search bar. When you type, komiq pauses briefly
 
 Catalogue search checks series titles and alternative names. Click the clear icon in the search bar to empty the query.
 
-## Searching external sources
-
-Catalogue search queries stored titles. With an account on the connected server, sign in and enter a query to see **Search external sources**, regardless of matches.
-
-This triggers a federated search, which combines results from sources installed on that server. It selects one source per extension package, preferring English, and excludes adult sources unless you opted in through your account on that server. Source count and simultaneous requests are limited.
-
-External results are deduplicated and displayed together. Because live queries contact upstream websites, external searches are rate limited. If you search too frequently, komiq shows a notice stating when you can search again.
+Search in the reader only finds titles that are already in the server’s catalogue. To look for a title on every installed source, a server admin uses [Search all](/admin/sources#search-all) in the admin app.
 
 ## Browse page and results
 
-The browse page at `/browse` displays up to 30 catalogue series cards per page. External search results appear in one list without pagination. Each card shows the cover image, title, chapter information, ratings, comic format flag, and status badge. Read [Ratings, comments, reports](/guide/community#two-ratings) for the two ratings a card can show. Scanlation translator credits appear when reported by sources.
+The browse page at `/browse` displays up to 40 catalogue series cards per page. Each card shows the cover image, title, chapter information, ratings, comic format flag, and status badge. Read [Ratings, comments, reports](/guide/community#two-ratings) for the two ratings a card can show. Scanlation translator credits appear when reported by sources.
 
 Below the grid, a pagination bar navigates between pages.
 

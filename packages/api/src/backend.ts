@@ -134,7 +134,7 @@ export interface Backend {
 	 * apply to the BROWSE branch ONLY — a text query is ordered by relevance and ignores
 	 * them. Callers must not present them as narrowing a search.
 	 *
-	 * BROWSE PAGES AT 30, not the API-wide 20 (server `BROWSE_PAGE_SIZE`); a pager built
+	 * BROWSE PAGES AT 40, not the API-wide 20 (server `BROWSE_PAGE_SIZE`); a pager built
 	 * on the wrong constant mis-computes the last page and clamps to it.
 	 *
 	 * `includeNsfw` is the ADMIN CONSOLE escape hatch: it overrides the caller's own
@@ -152,9 +152,9 @@ export interface Backend {
 	/**
 	 * Federated multi-extension catalogue search (S3): fans the query out to every
 	 * installed source, dedupes to one canonical work per series, and returns each
-	 * work with its per-source translator list. User-facing; NSFW-gated by the
-	 * viewer's `show_nsfw` posture (same as {@link search}). Optional: only the
-	 * unified Komika API implements it.
+	 * work with its per-source translator list. ADMIN ONLY (it persists mappings);
+	 * NSFW-gated by the caller's `show_nsfw` posture (same as {@link search}).
+	 * Optional: only the unified Komika API implements it.
 	 */
 	searchAllSources?(query: string, page?: number): Promise<FederatedSearchPage>;
 	/** The full genre/tag facet set across the persisted catalogue (S4), most-common
@@ -616,7 +616,7 @@ export interface Backend {
 	 * projected to the fields needed to spot a duplicate, plus each row's canonical
 	 * `workId` (which `search` deliberately omits — it is a per-row resolver field).
 	 *
-	 * Pages at the same BROWSE_PAGE_SIZE (30) as `search`, and forces `includeNsfw` —
+	 * Pages at the same BROWSE_PAGE_SIZE (40) as `search`, and forces `includeNsfw` —
 	 * honoured by the server for admins only, so a non-admin caller gains nothing.
 	 * Optional: only the unified Komika API implements it.
 	 */

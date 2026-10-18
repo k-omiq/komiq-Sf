@@ -55,7 +55,7 @@ use crate::graphql::types::BrowseSort;
 
 /// Rows per Browse page. Kept here rather than in the resolver because the COUNT memo,
 /// the two-phase offset arithmetic and `has_next_page` all have to agree with it.
-pub const BROWSE_PAGE_SIZE: i64 = 30;
+pub const BROWSE_PAGE_SIZE: i64 = 40;
 
 /// Ceiling on how many genre chips one request may filter by.
 ///
@@ -73,7 +73,7 @@ pub const MAX_GENRE_NAME_BYTES: usize = 128;
 ///
 /// Trending is a top-N ranking by construction (`views::trending_keys` aggregates the last
 /// 24 h of `series_view_bucket`), so a bound here is not an approximation of something
-/// exact — it IS the ranking. 500 keys is ~17 pages deep at [`BROWSE_PAGE_SIZE`], far past
+/// exact — it IS the ranking. 500 keys is ~12 pages deep at [`BROWSE_PAGE_SIZE`], far past
 /// where anyone scrolls, and matches `catalog::RANK_WINDOW`'s precedent for the same
 /// "rank a bounded window, then stop" decision. Production holds 43 bucket rows / 17
 /// resolvable works today, so this is entirely headroom.

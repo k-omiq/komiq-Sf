@@ -700,6 +700,9 @@
 					Searching catalogue works for “{appliedQuery}”.
 				{/if}
 				Clear the search to list series as the source engine has them.
+				<a class="k-link" href={href(`/sources/search?q=${encodeURIComponent(appliedQuery)}`)}
+					>Search all sources for it</a
+				>.
 			{:else}
 				{#if listed}
 					<span class="k-num">{countText}</span> series, listed as the source engine has them.

@@ -1089,55 +1089,6 @@ function mappingSourceUrl(wsList: WorkSource[], suwayomiMangaId: string | null):
 }
 
 /**
- * The outcome of a catalogue search. The federated (`searchAllSources`) path is
- * login-gated and per-user rate-limited on the server, so callers need to tell
- * "no matches" apart from "not authenticated" (fall back to native) and
- * "rate-limited" (honest transient message) rather than collapsing every case to
- * an empty grid.
- */
-export type SearchOutcome =
-	| { kind: 'ok'; rows: FederatedResultView[] }
-	| { kind: 'unauthenticated' }
-	| { kind: 'rateLimited'; retryAfter: number | null }
-	| { kind: 'error' };
-
-/**
- * Federated multi-extension search: one deduped row per canonical work, each
- * carrying its per-source translator tags. REQUIRES a signed-in viewer (the
- * server rejects anonymous callers) — callers should only invoke it when logged
- * in and fall back to {@link getNativeSearch} otherwise. Never rejects; classifies
- * the server's auth/rate-limit errors into {@link SearchOutcome}.
- */
-export async function getFederatedSearch(query: string): Promise<SearchOutcome> {
-	const q = query.trim();
-	if (!q) return { kind: 'ok', rows: [] };
-	if (!LIVE || !backend.searchAllSources) {
-		// Backend without federation — treat as unauthenticated so callers use the
-		// public native path (which carries no translators).
-		return { kind: 'unauthenticated' };
-	}
-	try {
-		const page = await backend.searchAllSources(q);
-		return {
-			kind: 'ok',
-			rows: page.items.map((fs, i) => ({
-				...toCatalogEntryFull(fs.series, i),
-				translators: dedupeChips(fs.translators.map(toTranslatorChip)),
-			})),
-		};
-	} catch (err) {
-		const msg = err instanceof Error ? err.message : String(err);
-		if (/not authenticated/i.test(msg)) return { kind: 'unauthenticated' };
-		if (/too many/i.test(msg)) {
-			const m = msg.match(/(\d+)\s*s/i);
-			return { kind: 'rateLimited', retryAfter: m ? Number(m[1]) : null };
-		}
-		console.warn('[komika] federated search failed:', err);
-		return { kind: 'error' };
-	}
-}
-
-/**
  * Browse-search filters applied server-side (S4).
  *
  * `types` / `status` are in the READER's vocabulary ('Manhwa', 'ongoing') because that
@@ -1321,8 +1272,9 @@ export async function getBrowseSearch(
 	return { items: r.data, error: r.error, hasNext, total, filterApplied };
 }
 
-/** A federated search row for the Browse grid: a catalog entry + translator tags
- *  + the full genre list (for client-side ANY-genre filtering of federated rows). */
+/** A search row for the Browse grid: a catalog entry + translator tags + the NSFW flag
+ *  and full genre list. (The name predates the admin-only move of the federated search,
+ *  which used to fill this grid too.) */
 export interface FederatedResultView extends CatalogEntry {
 	isNsfw: boolean;
 	genres: string[];
@@ -1430,7 +1382,7 @@ export function getBrowseCatalog(filters: CatalogFilters = {}): Promise<CatalogR
 /** Most cards the "Hot" grid will render in one pass. `Hot` is a curated top-N ranking
  *  off the discovery TRENDING feed with no server pagination anywhere in the stack, so
  *  paging it would be meaningless — the cap is what bounds it instead. The "New" list no
- *  longer needs a cap: the server pages it at `FEED_PAGE_SIZE`. */
+ *  longer needs a cap: the server pages it at `UPDATES_PAGE_SIZE`. */
 const HOT_MAX = 60;
 
 /** What `getUpdates` returns — the two grids plus the "New" list's server pager state. */

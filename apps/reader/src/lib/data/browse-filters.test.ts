@@ -15,7 +15,6 @@ import {
 	filterSig,
 	filtersOnlySig,
 	legacyUnapplied,
-	matchesFederated,
 	MAX_LANGUAGES,
 	MAX_TAGS,
 	normalize,
@@ -740,30 +739,6 @@ test('genre facets become GENRE tags with slug ids, first spelling wins', () => 
 		]),
 		[{ id: 'sci-fi', name: 'Sci-Fi', group: 'GENRE', count: 9 }],
 	);
-});
-
-// ---- federated --------------------------------------------------------------------------------
-
-test('federated rows honour tags (by name), format and status client-side', () => {
-	const row = { genres: ['Action', "Boys' Love"], type: 'Manhwa', status: 'ongoing' };
-	assert.ok(matchesFederated(row, parse('tag=action&tag=boys-love'), noNames));
-	assert.ok(!matchesFederated(row, parse('tag=action&tag=drama'), noNames));
-	assert.ok(matchesFederated(row, parse('tag=action&tag=drama&tagmode=or'), noNames));
-	assert.ok(!matchesFederated(row, parse('xtag=boys-love'), noNames));
-	assert.ok(matchesFederated(row, parse('xtag=boys-love&xtag=gore&xtagmode=and'), noNames));
-	assert.ok(!matchesFederated(row, parse('type=manga'), noNames));
-	assert.ok(!matchesFederated(row, parse('status=completed'), noNames));
-	assert.ok(matchesFederated(row, parse('type=manhwa&status=ongoing'), noNames));
-});
-
-test('a catalogue source does not narrow federated rows (the page says so instead)', () => {
-	const row = { genres: ['Action'], type: 'Manhwa', status: 'ongoing' };
-	assert.ok(matchesFederated(row, parse('source=mangadex'), noNames));
-	assert.ok(matchesFederated(row, parse('source=77&tag=action'), noNames));
-	// It still counts as a chip that is not one of the three these rows honour, which is
-	// what makes the page show its "only tags, format and status narrow them" note.
-	const keys = activeChips(parse('source=77&tag=action'), noNames).map((c) => c.key);
-	assert.deepEqual(keys, ['tag+:action', 'source:77']);
 });
 
 // ---- small helpers ---------------------------------------------------------------------------
