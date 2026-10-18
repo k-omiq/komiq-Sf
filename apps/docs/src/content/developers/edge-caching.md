@@ -64,6 +64,7 @@ SvelteKit simulates cross-origin resource sharing checks on server-side `fetch` 
 To prevent failed edge renders:
 
 - The komiq API server explicitly sets `Access-Control-Allow-Origin: *` for anonymous `GET /graphql` requests.
+- Covers, avatars, comment images and `/media/` routes also send `*`, with no `Vary: Origin`, so one URL is one cache entry. `POST /graphql` and signed-in requests keep the origin allowlist.
 - The reader's `guarded` fetch wrapper in `apps/reader/src/lib/data/load-fetch.ts` retries errors beginning with `CORS error` through global `fetch`. Other errors propagate.
 
 ## The cacheable GET /graphql path
@@ -96,6 +97,8 @@ The server compares the calculated ETag against the client's `If-None-Match` req
 
 This allows Cloudflare edge nodes and user browsers to revalidate catalog queries with minimal bandwidth.
 
+Covers, avatars, comment images, chapter pages and exact media objects carry a strong ETag: the SHA-256 of the bytes, in quotes. A matching `If-None-Match` returns 304 with the same `Cache-Control`, so an expired edge copy revalidates without a new download.
+
 ## Cache lifetimes summary
 
 Komiq applies tailored cache durations across each layer of the architecture:
@@ -115,14 +118,25 @@ Komiq applies tailored cache durations across each layer of the architecture:
 | Avatars, current version                     | `/avatars/{user_id}.webp?v={version}`                                                   | `public, max-age=31536000, immutable, s-maxage=600` | Browser lifetime: 1 year; shared-cache lifetime: 10 minutes.                                      |
 | Covers and avatars, newer requested version  | `/covers/{work_id}.webp?v={version}`, `/avatars/{user_id}.webp?v={version}`             | `no-store`                                          | Serve the stored bytes; never redirect backward.                                                  |
 | Covers and avatars, older or invalid version | Same versioned paths                                                                    | `no-store`                                          | 307 redirect forward to the current version.                                                      |
+| Generation chapter pages                     | `/media/v1/c/{epoch}/{chapterId}/{page}`                                                | `public, max-age=86400, s-maxage=600`               | Browser lifetime: 1 day; shared-cache lifetime: 10 minutes, then revalidation with the ETag.      |
 | Engine chapter pages                         | `/media/v1/c/{chapterId}/{page}`, `/api/v1/manga/{mangaId}/chapter/{index}/page/{page}` | `public, max-age=300, must-revalidate`              | Revalidate after 5 minutes.                                                                       |
 | Extension icons                              | `/ext-icons/{pkg}.png`                                                                  | `public, max-age=86400, must-revalidate`            | Revalidate after 1 day with a strong ETag; a matching `If-None-Match` returns 304 without a body. |
 
 Cover and avatar URLs with an older or invalid version return a 307 redirect to the current version with `Cache-Control: no-store`. A requested version newer than the stored version serves the stored bytes with `no-store`. It never redirects backward or uses immutable caching. URLs without `v` redirect to the current version with `public, max-age=300`. Cover redirects keep an allowlisted `w` width. Avatar uploads always increase the version, even within one millisecond.
 
+Cover and avatar URLs keep only `v`, the reader's `cache_policy=2` and, for covers, `w` set to `192` or `320`. Any other query returns a 307 redirect to that canonical URL, so stray parameters do not split the cache.
+
 A missing cover file is restored from PostgreSQL when an uploaded cover is available. Otherwise the server keeps the lazy MangaDex fetch path. That fetch response has `public, max-age=300, must-revalidate` without `v` and `no-store` with `v`, because the fetched bytes may not be the version the URL names. Suwayomi source covers use that same cache lifetime. If a derivative resize fails, the server serves the master with `no-store`. Missing covers, avatars and comment images also return `no-store`.
 
 `/media/v1/c/{chapterId}/{page}` is a chapter-id locator. The server looks up the chapter's current position at the engine. It keeps that result in a 30-second memo and drops it at the start and end of server refreshes. After a refresh with an unknown outcome, it turns the memo off for 60 seconds. Locator pages fetched during that window carry `no-store`, including fetches that finish after the window ends. Page fetches on both paths wait up to 10 seconds while the server refreshes that series, then return `503` with `no-store`. On the locator path, if a refresh starts or ends while a page is being fetched, the server drops those bytes and fetches the page once more. An engine refresh the server did not start can still cause a mismatch for up to 30 seconds.
+
+### Generation page URLs and fingerprint notes
+
+The `pages` query hands out `/media/v1/c/{epoch}/{chapterId}/{page}`, where the epoch is the engine's numeric epoch. A new engine generation raises it and can reuse chapter ids, so an older epoch returns `404` with `no-store` before any fetch. Older clients keep the path without an epoch.
+
+The edge revalidates a generation page every 10 minutes. So that this costs no engine fetch, the server keeps a fingerprint note in memory for each fetched page: the SHA-256 and the content type, keyed by epoch, chapter id and page index. A revalidation first runs every check a fetch runs: epoch, chapter lookup, block rules and a running refresh of the series. A matching note then answers `304` with the full page's headers. The server does not use a note older than 1 day, or one written before the series' page list was refreshed or reset. It fetches the page and writes a new note instead.
+
+The server keeps at most 65,536 notes, about 13 MB, and drops the oldest first. A restart drops them all. `komika_media_page_note_hits_total` and `komika_media_page_note_misses_total` count revalidations answered from a note and revalidations that needed a fetch.
 
 ## Where to look
 
@@ -137,3 +151,4 @@ A missing cover file is restored from PostgreSQL when an uploaded cover is avail
 - `apps/reader/csp.ts`: Connection origins derived from public build settings.
 - `apps/server/src/img_proxy.rs`: Self-hosted image proxy and cache headers.
 - `apps/server/src/main.rs`: Implements `graphql_get_handler`, weak ETag hashing, 304 revalidation, and public asset routes.
+- `apps/server/src/page_locator.rs`: Chapter position memo and page fingerprint notes.

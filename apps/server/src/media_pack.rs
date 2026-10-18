@@ -288,8 +288,8 @@ pub(crate) async fn serve_media_pack(
             result = async {
                 for idx in pack.unique {
                     allowed(&app, &copy, chapter, manga).await.map_err(policy_error)?;
-                    let (bytes, _, _) = crate::fetch_chapter_page(&app, chapter, &idx.to_string())
-                        .await.map_err(|_| io::Error::other("pack object fetch failed"))?;
+                    let bytes = crate::fetch_chapter_page(&app, chapter, &idx.to_string())
+                        .await.map_err(|_| io::Error::other("pack object fetch failed"))?.bytes;
                     let page = &manifest.pages[idx];
                     if bytes.len() as u64 != page.length || hex::encode(Sha256::digest(&bytes)) != page.sha256 {
                         // Drop the slot even if marking the revision needs to wait for the store.

@@ -377,6 +377,177 @@ async fn generation_page_urls_serve_the_same_bytes_until_the_epoch_moves() {
     assert_page(get_page(app, "/media/v1/c/8/0").await, 8).await;
 }
 
+async fn revalidate(
+    app: Arc<AppState>,
+    method: axum::http::Method,
+    path: &str,
+    etag: &str,
+) -> axum::response::Response {
+    router(app)
+        .oneshot(
+            axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::IF_NONE_MATCH, etag)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+fn page_fetches(engine: &Engine) -> usize {
+    engine.calls.pages.load(Ordering::SeqCst)
+}
+
+async fn assert_not_modified(response: axum::response::Response, etag: &str) {
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    let headers = response.headers();
+    assert_eq!(
+        headers[header::CACHE_CONTROL],
+        image_delivery::GENERATION_PAGE_CACHE
+    );
+    assert_eq!(headers[header::ETAG], etag);
+    assert_eq!(headers[header::CONTENT_TYPE], "image/png");
+    assert!(headers.contains_key(header::CONTENT_SECURITY_POLICY));
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(body.is_empty());
+}
+
+/// An edge revalidation of a generation page that its fingerprint note answers is a 304
+/// with no engine call at all. A different tag gets the full page; a refresh of the
+/// manga's page list sends the next revalidation to the engine, which notes it again.
+#[tokio::test]
+async fn generation_page_revalidation_is_answered_from_its_note() {
+    use axum::http::Method;
+    let (engine, app, _cover_dir) = fixture().await;
+    let path = "/media/v1/c/0/8/0";
+    let first = get_page(app.clone(), path).await;
+    let etag = first.headers()[header::ETAG].to_str().unwrap().to_owned();
+    assert_page_with_cache(first, 8, image_delivery::GENERATION_PAGE_CACHE).await;
+    assert_eq!((page_fetches(&engine), engine.co()), (1, 1));
+
+    let (hits, misses) = telemetry::MEDIA.page_notes();
+    for method in [Method::GET, Method::HEAD] {
+        assert_not_modified(revalidate(app.clone(), method, path, &etag).await, &etag).await;
+    }
+    let weak = format!("W/{etag}");
+    assert_not_modified(
+        revalidate(app.clone(), Method::GET, path, &weak).await,
+        &etag,
+    )
+    .await;
+    assert_eq!((page_fetches(&engine), engine.co()), (1, 1));
+    assert!(telemetry::MEDIA.page_notes().0 >= hits + 3);
+
+    let other = revalidate(app.clone(), Method::GET, path, "\"other\"").await;
+    assert_eq!(other.headers()[header::ETAG], etag.as_str());
+    assert_page_with_cache(other, 8, image_delivery::GENERATION_PAGE_CACHE).await;
+    assert_eq!(page_fetches(&engine), 2);
+    assert!(telemetry::MEDIA.page_notes().1 > misses);
+
+    // A changed page list never reuses the old note.
+    app.suwayomi.page_locator.begin_refresh(7).finish(true);
+    assert_not_modified(
+        revalidate(app.clone(), Method::GET, path, &etag).await,
+        &etag,
+    )
+    .await;
+    assert_eq!(page_fetches(&engine), 3);
+    assert_not_modified(
+        revalidate(app.clone(), Method::GET, path, &etag).await,
+        &etag,
+    )
+    .await;
+    assert_eq!(page_fetches(&engine), 3);
+    // The old path keeps no notes.
+    assert_not_modified_old(revalidate(app, Method::GET, "/media/v1/c/8/0", &etag).await);
+    assert_eq!(page_fetches(&engine), 4);
+}
+
+fn assert_not_modified_old(response: axum::response::Response) {
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        image_delivery::MUTABLE_CACHE
+    );
+}
+
+/// A note answers only what a fetch would have answered: an older epoch is still a
+/// no-store 404 and a blocked chapter still a 404, with no engine page fetch either way.
+#[tokio::test]
+async fn generation_page_notes_never_skip_a_refusal() {
+    use axum::http::Method;
+    let (engine, app, _cover_dir) = fixture().await;
+    let etag = get_page(app.clone(), "/media/v1/c/0/8/0").await.headers()[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    sqlx::query(
+        "INSERT INTO engine_numeric_state (singleton, epoch, changed_at) VALUES (true, 5, now())",
+    )
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    let refused_without_fetch = |response: axum::response::Response| {
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.headers()[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .contains("no-store"));
+    };
+    refused_without_fetch(revalidate(app.clone(), Method::GET, "/media/v1/c/0/8/0", &etag).await);
+    assert_eq!(page_fetches(&engine), 1);
+    // The new epoch has no note yet: one fetch, then the note answers.
+    for _ in 0..2 {
+        assert_not_modified(
+            revalidate(app.clone(), Method::GET, "/media/v1/c/5/8/0", &etag).await,
+            &etag,
+        )
+        .await;
+    }
+    assert_eq!(page_fetches(&engine), 2);
+
+    // A taken-down (blocked) chapter is refused although its note is fresh.
+    sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES('w_blocked',now(),now()); INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES('ss_blocked','w_blocked','suwayomi','source','7',now())")
+        .execute(&app.pool).await.unwrap();
+    let rule = block::BlockRule::new(Vec::<String>::new(), ["safe"]).unwrap();
+    block::replace(&app.pool, block::Scope::Site, &[rule])
+        .await
+        .unwrap();
+    app.policy.invalidate();
+    refused_without_fetch(revalidate(app, Method::GET, "/media/v1/c/5/8/0", &etag).await);
+    assert_eq!(page_fetches(&engine), 2);
+}
+
+/// A note older than its lifetime is not used: the revalidation fetches the page again.
+#[tokio::test]
+async fn an_expired_generation_page_note_sends_the_revalidation_to_the_engine() {
+    use axum::http::Method;
+    let (engine, mut app, _cover_dir) = fixture().await;
+    Arc::get_mut(&mut app).unwrap().suwayomi.page_locator = Arc::new(
+        page_locator::PageLocator::with_refresh_wait(page_locator::REFRESH_WAIT)
+            .with_note_ttl(Duration::ZERO),
+    );
+    let path = "/media/v1/c/0/8/0";
+    let etag = get_page(app.clone(), path).await.headers()[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let misses = telemetry::MEDIA.page_notes().1;
+    for fetched in [2, 3] {
+        assert_not_modified(
+            revalidate(app.clone(), Method::GET, path, &etag).await,
+            &etag,
+        )
+        .await;
+        assert_eq!(page_fetches(&engine), fetched);
+    }
+    assert!(telemetry::MEDIA.page_notes().1 >= misses + 2);
+}
+
 #[tokio::test]
 async fn warm_locator_survives_reorder_through_both_refresh_methods() {
     for combined in [false, true] {

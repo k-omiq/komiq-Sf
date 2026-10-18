@@ -791,13 +791,21 @@ async fn not_modified(
             .headers()
             .get(header::ETAG)
             .and_then(|etag| etag.to_str().ok())
-            .is_some_and(|etag| {
-                tags.iter()
-                    .any(|tag| if_none_match_matches(tag.to_str().ok(), etag))
-            });
+            .is_some_and(|etag| if_none_match_any(&tags, etag));
     if !matches {
         return response;
     }
+    into_not_modified(response)
+}
+
+/// [`if_none_match_matches`] over every `If-None-Match` header of a request.
+fn if_none_match_any(tags: &[HeaderValue], etag: &str) -> bool {
+    tags.iter()
+        .any(|tag| if_none_match_matches(tag.to_str().ok(), etag))
+}
+
+/// The 304 for a full answer: its headers (Cache-Control and ETag included), no body.
+fn into_not_modified(response: axum::response::Response) -> axum::response::Response {
     let (mut parts, _body) = response.into_parts();
     parts.status = StatusCode::NOT_MODIFIED;
     parts.headers.remove(header::CONTENT_LENGTH);
@@ -1644,7 +1652,7 @@ async fn serve_chapter_page(
     let Ok(UrlPath((chapter, page))) = path else {
         return image_failure_response(StatusCode::NOT_FOUND);
     };
-    serve_page(&app, None, &chapter, &page).await
+    serve_page(&app, None, &chapter, &page, &[]).await
 }
 
 /// `GET /media/v1/c/{epoch}/{chapterId}/{page}` — what `pages` hands out: the chapter
@@ -1652,22 +1660,31 @@ async fn serve_chapter_page(
 /// reuses chapter ids for other chapters and raises the epoch, so a URL of an older
 /// epoch is refused (404, `no-store`) instead of answering with another chapter's page.
 /// That makes the URL safe for a browser to keep for a day; a shared cache keeps it for
-/// one media policy lease (`GENERATION_PAGE_CACHE`).
+/// one media policy lease (`GENERATION_PAGE_CACHE`). A revalidation (`If-None-Match`)
+/// that the page's fingerprint note answers is a 304 without fetching the bytes again.
 async fn serve_generation_page(
     State(app): State<Arc<graphql::AppState>>,
+    headers: HeaderMap,
     path: Result<UrlPath<(String, String, String)>, axum::extract::rejection::PathRejection>,
 ) -> axum::response::Response {
     let Ok(UrlPath((epoch, chapter, page))) = path else {
         return image_failure_response(StatusCode::NOT_FOUND);
     };
-    serve_page(&app, Some(&epoch), &chapter, &page).await
+    let tags: Vec<HeaderValue> = headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .cloned()
+        .collect();
+    serve_page(&app, Some(&epoch), &chapter, &page, &tags).await
 }
 
+/// `tags`: the request's `If-None-Match` values, used only under an epoch.
 async fn serve_page(
     app: &graphql::AppState,
     epoch: Option<&str>,
     chapter: &str,
     page: &str,
+    tags: &[HeaderValue],
 ) -> axum::response::Response {
     let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     if !numeric(chapter) || !numeric(page) || epoch.is_some_and(|e| !numeric(e)) {
@@ -1695,12 +1712,14 @@ async fn serve_page(
             Err(error) => return media_read_error(error),
         }
     }
-    let cache = if epoch.is_some() {
-        image_delivery::GENERATION_PAGE_CACHE
-    } else {
-        image_delivery::MUTABLE_CACHE
+    let response = match epoch {
+        Some(epoch) => serve_generation_page_inner(app, epoch, chapter_id, page, tags).await,
+        None => {
+            serve_chapter_page_inner(app, chapter_id, page, image_delivery::MUTABLE_CACHE)
+                .await
+                .0
+        }
     };
-    let response = serve_chapter_page_inner(app, chapter_id, page, cache).await;
     if app
         .suwayomi
         .validate_read_generation(generation)
@@ -1765,59 +1784,136 @@ async fn resolve_page_location(
     }
 }
 
+/// A generation page. A revalidation whose ETag matches the page's fingerprint note gets
+/// a 304 after every check a fetch passes first (chapter in the engine, block rules, no
+/// running refresh); only the engine byte fetch is skipped. Otherwise the page is fetched
+/// and, when a shared cache may keep it, noted.
+async fn serve_generation_page_inner(
+    app: &graphql::AppState,
+    epoch: i64,
+    chapter_id: i64,
+    page: &str,
+    tags: &[HeaderValue],
+) -> axum::response::Response {
+    let cache = image_delivery::GENERATION_PAGE_CACHE;
+    let Ok(index) = page.parse::<usize>() else {
+        return image_failure_response(StatusCode::NOT_FOUND);
+    };
+    let locator = &app.suwayomi.page_locator;
+    if !tags.is_empty() {
+        let (manga_id, _, _, started) =
+            match locate_page(app, chapter_id, false, locator.deadline()).await {
+                Ok(location) => location,
+                Err(response) => return response,
+            };
+        let noted = locator
+            .note((epoch, chapter_id, index))
+            .filter(|note| note.manga_id == manga_id && locator.cacheable(manga_id, started))
+            .map(|note| (sha256_etag(&hex::encode(note.sha256)), note.content_type))
+            .filter(|(etag, _)| if_none_match_any(tags, etag.to_str().unwrap_or_default()));
+        telemetry::MEDIA.page_note(noted.is_some());
+        if let Some((etag, content_type)) = noted {
+            let mut response =
+                raw_image_response_with_cache(content_type, Default::default(), cache);
+            response.headers_mut().insert(header::ETAG, etag);
+            return into_not_modified(response);
+        }
+    }
+    let (response, fetched) = serve_chapter_page_inner(app, chapter_id, page, cache).await;
+    if let Some((page, sha256)) = fetched.filter(|(page, _)| page.cacheable) {
+        locator.note_put(
+            (epoch, chapter_id, index),
+            page.manga_id,
+            page.stamp,
+            sha256,
+            page.mime,
+        );
+    }
+    response
+}
+
+/// The page response, and for fetched bytes, the page (without its bytes) and their
+/// SHA-256.
 async fn serve_chapter_page_inner(
     app: &graphql::AppState,
     chapter_id: i64,
     page: &str,
     cache: &'static str,
-) -> axum::response::Response {
+) -> (axum::response::Response, Option<(ChapterPage, [u8; 32])>) {
+    use sha2::{Digest, Sha256};
     match fetch_chapter_page(app, chapter_id, page).await {
-        Ok((bytes, mime, cacheable)) => {
+        Ok(mut page) => {
             // Hashed once per fetch: an edge revalidation of unchanged bytes is a 304.
-            let etag = strong_etag(&bytes);
+            let sha256: [u8; 32] = Sha256::digest(&page.bytes).into();
+            let bytes = std::mem::take(&mut page.bytes);
             let mut response = raw_image_response_with_cache(
-                mime,
+                page.mime.clone(),
                 bytes,
-                if cacheable { cache } else { "no-store" },
+                if page.cacheable { cache } else { "no-store" },
             );
-            response.headers_mut().insert(header::ETAG, etag);
             response
+                .headers_mut()
+                .insert(header::ETAG, sha256_etag(&hex::encode(sha256)));
+            (response, Some((page, sha256)))
         }
-        Err(response) => response,
+        Err(response) => (response, None),
     }
+}
+
+/// A chapter page fetched from the engine, with the locator position it was fetched under.
+struct ChapterPage {
+    bytes: axum::body::Bytes,
+    mime: String,
+    /// Whether a shared cache may keep it (see `PageLocator::cacheable`).
+    cacheable: bool,
+    manga_id: i64,
+    stamp: u64,
+}
+
+/// Every check before a chapter page's bytes: the chapter is in the engine (404 if not),
+/// no block rule denies it (404), and no refresh of its manga is running (busy past the
+/// deadline). Returns the page's position, the locator stamp and the lookup start.
+async fn locate_page(
+    app: &graphql::AppState,
+    chapter_id: i64,
+    fresh: bool,
+    deadline: tokio::time::Instant,
+) -> Result<(i64, i32, u64, tokio::time::Instant), axum::response::Response> {
+    let (manga_id, order, stamp, started) =
+        match resolve_page_location(&app.suwayomi, chapter_id, fresh, deadline).await? {
+            Some(location) => location,
+            None => return Err(image_failure_response(StatusCode::NOT_FOUND)),
+        };
+    if check_page_block(app, manga_id)
+        .await?
+        .denies_chapter(chapter_id)
+    {
+        return Err(image_failure_response(StatusCode::NOT_FOUND));
+    }
+    if app
+        .suwayomi
+        .page_locator
+        .wait_idle(manga_id, deadline)
+        .await
+        .is_err()
+    {
+        return Err(page_busy_response());
+    }
+    Ok((manga_id, order, stamp, started))
 }
 
 async fn fetch_chapter_page(
     app: &graphql::AppState,
     chapter_id: i64,
     page: &str,
-) -> Result<(axum::body::Bytes, String, bool), axum::response::Response> {
+) -> Result<ChapterPage, axum::response::Response> {
     let page_index = page
         .parse::<usize>()
         .map_err(|_| image_failure_response(StatusCode::NOT_FOUND))?;
     let deadline = app.suwayomi.page_locator.deadline();
     for attempt in 0..2 {
         let (manga_id, order, stamp, started) =
-            match resolve_page_location(&app.suwayomi, chapter_id, attempt > 0, deadline).await {
-                Ok(Some(location)) => location,
-                Ok(None) => return Err(image_failure_response(StatusCode::NOT_FOUND)),
-                Err(response) => return Err(response),
-            };
-        if check_page_block(app, manga_id)
-            .await?
-            .denies_chapter(chapter_id)
-        {
-            return Err(image_failure_response(StatusCode::NOT_FOUND));
-        }
-        if app
-            .suwayomi
-            .page_locator
-            .wait_idle(manga_id, deadline)
-            .await
-            .is_err()
-        {
-            return Err(page_busy_response());
-        }
+            locate_page(app, chapter_id, attempt > 0, deadline).await?;
         let path = format!("/api/v1/manga/{manga_id}/chapter/{order}/page/{page}");
         let fetched = match engine_route::route_page(
             &app.suwayomi,
@@ -1840,12 +1936,12 @@ async fn fetch_chapter_page(
             }
             return Err(page_busy_response());
         }
-        return fetched.map(|(bytes, mime)| {
-            (
-                bytes,
-                mime,
-                app.suwayomi.page_locator.cacheable(manga_id, started),
-            )
+        return fetched.map(|(bytes, mime)| ChapterPage {
+            bytes,
+            mime,
+            cacheable: app.suwayomi.page_locator.cacheable(manga_id, started),
+            manga_id,
+            stamp,
         });
     }
     Err(page_busy_response())
@@ -1998,8 +2094,8 @@ async fn serve_media_object_inner(
         Ok(_) => {}
         Err(response) => return Ok(response),
     }
-    let (bytes, _, _) = match fetch_chapter_page(app, chapter, &idx.to_string()).await {
-        Ok(page) => page,
+    let bytes = match fetch_chapter_page(app, chapter, &idx.to_string()).await {
+        Ok(page) => page.bytes,
         Err(response) => return Ok(response),
     };
     if bytes.len() as i64 != length || Sha256::digest(&bytes).as_slice() != raw_hash {

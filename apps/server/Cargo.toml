@@ -49,6 +49,9 @@ hex = "0.4"
 sha2 = "0.10"
 # The pinned macOS cloudflared release is gzip-compressed (already locked).
 flate2 = "1"
+# Insertion-ordered map for the bounded page fingerprint notes (page_locator.rs).
+# Already in the tree through sqlx's statement cache.
+hashlink = "0.10"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 anyhow = "1"

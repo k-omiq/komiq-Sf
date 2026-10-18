@@ -855,6 +855,8 @@ pub(crate) struct MediaStats {
     delivery_aborts: AtomicU64,
     pack_objects_sent: AtomicU64,
     pack_bytes_aborted: AtomicU64,
+    page_note_hits: AtomicU64,
+    page_note_misses: AtomicU64,
     retained_owners: Level,
     retained_bytes: Level,
 }
@@ -874,6 +876,8 @@ impl MediaStats {
             delivery_aborts: AtomicU64::new(0),
             pack_objects_sent: AtomicU64::new(0),
             pack_bytes_aborted: AtomicU64::new(0),
+            page_note_hits: AtomicU64::new(0),
+            page_note_misses: AtomicU64::new(0),
             retained_owners: Level::new(),
             retained_bytes: Level::new(),
         }
@@ -910,6 +914,15 @@ impl MediaStats {
         self.pack_bytes_aborted.fetch_add(bytes, Relaxed);
     }
 
+    /// A generation page revalidation: answered from its fingerprint note, or fetched.
+    pub(crate) fn page_note(&self, hit: bool) {
+        if hit {
+            self.page_note_hits.fetch_add(1, Relaxed);
+        } else {
+            self.page_note_misses.fetch_add(1, Relaxed);
+        }
+    }
+
     pub(crate) fn retain(&self, bytes: usize) {
         self.retained_owners.raise(1);
         self.retained_bytes.raise(bytes as u64);
@@ -933,6 +946,14 @@ impl MediaStats {
     #[cfg(test)]
     pub(crate) fn body_checks(&self, source: BodySource, result: BodyCheck) -> u64 {
         self.body_checks[source as usize][result as usize].load(Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn page_notes(&self) -> (u64, u64) {
+        (
+            self.page_note_hits.load(Relaxed),
+            self.page_note_misses.load(Relaxed),
+        )
     }
 
     #[cfg(test)]
@@ -1013,6 +1034,19 @@ impl MediaStats {
                 "Declared pack bytes not handed to the HTTP transport on abort or cancellation",
                 "counter",
                 self.pack_bytes_aborted.load(Relaxed),
+            ),
+            (
+                "komika_media_page_note_hits_total",
+                "Generation page revalidations answered 304 from a fingerprint note, \
+                 without an engine page fetch",
+                "counter",
+                self.page_note_hits.load(Relaxed),
+            ),
+            (
+                "komika_media_page_note_misses_total",
+                "Generation page revalidations with no usable fingerprint note, so fetched",
+                "counter",
+                self.page_note_misses.load(Relaxed),
             ),
             (
                 "komika_media_delivered_bytes_total",

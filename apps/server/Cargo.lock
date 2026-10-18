@@ -1355,6 +1355,7 @@ dependencies = [
  "dotenvy",
  "flate2",
  "futures",
+ "hashlink",
  "hex",
  "http-body",
  "image",

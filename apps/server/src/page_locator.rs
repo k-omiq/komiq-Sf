@@ -1,10 +1,12 @@
-//! Refresh tickets and the short-lived chapter position memo shared by one engine client.
+//! Refresh tickets, the short-lived chapter position memo and the page fingerprint notes
+//! shared by one engine client.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hashlink::LinkedHashMap;
 use tokio::sync::{Notify, OnceCell, Semaphore};
 use tokio::time::Instant;
 
@@ -15,6 +17,12 @@ const MEMO_CAP: usize = 4096;
 /// Distinct chapters looked up in the engine at once; requests for the same chapter share one.
 const LOOKUP_CONCURRENCY: usize = 4;
 pub(crate) const REFRESH_WAIT: Duration = Duration::from_secs(10);
+/// How long a page's fingerprint note can answer a revalidation without the engine: the
+/// browser lifetime of a generation page (`image_delivery::GENERATION_PAGE_CACHE`).
+const NOTE_TTL: Duration = Duration::from_secs(86_400);
+/// Most fingerprint notes kept, the oldest written dropped first. A note is about 200
+/// bytes with its map entry, so this bounds them near 13 MB.
+const NOTE_CAP: usize = 65_536;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Entry {
@@ -54,6 +62,22 @@ struct State {
 /// One engine lookup's answer, event stamp and start time.
 pub(crate) type Lookup = (u64, Option<(i64, i32)>, Instant);
 
+/// A page under one numeric epoch: `(epoch, chapter id, page index)`.
+pub(crate) type NoteKey = (i64, i64, usize);
+
+/// A generation page's fingerprint as of its last fetch: enough to answer a matching
+/// `If-None-Match` with a 304 instead of fetching the bytes again.
+#[derive(Clone, Debug)]
+pub(crate) struct Note {
+    pub manga_id: i64,
+    /// The locator event stamp the page was fetched under. A refresh or reset of the
+    /// manga's page list after it retires the note.
+    pub stamp: u64,
+    pub sha256: [u8; 32],
+    pub content_type: String,
+    at: Instant,
+}
+
 #[derive(Default)]
 struct SharedLookup {
     cell: Arc<OnceCell<Lookup>>,
@@ -64,8 +88,12 @@ pub(crate) struct PageLocator {
     state: Mutex<State>,
     lookups: Mutex<HashMap<i64, SharedLookup>>,
     lookup_permits: Semaphore,
+    /// In write order. Lost on restart, which only costs one fetch per page.
+    notes: Mutex<LinkedHashMap<NoteKey, Note>>,
     #[cfg(test)]
     refresh_wait: Option<Duration>,
+    #[cfg(test)]
+    note_ttl: Option<Duration>,
 }
 
 impl Default for PageLocator {
@@ -74,8 +102,11 @@ impl Default for PageLocator {
             state: Default::default(),
             lookups: Default::default(),
             lookup_permits: Semaphore::new(LOOKUP_CONCURRENCY),
+            notes: Default::default(),
             #[cfg(test)]
             refresh_wait: None,
+            #[cfg(test)]
+            note_ttl: None,
         }
     }
 }
@@ -90,6 +121,22 @@ impl PageLocator {
             refresh_wait: Some(wait),
             ..Self::default()
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_note_ttl(self, ttl: Duration) -> Self {
+        Self {
+            note_ttl: Some(ttl),
+            ..self
+        }
+    }
+
+    fn note_ttl(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(ttl) = self.note_ttl {
+            return ttl;
+        }
+        NOTE_TTL
     }
 
     pub(crate) fn deadline(&self) -> Instant {
@@ -262,6 +309,54 @@ impl PageLocator {
                     state.chapters.remove(&oldest);
                 }
             }
+        }
+    }
+
+    /// A page's note, while it is younger than [`NOTE_TTL`] and its manga's page list has
+    /// had no refresh or reset since the note was written.
+    pub(crate) fn note(&self, key: NoteKey) -> Option<Note> {
+        let note = {
+            let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+            let note = notes.get(&key)?.clone();
+            if note.at.elapsed() >= self.note_ttl() {
+                notes.remove(&key);
+                return None;
+            }
+            note
+        };
+        self.unchanged(note.manga_id, note.stamp).then_some(note)
+    }
+
+    /// Note a page fetched under `stamp`, replacing an older note of the same page. Only
+    /// for bytes a shared cache may keep. The oldest notes go past [`NOTE_CAP`], and expired
+    /// ones as they reach the front.
+    pub(crate) fn note_put(
+        &self,
+        key: NoteKey,
+        manga_id: i64,
+        stamp: u64,
+        sha256: [u8; 32],
+        content_type: String,
+    ) {
+        let now = Instant::now();
+        let ttl = self.note_ttl();
+        let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        notes.insert(
+            key,
+            Note {
+                manga_id,
+                stamp,
+                sha256,
+                content_type,
+                at: now,
+            },
+        );
+        while notes.len() > NOTE_CAP
+            || notes
+                .front()
+                .is_some_and(|(_, note)| now.duration_since(note.at) >= ttl)
+        {
+            notes.pop_front();
         }
     }
 
@@ -516,5 +611,52 @@ mod tests {
         locator.memo_put(9999, 99, 0, stamp);
         assert!(locator.memo_get(9999).is_none());
         assert!(locator.memo_get(1).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notes_expire_drop_oldest_first_and_retire_on_a_page_list_change() {
+        let locator = Arc::new(PageLocator::default());
+        let note = |chapter: i64, manga: i64| {
+            locator.note_put(
+                (1, chapter, 0),
+                manga,
+                locator.snapshot(),
+                [chapter as u8; 32],
+                "image/png".into(),
+            )
+        };
+        note(1, 7);
+        tokio::time::advance(NOTE_TTL - Duration::from_millis(1)).await;
+        let kept = locator.note((1, 1, 0)).unwrap();
+        assert_eq!((kept.manga_id, kept.sha256), (7, [1; 32]));
+        assert!(locator.note((2, 1, 0)).is_none(), "another epoch");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(locator.note((1, 1, 0)).is_none(), "a day old");
+
+        for chapter in 0..=NOTE_CAP as i64 {
+            note(chapter, 7);
+        }
+        assert_eq!(locator.notes.lock().unwrap().len(), NOTE_CAP);
+        assert!(
+            locator.note((1, 0, 0)).is_none(),
+            "the oldest written goes first"
+        );
+        // Rewriting a note makes it the newest.
+        note(1, 7);
+        note(NOTE_CAP as i64 + 1, 7);
+        assert!(locator.note((1, 1, 0)).is_some());
+        assert!(locator.note((1, 2, 0)).is_none());
+        // An expired front goes on the next write, under the cap too.
+        tokio::time::advance(NOTE_TTL).await;
+        note(9, 8);
+        assert_eq!(locator.notes.lock().unwrap().len(), 1);
+
+        // A refresh of the manga's page list retires its notes only; a reset retires all.
+        note(10, 7);
+        locator.begin_refresh(7).finish(true);
+        assert!(locator.note((1, 10, 0)).is_none());
+        assert!(locator.note((1, 9, 0)).is_some());
+        locator.clear();
+        assert!(locator.note((1, 9, 0)).is_none());
     }
 }
