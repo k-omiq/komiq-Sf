@@ -39,13 +39,25 @@ requires the owner's OK.
 
 ## Caching
 
-1. **Cloudflare edge** (`caches.default`) — keyed on the normalized upstream URL
-   plus an internal validation-version token, so hotlink/query noise shares one
-   entry. Current source URLs are mutable and use
-   `Cache-Control: public, max-age=300, must-revalidate`.
-2. **Upstream** — origin of last resort; the response is written back to the edge
-   cache only after a capped body read and raster-container validation. Errors are
-   `no-store`. The new internal key avoids reusing earlier unvalidated edge entries.
+1. **Cloudflare edge** (`caches.default`). A MangaDex chapter page
+   (`…/data/{chapter hash}/{n}-{sha256}.{ext}` or `data-saver`, on a
+   `*.mangadex.network` node or `uploads.mangadex.org`) keys on
+   `/img/md/{folder}/{chapter hash}/{file}`, so every MangaDex@Home node URL for
+   one file shares an entry. It is stored with `public, max-age=2592000` (30 days)
+   and sent to browsers as `public, max-age=604800, immutable` (7 days). Other
+   URLs key on the normalized upstream URL plus an internal validation-version
+   token, so hotlink/query noise shares one entry. They are mutable and use
+   `Cache-Control: public, max-age=300, must-revalidate`. A hit never calls the
+   rate limiter.
+2. **Upstream** — origin of last resort, with one 25 s deadline across every
+   redirect hop and the body (504 when it passes). A page miss goes through the
+   zone cache and its upper tier (`cf.cacheEverything`, 2xx kept 30 days, other
+   statuses not cached); that tier keys on the node URL, because custom cache keys
+   are Enterprise-only. The response is written back to the edge cache only after
+   a capped body read and raster-container validation, and for a page only when
+   the body's SHA-256 matches the file name, so one bad node cannot fill the shared
+   entry. A HEAD miss stores nothing. Errors are `no-store`; a 429 carries
+   `Retry-After: 10`.
 
 Container validation checks framing, MIME and recognized signatures; it does not
 decode every pixel or authenticate source art. A future signed manifest must bind
