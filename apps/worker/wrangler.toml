@@ -9,6 +9,11 @@ routes = [
   { pattern = "img.komiq.cc", custom_domain = true },
 ]
 
+# Workers Logs for the console.error lines on refused and failed fetches.
+# Default sampling (1): traffic is low.
+[observability]
+enabled = true
+
 # ---------------------------------------------------------------------------
 # Non-secret configuration.
 #

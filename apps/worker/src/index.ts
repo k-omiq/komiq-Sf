@@ -15,8 +15,11 @@
  *           be in ALLOWED_SOURCE_HOSTS; an empty allowlist denies all (fail closed).
  *
  * Caching layers, in order:
- *   1. Cloudflare edge cache (caches.default) — always on.
+ *   1. Cloudflare edge cache (caches.default) — always on. MangaDex page files
+ *      use a content key (folder, chapter hash, file name) that ignores the
+ *      MangaDex@Home node host, so every node URL for one file shares an entry.
  *   2. Upstream fetch — origin of last resort; the response is cached at the edge.
+ *      MangaDex page fetches also go through the zone cache and its upper tier.
  */
 
 interface Env {
@@ -29,7 +32,24 @@ interface Env {
 	IMG_RATE_LIMITER: RateLimit;
 }
 
-const IMAGE_CACHE = 'public, max-age=300, must-revalidate';
+// Other upstreams (covers, our own API's page paths) can change under one URL.
+const MUTABLE_IMAGE_CACHE = 'public, max-age=300, must-revalidate';
+// MangaDex page files never change: the file name carries the SHA-256 of the
+// bytes, and the Worker checks it before storing. MangaDex@Home nodes send the
+// same 7-day immutable browser header themselves.
+const PAGE_EDGE_TTL = 2_592_000; // 30 days
+const PAGE_EDGE_CACHE = `public, max-age=${PAGE_EDGE_TTL}`;
+const PAGE_BROWSER_CACHE = 'public, max-age=604800, immutable'; // 7 days
+// A page miss goes through the zone cache and its upper tier (Tiered Cache), so
+// one colo's fetch can fill another; the Cache API alone never uses the tiers.
+// Only 2xx is kept there; a negative TTL keeps every other status out.
+// The tier key is the node URL: custom cf.cacheKey is Enterprise-only.
+const PAGE_TIERED_FETCH: RequestInitCfProperties = {
+	cacheEverything: true,
+	cacheTtlByStatus: { '200-299': PAGE_EDGE_TTL, '300-599': -1 },
+};
+// One deadline for the whole upstream fetch: every redirect hop and the body.
+const UPSTREAM_DEADLINE_MS = 25_000;
 // Image size ceiling, mirroring the native reference (`MAX_IMAGE_BYTES`,
 // src-tauri/src/lib.rs). Enforced both from the upstream Content-Length (fail
 // fast) and while streaming (in case the length is absent or lies).
@@ -101,17 +121,24 @@ export default {
 		}
 
 		// --- 1. Edge cache. ------------------------------------------------------
-		// Key on the normalized upstream URL so /img?src=X and any hotlink query
-		// noise share one edge entry.
+		// A MangaDex page keys on its content (folder, chapter hash, file), so the
+		// same file from any MangaDex@Home node shares one entry. Anything else keys
+		// on the normalized upstream URL, so /img?src=X and any hotlink query noise
+		// share one edge entry.
+		upstream.hash = '';
+		const page = mangadexPage(upstream);
 		const cacheKey = new Request(
-			`${url.origin}/img?src=${encodeURIComponent(upstream.toString())}&validated=1`,
+			page
+				? `${url.origin}/img/md/${page.folder}/${page.chapter}/${page.file}`
+				: `${url.origin}/img?src=${encodeURIComponent(upstream.toString())}&validated=1`,
 			{ method: 'GET' },
 		);
+		const browserCache = page ? PAGE_BROWSER_CACHE : MUTABLE_IMAGE_CACHE;
 		const edge = caches.default;
 		// An explicit reader recovery bypasses a stale image, still subject to the
 		// normal miss rate limit and host validation. Refresh the shared cache on success.
 		const cached = url.searchParams.get('retry') === '1' ? undefined : await edge.match(cacheKey);
-		if (cached) return withMethod(cached, request.method);
+		if (cached) return served(cached, browserCache, request.method);
 
 		// --- Rate limit (per client IP) — only reached on a cache MISS. ----------
 		// Hot images served from the edge cache above are never throttled; this caps
@@ -120,7 +147,7 @@ export default {
 		// bucket. Kept BEFORE the upstream fetch so throttled requests never hit it.
 		const clientIp = request.headers.get('CF-Connecting-IP') ?? 'unknown';
 		const { success } = await env.IMG_RATE_LIMITER.limit({ key: clientIp });
-		if (!success) return errorResponse(429, 'Too Many Requests');
+		if (!success) return errorResponse(429, 'Too Many Requests', { 'Retry-After': '10' });
 
 		// --- 2. Upstream fetch. --------------------------------------------------
 		// Follow redirects MANUALLY (`redirect: 'manual'`), re-running the host
@@ -134,11 +161,16 @@ export default {
 				upstream,
 				env.ALLOWED_SOURCE_HOSTS,
 				env.MEDIA_ROUTE_HOSTS,
+				page ? PAGE_TIERED_FETCH : undefined,
 			);
 		} catch (err) {
 			if (err instanceof ProxyError) {
 				console.error(`img proxy: ${err.message} for ${upstream.origin}`);
 				return errorResponse(err.status, err.message);
+			}
+			if (isTimeout(err)) {
+				console.error(`img proxy: upstream deadline passed for ${upstream.origin}`);
+				return errorResponse(504, 'Upstream timed out');
 			}
 			console.error(`img proxy: upstream fetch failed for ${upstream.origin}`);
 			return errorResponse(502, 'Upstream fetch failed');
@@ -172,15 +204,23 @@ export default {
 		let bytes: Uint8Array;
 		try {
 			bytes = await readBoundedImage(originResp);
-		} catch {
+		} catch (err) {
+			if (isTimeout(err)) return errorResponse(504, 'Upstream timed out');
 			return errorResponse(502, 'Upstream image is incomplete or too large');
 		}
 		if (!validateImageBody(bytes, contentType)) {
 			return errorResponse(502, 'Upstream image is invalid or incomplete');
 		}
-		const res = finalizeImage(bytes, contentType);
-		ctx.waitUntil(edge.put(cacheKey, res.clone()));
-		return withMethod(res, request.method);
+		// The content key is shared by every MangaDex@Home node, so one bad node
+		// must not fill it for all: store only bytes that match their file name.
+		if (page && (await sha256Hex(bytes)) !== page.sha256) {
+			console.error(`img proxy: content hash mismatch for ${upstream.origin}`);
+			return errorResponse(502, 'Upstream image does not match its content hash');
+		}
+		const res = finalizeImage(bytes, contentType, page ? PAGE_EDGE_CACHE : MUTABLE_IMAGE_CACHE);
+		// A HEAD miss answers with headers only and stores nothing.
+		if (request.method !== 'HEAD') ctx.waitUntil(edge.put(cacheKey, res.clone()));
+		return served(res, browserCache, request.method);
 	},
 } satisfies ExportedHandler<Env>;
 
@@ -192,12 +232,16 @@ export default {
  * allowlist. Relative `Location`s are resolved against the current URL. Any hop to a
  * non-allowlisted host (or non-http(s) scheme) rejects — this is what keeps a
  * 3xx from turning the proxy into an SSRF/open-proxy primitive.
+ *
+ * One `UPSTREAM_DEADLINE_MS` signal covers every hop and the returned body.
  */
 async function fetchFollowingRedirects(
 	start: URL,
 	allowRaw: string | undefined,
 	mediaRouteHosts: string | undefined,
+	cf: RequestInitCfProperties | undefined,
 ): Promise<Response> {
+	const deadline = AbortSignal.timeout(UPSTREAM_DEADLINE_MS);
 	let current = start;
 	for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
 		const resp = await fetch(current.toString(), {
@@ -208,7 +252,8 @@ async function fetchFollowingRedirects(
 				Accept: 'image/*,*/*;q=0.8',
 			},
 			redirect: 'manual',
-			signal: AbortSignal.timeout(15_000),
+			signal: deadline,
+			cf,
 		});
 
 		if (!isRedirectStatus(resp.status)) return resp;
@@ -244,11 +289,41 @@ function isRedirectStatus(status: number): boolean {
 	return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
 }
 
-/** Build the response we serve + cache: image bytes, CORS, long cache. */
-function finalizeImage(bytes: Uint8Array, contentType: string): Response {
+/**
+ * A MangaDex page file: `{baseUrl}/{data|data-saver}/{chapter hash}/{n}-{sha256}.{ext}`.
+ * The baseUrl is a MangaDex@Home node (`*.mangadex.network`, sometimes with a
+ * token path segment) or `uploads.mangadex.org`. Other URLs, and page files
+ * without a SHA-256 in the name, return null and keep the upstream URL key.
+ */
+export function mangadexPage(
+	url: URL,
+): { folder: string; chapter: string; file: string; sha256: string } | null {
+	const host = url.hostname.toLowerCase().replace(/\.$/, '');
+	if (host !== 'uploads.mangadex.org' && !host.endsWith('.mangadex.network')) return null;
+	if (url.search !== '') return null;
+	const match =
+		/\/(data|data-saver)\/([0-9a-f]{32})\/([A-Za-z0-9]+-([0-9a-f]{64})\.[A-Za-z0-9]+)$/.exec(
+			url.pathname,
+		);
+	if (!match) return null;
+	const [, folder, chapter, file, sha256] = match;
+	return { folder, chapter, file, sha256 };
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+	const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+	return Array.from(digest, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function isTimeout(err: unknown): boolean {
+	return (err as { name?: unknown } | null)?.name === 'TimeoutError';
+}
+
+/** Build the response we store: image bytes, CORS, the stored lifetime. */
+function finalizeImage(bytes: Uint8Array, contentType: string, cacheControl: string): Response {
 	const headers = new Headers();
 	headers.set('Content-Type', contentType || 'application/octet-stream');
-	headers.set('Cache-Control', IMAGE_CACHE);
+	headers.set('Cache-Control', cacheControl);
 	// Defense in depth against content-sniffing: never let a browser reinterpret
 	// these bytes as anything other than the declared image type, and force an
 	// inline disposition so a mislabeled body can't be treated as a download.
@@ -461,21 +536,25 @@ export function validateImageBody(bytes: Uint8Array, contentType: string): boole
 	return false;
 }
 
-/** HEAD requests get headers only. */
-function withMethod(res: Response, method: string): Response {
-	if (method === 'HEAD') {
-		return new Response(null, { status: res.status, headers: res.headers });
-	}
-	return res;
+/** What the client gets: the browser lifetime, and headers only for HEAD. */
+function served(res: Response, cacheControl: string, method: string): Response {
+	const headers = new Headers(res.headers);
+	headers.set('Cache-Control', cacheControl);
+	return new Response(method === 'HEAD' ? null : res.body, { status: res.status, headers });
 }
 
-function errorResponse(status: number, message: string): Response {
+function errorResponse(
+	status: number,
+	message: string,
+	extra: Record<string, string> = {},
+): Response {
 	return new Response(message, {
 		status,
 		headers: {
 			'Content-Type': 'text/plain; charset=utf-8',
 			'Cache-Control': 'no-store',
 			...CORS_HEADERS,
+			...extra,
 		},
 	});
 }
