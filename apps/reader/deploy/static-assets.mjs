@@ -23,14 +23,15 @@ export function writeStaticHeaders(directory, connectSources) {
 	// The wildcard covers SPA fallback URLs too. Workers Assets applies _headers
 	// to the requested URL; /index.html alone would miss /browse and /read/*.
 	// Dynamic series responses get their own CSP from SvelteKit, not this file.
-	// Chunks are content-hashed, so they are kept a year without revalidation. SPA
+	// Chunks are content-hashed, so they are kept 7 days without revalidation. SPA
 	// fallback also serves index.html at a missing chunk URL (including non-navigation
-	// requests), and _headers cannot tell a real asset from that fallback, so this is
-	// safe only because a release never drops a chunk: deploy/release.mjs copies every
-	// earlier release's chunks into the new output. `! Cache-Control` drops the
-	// wildcard's `no-cache` first, so the value is replaced, not appended.
+	// requests), and _headers cannot tell a real asset from that fallback, so a missing
+	// chunk would be cached as HTML for up to 7 days. A release therefore never drops a
+	// chunk: deploy/release.mjs copies every earlier release's chunks into the new
+	// output. `! Cache-Control` drops the wildcard's `no-cache` first, so the value is
+	// replaced, not appended.
 	writeFileSync(
 		join(directory, '_headers'),
-		`${security}\n  Content-Security-Policy: ${policy}\n  Cache-Control: no-cache\n\n/_app/*\n  X-Robots-Tag: noindex\n\n/_app/immutable/*\n  ! Cache-Control\n  Cache-Control: public, max-age=31536000, immutable\n`,
+		`${security}\n  Content-Security-Policy: ${policy}\n  Cache-Control: no-cache\n\n/_app/*\n  X-Robots-Tag: noindex\n\n/_app/immutable/*\n  ! Cache-Control\n  Cache-Control: public, max-age=604800, immutable\n`,
 	);
 }

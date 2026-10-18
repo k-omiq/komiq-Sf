@@ -167,20 +167,20 @@ test('bundled router excludes slugless series while keeping series SSR', async (
 });
 
 for (const settings of [config, staticConfig]) {
-	test(`${settings.name}: chunks are kept a year and never invoke a User Worker`, async () => {
+	test(`${settings.name}: chunks are kept 7 days and never invoke a User Worker`, async () => {
 		const router = await routerFor(settings);
 		for (const path of ['/_app/missing.js', '/_app/immutable/missing.js']) {
 			for (const mode of [undefined, 'navigate', 'cors', 'same-origin']) {
 				const response = await router.fetch(path, mode ? { 'Sec-Fetch-Mode': mode } : {});
 				// The bundled worker's fetch path applies SPA fallback for every mode, and
 				// _headers matches the requested URL, so a missing chunk would get the shell
-				// under the year-long chunk header. That is why deploy/release.mjs never drops
+				// under the 7-day chunk header. That is why deploy/release.mjs never drops
 				// a chunk: every release carries all earlier releases' chunks.
 				assert.equal(response.status, 200);
 				assert.equal(await response.text(), router.shell);
 				assert.equal(
 					response.headers.get('Cache-Control'),
-					path.startsWith('/_app/immutable/') ? 'public, max-age=31536000, immutable' : 'no-cache',
+					path.startsWith('/_app/immutable/') ? 'public, max-age=604800, immutable' : 'no-cache',
 				);
 				assert.equal(response.headers.get('X-Robots-Tag'), 'noindex');
 				assert.equal(router.invocations, 0);
@@ -190,7 +190,7 @@ for (const settings of [config, staticConfig]) {
 		const existing = await router.fetch(entry, { 'Sec-Fetch-Mode': 'cors' });
 		assert.equal(existing.status, 200);
 		assert.equal(existing.headers.get('Content-Type'), 'text/javascript');
-		assert.equal(existing.headers.get('Cache-Control'), 'public, max-age=31536000, immutable');
+		assert.equal(existing.headers.get('Cache-Control'), 'public, max-age=604800, immutable');
 		assert.notEqual(await existing.text(), router.shell);
 		assert.equal(router.invocations, 0);
 	});

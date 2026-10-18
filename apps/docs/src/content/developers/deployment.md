@@ -47,7 +47,7 @@ The adapter generates the shell from the SPA fallback setting. `_routes.json` ap
 
 The split has been checked offline against the bundled router and generated output. Production invocation counts have not been measured. No deployment or billing result follows from the local check.
 
-For a pure static alternative, build with `KOMIKA_TARGET=static pnpm -C apps/reader build`. `apps/reader/wrangler.static.toml` serves `build` without a script, including series routes. It uses the separate name `komika-reader-static`, has no routes and disables `workers_dev`. An operator adds a test hostname when ready. Both builds generate `_headers` with exact inline-script CSP hashes, `Cache-Control: no-cache` for HTML and `public, max-age=31536000, immutable` for `/_app/immutable/*`. Browsers then keep the hashed app files for a year without asking again. The bundled asset worker returns the SPA shell for a missing chunk, even without `Sec-Fetch-Mode: navigate`. Since `_headers` matches the requested URL, that shell would be kept for a year under the missing chunk URL. So a release must never remove a chunk.
+For a pure static alternative, build with `KOMIKA_TARGET=static pnpm -C apps/reader build`. `apps/reader/wrangler.static.toml` serves `build` without a script, including series routes. It uses the separate name `komika-reader-static`, has no routes and disables `workers_dev`. An operator adds a test hostname when ready. Both builds generate `_headers` with exact inline-script CSP hashes, `Cache-Control: no-cache` for HTML and `public, max-age=604800, immutable` for `/_app/immutable/*`. Browsers then keep the hashed app files for 7 days without asking again. The bundled asset worker returns the SPA shell for a missing chunk, even without `Sec-Fetch-Mode: navigate`. Since `_headers` matches the requested URL, a missing app file can be cached as `index.html` for up to 7 days under its URL. So a release must never remove a chunk, and every release goes through `apps/reader/deploy/release.mjs`.
 
 ### Releasing the reader
 
@@ -71,7 +71,7 @@ The record lives in the git common directory, in `komika-reader-release/`. The m
 
 The script refuses to run when there is no record. For the first release with the script, pass `--previous DIR` with the output of the release that is live now, or `--no-previous` when nothing was released before.
 
-To roll back, release the older commit with the script. It keeps every chunk. `wrangler rollback` brings back an older version without the newer chunks, so an open tab that asks for one of those chunks keeps the shell under that URL for a year.
+To roll back, release the older commit with the script. It keeps every chunk. `wrangler rollback` brings back an older version without the newer chunks, so an open tab that asks for one of those chunks can keep the shell under that URL for up to 7 days.
 
 The page reloads once on a failed bootstrap import or Vite preload, then offers a manual Reload button. The guard is stored per build in the tab's `sessionStorage` and is never cleared, because a deferred import can still fail after the root mounts. A new build has its own guard, so it can reload once again.
 

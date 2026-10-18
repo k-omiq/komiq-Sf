@@ -7,7 +7,7 @@ import { retainImmutableAssets } from './retain-assets.mjs';
 // Release the reader: build, copy every earlier release's chunks into the output,
 // deploy, then record the output as the new last release.
 //
-// `/_app/immutable/*` is kept a year by browsers (deploy/static-assets.mjs), and Workers
+// `/_app/immutable/*` is kept 7 days by browsers (deploy/static-assets.mjs), and Workers
 // Assets answers a missing chunk URL with the SPA shell, so a release must never drop a
 // chunk that an open tab or a cached page may still import. The record of the last
 // release lives in the git common directory, which the main checkout and every worktree
