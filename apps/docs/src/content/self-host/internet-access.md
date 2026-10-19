@@ -77,7 +77,7 @@ A checklist shows each line as it runs:
 1. Checks the token and finds your domain's zone.
 2. For Tunnel: gets the connector, creates the tunnel and starts it. For Public IP: creates the certificate, serves HTTPS and sets SSL to Full (strict).
 3. Sets the trusted proxy ranges, so rate limits see real visitor addresses.
-4. Creates the DNS record and the cache rules for covers, page images and static files.
+4. Creates the DNS record and the cache rules, for your domain only. They cache chapter pages, exact media objects, covers, avatars, comment images, anonymous `GET` reads of `/graphql` and `/graphql/ssr`, legacy page images, `/img` and static files. One rule never caches `/health` and the media policy endpoints.
 5. Tells Cloudflare to respect your server's cache headers, then tests `https://<domain>/health`.
 
 ## What the server stores
@@ -88,7 +88,9 @@ The database keeps the IDs of what setup created, and no token or private key. C
 
 **I will do it by hand** in the form shows the steps for the Cloudflare dashboard instead.
 
-The server sends a Content-Security-Policy header on its web pages. This tells the browser which scripts and resources it can load. A reverse proxy is a service in front of your server. Do not add a second, different policy there. It can stop the app from loading.
+The server sends a Content-Security-Policy header on its web pages. This tells the browser which scripts and resources it can load. A reverse proxy is a service in front of your server. Do not add a second, different policy there. It can stop the app from loading. If your proxy adds one anyway, it must allow `https://challenges.cloudflare.com` when Turnstile, Cloudflare's security check on sign-in and posts, is on.
+
+The proxy must forward `/graphql/ssr` like `/graphql`, and keep the server's `ETag`, `Cache-Control` and `Access-Control-Allow-Origin` headers.
 
 Old cover and avatar links redirect to the current version. Keep these redirects working through your proxy.
 

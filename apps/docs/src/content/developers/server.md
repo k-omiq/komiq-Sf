@@ -165,7 +165,7 @@ The router in `apps/server/src/web_dir.rs` mounts these applications below API r
 
 Missing app paths return that app’s `index.html`, so client-side routes work on reload. Missing files under `/_app/` or `/admin/_app/` return `404` with `Cache-Control: no-store` instead. API routes take precedence.
 
-HTML carries `Cache-Control: no-cache` so the browser checks the page with the server before reusing it. At mount time, the server reads each app's `index.html` and computes a Content Security Policy (CSP) with SHA-256 hashes of its inline scripts. The policy permits same-origin scripts, inline styles, HTTP(S) connections to servers, and HTTP(S), data and blob images. It blocks objects and framing. The header applies to HTML only. If an index cannot be read at mount time, the server logs a warning and omits that app's CSP header.
+HTML carries `Cache-Control: no-cache` so the browser checks the page with the server before reusing it. At mount time, the server reads each app's `index.html` and computes a Content Security Policy (CSP) with SHA-256 hashes of its inline scripts. The policy permits same-origin scripts, inline styles, HTTP(S) connections to servers, and HTTP(S), data and blob images. It also allows `https://challenges.cloudflare.com` for scripts and frames, for the Cloudflare Turnstile check. It blocks objects, and no other site may frame the page. The header applies to HTML only. If an index cannot be read at mount time, the server logs a warning and omits that app's CSP header.
 
 > [!NOTE]
 > When `KOMIKA_WEB_DIR` is unset, the server acts as an API-only service and serves no static web files.

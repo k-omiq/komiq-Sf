@@ -108,6 +108,12 @@ Passwords are case-sensitive. When creating an account, passwords must be at lea
 
 If an administrator created your account with a temporary password or initiated a credential reset, komiq presents a Choose a new password prompt upon sign-in. You must choose a new password before you can proceed to the reader.
 
+### The server asks for a security check
+
+Some servers ask for a security check when you sign in, create an account, change your password, comment, rate or report. The desktop and phone apps cannot show it. They say "This server asks for a security check that only its website can show." Do these things on the server's website in a browser.
+
+If the website says "The security check could not be confirmed right now", try again in a moment. If it lasts, tell the server owner: the server's Turnstile secret, the key it uses to confirm the check with Cloudflare, may be wrong, or the server cannot reach Cloudflare.
+
 ### Expired session tokens
 
 Komiq stores a session token in browser local storage. This credential keeps you signed in. If it expires or the server invalidates it, authenticated actions fail. Open `/login` and sign in again. See [Accounts](/guide/accounts).

@@ -31,6 +31,8 @@ Sign in with an account on the connected server:
 2. Enter your username and password.
 3. Select **Sign in**.
 
+Some servers also ask for a security check. The desktop and phone apps cannot show it, so sign in on that server's website. See [Fix reader problems](/guide/troubleshooting).
+
 The app stores your session token locally and validates it against the server. If you arrived from a specific series or chapter, the app returns you there after sign-in.
 
 In native desktop and mobile apps, the sign-in card displays the address of the current server with a **Change server** link. Switching servers clears the previous server’s session. Sign in with an account on your chosen server. See [Connect to a server](/guide/connect).

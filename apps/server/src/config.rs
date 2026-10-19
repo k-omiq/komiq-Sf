@@ -354,8 +354,9 @@ pub struct Config {
     pub graphiql_enabled: bool,
     /// `KOMIKA_PERSISTED_ONLY=on`: a `GET /graphql` (or `/graphql/ssr`) must name a
     /// persisted document by `id`; one that carries the document text is refused with
-    /// 400. Off by default, so self-hosted servers, older apps and development keep
-    /// sending text. POST always takes full documents. See the `persisted` module.
+    /// 405 (`PERSISTED_QUERY_REQUIRED`, `Allow: POST`). Off by default, so self-hosted
+    /// servers, older apps and development keep sending text. POST always takes full
+    /// documents. See the `persisted` module.
     pub persisted_only: bool,
     /// Global request budget for the MangaDex crawl (fleet-wide; shared egress IP).
     /// MangaDex's per-IP ceiling is ~5 req/s.
