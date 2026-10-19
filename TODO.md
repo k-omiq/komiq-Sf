@@ -10,6 +10,33 @@
   - Check which paths the live `komika-reader` version runs the Worker on. The repo config says only `/series/*`, but the Worker gets more requests than that.
   - Tail both Workers until a 504 shows up, find the cause and fix it.
   - Find why a few phones request the same `/read` page hundreds of times (a reload or retry loop) and stop it.
+  - 2026-10-18: no visitor got a 504 from 2026-10-11 to 2026-10-17. The 504 rows in the logs are Workers cache lookups that missed, and Cloudflare logs every such miss as 504. Remaining: the 282 × 502 on api.komiq.cc in the same week.
+
+## Edge cache and bot protection (added 2026-10-18)
+
+Edge cache: fix these and Cloudflare serves far more traffic, so fewer requests reach the server.
+
+- [x] Chapter pages at `/media/v1/*` are cached at the edge. Page URLs carry the engine generation, so cached pages stay correct after an engine reset. (2026-10-18)
+- [x] Anonymous `GET /graphql` is cached at the edge. (2026-10-18)
+- [x] Zone Browser Cache TTL set to "Respect Existing Headers". (2026-10-18)
+- [x] Public responses send `Access-Control-Allow-Origin: *` without `Vary: Origin`. (2026-10-18)
+- [x] Extra query parameters on cover and avatar URLs redirect to the canonical URL. (2026-10-18)
+- [x] Series pages no longer cache errors or unknown series. (2026-10-18)
+- [x] The image Worker keys MangaDex pages by content and keeps them 30 days, and browsers keep them 7 days. (2026-10-18)
+- [x] Strong ETags on covers and media, so the edge revalidates with a 304. (2026-10-18)
+- [x] Worker observability on for `komika-reader` and `komika-img`. (2026-10-18)
+- [x] Removed the dead "cache public ssr html" rule and the duplicate cover rule. (2026-10-18)
+- [x] Series ids of the wrong shape give "not found" instead of an internal error. (2026-10-19)
+
+Bots: keep cached GETs free of challenges, because a challenge breaks fetch and image loads.
+
+- [x] Bot Fight Mode is off. It challenged search engines and our apps. (2026-10-18)
+- [x] AI training crawlers are blocked at the edge. AI search and assistant fetches are allowed. (2026-10-18)
+- [ ] WAF custom rules (scripting clients on `/graphql`, datacentre traffic on HTML pages only, odd methods) run in watch-only mode since 2026-10-18. Switch them on one at a time after 48 hours.
+- [x] One rate-limit rule on path `/graphql`. The reader's server-side calls use their own path, which only the reader can call. (2026-10-19)
+- [x] Accept GET `/graphql` only for known persisted queries, and let signed-in readers use the cache for public data. (2026-10-19)
+- [x] Add Turnstile to sign-up, sign-in, password changes and posting, checked by the server. Optional for self-hosted servers. (2026-10-19)
+- [x] Keep the website's GraphQL direct to `api.komiq.cc`. A same-origin Worker proxy would add about 3.5 billed Worker requests per page view, even for cache hits.
 
 ## Open api.komiq.cc to our own apps only
 
