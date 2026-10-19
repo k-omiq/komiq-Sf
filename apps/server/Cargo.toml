@@ -9,6 +9,11 @@ license = "AGPL-3.0-only"
 name = "komika-server"
 path = "src/main.rs"
 
+[lints.clippy]
+# HTTP helpers return `Result<_, axum::response::Response>` so a handler can `?` its
+# refusal straight out; boxing that Response would only add an allocation per request.
+result_large_err = "allow"
+
 [dependencies]
 # `process` + `io-util`: the self-host Cloudflare connector runs `cloudflared` as a
 # supervised child and reads its log lines (cloudflare/connector.rs).

@@ -1349,7 +1349,9 @@ async fn library_row_cached(
         });
     }
     loop {
-        if let Some(value) = { receiver.borrow().clone() } {
+        // Clone out of the borrow so its guard is gone before the `await` below.
+        let current = receiver.borrow().clone();
+        if let Some(value) = current {
             return value;
         }
         receiver.changed().await.map_err(gql_err)?;

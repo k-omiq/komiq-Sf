@@ -186,7 +186,7 @@ impl Reserve {
 
     fn add(&self, bytes: usize) {
         let (_, usage) = self.usage();
-        let _ = usage.bytes.fetch_update(Relaxed, Relaxed, |old| {
+        let _ = usage.bytes.try_update(Relaxed, Relaxed, |old| {
             Some(old.saturating_add(bytes as u64))
         });
         self.warn_exhausted(&usage);
