@@ -12,11 +12,12 @@
 	import { page as pageState } from '$app/state';
 	import { auth } from '$lib/auth.svelte';
 	import { assetSrc } from '$lib/config';
-	import { confirm } from '$lib/confirm.svelte';
+	import { confirm, confirmSkipped, skipConfirm } from '$lib/confirm.svelte';
 	import { toast } from '$lib/toast.svelte';
 	import Button from '$lib/components/Button.svelte';
 	import Cover from '$lib/components/Cover.svelte';
 	import Dialog from '$lib/components/Dialog.svelte';
+	import DontAskAgain from '$lib/components/DontAskAgain.svelte';
 	import GettingStarted from '$lib/components/GettingStarted.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import LoadState from '$lib/components/LoadState.svelte';
@@ -217,6 +218,11 @@
 	// A failed merge stays inline in the confirm dialog: the dialog is still open and
 	// makes everything behind it (the toaster included) inert.
 	let mergeError = $state<string | null>(null);
+	/** "Don't ask again this session": a picked target then merges without the dialog. */
+	const MERGE_WORKS_SKIP = 'merge-works';
+	let dontAskMerge = $state(false);
+	/** Row whose "Keep this one" is merging with no dialog open. */
+	let quickMergeId = $state<string | null>(null);
 
 	/** The canonical work id for a row, or null when not catalogued. A text-search row
 	 * IS a canonical work, so its own id is the work id — no provenance lookup needed. */
@@ -262,11 +268,21 @@
 	}
 
 	async function pickTarget(s: Series): Promise<void> {
-		if (!mergeSource || !canBeTarget(s)) return;
+		if (!mergeSource || !canBeTarget(s) || merging) return;
 		const side = await sideFor(s);
-		if (!mergeSource) return; // the merge was cancelled while we fetched
-		mergeTarget = side;
+		if (!mergeSource || !side) return; // the merge was cancelled while we fetched
 		mergeError = null;
+		if (confirmSkipped(MERGE_WORKS_SKIP)) {
+			quickMergeId = s.id;
+			try {
+				await runMerge(mergeSource, side);
+			} finally {
+				quickMergeId = null;
+			}
+			return;
+		}
+		dontAskMerge = false;
+		mergeTarget = side;
 	}
 
 	function cancelMerge(): void {
@@ -282,13 +298,19 @@
 
 	async function confirmMerge(): Promise<void> {
 		if (!mergeSource || !mergeTarget || merging) return;
+		if (dontAskMerge) skipConfirm(MERGE_WORKS_SKIP);
+		await runMerge(mergeSource, mergeTarget);
+	}
+
+	/** Run the merge. From the dialog a failure shows inline; without it, as a toast. */
+	async function runMerge(source: MergeSide, target: MergeSide): Promise<void> {
 		merging = true;
 		mergeError = null;
 		try {
-			const res = await mergeWorks(mergeSource.workId, mergeTarget.workId);
+			const res = await mergeWorks(source.workId, target.workId);
 			const moved = res.movedSourceSeries;
 			toast.success(
-				`Merged into ${mergeTarget.title}. ${moved} source ${moved === 1 ? 'link' : 'links'} moved and the duplicate work was deleted.`,
+				`Merged into ${target.title}. ${moved} source ${moved === 1 ? 'link' : 'links'} moved and the duplicate work was deleted.`,
 			);
 			mergeSource = null;
 			mergeTarget = null;
@@ -300,7 +322,9 @@
 			// and the Source column would keep showing the deleted work's mappings.
 			await loadProvenance(series);
 		} catch (err) {
-			mergeError = err instanceof Error ? err.message : 'Merge failed.';
+			const why = err instanceof Error ? err.message : 'Merge failed.';
+			if (mergeTarget) mergeError = why;
+			else toast.error(`The merge failed and nothing was changed. ${why}`);
 		} finally {
 			merging = false;
 		}
@@ -841,8 +865,12 @@
 							{#if mergeSource.seriesId === s.id}
 								<span class="k-badge" data-tone="danger">Will be deleted</span>
 							{:else if canBeTarget(s)}
-								<Button size="sm" variant="primary" onclick={() => pickTarget(s)}
-									>Keep this one</Button
+								<Button
+									size="sm"
+									variant="primary"
+									busy={quickMergeId === s.id}
+									disabled={merging && quickMergeId !== s.id}
+									onclick={() => pickTarget(s)}>Keep this one</Button
 								>
 							{:else if workIdOf(s) === mergeSource.workId}
 								<span class="detail">Same work</span>
@@ -1034,6 +1062,7 @@
 			{/if}
 		</div>
 		{#snippet footer()}
+			<DontAskAgain bind:checked={dontAskMerge} disabled={merging} />
 			<Button variant="ghost" disabled={merging} onclick={backToTargets}>Back</Button>
 			<Button variant="danger-solid" busy={merging} onclick={confirmMerge}
 				>Merge and delete source</Button

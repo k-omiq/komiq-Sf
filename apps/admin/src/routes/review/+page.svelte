@@ -202,6 +202,7 @@
 					`This cannot be undone.`,
 				confirmLabel: 'Merge',
 				danger: true,
+				skipKey: 'merge-candidate',
 			}))
 		)
 			return;

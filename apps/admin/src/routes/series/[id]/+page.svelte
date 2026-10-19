@@ -677,6 +677,7 @@
 			message: `Merge ${dropped} into ${kept}? The dropped entry's copies move to the kept entry. Readers keep what they have read.`,
 			confirmLabel: 'Merge entries',
 			danger: true,
+			skipKey: 'merge-chapter-entries',
 		});
 		if (!ok || id !== here || seq !== loadSeq || entryBusyKey !== null) return;
 		entryBusyKey = entry.id;
