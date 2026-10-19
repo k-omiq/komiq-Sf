@@ -63,13 +63,17 @@ The removal runs in the background and resumes after a restart. Turn the switch 
 
 The Cover issues section lists works with recorded cover issues.
 
-Each row shows the cover, the series, the reason, the number of tries, the last attempt, and the **Retry** and **Upload** buttons. Reasons have readable labels: **Image too large** (`too_large`), **Unsupported or damaged file** (`unsupported`), **Image is empty** (`empty`), **Could not convert** (`encode`) and **Could not save** (`store`). Other reasons, such as `truncated` and `fetch`, appear as raw codes.
+Each row shows the cover, the series, the reason, the number of tries, the last attempt, and the **Retry** and **Upload** buttons. Reasons have readable labels: **Image too large** (`too_large`), **Unsupported or damaged file** (`unsupported`), **Image is empty** (`empty`), **Could not convert** (`encode`) and **Could not save** (`store`). Other reasons, such as `truncated`, `garbled` and `fetch`, appear as raw codes.
 
 ## How to repair a cover
 
 ### Retry the download
 
 Use **Retry** after a temporary network failure, timeout or rate limit. Your server tries the linked sources in cover ranking order, MangaDex only when it is enabled, until one supplies a processable image. On success it saves the cover and its new version in one database transaction, and the row leaves the list. A deterministic processing failure updates the attempt count and the error. If no image can be fetched, the issue stays as it was.
+
+For an extension source, **Retry** first has the engine download the cover again, since it keeps a saved copy. **Fetch cover** on a reader series page does the same.
+
+A damaged JPEG can show smeared or green blocks. Your server refuses it (`garbled`) and asks the engine for a new copy, at most hourly per series.
 
 ### Upload a replacement image
 

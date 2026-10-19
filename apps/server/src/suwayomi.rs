@@ -15,6 +15,58 @@ use crate::source_health::{Subject, Surface};
 use crate::telemetry::BodySource;
 use crate::upstream_cache::TtlMemo;
 
+/// How long after asking the engine to download a garbled thumbnail again the same
+/// manga may ask again on its own. The repair fetches the manga's details from the
+/// source, so a cover the source itself serves damaged must not do that on every view.
+const THUMBNAIL_REPAIR_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Engine thumbnail requests, one at a time per manga.
+///
+/// Suwayomi downloads a thumbnail into one temp file per manga
+/// (`/tmp/Tachidesk/thumbnails/<id>.tmp`). Two requests for the same manga at once
+/// write into that file together, and the saved copy (`downloads/thumbnails/<id>.jpg`,
+/// kept for good once the manga is in the library) is a mix of both: it still has its
+/// start and end markers and decodes, with a band of garbage. Enrolment asks for the
+/// cover twice at once (its pHash and the cover store), so the server itself started
+/// that race. Every thumbnail request of this client takes the manga's turn first.
+#[derive(Default)]
+struct ThumbnailTurns {
+    turns:
+        std::sync::Mutex<std::collections::HashMap<i64, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// When each manga last asked the engine for a fresh download by itself.
+    repaired: std::sync::Mutex<std::collections::HashMap<i64, std::time::Instant>>,
+}
+
+impl ThumbnailTurns {
+    async fn take(&self, manga_id: i64) -> tokio::sync::OwnedMutexGuard<()> {
+        let turn = {
+            let mut turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
+            turns.retain(|_, turn| turn.strong_count() > 0);
+            match turns.get(&manga_id).and_then(std::sync::Weak::upgrade) {
+                Some(turn) => turn,
+                None => {
+                    let turn = Arc::new(tokio::sync::Mutex::new(()));
+                    turns.insert(manga_id, Arc::downgrade(&turn));
+                    turn
+                }
+            }
+        };
+        turn.lock_owned().await
+    }
+
+    /// Whether `manga_id` may ask for a fresh download now (and note that it did).
+    fn may_repair(&self, manga_id: i64) -> bool {
+        let now = std::time::Instant::now();
+        let mut repaired = self.repaired.lock().unwrap_or_else(|e| e.into_inner());
+        repaired.retain(|_, at| now.duration_since(*at) < THUMBNAIL_REPAIR_EVERY);
+        if repaired.contains_key(&manga_id) {
+            return false;
+        }
+        repaired.insert(manga_id, now);
+        true
+    }
+}
+
 /// Max simultaneous upstream COVER fetches (Suwayomi -> source CDN) across the whole
 /// process. Covers are the only Suwayomi call a browser `<img>` blocks on, and the
 /// engine proxies each one to a third-party CDN, so an unbounded fan-out (a 30-card
@@ -553,6 +605,9 @@ pub struct SuwayomiClient {
     cover_sem: Arc<Semaphore>,
     /// Bound on detached background materializations (see [`BG_MATERIALIZE_CONCURRENCY`]).
     bg_sem: Arc<Semaphore>,
+    /// One thumbnail request at a time per manga (see [`ThumbnailTurns`]). Shared by
+    /// every clone of the client.
+    thumbnails: Arc<ThumbnailTurns>,
     /// Separate HTTP client for PAGE fetches — its own timeout ([`PAGE_TIMEOUT_SECS`]),
     /// between the cover and scan clients.
     page_http: reqwest::Client,
@@ -652,6 +707,7 @@ impl SuwayomiClient {
             cover_http,
             cover_sem: Arc::new(Semaphore::new(COVER_FETCH_CONCURRENCY)),
             bg_sem: Arc::new(Semaphore::new(BG_MATERIALIZE_CONCURRENCY)),
+            thumbnails: Arc::default(),
             page_http,
             page_sem: Arc::new(Semaphore::new(PAGE_FETCH_CONCURRENCY)),
             pages_memo: Arc::new(TtlMemo::new(
@@ -760,6 +816,8 @@ impl SuwayomiClient {
         } else {
             format!("{}{}", self.base_url, raw)
         };
+        let manga_id = crate::engine_route::cover_manga_id(&url);
+        let _turn = self.thumbnail_turn(manga_id).await;
         // Patient acquire. Two classes of caller, and only one is fan-out bounded:
         // the background crawl/warmer holds at most `WARM_COVER_CONCURRENCY` (enforced
         // by its `buffer_unordered`), but the pHash enrol paths in `graphql/mod.rs`
@@ -769,29 +827,97 @@ impl SuwayomiClient {
         // at the top of this module; see it for the real on-demand floor. If enrolment
         // is ever parallelised it must take a background slot instead of competing here.
         let _permit = self.cover_sem.clone().acquire_owned().await.ok()?;
+        self.checked_thumbnail(manga_id, || self.cover_bytes_once(&url))
+            .await
+            .inspect_err(|e| tracing::debug!(error = %e, "suwayomi cover bytes unavailable"))
+            .ok()
+            .map(|(bytes, _)| bytes)
+    }
+
+    /// One download for [`Self::cover_bytes`]. Assumes the caller holds a permit.
+    async fn cover_bytes_once(&self, url: &str) -> Result<(Vec<u8>, String)> {
         let res = self
             .cover_http
             .get(url)
             .send()
             .await
-            .inspect_err(|e| self.connection_failed(e))
-            .ok()?;
+            .inspect_err(|e| self.connection_failed(e))?;
         if !res.status().is_success() {
-            return None;
+            return Err(anyhow!("Suwayomi cover error {}", res.status()));
         }
         let bytes = read_capped(res, MAX_COVER_SOURCE_BYTES)
             .await
-            .inspect_err(|e| self.body_failed(e))
-            .ok()?;
+            .inspect_err(|e| self.body_failed(e))?;
         // A well-formed HTTP response can still carry an INCOMPLETE image: the source
         // CDN (or Suwayomi's proxy of it) closes the body early and `zune-jpeg` decodes
         // the partial data to `Ok` with a flat decoder-fill tail. Reject it here so the
         // truncated bytes never reach `process_cover` and get frozen into the cache.
         if let Err(e) = crate::avatar::ensure_complete(&bytes) {
             tracing::warn!(error = %e, "suwayomi cover: rejected truncated source");
-            return None;
+            return Err(e);
         }
-        Some(bytes)
+        Ok((bytes, String::new()))
+    }
+
+    /// The manga's thumbnail turn (see [`ThumbnailTurns`]); `None` for a URL that names
+    /// no manga, which then runs unserialized as before.
+    async fn thumbnail_turn(
+        &self,
+        manga_id: Option<i64>,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        Some(self.thumbnails.take(manga_id?).await)
+    }
+
+    /// Run one thumbnail download and refuse garbled JPEG data. A garbled copy is the
+    /// engine's SAVED thumbnail, so fetching again returns the same bytes: instead the
+    /// engine is asked for the manga's details, which drops its saved thumbnail
+    /// (Suwayomi `Manga.clearThumbnail`), and the download runs once more. At most once
+    /// per [`THUMBNAIL_REPAIR_EVERY`] per manga. The caller holds the manga's turn.
+    async fn checked_thumbnail<F, Fut>(
+        &self,
+        manga_id: Option<i64>,
+        fetch: F,
+    ) -> Result<(Vec<u8>, String)>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<(Vec<u8>, String)>>,
+    {
+        let fetched = fetch().await?;
+        let Err(error) = crate::jpeg_scan::check(&fetched.0) else {
+            return Ok(fetched);
+        };
+        let Some(id) = manga_id.filter(|&id| self.thumbnails.may_repair(id)) else {
+            return Err(error);
+        };
+        tracing::warn!(
+            manga_id = id,
+            error = %error,
+            "suwayomi cover: saved thumbnail is garbled, asking the engine to download it again"
+        );
+        self.drop_saved_thumbnail(id).await?;
+        let fetched = fetch().await?;
+        crate::jpeg_scan::check(&fetched.0)?;
+        Ok(fetched)
+    }
+
+    /// Ask the engine to download `manga_id`'s thumbnail again on its next request:
+    /// fetching the manga's details from the source drops the saved copy when the
+    /// source names a thumbnail. Errors when the source could not be reached, because
+    /// then the saved copy is still there.
+    async fn drop_saved_thumbnail(&self, manga_id: i64) -> Result<()> {
+        match self.series_with_provenance(manga_id).await? {
+            (_, Provenance::Upstream) => Ok(()),
+            (_, Provenance::CachedFallback) => Err(anyhow!(
+                "the engine could not reach the source to download manga {manga_id}'s cover again"
+            )),
+        }
+    }
+
+    /// [`Self::drop_saved_thumbnail`] in the manga's turn, for an admin's explicit
+    /// "fetch the cover again".
+    pub async fn refresh_thumbnail(&self, manga_id: i64) -> Result<()> {
+        let _turn = self.thumbnails.take(manga_id).await;
+        self.drop_saved_thumbnail(manga_id).await
     }
 
     pub(crate) fn page_permits_available(&self) -> usize {
@@ -820,17 +946,23 @@ impl SuwayomiClient {
     /// * uses the short cover timeout, not the 30 s scan timeout;
     /// * streams the body under [`MAX_COVER_SOURCE_BYTES`] and rejects a truncated
     ///   image instead of handing partial bytes to the decoder.
+    ///
+    /// The one wait it does have is the manga's turn ([`ThumbnailTurns`]), taken before
+    /// the permit: behind another request for the SAME cover only, so it never holds a
+    /// permit while it waits.
     pub async fn fetch_cover_now(
         &self,
         path: &str,
     ) -> std::result::Result<(Vec<u8>, String), CoverFetchError> {
+        let manga_id = crate::engine_route::cover_manga_id(path);
+        let _turn = self.thumbnail_turn(manga_id).await;
         let lane = crate::telemetry::ADMISSION.lane(crate::telemetry::Lane::CoverFetch);
         let Ok(_permit) = self.cover_sem.clone().try_acquire_owned() else {
             lane.refuse();
             return Err(CoverFetchError::Busy);
         };
         lane.admitted();
-        self.fetch_cover_inner(path)
+        self.checked_thumbnail(manga_id, || self.fetch_cover_inner(path))
             .await
             .map_err(CoverFetchError::Upstream)
     }
@@ -840,16 +972,20 @@ impl SuwayomiClient {
     /// background work is patient — but the caller must bound its own fan-out to
     /// [`WARM_COVER_CONCURRENCY`] so on-demand requests keep their headroom.
     pub async fn fetch_cover_background(&self, path: &str) -> Result<(Vec<u8>, String)> {
+        let manga_id = crate::engine_route::cover_manga_id(path);
+        let _turn = self.thumbnail_turn(manga_id).await;
         let _permit = self
             .cover_sem
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| anyhow!("cover fetch semaphore closed"))?;
-        self.fetch_cover_inner(path).await
+        self.checked_thumbnail(manga_id, || self.fetch_cover_inner(path))
+            .await
     }
 
-    /// Shared body of the two cover fetchers. Assumes the caller holds a permit.
+    /// One download for the two cover fetchers. Assumes the caller holds a permit and
+    /// the manga's turn.
     async fn fetch_cover_inner(&self, path: &str) -> Result<(Vec<u8>, String)> {
         self.wait_for_generation().await?;
         let generation = self.read_generation();
@@ -1997,6 +2133,9 @@ pub(crate) mod testsrv {
     pub struct TestOrigin {
         pub base_url: String,
         pub hits: Arc<AtomicUsize>,
+        /// The requests in `hits` that were not GraphQL (`POST /api/graphql`): image
+        /// counts stay exact when a client also asks the engine for a manga's details.
+        pub image_hits: Arc<AtomicUsize>,
         /// Highest number of requests that were in flight at the same instant — the
         /// observable that proves the client-side semaphore bounds concurrency.
         pub peak_concurrent: Arc<AtomicUsize>,
@@ -2029,9 +2168,15 @@ pub(crate) mod testsrv {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let hits = Arc::new(AtomicUsize::new(0));
+        let image_hits = Arc::new(AtomicUsize::new(0));
         let inflight = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
-        let (h, i, p) = (hits.clone(), inflight.clone(), peak.clone());
+        let (h, g, i, p) = (
+            hits.clone(),
+            image_hits.clone(),
+            inflight.clone(),
+            peak.clone(),
+        );
         let body = Arc::new(body);
         let content_type = Arc::new(content_type.to_string());
         tokio::spawn(async move {
@@ -2039,16 +2184,20 @@ pub(crate) mod testsrv {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
                 };
-                let (h, i, p, body) = (h.clone(), i.clone(), p.clone(), body.clone());
+                let (h, g, i, p, body) = (h.clone(), g.clone(), i.clone(), p.clone(), body.clone());
                 let ct = content_type.clone();
                 tokio::spawn(async move {
-                    // Drain the request head; we don't care what it asks for.
+                    // Drain the request head; only GraphQL is told apart.
                     let mut buf = [0u8; 2048];
-                    let _ = sock.read(&mut buf).await;
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let graphql = buf[..n].starts_with(b"POST /api/graphql");
                     h.fetch_add(1, Ordering::SeqCst);
+                    if !graphql {
+                        g.fetch_add(1, Ordering::SeqCst);
+                    }
                     let now = i.fetch_add(1, Ordering::SeqCst) + 1;
                     p.fetch_max(now, Ordering::SeqCst);
-                    if !delay.is_zero() {
+                    if !delay.is_zero() && !graphql {
                         tokio::time::sleep(delay).await;
                     }
                     let head = format!(
@@ -2065,6 +2214,7 @@ pub(crate) mod testsrv {
         TestOrigin {
             base_url: format!("http://127.0.0.1:{port}"),
             hits,
+            image_hits,
             peak_concurrent: peak,
         }
     }
@@ -2214,6 +2364,174 @@ mod tests {
         fetch.abort();
         assert!(fetch.await.unwrap_err().is_cancelled());
         assert_eq!(c.page_sem.available_permits(), PAGE_FETCH_CONCURRENCY);
+    }
+
+    /// A garbled copy of `whole`: a chunk of scan data is missing, as when two
+    /// downloads wrote into the engine's one temp file at once.
+    fn garbled(whole: &[u8]) -> Vec<u8> {
+        let cut = whole.len() / 2;
+        let mut out = whole[..cut].to_vec();
+        out.extend_from_slice(&whole[cut + 512..]);
+        out
+    }
+
+    /// A fake engine: thumbnails answer `garbled` until a details fetch
+    /// (`fetchMangaAndChapters`) drops the saved copy, as Suwayomi's `clearThumbnail`
+    /// does. Returns the base URL and the counts of thumbnail and details requests,
+    /// plus the highest number of thumbnail requests at once.
+    async fn fake_engine(
+        whole: Vec<u8>,
+        details_reach_source: bool,
+        delay: Duration,
+    ) -> (String, Arc<[std::sync::atomic::AtomicUsize; 4]>) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        // [thumbnails, details, in flight, peak in flight]
+        let counts: Arc<[AtomicUsize; 4]> = Arc::new(Default::default());
+        let fresh = Arc::new(AtomicBool::new(false));
+        let bad = garbled(&whole);
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/manga/{id}/thumbnail",
+                axum::routing::get({
+                    let (counts, fresh) = (counts.clone(), fresh.clone());
+                    move || {
+                        let (counts, fresh) = (counts.clone(), fresh.clone());
+                        let (whole, bad) = (whole.clone(), bad.clone());
+                        async move {
+                            counts[0].fetch_add(1, Ordering::SeqCst);
+                            let now = counts[2].fetch_add(1, Ordering::SeqCst) + 1;
+                            counts[3].fetch_max(now, Ordering::SeqCst);
+                            tokio::time::sleep(delay).await;
+                            counts[2].fetch_sub(1, Ordering::SeqCst);
+                            let body = if fresh.load(Ordering::SeqCst) {
+                                whole
+                            } else {
+                                bad
+                            };
+                            ([(axum::http::header::CONTENT_TYPE, "image/jpeg")], body)
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/graphql",
+                axum::routing::post({
+                    let (counts, fresh) = (counts.clone(), fresh.clone());
+                    move |axum::Json(request): axum::Json<Value>| {
+                        let (counts, fresh) = (counts.clone(), fresh.clone());
+                        async move {
+                            let id = request["variables"]["id"].as_i64().unwrap_or(0);
+                            let manga = json!({"id": id, "title": "Series", "url": "/manga/1",
+                                "thumbnailUrl": format!("/api/v1/manga/{id}/thumbnail"), "status": "ONGOING",
+                                "inLibrary": true, "sourceId": "1", "source": {"lang": "en"}});
+                            let query = request["query"].as_str().unwrap_or("");
+                            axum::Json(if !query.contains("fetchMangaAndChapters") {
+                                json!({"data": {"manga": manga}})
+                            } else if details_reach_source {
+                                counts[1].fetch_add(1, Ordering::SeqCst);
+                                fresh.store(true, Ordering::SeqCst);
+                                json!({"data": {"fetchMangaAndChapters": {"manga": manga}}})
+                            } else {
+                                counts[1].fetch_add(1, Ordering::SeqCst);
+                                json!({"errors": [{"message": "source unreachable"}]})
+                            })
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, counts)
+    }
+
+    #[tokio::test]
+    async fn garbled_saved_thumbnail_is_downloaded_again_once() {
+        use std::sync::atomic::Ordering;
+        let whole = testsrv::jpeg(200, 300);
+        let (url, counts) = fake_engine(whole.clone(), true, Duration::ZERO).await;
+        let c = client(&url);
+        let (bytes, _) = c
+            .fetch_cover_now("/api/v1/manga/5/thumbnail")
+            .await
+            .expect("the repaired thumbnail is served");
+        assert_eq!(bytes, whole);
+        assert_eq!(counts[0].load(Ordering::SeqCst), 2, "garbled, then fresh");
+        assert_eq!(counts[1].load(Ordering::SeqCst), 1, "one details fetch");
+        // The pHash path shares the turn and the check.
+        assert_eq!(
+            c.cover_bytes(Some("/api/v1/manga/5/thumbnail")).await,
+            Some(whole)
+        );
+    }
+
+    #[tokio::test]
+    async fn garbled_thumbnail_is_refused_and_repair_is_rate_limited() {
+        use std::sync::atomic::Ordering;
+        let (url, counts) = fake_engine(testsrv::jpeg(200, 300), false, Duration::ZERO).await;
+        let c = client(&url);
+        let first = c.fetch_cover_background("/api/v1/manga/6/thumbnail").await;
+        assert!(
+            first.is_err(),
+            "the source was unreachable, the copy is still garbled"
+        );
+        assert_eq!(counts[1].load(Ordering::SeqCst), 1);
+        let second = c.fetch_cover_background("/api/v1/manga/6/thumbnail").await;
+        let error = second
+            .expect_err("garbled bytes are never served")
+            .to_string();
+        assert!(error.contains("garbled"), "{error}");
+        assert_eq!(
+            counts[1].load(Ordering::SeqCst),
+            1,
+            "no second repair within the hour"
+        );
+        assert_eq!(c.cover_bytes(Some("/api/v1/manga/6/thumbnail")).await, None);
+        // An admin's explicit refresh is not rate limited, and reports the failure.
+        assert!(c.refresh_thumbnail(6).await.is_err());
+        assert_eq!(counts[1].load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn thumbnail_requests_for_one_manga_take_turns() {
+        use std::sync::atomic::Ordering;
+        let whole = testsrv::jpeg(64, 96);
+        let (url, counts) = fake_engine(whole, true, Duration::from_millis(150)).await;
+        let c = client(&url);
+        c.refresh_thumbnail(8).await.unwrap(); // serve whole images from here on
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let c = c.clone();
+            handles.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    c.fetch_cover_background("/api/v1/manga/8/thumbnail")
+                        .await
+                        .is_ok()
+                } else {
+                    c.cover_bytes(Some("/api/v1/manga/8/thumbnail"))
+                        .await
+                        .is_some()
+                }
+            }));
+        }
+        for h in handles {
+            assert!(h.await.unwrap());
+        }
+        assert_eq!(counts[0].load(Ordering::SeqCst), 4);
+        assert_eq!(
+            counts[3].load(Ordering::SeqCst),
+            1,
+            "never two at once for one manga"
+        );
+        // Different manga still run side by side.
+        let (a, b) = tokio::join!(
+            c.fetch_cover_background("/api/v1/manga/8/thumbnail"),
+            c.fetch_cover_background("/api/v1/manga/9/thumbnail"),
+        );
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(counts[3].load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -2397,10 +2715,12 @@ mod tests {
 
         // Saturate: exactly COVER_FETCH_CONCURRENCY in-flight fetches.
         let mut handles = Vec::new();
-        for _ in 0..COVER_FETCH_CONCURRENCY {
+        // One manga each: requests for the same manga take turns (`ThumbnailTurns`).
+        for i in 0..COVER_FETCH_CONCURRENCY {
             let c = c.clone();
             handles.push(tokio::spawn(async move {
-                c.fetch_cover_now("/api/v1/manga/1/thumbnail").await.is_ok()
+                let path = format!("/api/v1/manga/{}/thumbnail", 10 + i);
+                c.fetch_cover_now(&path).await.is_ok()
             }));
         }
         // Wait for every permit to be taken (not for the fetches to finish).

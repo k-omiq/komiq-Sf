@@ -140,6 +140,9 @@ pub fn process_cover(bytes: &[u8]) -> Result<Vec<u8>> {
     // keeps the failure attributable to the cover pipeline (and to
     // `classify_cover_error`'s `truncated` reason) for every `process_cover` caller.
     crate::avatar::ensure_complete(bytes)?;
+    // Same reason, for a JPEG whose bytes are all there but mixed up (two downloads
+    // written into one file): it decodes to `Ok` with a band of garbage.
+    crate::jpeg_scan::check(bytes)?;
     let img = decode_limited(bytes)?;
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
@@ -1519,6 +1522,9 @@ pub fn classify_cover_error(err: &anyhow::Error) -> &'static str {
     } else if s.contains("truncated") {
         // A partial download, not a property of the source — see `is_transient`.
         "truncated"
+    } else if s.contains("garbled") {
+        // A damaged download (`jpeg_scan`), not a property of the source either.
+        "garbled"
     } else if s.contains("unsupported") || s.contains("corrupt") || s.contains("zero dimension") {
         "unsupported"
     } else if s.contains("empty") {
@@ -1536,7 +1542,7 @@ pub fn classify_cover_error(err: &anyhow::Error) -> &'static str {
 /// cut short. Recording it would turn one flaky CDN response into a permanently
 /// coverless work — exactly the failure mode this whole change set exists to remove.
 pub fn is_transient_cover_error(err: &anyhow::Error) -> bool {
-    classify_cover_error(err) == "truncated"
+    matches!(classify_cover_error(err), "truncated" | "garbled")
 }
 
 /// Record (or refresh) a cover-processing failure so the crawl stops re-attempting
@@ -1746,6 +1752,10 @@ pub fn classify_fetch_error(err: &anyhow::Error) -> CoverFailure {
     if s.contains("truncated") {
         // The image is fine, the download was cut short (see `is_transient_cover_error`).
         return CoverFailure::Transient("truncated");
+    }
+    if s.contains("garbled") {
+        // The download was damaged; the engine was already asked for a fresh one.
+        return CoverFailure::Transient("garbled");
     }
     match cover_error_status(&s) {
         // Deterministic for this URL: a malformed/absent upstream reference.
@@ -2120,6 +2130,16 @@ pub async fn retry_one_cover(
         sources.retain(|s| !matches!(s, RepairCoverSource::MangaDex { .. }));
     }
     let processed = process_repair_sources(sources, |source| async move {
+        // An explicit retry wants a FRESH engine download: the engine keeps the
+        // thumbnail it saved for a library manga, so without this a damaged copy
+        // comes back every time.
+        if let RepairCoverSource::Suwayomi { path, .. } = &source {
+            if let Some(id) = crate::engine_route::cover_manga_id(path) {
+                if let Err(error) = suwayomi.refresh_thumbnail(id).await {
+                    tracing::warn!(manga_id = id, error = %error, "cover retry: engine refresh failed; fetching its saved copy");
+                }
+            }
+        }
         fetch_cover_source(main, mangadex, suwayomi, &source).await
     })
     .await;
@@ -4564,7 +4584,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(issues, 0);
-        assert_eq!(origin.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(origin.image_hits.load(Ordering::SeqCst), 1);
+        // The retry asked the engine for a fresh download first (a details fetch).
+        assert!(origin.hits.load(Ordering::SeqCst) > 1);
         let bad_origin =
             crate::suwayomi::testsrv::spawn(b"not an image".to_vec(), Duration::ZERO).await;
         let bad_client =
@@ -4610,7 +4632,7 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(md_origin.hits.load(Ordering::SeqCst), 0);
-        assert_eq!(suw_origin.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(suw_origin.image_hits.load(Ordering::SeqCst), 1);
         // On, MangaDex is the preferred source again.
         mangadex.set_enabled(true);
         assert!(
@@ -4619,7 +4641,7 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(md_origin.hits.load(Ordering::SeqCst), 1);
-        assert_eq!(suw_origin.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(suw_origin.image_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

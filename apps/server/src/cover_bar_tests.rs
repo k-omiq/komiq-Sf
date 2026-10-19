@@ -159,7 +159,7 @@ async fn barred_oldest_suwayomi_mapping_is_skipped_for_the_next_allowed_mapping(
         provenance(&main, "w_suw").await.1.as_deref(),
         Some("next-source")
     );
-    assert_eq!(origin.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(origin.image_hits.load(Ordering::SeqCst), 1);
     assert!(cover::retry_one_cover(&main, &covers, &md, &suw, "w_suw")
         .await
         .unwrap());
@@ -167,7 +167,7 @@ async fn barred_oldest_suwayomi_mapping_is_skipped_for_the_next_allowed_mapping(
         provenance(&main, "w_suw").await.1.as_deref(),
         Some("next-source")
     );
-    assert_eq!(origin.hits.load(Ordering::SeqCst), 2);
+    assert_eq!(origin.image_hits.load(Ordering::SeqCst), 2);
     bar(&main, "next-source").await;
     assert_eq!(cover::pending_cover_count(&main).await.unwrap(), 0);
 }
@@ -622,7 +622,7 @@ async fn without_bars_crawl_and_repair_keep_mangadex_first_then_oldest_suwayomi(
         Some("old-source")
     );
     assert_eq!(md_origin.hits.load(Ordering::SeqCst), 1);
-    assert_eq!(suw_origin.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(suw_origin.image_hits.load(Ordering::SeqCst), 1);
     for id in ["w_both", "w_suw"] {
         assert!(cover::retry_one_cover(&main, &covers, &md, &suw, id)
             .await
@@ -637,7 +637,7 @@ async fn without_bars_crawl_and_repair_keep_mangadex_first_then_oldest_suwayomi(
         Some("old-source")
     );
     assert_eq!(md_origin.hits.load(Ordering::SeqCst), 2);
-    assert_eq!(suw_origin.hits.load(Ordering::SeqCst), 2);
+    assert_eq!(suw_origin.image_hits.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

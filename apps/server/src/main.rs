@@ -33,6 +33,7 @@ mod img_proxy;
 mod ingest;
 mod instance;
 mod job_lease;
+mod jpeg_scan;
 mod lan;
 mod legacy_sqlite;
 mod locks;
