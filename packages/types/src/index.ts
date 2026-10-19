@@ -1297,6 +1297,8 @@ export interface ReportInput {
 	commentId?: string | null;
 	reportedUsername?: string | null;
 	sourceUrl?: string | null;
+	/** The Turnstile widget's token, for a server that asks for one. */
+	turnstileToken?: string;
 }
 
 /** A page of reports. `total` counts the filtered set; `openCount` is always the

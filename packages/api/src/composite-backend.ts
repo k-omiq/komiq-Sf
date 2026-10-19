@@ -300,8 +300,8 @@ export class CompositeBackend implements Backend {
 	session(): Promise<Session | null> {
 		return this.opts.hosted.session();
 	}
-	login(username: string, password: string): Promise<Session> {
-		return this.opts.hosted.login(username, password);
+	login(username: string, password: string, turnstileToken?: string): Promise<Session> {
+		return this.opts.hosted.login(username, password, turnstileToken);
 	}
 	register(input: RegisterInput): Promise<Session> {
 		return this.opts.hosted.register(input);
@@ -312,11 +312,18 @@ export class CompositeBackend implements Backend {
 	instance(): Promise<InstanceInfo> {
 		return this.opts.hosted.instance!();
 	}
+	async turnstileSiteKey(): Promise<string | null> {
+		return (await this.opts.hosted.turnstileSiteKey?.()) ?? null;
+	}
 	createOwner(input: CreateOwnerInput): Promise<Session> {
 		return this.opts.hosted.createOwner!(input);
 	}
-	changePassword(currentPassword: string, newPassword: string): Promise<Session['user']> {
-		return this.opts.hosted.changePassword!(currentPassword, newPassword);
+	changePassword(
+		currentPassword: string,
+		newPassword: string,
+		turnstileToken?: string,
+	): Promise<Session['user']> {
+		return this.opts.hosted.changePassword!(currentPassword, newPassword, turnstileToken);
 	}
 	/** Forward the bearer token to the hosted backend only — the local engine is
 	 * content-only and never receives a token. */
@@ -971,8 +978,8 @@ export class CompositeBackend implements Backend {
 	createUser(input: CreateUserInput): Promise<AdminUser> {
 		return this.opts.hosted.createUser!(input);
 	}
-	resetUserPassword(userId: Id, password: string): Promise<boolean> {
-		return this.opts.hosted.resetUserPassword!(userId, password);
+	resetUserPassword(userId: Id, password: string, turnstileToken?: string): Promise<boolean> {
+		return this.opts.hosted.resetUserPassword!(userId, password, turnstileToken);
 	}
 	mangadexSetting(): Promise<MangadexSetting> {
 		return this.opts.hosted.mangadexSetting!();

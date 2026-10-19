@@ -248,15 +248,18 @@ export async function loadSeriesSocial(seriesId: string, key: string): Promise<S
 }
 
 /** Upsert the user's rating (score only; preserves any existing body). Score 0 is not a
- *  rating — call {@link clearSeriesRating} to withdraw one. */
+ *  rating — call {@link clearSeriesRating} to withdraw one. `turnstileToken`: from the
+ *  rating's `TurnstileWidget`, for a server that asks for one. */
 export async function saveSeriesRating(
 	seriesId: string,
 	key: string,
 	score: number,
 	body: string,
+	turnstileToken?: string,
 ): Promise<void> {
 	if (socialLive()) {
-		if (score > 0) await backend.postReview({ seriesId, score, body, hasSpoiler: false });
+		if (score > 0)
+			await backend.postReview({ seriesId, score, body, hasSpoiler: false, turnstileToken });
 		return;
 	}
 	local.setRating('series', key, score);
@@ -410,6 +413,8 @@ export interface CommentOpts {
 	parentId?: string | null;
 	/** A staged image to attach (from {@link uploadCommentMedia}). */
 	media?: PendingMedia | null;
+	/** From the composer's `TurnstileWidget`, for a server that asks for one. */
+	turnstileToken?: string;
 }
 
 async function submitComment(
@@ -434,6 +439,7 @@ async function submitComment(
 			body,
 			hasSpoiler,
 			mediaId: opts.media?.mediaId ?? null,
+			turnstileToken: opts.turnstileToken,
 		});
 		// Append (newest last): the CommentThread component orders root threads and
 		// nests replies from the flat list, so position within the array only needs

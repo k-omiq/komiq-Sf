@@ -22,6 +22,9 @@ for (const directory of ['../.svelte-kit/cloudflare/', '../build/']) {
 		const scriptDirective = policy.match(/script-src ([^;]+)/)[1];
 		assert.deepEqual(new Set(scriptDirective.match(/'sha256-[^']+'/g)), expected);
 		assert.ok(!scriptDirective.includes('unsafe-inline'));
+		// The Turnstile widget (script and frame), for a server that asks for the check.
+		assert.ok(scriptDirective.includes('https://challenges.cloudflare.com'));
+		assert.match(policy, /frame-src https:\/\/challenges\.cloudflare\.com/);
 		const meta = html.match(/<meta http-equiv="content-security-policy" content="([^"]+)"/);
 		if (meta)
 			for (const hash of expected)

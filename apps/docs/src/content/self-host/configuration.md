@@ -126,6 +126,21 @@ These variables configure Cloudflare and reverse proxies, services that forward 
 | `KOMIKA_ACME_CA_FILE`   | unset               | PEM root certificate to trust when talking to that directory.                                                                                                                                       |
 | `KOMIKA_CLOUDFLARE_DIR` | `<data>/cloudflare` | Directory where Cloudflare credentials, keys and certificates are stored. Its `bin/` folder is the tool folder for a downloaded `cloudflared`.                                                      |
 
+### Bot checks
+
+Cloudflare Turnstile is a browser check that tells people from scripts. With it on, sign-up, sign-in, password changes, comments, reviews and reports need the check to pass. Make a Turnstile widget in the Cloudflare dashboard, list the website names people use, such as `example.com` and `admin.example.com`, and copy its two keys.
+
+| Variable                    | Default | Description                                                                                                       |
+| --------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------- |
+| `KOMIKA_TURNSTILE`          | `off`   | `on` asks for the check. The server refuses to start when `on` is set and either key is missing.                  |
+| `KOMIKA_TURNSTILE_SITE_KEY` | unset   | The widget's site key. It is public: the server gives it to the web apps.                                         |
+| `KOMIKA_TURNSTILE_SECRET`   | unset   | The widget's secret key. Keep it out of shared files. The server sends it only to Cloudflare to check each token. |
+
+The self-host compose file passes these three from `.env`. Set `TRUSTED_PROXY_CIDRS` too when a proxy stands in front of the server, so Cloudflare sees the visitor's address.
+
+> [!NOTE]
+> The check works only on the website. The native apps cannot show it, so on a server with the check on, people sign in and post on the website. Run `komika-server setup` while the check is off, because it signs in without a browser.
+
 ## Scanner and maintenance tasks
 
 Use the admin console's source settings for scan limits and extension subscriptions. Environment settings can also set source rate caps with `SCAN_SOURCE_RATE_LIMITS` (one cap covers every background fetch from that source), discovery page limits with `SOURCE_SYNC_MAX_PAGES` and update cadence with `EXTENSION_AUTO_UPDATE_INTERVAL_SECONDS`.

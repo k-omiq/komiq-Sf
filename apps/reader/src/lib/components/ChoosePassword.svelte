@@ -2,6 +2,7 @@
 	import { invalidateAll } from '$app/navigation';
 	import { auth, changeOwnPassword, logout, needsCurrentPassword } from '$lib/auth.svelte';
 	import AccountScreen from './AccountScreen.svelte';
+	import TurnstileWidget from './TurnstileWidget.svelte';
 
 	// Shown instead of the app while the signed-in account still has a password the
 	// owner chose (a new account, or a reset). Picking their own is the way in.
@@ -12,6 +13,7 @@
 	let busy = $state(false);
 	let errors = $state<Partial<Record<'current' | 'password' | 'confirm', string>>>({});
 	let formError = $state<string | null>(null);
+	let check = $state<TurnstileWidget>();
 
 	async function submit(e: SubmitEvent): Promise<void> {
 		e.preventDefault();
@@ -24,7 +26,7 @@
 		if (Object.keys(errors).length) return;
 		busy = true;
 		try {
-			await changeOwnPassword(password, askCurrent ? current : undefined);
+			await changeOwnPassword(password, askCurrent ? current : undefined, await check?.token());
 			// Pages behind this screen loaded while the server still answered this
 			// account as signed out (an empty library); load them again as the user.
 			await invalidateAll();
@@ -92,6 +94,7 @@
 			/>
 			{#if errors.confirm}<span class="field-error">{errors.confirm}</span>{/if}
 		</label>
+		<TurnstileWidget bind:this={check} />
 		{#if formError}<p class="error" role="alert">{formError}</p>{/if}
 		<button class="submit" type="submit" disabled={busy}>
 			{busy ? 'Saving…' : 'Save password'}

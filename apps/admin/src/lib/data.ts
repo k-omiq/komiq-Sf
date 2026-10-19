@@ -954,9 +954,13 @@ export async function createUser(input: CreateUserInput): Promise<AdminUser> {
  * Give another account a new temporary password. Signs them out everywhere; they
  * pick their own at next sign-in.
  */
-export async function resetUserPassword(userId: Id, password: string): Promise<void> {
+export async function resetUserPassword(
+	userId: Id,
+	password: string,
+	turnstileToken?: string,
+): Promise<void> {
 	if (!backend.resetUserPassword) accountsUnavailable();
-	await backend.resetUserPassword(userId, password);
+	await backend.resetUserPassword(userId, password, turnstileToken);
 }
 
 // ---- access + Cloudflare setup ----------------------------------------------

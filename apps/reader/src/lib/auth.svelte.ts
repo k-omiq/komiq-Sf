@@ -171,9 +171,14 @@ export async function revalidateSession(): Promise<User | null> {
 	return auth.user;
 }
 
-export async function login(username: string, password: string): Promise<void> {
+/** `turnstileToken`: from the form's `TurnstileWidget`, for a server that asks for one. */
+export async function login(
+	username: string,
+	password: string,
+	turnstileToken?: string,
+): Promise<void> {
 	const operation = ++authOperation;
-	const session = await backend.login(username, password);
+	const session = await backend.login(username, password, turnstileToken);
 	if (authOperation !== operation) return;
 	persist(session.token);
 	remember(session.user);
@@ -188,11 +193,15 @@ export async function login(username: string, password: string): Promise<void> {
  * or reset the account). `current` may be omitted right after sign-in: the password
  * just typed is used. Clears `mustChangePassword` on success.
  */
-export async function changeOwnPassword(newPassword: string, current?: string): Promise<void> {
+export async function changeOwnPassword(
+	newPassword: string,
+	current?: string,
+	turnstileToken?: string,
+): Promise<void> {
 	if (!backend.changePassword) throw new Error('This server cannot change passwords.');
 	const currentPassword = current ?? temporaryPassword;
 	if (currentPassword === null) throw new Error('Enter your current password.');
-	const user = await backend.changePassword(currentPassword, newPassword);
+	const user = await backend.changePassword(currentPassword, newPassword, turnstileToken);
 	temporaryPassword = null;
 	if (auth.user) {
 		auth.user = { ...auth.user, ...user, mustChangePassword: false };

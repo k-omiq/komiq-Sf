@@ -28,6 +28,8 @@ mod scanlator_rating_tests;
 mod series_page_viewer_tests;
 #[cfg(test)]
 mod sources_tests;
+#[cfg(test)]
+mod turnstile_tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -1186,6 +1188,35 @@ fn client_ip(ctx: &Context<'_>) -> String {
     ctx.data_opt::<ClientIp>()
         .and_then(|c| c.0.clone())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The Cloudflare Turnstile check for one sensitive mutation (`crate::turnstile`). With
+/// Turnstile off (no checker in the schema data, the default) every request passes,
+/// with or without a token. Call it after the cheap rate-limit and input checks and
+/// before any costly or lasting work: the token is single use either way.
+async fn require_turnstile(ctx: &Context<'_>, token: Option<&str>) -> Result<()> {
+    use crate::turnstile::{Rejection, Turnstile};
+    let Some(turnstile) = ctx.data_opt::<Turnstile>() else {
+        return Ok(());
+    };
+    let ip = ctx.data_opt::<ClientIp>().and_then(|c| c.0.as_deref());
+    turnstile.verify(token, ip).await.map_err(|rejection| {
+        let (code, message) = match rejection {
+            Rejection::Missing => (
+                "TURNSTILE_REQUIRED",
+                "Complete the security check, then try again.",
+            ),
+            Rejection::Refused => (
+                "TURNSTILE_FAILED",
+                "The security check did not pass. Try it again.",
+            ),
+            Rejection::Unavailable => (
+                "TURNSTILE_UNAVAILABLE",
+                "The security check could not be confirmed right now. Try again in a moment.",
+            ),
+        };
+        Error::new(message).extend_with(|_, extensions| extensions.set("code", code))
+    })
 }
 
 /// Resolve the authenticated user, or `None` if the request is anonymous. An
@@ -5493,6 +5524,8 @@ pub struct ReportInput {
     pub comment_id: Option<String>,
     pub reported_username: Option<String>,
     pub source_url: Option<String>,
+    /// Required when the server has Turnstile on (`turnstile`); ignored otherwise.
+    pub turnstile_token: Option<String>,
 }
 
 /// Sliding-window budget for the unauthenticated `submitReport` write, keyed
@@ -9435,6 +9468,9 @@ impl QueryRoot {
                 .as_bool(),
             // Asked only while there is no owner: nothing reads it afterwards.
             setup_needs_terminal: setup_required && plain_from_internet(ctx).await,
+            turnstile_site_key: ctx
+                .data_opt::<crate::turnstile::Turnstile>()
+                .map(|t| t.site_key().to_string()),
         })
     }
 
@@ -13202,6 +13238,8 @@ impl MutationRoot {
             }
         }
 
+        require_turnstile(ctx, input.turnstile_token.as_deref()).await?;
+
         // Both ids, when given, must name a series we know. Note this validates the id
         // EXISTS, not that the reader's claim about it is right — that is the admin's job.
         for id in [subject_id.as_deref(), subject_id_secondary.as_deref()]
@@ -13501,6 +13539,7 @@ impl MutationRoot {
         // rating widget) with no written review. The body-bearing reviews are
         // what the client shows as the comment thread.
         let user = require_user(ctx).await?;
+        require_turnstile(ctx, input.turnstile_token.as_deref()).await?;
         let st = state(ctx);
         let row = crate::db::retry_transaction(|| post_review_once(&st.pool, &user.id, &input))
             .await
@@ -13611,6 +13650,7 @@ impl MutationRoot {
                 "You are posting too fast. Try again in {retry}s."
             )));
         }
+        require_turnstile(ctx, input.turnstile_token.as_deref()).await?;
 
         // A scanlator is no row to lock: its id is checked against the readers' list
         // here, and the thread is stored under the id as that list writes it.
@@ -13898,6 +13938,8 @@ impl MutationRoot {
         ctx: &Context<'_>,
         username: String,
         password: String,
+        // Required when the server has Turnstile on (`turnstile`); ignored otherwise.
+        turnstile_token: Option<String>,
     ) -> Result<Session> {
         let st = state(ctx);
         // Reserve the attempt atomically before expensive verification. Checking
@@ -13918,6 +13960,9 @@ impl MutationRoot {
         if password.len() > MAX_PASSWORD_LEN || username.len() > MAX_LOGIN_USERNAME_LEN {
             return Err(Error::new("Invalid username or password"));
         }
+        // Before the per-account budget, so a client without a token cannot spend it and
+        // keep the owner of the account out.
+        require_turnstile(ctx, turnstile_token.as_deref()).await?;
         // Then per account, whatever the address: guesses at one account from many
         // addresses each pass the limit above. Lower-cased, so spellings of one name
         // share a budget. The budget is larger than one address has, so one address
@@ -14017,6 +14062,8 @@ impl MutationRoot {
         {
             return Err(Error::new("This username is reserved."));
         }
+        // Before the name lookup, so a client without a token cannot probe names.
+        require_turnstile(ctx, input.turnstile_token.as_deref()).await?;
         ensure_username_free(&st.pool, username).await?;
         let hash = hash_password_bounded(st, &input.password).await?;
         let id = uuid::Uuid::new_v4().to_string();
@@ -14148,6 +14195,8 @@ impl MutationRoot {
         ctx: &Context<'_>,
         current_password: String,
         new_password: String,
+        // Required when the server has Turnstile on (`turnstile`); ignored otherwise.
+        turnstile_token: Option<String>,
     ) -> Result<SessionUser> {
         // The one mutation an account with a temporary password may call.
         let user = session_user(ctx)
@@ -14162,6 +14211,7 @@ impl MutationRoot {
                 "Too many password attempts — try again in {retry}s"
             )));
         }
+        require_turnstile(ctx, turnstile_token.as_deref()).await?;
         if current_password.len() > MAX_PASSWORD_LEN
             || !verify_password_bounded(st, &current_password, &user.password_hash).await?
         {
@@ -15620,6 +15670,8 @@ impl MutationRoot {
         ctx: &Context<'_>,
         user_id: ID,
         password: String,
+        // Required when the server has Turnstile on (`turnstile`); ignored otherwise.
+        turnstile_token: Option<String>,
     ) -> Result<bool> {
         let admin = require_admin(ctx).await?;
         let st = state(ctx);
@@ -15629,6 +15681,7 @@ impl MutationRoot {
             ));
         }
         validate_new_password(&password)?;
+        require_turnstile(ctx, turnstile_token.as_deref()).await?;
         let hash = hash_password_bounded(st, &password).await?;
         let mut tx = st.pool.begin().await.map_err(gql_err)?;
         crate::locks::advisory(&mut tx, &[crate::locks::AdvisoryKey::membership()])
@@ -21057,7 +21110,7 @@ mod tests {
         pool.close().await;
     }
 
-    async fn setup_with_state(
+    pub(super) async fn setup_with_state(
         max: u32,
     ) -> (
         ApiSchema,
@@ -22310,7 +22363,7 @@ mod tests {
         }
     }
 
-    fn first_error(resp: &async_graphql::Response) -> String {
+    pub(super) fn first_error(resp: &async_graphql::Response) -> String {
         resp.errors
             .first()
             .map(|e| e.message.clone())

@@ -83,14 +83,17 @@ fn content_security_policy(html: &str) -> HeaderValue {
         rest = &rest[close_end..];
     }
 
-    let mut policy = "default-src 'self'; script-src 'self'".to_string();
+    // Cloudflare Turnstile (`crate::turnstile`): the widget script and its frame, used
+    // only when the server the apps talk to sends a site key.
+    let mut policy =
+        "default-src 'self'; script-src 'self' https://challenges.cloudflare.com".to_string();
     for hash in hashes {
         policy.push(' ');
         policy.push_str(&hash);
     }
     // Like the hosted policy, with HTTP(S) destinations for servers selected at
     // runtime, including LAN servers, and blob/data images used by the reader.
-    policy.push_str("; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data: blob:; connect-src 'self' https: http:; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'");
+    policy.push_str("; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data: blob:; connect-src 'self' https: http:; font-src 'self' data:; frame-src https://challenges.cloudflare.com; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'");
     HeaderValue::from_str(&policy).expect("CSP contains only fixed directives and base64 hashes")
 }
 
@@ -428,7 +431,9 @@ mod tests {
                 assert_eq!(res.headers()[CACHE_CONTROL], "no-cache", "{uri}");
                 let policy = res.headers()[CONTENT_SECURITY_POLICY].to_str().unwrap();
                 assert!(
-                    policy.contains(&format!("script-src 'self' 'sha256-{hash}';")),
+                    policy.contains(&format!(
+                        "script-src 'self' https://challenges.cloudflare.com 'sha256-{hash}';"
+                    )),
                     "{uri}: {policy}"
                 );
                 for directive in [
@@ -437,6 +442,7 @@ mod tests {
                     "img-src 'self' https: http: data: blob:",
                     "connect-src 'self' https: http:",
                     "font-src 'self' data:",
+                    "frame-src https://challenges.cloudflare.com",
                     "object-src 'none'",
                     "base-uri 'self'",
                     "form-action 'self'",
@@ -639,7 +645,7 @@ mod tests {
         let script_src = policy.to_str().unwrap().split(';').nth(1).unwrap().trim();
         assert_eq!(
             script_src,
-            "script-src 'self' 'sha256-+AdlzVIaxZ7zO7M+D5zeromszQ+2o0eZ6bjYMOFOaHI=' 'sha256-MeZS89WlF0u+o0hCvHTBt4q1WHU+U+sJKgbdRUc36mY='"
+            "script-src 'self' https://challenges.cloudflare.com 'sha256-+AdlzVIaxZ7zO7M+D5zeromszQ+2o0eZ6bjYMOFOaHI=' 'sha256-MeZS89WlF0u+o0hCvHTBt4q1WHU+U+sJKgbdRUc36mY='"
         );
     }
 }

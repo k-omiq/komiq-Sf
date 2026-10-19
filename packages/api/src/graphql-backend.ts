@@ -781,8 +781,14 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ session: Session | null }>(ops.SESSION);
 		return d.session;
 	}
-	async login(username: string, password: string): Promise<Session> {
-		const d = await this.gql<{ login: Session }>(ops.LOGIN, { username, password });
+	async login(username: string, password: string, turnstileToken?: string): Promise<Session> {
+		const d = turnstileToken
+			? await this.gql<{ login: Session }>(ops.LOGIN_TURNSTILE, {
+					username,
+					password,
+					turnstileToken,
+				})
+			: await this.gql<{ login: Session }>(ops.LOGIN, { username, password });
 		return d.login;
 	}
 	async register(input: RegisterInput): Promise<Session> {
@@ -816,15 +822,35 @@ export class GraphQLBackend implements Backend {
 			throw e;
 		}
 	}
+	async turnstileSiteKey(): Promise<string | null> {
+		const authRevision = this.auth.revision;
+		try {
+			const d = await this.gql<{ instance: { turnstileSiteKey?: string | null } }>(
+				ops.TURNSTILE_SITE_KEY,
+			);
+			return d.instance.turnstileSiteKey ?? null;
+		} catch (e) {
+			this.assertAuthRevision(authRevision);
+			// A server that predates Turnstile asks for no check.
+			if (e instanceof Error && e.message.includes('Unknown field "turnstileSiteKey"')) return null;
+			throw e;
+		}
+	}
 	async createOwner(input: CreateOwnerInput): Promise<Session> {
 		const d = await this.gql<{ createOwner: Session }>(ops.CREATE_OWNER, { ...input });
 		return d.createOwner;
 	}
-	async changePassword(currentPassword: string, newPassword: string): Promise<Session['user']> {
-		const d = await this.gql<{ changePassword: Session['user'] }>(ops.CHANGE_PASSWORD, {
-			currentPassword,
-			newPassword,
-		});
+	async changePassword(
+		currentPassword: string,
+		newPassword: string,
+		turnstileToken?: string,
+	): Promise<Session['user']> {
+		const d = await this.gql<{ changePassword: Session['user'] }>(
+			turnstileToken ? ops.CHANGE_PASSWORD_TURNSTILE : ops.CHANGE_PASSWORD,
+			turnstileToken
+				? { currentPassword, newPassword, turnstileToken }
+				: { currentPassword, newPassword },
+		);
 		return d.changePassword;
 	}
 
@@ -1442,11 +1468,11 @@ export class GraphQLBackend implements Backend {
 		return d.createUser;
 	}
 
-	async resetUserPassword(userId: Id, password: string): Promise<boolean> {
-		const d = await this.gql<{ resetUserPassword: boolean }>(ops.RESET_USER_PASSWORD, {
-			userId,
-			password,
-		});
+	async resetUserPassword(userId: Id, password: string, turnstileToken?: string): Promise<boolean> {
+		const d = await this.gql<{ resetUserPassword: boolean }>(
+			turnstileToken ? ops.RESET_USER_PASSWORD_TURNSTILE : ops.RESET_USER_PASSWORD,
+			turnstileToken ? { userId, password, turnstileToken } : { userId, password },
+		);
 		return d.resetUserPassword;
 	}
 

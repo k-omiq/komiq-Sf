@@ -298,6 +298,10 @@ pub struct Config {
     /// for the hosted API, which has the image Worker instead.
     pub img_proxy_enabled: bool,
     pub fallback: Option<FallbackConfig>,
+    /// Cloudflare Turnstile on the sensitive mutations (`KOMIKA_TURNSTILE=on`, with
+    /// `KOMIKA_TURNSTILE_SITE_KEY` and `KOMIKA_TURNSTILE_SECRET`). `None` (the default)
+    /// asks for no token. On without both keys refuses to start. See `turnstile`.
+    pub turnstile: Option<crate::turnstile::TurnstileConfig>,
     pub suwayomi_url: String,
     /// Publicly reachable base for Suwayomi image URLs (covers + pages). GraphQL
     /// federation uses the internal `suwayomi_url`, but image URLs are handed to
@@ -663,6 +667,8 @@ impl Config {
             }
             .unwrap_or_else(|error| panic!("{error}")),
             fallback: FallbackConfig::parse(|name| env::var(name).ok())
+                .unwrap_or_else(|error| panic!("{error}")),
+            turnstile: crate::turnstile::TurnstileConfig::parse(|name| env::var(name).ok())
                 .unwrap_or_else(|error| panic!("{error}")),
             media_manifests: env::var("KOMIKA_MEDIA_MANIFESTS").is_ok_and(|v| v == "on"),
             media_routes_raw: env::var("KOMIKA_MEDIA_ROUTES").ok(),

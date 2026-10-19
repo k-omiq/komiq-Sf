@@ -116,11 +116,11 @@ type Mutation {
 	postComment(input: PostCommentInput!): Comment! # [komika] chapter thread, series discussion, or scanlator thread
 	voteComment(commentId: ID!, value: Int!): CommentVote! # [komika] like (1) / dislike (-1) / clear (0) a comment
 	markNotificationsRead(ids: [ID!]): Int! # [komika] mark given (or all, if omitted) notifications read; returns count changed
-	login(username: String!, password: String!): Session! # [komika]
+	login(username: String!, password: String!, turnstileToken: String): Session! # [komika] turnstileToken: required when the server has Turnstile on (instance.turnstileSiteKey), ignored otherwise; same on register, changePassword, resetUserPassword, postComment, postReview and submitReport
 	register(input: RegisterInput!): Session! # [komika]
 	logout: Boolean! # [komika]
 	createOwner(setupCode: String!, username: String!, email: String!, password: String!): Session! # [komika] first-run setup — create the first admin with the setup code from the server log; only while no admin exists; rate-limited per IP like login
-	changePassword(currentPassword: String!, newPassword: String!): SessionUser! # [komika] change the viewer's own password; clears mustChangePassword and signs out their other sessions (requires auth)
+	changePassword(currentPassword: String!, newPassword: String!, turnstileToken: String): SessionUser! # [komika] change the viewer's own password; clears mustChangePassword and signs out their other sessions (requires auth)
 	setShowNsfw(value: Boolean!): Boolean! # [komika] set the viewer's NSFW visibility preference (CATALOGUE.md §2)
 	setMyBlockRules(rules: [BlockRuleInput!]!): [BlockRule!]! # [komika] replace the viewer's own content block rules (at most 50; an empty list clears them). They hide matching series from the viewer's lists (browse, search, updates, discovery), on top of the site-wide rules; a series opened by its link still opens. Returns the stored list (requires auth)
 	updateProfile(input: UpdateProfileInput!): SessionUser! # [komika] update the viewer's display name + bio (avatar upload is REST: POST /avatar)
@@ -130,7 +130,7 @@ type Mutation {
 	deleteComment(commentId: ID!): Boolean! # [komika] admin moderation — remove a chapter comment (requires isAdmin)
 	setUserAdmin(userId: ID!, isAdmin: Boolean!): AdminUser! # [komika] admin — grant/revoke admin (requires isAdmin)
 	createUser(input: CreateUserInput!): AdminUser! # [komika] admin — create an account directly, works with sign-up closed (requires isAdmin)
-	resetUserPassword(userId: ID!, password: String!): Boolean! # [komika] admin — set another account's password; revokes its sessions and sets mustChangePassword (requires isAdmin)
+	resetUserPassword(userId: ID!, password: String!, turnstileToken: String): Boolean! # [komika] admin — set another account's password; revokes its sessions and sets mustChangePassword (requires isAdmin)
 	setRegistrationOpen(open: Boolean!): Boolean! # [komika] admin — open/close sign-up (starts closed on a self-hosted install, open elsewhere); refused when KOMIKA_REGISTRATION_OPEN pins it (requires isAdmin)
 	setMangadexEnabled(enabled: Boolean!): Boolean! # [komika] admin — turn MangaDex usage on/off, applied live; refused when KOMIKA_MANGADEX or CATALOGUE_SYNC=on pins it (requires isAdmin)
 	setShowMangadexRatings(shown: Boolean!): Boolean! # [komika] admin — show/hide MangaDex's community rating next to our own readers' rating, for everyone; refused when KOMIKA_MANGADEX_RATINGS pins it (requires isAdmin)
@@ -850,6 +850,7 @@ type Instance {
 	mangadexEnabled: Boolean!
 	showMangadexRatings: Boolean! # false: the admin turned MangaDex ratings off, so no `mangadexRating` is ever returned and the reader hides its own switch
 	appsFetchThemselves: Boolean! # true: reader apps fetch chapter pages from the sources themselves; an app with its own engine does not offer fetching through this server
+	turnstileSiteKey: String # the Cloudflare Turnstile site key when the server has Turnstile on (KOMIKA_TURNSTILE=on), else null; the web apps then send the widget's token with the sensitive mutations
 }
 
 # Self-host access (admin). The Cloudflare API token is never stored or returned.
@@ -960,6 +961,7 @@ input PostReviewInput {
 	score: Int!
 	body: String!
 	hasSpoiler: Boolean!
+	turnstileToken: String # [komika] required when the server has Turnstile on
 }
 
 input PostCommentInput {
@@ -969,6 +971,7 @@ input PostCommentInput {
 	body: String!
 	hasSpoiler: Boolean!
 	mediaId: ID # [komika] a previously-uploaded comment-media id to attach (owned + unlinked)
+	turnstileToken: String # [komika] required when the server has Turnstile on
 }
 
 input CreateUserInput {
@@ -983,6 +986,7 @@ input RegisterInput {
 	username: String!
 	email: String!
 	password: String!
+	turnstileToken: String # [komika] required when the server has Turnstile on
 }
 
 # Editable profile fields. A null/blank field clears that value (display name
@@ -1523,6 +1527,7 @@ input ReportInput {
 	commentId: String
 	reportedUsername: String
 	sourceUrl: String
+	turnstileToken: String # required when the server has Turnstile on
 }
 
 type ReportPage {

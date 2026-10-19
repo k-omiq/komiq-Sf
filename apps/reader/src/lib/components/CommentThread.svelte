@@ -21,6 +21,7 @@
 	} from '$lib/data/social-repo';
 	import Icon from '$lib/components/Icon.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
+	import TurnstileWidget from '$lib/components/TurnstileWidget.svelte';
 
 	interface Props {
 		/** 'chapter' for a per-chapter thread, 'series' for series-level discussion,
@@ -54,6 +55,8 @@
 	let media = $state<PendingMedia | null>(null);
 	let uploading = $state(false);
 	let rootFileInput = $state<HTMLInputElement | null>(null);
+	// The security check for a server that asks for one; shown once there is something to post.
+	let rootCheck = $state<TurnstileWidget>();
 
 	// Reply composer state (only one reply box is open at a time).
 	let replyingTo = $state<string | null>(null);
@@ -68,6 +71,7 @@
 	let replyMedia = $state<PendingMedia | null>(null);
 	let replyUploading = $state(false);
 	let replyFileInput = $state<HTMLInputElement | null>(null);
+	let replyCheck = $state<TurnstileWidget>();
 
 	const needsAuth = $derived(socialLive() && !auth.user);
 	// Voting needs the live backend AND a signed-in user; on a Suwayomi/mock deployment
@@ -209,6 +213,7 @@
 		try {
 			comments = await submit(targetId ?? '', storageKey, draft.trim(), spoiler, comments, {
 				media,
+				turnstileToken: await rootCheck?.token(),
 			});
 			draft = '';
 			spoiler = false;
@@ -248,6 +253,7 @@
 				{
 					parentId,
 					media: replyMedia,
+					turnstileToken: await replyCheck?.token(),
 				},
 			);
 			replyingTo = null;
@@ -358,6 +364,7 @@
 					</button>
 				</div>
 			{/if}
+			{#if draft.trim() || media}<TurnstileWidget bind:this={rootCheck} />{/if}
 			{#if postError}<p class="post-error" role="alert">{postError}</p>{/if}
 			<div class="composer-foot">
 				<label class="spoiler-toggle">
@@ -571,6 +578,7 @@
 										</button>
 									</div>
 								{/if}
+								<TurnstileWidget bind:this={replyCheck} />
 								{#if replyError}<p class="post-error" role="alert">{replyError}</p>{/if}
 								<div class="composer-foot">
 									<label class="spoiler-toggle">

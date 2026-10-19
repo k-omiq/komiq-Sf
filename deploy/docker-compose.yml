@@ -275,6 +275,12 @@ services:
       # GraphiQL IDE + schema introspection. Off by default so the public API
       # exposes neither; set GRAPHIQL_ENABLED=on in deploy/.env only for dev.
       GRAPHIQL_ENABLED: ${GRAPHIQL_ENABLED:-off}
+      # Cloudflare Turnstile on sign-up, sign-in, password changes, comments, reviews and
+      # reports (apps/server/src/turnstile.rs). Off by default. On needs both keys from
+      # the widget in deploy/.env; the server refuses to start without them.
+      KOMIKA_TURNSTILE: ${KOMIKA_TURNSTILE:-off}
+      KOMIKA_TURNSTILE_SITE_KEY: ${KOMIKA_TURNSTILE_SITE_KEY:-}
+      KOMIKA_TURNSTILE_SECRET: ${KOMIKA_TURNSTILE_SECRET:-}
       # DEAD UNDER E3 — kept only so an existing deploy/.env does not error. The
       # global scan tick was replaced by a supervisor + per-source loops, which use
       # SOURCE_TICK_SECONDS (60s, compiled). `scanner::spawn` takes this value as

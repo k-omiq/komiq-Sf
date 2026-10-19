@@ -12,6 +12,7 @@ const {
 	deleteComment,
 	loadChapterComments,
 	loadSeriesComments,
+	saveSeriesRating,
 	submitChapterComment,
 	submitSeriesComment,
 } = await import('./social-repo.ts');
@@ -236,6 +237,38 @@ for (const targetType of ['chapter', 'series'] as const) {
 		assert.deepEqual(await load('target', 'key'), []);
 	});
 }
+
+test('a comment and a rating carry the security check token to the backend', async () => {
+	const sent: Record<string, unknown>[] = [];
+	testGlobals.backend.postComment = async (input: Record<string, unknown>) => {
+		sent.push(input);
+		return {
+			id: 'c1',
+			parentId: null,
+			author: { id: 'me', username: 'Me', avatarUrl: null },
+			body: 'hi',
+			hasSpoiler: false,
+			createdAt: new Date().toISOString(),
+			likes: 0,
+			dislikes: 0,
+			myVote: 0,
+		};
+	};
+	testGlobals.backend.postReview = async (input: Record<string, unknown>) => {
+		sent.push(input);
+		return { id: 'r1' };
+	};
+	await submitSeriesComment('w_1', 'key', 'hi', false, [], {
+		turnstileToken: 'XXXX.DUMMY.TOKEN.XXXX',
+	});
+	await saveSeriesRating('w_1', 'key', 8, '', 'XXXX.DUMMY.TOKEN.XXXX');
+	// A server that asks for no check gets none.
+	await submitSeriesComment('w_1', 'key', 'hi', false, []);
+	assert.deepEqual(
+		sent.map((input) => input.turnstileToken),
+		['XXXX.DUMMY.TOKEN.XXXX', 'XXXX.DUMMY.TOKEN.XXXX', undefined],
+	);
+});
 
 test('legacy offline records still load with live defaults', async () => {
 	testGlobals.config.backendEnabled = false;

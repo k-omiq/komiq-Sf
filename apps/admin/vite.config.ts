@@ -52,7 +52,11 @@ export default defineConfig({
 				mode: 'hash',
 				directives: {
 					'default-src': ['self'],
-					'script-src': ['self'],
+					// challenges.cloudflare.com: the Turnstile widget's script and frame, for
+					// a server that asks for the check. The desktop app cannot run it.
+					'script-src':
+						target === 'desktop' ? ['self'] : ['self', 'https://challenges.cloudflare.com'],
+					...(target === 'desktop' ? {} : { 'frame-src': ['https://challenges.cloudflare.com'] }),
 					'style-src': ['self', 'unsafe-inline'],
 					'img-src': ['self', 'https:', 'http:', 'data:'],
 					// The desktop app also talks to its native side over Tauri's IPC.

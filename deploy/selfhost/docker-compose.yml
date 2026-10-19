@@ -41,6 +41,11 @@ services:
       # The port published below: the server names it in the addresses it suggests.
       # Inside the container it always listens on 8080.
       KOMIKA_PUBLISHED_PORT: ${KOMIQ_PORT:-8080}
+      # Optional Cloudflare Turnstile (a browser check) on sign-up, sign-in, comments,
+      # reviews and reports. Off unless you set it in .env, see .env.example.
+      KOMIKA_TURNSTILE: ${KOMIKA_TURNSTILE:-off}
+      KOMIKA_TURNSTILE_SITE_KEY: ${KOMIKA_TURNSTILE_SITE_KEY:-}
+      KOMIKA_TURNSTILE_SECRET: ${KOMIKA_TURNSTILE_SECRET:-}
     ports:
       # KOMIQ_BIND=0.0.0.0 (default): phones and other computers on your network
       # can open komiq. KOMIQ_BIND=127.0.0.1: this machine only, which is what you

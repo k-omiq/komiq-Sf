@@ -1433,6 +1433,8 @@ pub struct PostReviewInput {
     pub score: i32,
     pub body: String,
     pub has_spoiler: bool,
+    /// Required when the server has Turnstile on (`turnstile`); ignored otherwise.
+    pub turnstile_token: Option<String>,
 }
 
 #[derive(InputObject)]
@@ -1449,6 +1451,8 @@ pub struct PostCommentInput {
     /// A previously-uploaded `comment_media` id (from `POST /comment-media`) to
     /// attach. Must be owned by the poster and not yet linked to another comment.
     pub media_id: Option<ID>,
+    /// Required when the server has Turnstile on (`turnstile`); ignored otherwise.
+    pub turnstile_token: Option<String>,
 }
 
 #[derive(InputObject)]
@@ -1456,6 +1460,8 @@ pub struct RegisterInput {
     pub username: String,
     pub email: String,
     pub password: String,
+    /// Required when the server has Turnstile on (`turnstile`); ignored otherwise.
+    pub turnstile_token: Option<String>,
 }
 
 /// Admin-created account (`createUser`).
@@ -1500,6 +1506,10 @@ pub struct Instance {
     /// `createOwner` is refused there (the owner password would travel in the clear):
     /// the setup screens show how to run `komika-server setup` on the server instead.
     pub setup_needs_terminal: bool,
+    /// The Cloudflare Turnstile site key when the server has Turnstile on
+    /// (`KOMIKA_TURNSTILE=on`), else null. The web apps then render the widget and send
+    /// its token with sign-up, sign-in, password changes, comments, reviews and reports.
+    pub turnstile_site_key: Option<String>,
 }
 
 /// The MangaDex switch as the admin console sees it (`mangadexSetting`).

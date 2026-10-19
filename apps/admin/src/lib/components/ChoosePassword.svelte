@@ -2,6 +2,7 @@
 	import { auth, changeOwnPassword, logout, needsCurrentPassword } from '$lib/auth.svelte';
 	import Button from './Button.svelte';
 	import Onboarding from './Onboarding.svelte';
+	import TurnstileWidget from './TurnstileWidget.svelte';
 
 	// Shown instead of the console while the signed-in admin's account still has a
 	// password someone else chose (a new account, or a reset). Nothing else in the
@@ -13,6 +14,7 @@
 	let busy = $state(false);
 	let errors = $state<Partial<Record<'current' | 'password' | 'confirm', string>>>({});
 	let formError = $state<string | null>(null);
+	let check = $state<TurnstileWidget>();
 
 	async function submit(e: SubmitEvent): Promise<void> {
 		e.preventDefault();
@@ -25,7 +27,7 @@
 		if (Object.keys(errors).length) return;
 		busy = true;
 		try {
-			await changeOwnPassword(password, askCurrent ? current : undefined);
+			await changeOwnPassword(password, askCurrent ? current : undefined, await check?.token());
 		} catch (err) {
 			const message = err instanceof Error ? err.message : 'The password could not be saved.';
 			const m = message.toLowerCase();
@@ -93,6 +95,7 @@
 			/>
 			{#if errors.confirm}<span class="k-error">{errors.confirm}</span>{/if}
 		</label>
+		<TurnstileWidget bind:this={check} />
 		{#if formError}<p class="k-error" role="alert">{formError}</p>{/if}
 	</form>
 	{#snippet aside()}

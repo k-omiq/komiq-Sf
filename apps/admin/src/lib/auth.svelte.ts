@@ -133,8 +133,13 @@ export function adoptSession(session: Session): void {
 	auth.user = session.user;
 }
 
-export async function login(username: string, password: string): Promise<void> {
-	const session = await backend.login(username, password);
+/** `turnstileToken`: from the form's `TurnstileWidget`, for a server that asks for one. */
+export async function login(
+	username: string,
+	password: string,
+	turnstileToken?: string,
+): Promise<void> {
+	const session = await backend.login(username, password, turnstileToken);
 	if (!session.user.isAdmin) {
 		// Not an admin — drop the session we just created and refuse.
 		backend.setToken?.(session.token);
@@ -157,11 +162,15 @@ export async function login(username: string, password: string): Promise<void> {
  * reset). `current` may be omitted right after sign-in: the password just typed is
  * used. Clears `mustChangePassword` on success.
  */
-export async function changeOwnPassword(newPassword: string, current?: string): Promise<void> {
+export async function changeOwnPassword(
+	newPassword: string,
+	current?: string,
+	turnstileToken?: string,
+): Promise<void> {
 	if (!backend.changePassword) throw new Error('This server cannot change passwords.');
 	const currentPassword = current ?? temporaryPassword;
 	if (currentPassword === null) throw new Error('Enter your current password.');
-	const user = await backend.changePassword(currentPassword, newPassword);
+	const user = await backend.changePassword(currentPassword, newPassword, turnstileToken);
 	temporaryPassword = null;
 	if (auth.user) {
 		auth.user = { ...auth.user, ...user, mustChangePassword: false };

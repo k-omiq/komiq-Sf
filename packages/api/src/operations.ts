@@ -942,10 +942,24 @@ export const SESSION = /* GraphQL */ `
 	}
 `;
 
+// Turnstile (`turnstileSiteKey`): the mutations whose token is an argument have a second
+// document that carries it. The plain one stays for a server that predates the argument,
+// where an unknown argument would fail the document. Input-object mutations need no
+// second document: the token is a field of their input.
+
 export const LOGIN = /* GraphQL */ `
 	${SESSION_FIELDS}
 	mutation Login($username: String!, $password: String!) {
 		login(username: $username, password: $password) {
+			...SessionFields
+		}
+	}
+`;
+
+export const LOGIN_TURNSTILE = /* GraphQL */ `
+	${SESSION_FIELDS}
+	mutation LoginTurnstile($username: String!, $password: String!, $turnstileToken: String!) {
+		login(username: $username, password: $password, turnstileToken: $turnstileToken) {
 			...SessionFields
 		}
 	}
@@ -1004,6 +1018,33 @@ export const CHANGE_PASSWORD = /* GraphQL */ `
 	mutation ChangePassword($currentPassword: String!, $newPassword: String!) {
 		changePassword(currentPassword: $currentPassword, newPassword: $newPassword) {
 			...SessionUserFields
+		}
+	}
+`;
+
+export const CHANGE_PASSWORD_TURNSTILE = /* GraphQL */ `
+	${SESSION_USER_FIELDS}
+	mutation ChangePasswordTurnstile(
+		$currentPassword: String!
+		$newPassword: String!
+		$turnstileToken: String!
+	) {
+		changePassword(
+			currentPassword: $currentPassword
+			newPassword: $newPassword
+			turnstileToken: $turnstileToken
+		) {
+			...SessionUserFields
+		}
+	}
+`;
+
+/** Its own document, like `SETUP_NEEDS_TERMINAL`: a server that predates Turnstile does
+ *  not know the field, and the answer then reads as "no check". */
+export const TURNSTILE_SITE_KEY = /* GraphQL */ `
+	query TurnstileSiteKey {
+		instance {
+			turnstileSiteKey
 		}
 	}
 `;
@@ -1101,6 +1142,12 @@ export const CREATE_USER = /* GraphQL */ `
 export const RESET_USER_PASSWORD = /* GraphQL */ `
 	mutation ResetUserPassword($userId: ID!, $password: String!) {
 		resetUserPassword(userId: $userId, password: $password)
+	}
+`;
+
+export const RESET_USER_PASSWORD_TURNSTILE = /* GraphQL */ `
+	mutation ResetUserPasswordTurnstile($userId: ID!, $password: String!, $turnstileToken: String!) {
+		resetUserPassword(userId: $userId, password: $password, turnstileToken: $turnstileToken)
 	}
 `;
 

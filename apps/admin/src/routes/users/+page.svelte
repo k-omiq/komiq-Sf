@@ -13,6 +13,7 @@
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import Pager from '$lib/components/Pager.svelte';
 	import Switch from '$lib/components/Switch.svelte';
+	import TurnstileWidget from '$lib/components/TurnstileWidget.svelte';
 
 	let users = $state<AdminUser[]>([]);
 	const page = $derived(queuePage(pageState.url));
@@ -21,6 +22,8 @@
 	let loading = $state(false);
 	let loadError = $state<string | null>(null);
 	let busy = $state<string | null>(null); // id currently being mutated
+	// A password reset needs a security check on a server that asks for one.
+	let check = $state<TurnstileWidget>();
 
 	// Auth redirect is centralized in +layout.svelte.
 
@@ -177,7 +180,7 @@
 		busy = u.id;
 		const password = tempPassword();
 		try {
-			await resetUserPassword(u.id, password);
+			await resetUserPassword(u.id, password, await check?.token());
 			copied = false;
 			issued = { username: u.username, password, created: false };
 		} catch (err) {
@@ -206,6 +209,8 @@
 			<Button variant="primary" icon="plus" onclick={openAdd}>Add user</Button>
 		{/snippet}
 	</PageHeader>
+
+	<TurnstileWidget bind:this={check} />
 
 	<LoadState
 		loading={loading && users.length === 0}

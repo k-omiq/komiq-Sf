@@ -4,11 +4,13 @@
 	import { auth, login } from '$lib/auth.svelte';
 	import Brand from '$lib/components/Brand.svelte';
 	import Button from '$lib/components/Button.svelte';
+	import TurnstileWidget from '$lib/components/TurnstileWidget.svelte';
 
 	let username = $state('');
 	let password = $state('');
 	let error = $state<string | null>(null);
 	let busy = $state(false);
+	let check = $state<TurnstileWidget>();
 
 	$effect(() => {
 		if (auth.user) goto(href('/'), { replaceState: true });
@@ -20,7 +22,7 @@
 		error = null;
 		busy = true;
 		try {
-			await login(username.trim(), password);
+			await login(username.trim(), password, await check?.token());
 			await goto(href('/'), { replaceState: true });
 		} catch (err) {
 			error = err instanceof Error ? err.message : 'Sign in failed.';
@@ -60,6 +62,8 @@
 				required
 			/>
 		</label>
+
+		<TurnstileWidget bind:this={check} />
 
 		<Button type="submit" variant="primary" size="lg" class="submit" {busy}>
 			{busy ? 'Signing in…' : 'Sign in'}

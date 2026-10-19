@@ -6,6 +6,7 @@
 	import AiBadge from '$lib/components/AiBadge.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import Stars from '$lib/components/Stars.svelte';
+	import TurnstileWidget from '$lib/components/TurnstileWidget.svelte';
 	import Ratings from '$lib/components/Ratings.svelte';
 	import MangaCard from '$lib/components/MangaCard.svelte';
 	import SeriesMetadata from '$lib/components/SeriesMetadata.svelte';
@@ -446,9 +447,20 @@
 		if (r?.view) override = r;
 		return true;
 	}
+	// A rating is a review: a server with Turnstile on asks for the check first.
+	let rateCheck = $state<TurnstileWidget>();
+	let rateError = $state<string | null>(null);
 	async function onRate(v: number): Promise<void> {
 		if (needsAuth) return;
-		await applyRatingChange(() => saveSeriesRating(seriesId, socialKey, v, myBody));
+		rateError = null;
+		await applyRatingChange(async () => {
+			try {
+				await saveSeriesRating(seriesId, socialKey, v, myBody, await rateCheck?.token());
+			} catch (err) {
+				rateError = err instanceof Error ? err.message : 'Your rating could not be saved.';
+				throw err;
+			}
+		});
 	}
 	// Clearing withdraws the vote for real (`deleteReview`), so the community count drops
 	// with it. The stars are local state and move immediately — the count they sit next to
@@ -1154,6 +1166,8 @@
 									<button class="clear k-hit" onclick={clearRating}>Remove</button>
 								{/if}
 							</div>
+							{#if !needsAuth}<TurnstileWidget bind:this={rateCheck} />{/if}
+							{#if rateError}<p class="rate-error" role="alert">{rateError}</p>{/if}
 						</div>
 					{/if}
 				</div>
@@ -2026,6 +2040,13 @@
 		align-items: center;
 		justify-content: space-between;
 		gap: 12px;
+	}
+	.rate-error {
+		margin: 0;
+		max-width: 260px;
+		color: var(--k-accent);
+		font-size: 12.5px;
+		line-height: 1.4;
 	}
 	.rate-pop-title {
 		font-weight: 700;

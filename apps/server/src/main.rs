@@ -90,6 +90,7 @@ mod task;
 mod telemetry;
 #[cfg(test)]
 mod test_postgres;
+mod turnstile;
 #[cfg(test)]
 mod upstream_admission_tests;
 mod upstream_cache;
@@ -4202,10 +4203,18 @@ async fn main() -> anyhow::Result<()> {
         trusted_proxies.clone(),
     ));
 
-    let schema = graphql::schema_builder(state.clone(), !cfg.graphiql_enabled)
+    let mut schema = graphql::schema_builder(state.clone(), !cfg.graphiql_enabled)
         .data(cloudflare.clone())
-        .data(media_routes)
-        .finish();
+        .data(media_routes);
+    // Turnstile is schema data, like the Cloudflare setup manager: absent (the default)
+    // means no mutation asks for a token.
+    if let Some(turnstile) = &cfg.turnstile {
+        tracing::info!(
+            "turnstile on: sign-up, sign-in, password changes, comments, reviews and reports need a token"
+        );
+        schema = schema.data(turnstile::Turnstile::new(turnstile));
+    }
+    let schema = schema.finish();
 
     let router_state = RouterState {
         schema,

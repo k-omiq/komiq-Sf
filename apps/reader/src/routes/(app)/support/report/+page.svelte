@@ -4,6 +4,7 @@
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import Icon from '$lib/components/Icon.svelte';
+	import TurnstileWidget from '$lib/components/TurnstileWidget.svelte';
 	import { auth } from '$lib/auth.svelte';
 	import { REPORT_TOPICS, topicFor } from '$lib/data/content';
 	import { submitReport } from '$lib/data/source';
@@ -96,6 +97,7 @@
 
 	let busy = $state(false);
 	let error = $state<string | null>(null);
+	let check = $state<TurnstileWidget>();
 	let done = $state<Report | null>(null);
 	protectUnsaved(
 		() => !done && !!(detail.trim() || title.trim() || username.trim() || sourceUrl.trim()),
@@ -250,6 +252,7 @@
 				commentId: topic.needs.user ? commentId || null : null,
 				reportedUsername: topic.needs.user && !commentId ? username.trim() || null : null,
 				sourceUrl: sourceUrl.trim() || null,
+				turnstileToken: await check?.token(),
 			});
 			window.scrollTo({ top: 0, behavior: 'smooth' });
 		} catch (err) {
@@ -431,6 +434,8 @@
 					autocomplete="off"
 				/>
 			</label>
+
+			<TurnstileWidget bind:this={check} />
 
 			{#if error}
 				<div class="error" role="alert">{error}</div>

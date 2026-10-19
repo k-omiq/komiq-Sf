@@ -5,6 +5,7 @@
 	import { loadInstance, registrationOpen } from '$lib/instance.svelte';
 	import { apiOrigin, canChooseServer } from '$lib/config';
 	import { connectScreen } from '$lib/server-connect.svelte';
+	import TurnstileWidget from '$lib/components/TurnstileWidget.svelte';
 
 	type Mode = 'login' | 'register';
 	let mode = $state<Mode>('login');
@@ -24,6 +25,7 @@
 	let password = $state('');
 	let error = $state<string | null>(null);
 	let busy = $state(false);
+	let check = $state<TurnstileWidget>();
 
 	// Native app: which server this signs in to, with a way to pick another.
 	const serverHost = apiOrigin.replace(/^https?:\/\//, '');
@@ -46,10 +48,16 @@
 		error = null;
 		busy = true;
 		try {
+			const turnstileToken = await check?.token();
 			if (mode === 'login') {
-				await login(username.trim(), password);
+				await login(username.trim(), password, turnstileToken);
 			} else {
-				await register({ username: username.trim(), email: email.trim(), password });
+				await register({
+					username: username.trim(),
+					email: email.trim(),
+					password,
+					turnstileToken,
+				});
 			}
 			await goto(redirectTo, { replaceState: true });
 		} catch (err) {
@@ -134,6 +142,8 @@
 					required
 				/>
 			</label>
+
+			<TurnstileWidget bind:this={check} />
 
 			{#if error}
 				<p class="error" role="alert">{error}</p>

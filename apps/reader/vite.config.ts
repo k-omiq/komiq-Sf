@@ -108,7 +108,10 @@ export default defineConfig(({ command, mode, isPreview }) => {
 							mode: 'hash',
 							directives: {
 								'default-src': ['self'],
-								'script-src': ['self', ...templateHashes],
+								// challenges.cloudflare.com: the Turnstile widget's script and
+								// frame, for a server that asks for the check (TurnstileWidget).
+								'script-src': ['self', 'https://challenges.cloudflare.com', ...templateHashes],
+								'frame-src': ['https://challenges.cloudflare.com'],
 								'style-src': ['self', 'unsafe-inline'],
 								'img-src': ['self', 'https:', 'http:', 'data:', 'blob:'],
 								'connect-src': connectSources,

@@ -10,7 +10,10 @@ export function writeStaticHeaders(directory, connectSources) {
 		html,
 		[
 			"default-src 'self'",
-			"script-src 'self' ${CSP_SCRIPT_HASHES}",
+			// challenges.cloudflare.com: the Turnstile widget's script and frame, for a
+			// server that asks for the check (src/lib/components/TurnstileWidget.svelte).
+			"script-src 'self' https://challenges.cloudflare.com ${CSP_SCRIPT_HASHES}",
+			'frame-src https://challenges.cloudflare.com',
 			"style-src 'self' 'unsafe-inline'",
 			"img-src 'self' https: http: data: blob:",
 			`connect-src ${connectSources.map((source) => (source === 'self' ? "'self'" : source)).join(' ')}`,

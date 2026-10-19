@@ -68,19 +68,32 @@ import type {
 export interface Backend {
 	// --- auth ---
 	session(): Promise<Session | null>;
-	login(username: string, password: string): Promise<Session>;
+	/** `turnstileToken`: the Turnstile widget's token, for a server that asks for one
+	 *  ({@link turnstileSiteKey}). Leave it out for a server that does not. */
+	login(username: string, password: string, turnstileToken?: string): Promise<Session>;
 	register(input: RegisterInput): Promise<Session>;
 	logout(): Promise<void>;
 	/** Public server facts (setup state, sign-up switch) — no sign-in needed.
 	 * Optional: only the unified Komika API implements it. */
 	instance?(): Promise<InstanceInfo>;
+	/**
+	 * The server's Cloudflare Turnstile site key, or `null` when it asks for no check. With
+	 * a key, sign-up, sign-in, password changes and resets, comments, reviews and reports
+	 * each need a fresh widget token (`turnstileToken`). A server that predates the field
+	 * answers `null`. Optional: only the unified Komika API implements it.
+	 */
+	turnstileSiteKey?(): Promise<string | null>;
 	/** First-run setup: create the owner (first admin) account with the setup
 	 * code from the server log, and sign in. Works only while
 	 * {@link InstanceInfo.setupRequired}. Optional. */
 	createOwner?(input: CreateOwnerInput): Promise<Session>;
 	/** Change the signed-in user's own password; signs out their other sessions
 	 * and clears `mustChangePassword`. Optional. */
-	changePassword?(currentPassword: string, newPassword: string): Promise<Session['user']>;
+	changePassword?(
+		currentPassword: string,
+		newPassword: string,
+		turnstileToken?: string,
+	): Promise<Session['user']>;
 	/**
 	 * Set (or clear) the bearer token used for authenticated requests. Optional:
 	 * only backends with real auth (the unified Komika API) implement it; the
@@ -467,7 +480,7 @@ export interface Backend {
 	createUser?(input: CreateUserInput): Promise<AdminUser>;
 	/** Set a new password for another account; signs it out everywhere and asks
 	 * for a change at next sign-in. Optional. */
-	resetUserPassword?(userId: Id, password: string): Promise<boolean>;
+	resetUserPassword?(userId: Id, password: string, turnstileToken?: string): Promise<boolean>;
 	/** Open or close public sign-up; returns the new effective value. Refused when
 	 * the server pins it by env. Optional. */
 	setRegistrationOpen?(open: boolean): Promise<boolean>;
@@ -1430,6 +1443,8 @@ export interface RegisterInput {
 	username: string;
 	email: string;
 	password: string;
+	/** The Turnstile widget's token, for a server that asks for one. */
+	turnstileToken?: string;
 }
 
 /** Editable profile fields. A blank/undefined field clears that value. */
@@ -1443,6 +1458,8 @@ export interface PostReviewInput {
 	score: number;
 	body: string;
 	hasSpoiler: boolean;
+	/** The Turnstile widget's token, for a server that asks for one. */
+	turnstileToken?: string;
 }
 
 export interface PostCommentInput {
@@ -1454,6 +1471,8 @@ export interface PostCommentInput {
 	hasSpoiler: boolean;
 	/** A previously-uploaded comment-media id to attach (owned by the poster, unlinked). */
 	mediaId?: Id | null;
+	/** The Turnstile widget's token, for a server that asks for one. */
+	turnstileToken?: string;
 }
 
 /** Result of staging a comment image via `POST /comment-media`. Pass `mediaId` to

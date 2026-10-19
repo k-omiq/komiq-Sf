@@ -15,8 +15,10 @@
 # frame-ancestors remains a response header (meta policies cannot enforce it).
 #
 # connect-src pins the GraphQL API baked in at build time (PUBLIC_KOMIKA_API).
+# challenges.cloudflare.com (script and frame) is the Turnstile widget, shown on the
+# sign-in, password and user pages when the API asks for the check.
 /*
-  Content-Security-Policy: default-src 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; font-src 'self' data:; connect-src 'self' https://api.komiq.cc; manifest-src 'self'; worker-src 'self'; upgrade-insecure-requests
+  Content-Security-Policy: default-src 'self'; base-uri 'none'; object-src 'none'; frame-src https://challenges.cloudflare.com; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; font-src 'self' data:; connect-src 'self' https://api.komiq.cc; manifest-src 'self'; worker-src 'self'; upgrade-insecure-requests
   X-Content-Type-Options: nosniff
   X-Frame-Options: DENY
   Referrer-Policy: no-referrer

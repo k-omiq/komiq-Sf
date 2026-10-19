@@ -12,3 +12,4 @@ export * from './numeric-epoch.js';
 export * from './progress-conflict.js';
 export * from './session-keeper.js';
 export * from './pack.js';
+export * from './turnstile.js';
