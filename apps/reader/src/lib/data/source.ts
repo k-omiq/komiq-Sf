@@ -2469,7 +2469,13 @@ export async function getSeries(id: string, fetch?: LoadFetch): Promise<SeriesRe
 			.search('', 1, { sort: 'NEWEST' })
 			.then((r) => r.items)
 			.catch(() => [] as Series[]);
-		const s = await b.series(id);
+		// The resolver's own not-found (unknown or malformed id, NSFW-gated): the page
+		// 404s, as `seriesPage` does for a work. Anything else is an outage.
+		const s = await b.series(id).catch((e: unknown) => {
+			if (String(e instanceof Error ? e.message : e).includes('No such series')) return null;
+			throw e;
+		});
+		if (!s) return null;
 		if (s.workId && isCanonicalId(s.workId)) {
 			const canonical = await getSeries(s.workId, fetch);
 			if (canonical.view) return canonical.view;

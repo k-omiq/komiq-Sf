@@ -221,3 +221,20 @@ test("the reader keeps the work title and still honours the source's long-strip 
 	assert.equal(view.seriesTitle, 'Work Title');
 	assert.equal(view.longStrip, true);
 });
+
+test('a series id the server does not know is not found, not an outage', async () => {
+	g.backend.series = async () => {
+		throw new Error('No such series');
+	};
+	g.backend.chapters = async () => {
+		throw new Error('No such series');
+	};
+	g.backend.search = async () => ({ items: [] });
+	assert.deepEqual(await getSeries('kci-no-such-series'), { view: null, error: false });
+
+	// Any other failure still shows the error state.
+	g.backend.series = async () => {
+		throw new Error('Failed to fetch');
+	};
+	assert.deepEqual(await getSeries('kci-no-such-series'), { view: null, error: true });
+});
