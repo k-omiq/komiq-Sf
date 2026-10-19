@@ -23,6 +23,16 @@ use crate::telemetry::{AdmissionStats, Deadline, Held, Lane, LaneStats};
 
 pub(crate) const UPSTREAM_CLIENT_CONCURRENCY: usize = 3;
 
+/// The upstream identity of every edge render (`GET /graphql/ssr`). The renders reach
+/// the API from a handful of shared Workers addresses, so they get one budget of their
+/// own: [`EDGE_RENDER_SHARE`] times one reader's miss rate, and [`EDGE_RENDER_CONCURRENCY`]
+/// of the global upstream slots. Only the reader's Worker can reach that path on the
+/// hosted service (a WAF rule); elsewhere the worst a caller can do with it is use up
+/// this one shared budget.
+pub(crate) const EDGE_RENDER_CLIENT: &str = "edge-render";
+const EDGE_RENDER_SHARE: u32 = 10;
+const EDGE_RENDER_CONCURRENCY: usize = 8;
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Class {
     Local,
@@ -194,7 +204,12 @@ impl RequestBudgets {
             match clients.get(client).and_then(Weak::upgrade) {
                 Some(semaphore) => semaphore,
                 None => {
-                    let semaphore = Arc::new(Semaphore::new(UPSTREAM_CLIENT_CONCURRENCY));
+                    let limit = if client == EDGE_RENDER_CLIENT {
+                        EDGE_RENDER_CONCURRENCY
+                    } else {
+                        UPSTREAM_CLIENT_CONCURRENCY
+                    };
+                    let semaphore = Arc::new(Semaphore::new(limit));
                     clients.insert(client.to_owned(), Arc::downgrade(&semaphore));
                     semaphore
                 }
@@ -370,7 +385,12 @@ impl std::error::Error for UpstreamRateLimit {}
 pub(crate) fn check_upstream_rate(client: Option<&str>) -> anyhow::Result<()> {
     if let Some(client) = client {
         let lane = crate::telemetry::ADMISSION.lane(Lane::UpstreamRate);
-        match UPSTREAM_LIMITER.check(&format!("upstream:{client}")) {
+        let share = if client == EDGE_RENDER_CLIENT {
+            EDGE_RENDER_SHARE
+        } else {
+            1
+        };
+        match UPSTREAM_LIMITER.check_scaled(&format!("upstream:{client}"), share) {
             Ok(()) => lane.admitted(),
             Err(retry) => {
                 lane.refuse();
@@ -1692,5 +1712,19 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(stats.deadlines(Deadline::Upload), 1);
         assert_eq!(stats.lane(Lane::Uploads).snapshot(), (1, 0, 0, 1));
+    }
+
+    /// Edge renders share one budget of their own, larger than one reader's.
+    #[test]
+    fn edge_renders_get_a_shared_budget_larger_than_one_readers() {
+        for _ in 0..(60 * EDGE_RENDER_SHARE as usize) {
+            check_upstream_rate(Some(EDGE_RENDER_CLIENT)).unwrap();
+        }
+        assert!(check_upstream_rate(Some(EDGE_RENDER_CLIENT)).is_err());
+        let reader = "edge-render-test-reader";
+        for _ in 0..60 {
+            check_upstream_rate(Some(reader)).unwrap();
+        }
+        assert!(check_upstream_rate(Some(reader)).is_err());
     }
 }

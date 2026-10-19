@@ -171,6 +171,7 @@ These operations manage account registration, login and profile updates:
 - `changePassword`: update user password and clear forced change flag.
 - `updateProfile`: update display name and biography.
 - `setShowNsfw`: toggle adult content visibility preference.
+- `nsfwPass`: the shared NSFW pass for a viewer with NSFW content on, or null. Read [Edge rendering and caching](/developers/edge-caching).
 - `myBlockRules` and `setMyBlockRules`: read and replace the signed-in user's content block rules.
 
 ### Administration and operations

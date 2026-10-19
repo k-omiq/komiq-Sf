@@ -217,8 +217,22 @@ const PUBLIC_READS = new Set([
 	ops.MEDIA_ROUTES,
 ]);
 
-/** How long a viewer's posture (see {@link GraphQLBackend.anonymousPosture}) is kept. */
+/** How long a viewer's posture (see {@link GraphQLBackend.posture}) is kept. */
 const POSTURE_TTL_MS = 5 * 60_000;
+
+/**
+ * A signed-in viewer's catalogue posture. `anonymous`: their catalogue reads can go
+ * without the token. `nsfwPass`: the shared pass those reads carry when the viewer opted
+ * in to NSFW (`apps/server/src/nsfw_pass.rs`); null when they did not.
+ */
+interface Posture {
+	anonymous: boolean;
+	nsfwPass: string | null;
+}
+const SIGNED_IN: Posture = { anonymous: false, nsfwPass: null };
+
+/** The server's answer to a pass that no longer verifies (`nsfw_pass::EXPIRED`). */
+const NSFW_PASS_EXPIRED = 'NSFW_PASS_EXPIRED';
 
 /**
  * How {@link GraphQLBackend.gql} sends a request. `auto`: a GET when nothing needs the
@@ -334,7 +348,7 @@ interface AuthCell {
 	numericEpoch?: Promise<number | null>;
 	staleNumericEpochNotified?: boolean;
 	/** Whether the viewer's catalogue answers are the anonymous ones, and until when. */
-	posture?: { expiresAt: number; anonymous: Promise<boolean> };
+	posture?: { expiresAt: number; posture: Promise<Posture> };
 }
 
 const CAPABILITY_ENDPOINT_CAPACITY = 64;
@@ -459,27 +473,49 @@ export class GraphQLBackend implements Backend {
 	}
 
 	/**
-	 * Whether the signed-in viewer's catalogue answers are the anonymous ones: no NSFW
-	 * opt-in and no block rule of their own (site rules apply to everyone). Read once per
-	 * sign-in, again after {@link POSTURE_TTL_MS} or a change made here; a failed read
-	 * keeps every read signed in. A change made on another device applies within the TTL.
+	 * Whether the signed-in viewer's catalogue answers are the anonymous ones: no block
+	 * rule of their own (site rules apply to everyone), and either no NSFW opt-in or the
+	 * shared NSFW pass that stands in for it. Read once per sign-in, again after
+	 * {@link POSTURE_TTL_MS} or a change made here; a failed read keeps every read signed
+	 * in. A change made on another device applies within the TTL.
 	 */
-	private anonymousPosture(authRevision: number): Promise<boolean> {
+	private posture(authRevision: number): Promise<Posture> {
 		const cell = this.auth;
 		const now = Date.now();
-		if (cell.posture && cell.posture.expiresAt > now) return cell.posture.anonymous;
-		const anonymous = this.gql<{
+		if (cell.posture && cell.posture.expiresAt > now) return cell.posture.posture;
+		const posture = this.gql<{
 			session: { user: { showNsfw: boolean } } | null;
 			myBlockRules: BlockRule[];
 		}>(ops.VIEWER_POSTURE, undefined, false, undefined, authRevision, 'post').then(
-			(d) =>
-				!!d.session &&
-				!d.session.user.showNsfw &&
-				d.myBlockRules.every((rule) => rule.tags.length === 0 && rule.ratings.length === 0),
-			() => false,
+			async (d): Promise<Posture> => {
+				const noRules = d.myBlockRules.every(
+					(rule) => rule.tags.length === 0 && rule.ratings.length === 0,
+				);
+				if (!d.session || !noRules) return SIGNED_IN;
+				if (!d.session.user.showNsfw) return { anonymous: true, nsfwPass: null };
+				// A server that predates the pass answers with an error: stay signed in.
+				const pass = await this.gql<{ nsfwPass: string | null }>(
+					ops.NSFW_PASS,
+					undefined,
+					false,
+					undefined,
+					authRevision,
+					'post',
+				).then(
+					(p) => p.nsfwPass,
+					() => null,
+				);
+				return pass ? { anonymous: true, nsfwPass: pass } : SIGNED_IN;
+			},
+			() => SIGNED_IN,
 		);
-		cell.posture = { expiresAt: now + POSTURE_TTL_MS, anonymous };
-		return anonymous;
+		cell.posture = { expiresAt: now + POSTURE_TTL_MS, posture };
+		return posture;
+	}
+
+	/** {@link posture}'s `anonymous`. */
+	private async anonymousPosture(authRevision: number): Promise<boolean> {
+		return (await this.posture(authRevision)).anonymous;
 	}
 
 	/**
@@ -639,9 +675,29 @@ export class GraphQLBackend implements Backend {
 		// The token goes only where the answer depends on the viewer: a signed-in
 		// viewer's catalogue read whose answer is the anonymous one goes without it.
 		let sent: string | null = token && transport !== 'public' ? token : null;
+		// The shared NSFW pass a viewer's anonymous catalogue read carries (see `posture`).
+		let nsfwPass: string | null = null;
 		if (sent && transport === 'auto' && !mutation && this.publicCandidate(query, variables)) {
-			if (await this.anonymousPosture(authRevision)) sent = null;
+			const posture = await this.posture(authRevision);
 			this.assertAuthRevision(authRevision);
+			if (posture.anonymous) {
+				sent = null;
+				nsfwPass = posture.nsfwPass;
+			}
+		} else if (token && transport === 'public' && !mutation) {
+			// `public` is chosen only after the posture allowed it, so this is a cache read.
+			nsfwPass = (await this.posture(authRevision)).nsfwPass;
+			this.assertAuthRevision(authRevision);
+		}
+		// The pass rides only on a persisted GET. Where that is not possible, an `auto`
+		// read keeps the token instead, so it still sees what this viewer opted in to.
+		const persistable =
+			!this.capabilities.getUnsupported &&
+			!this.capabilities.persistedUnsupported &&
+			!this.capabilities.unknownPersisted.has(stripped);
+		if (nsfwPass && !persistable) {
+			if (transport === 'auto') sent = token;
+			nsfwPass = null;
 		}
 		// Anonymous READS go over GET so Cloudflare and the browser's HTTP cache can
 		// serve them (the server sends Cache-Control + ETag on anonymous GETs; 304
@@ -662,9 +718,12 @@ export class GraphQLBackend implements Backend {
 		if (useGet && (persisted || !this.capabilities.fullTextGetRefused)) {
 			// Single-operation documents, so no `operationName`; `variables` only when
 			// there are any. No Authorization header by construction.
+			// The server redirects any other spelling, so this order and encoding are fixed:
+			// `id`, `variables`, `nsfw` (`apps/server/src/persisted.rs`).
 			const params =
 				(persisted ? `id=${persisted}` : `query=${encodeURIComponent(stripped)}`) +
-				(variables ? `&variables=${encodeURIComponent(JSON.stringify(variables))}` : '');
+				(variables ? `&variables=${encodeURIComponent(JSON.stringify(variables))}` : '') +
+				(persisted && nsfwPass ? `&nsfw=${nsfwPass}` : '');
 			res = await doFetch(canonicalUrl(`${this.config.endpoint}?${params}`));
 			if (res.status === 405 && (await refusalCode(res.clone())) === PERSISTED_REQUIRED) {
 				// The server runs only persisted documents over GET, and this one it does not
@@ -706,6 +765,13 @@ export class GraphQLBackend implements Backend {
 		}
 		if (!res.ok) throw new Error(`Backend error ${res.status}`);
 		const json = (await res.json()) as { data?: T; errors?: GraphQLErrorLike[] };
+		// The pass expired (it changes every UTC day): forget the posture, so the next
+		// read fetches a fresh one, and answer this read signed in.
+		if (nsfwPass && json.errors?.some((e) => e.extensions?.code === NSFW_PASS_EXPIRED)) {
+			this.assertAuthRevision(authRevision);
+			this.auth.posture = undefined;
+			return this.gql<T>(query, variables, retried, tolerate, authRevision, 'post');
+		}
 		// A server that predates persisted documents parses the missing `query` as an empty
 		// document (`persisted.rs` keeps the words in a test). Send the text from now on.
 		if (persisted && json.errors?.some((e) => e.message.includes('executable_definition'))) {

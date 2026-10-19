@@ -90,6 +90,7 @@ type Query {
 	scanlatorRatings(search: String, kind: ScanlatorKind, mine: Boolean, sort: ScanlatorSort, page: Int = 1): RatedScanlatorPage! # [komika] the readers' scanlator list — every site and every group with the rating this server's readers gave it, 30 per page, public. `search` matches part of the name; `mine` keeps what the viewer rated (empty when signed out); default sort TOP. A joint credit ("A & B") whose members all exist on their own is not listed. Nothing is counted: one indexed query filters, orders and pages
 	ratedScanlator(id: ID!): RatedScanlator # [komika] one scanlator by id, null when there is none — public
 	siteBlockRules: [BlockRule!]! # [komika] admin — the site-wide content block rules, in saved order (requires isAdmin)
+	nsfwPass: String # [komika] today's shared NSFW pass for an opted-in viewer, else null; sent as &nsfw= on catalogue GETs
 	myBlockRules: [BlockRule!]! # [komika] the viewer's own content block rules, in saved order (requires auth)
 	mediaTakedowns: [MediaTakedown!]! # [komika] admin — every operator takedown, newest first (requires isAdmin)
 	sources: [SourceInfo!]! # [komika] installed Suwayomi sources — the sourceBrowse picker. Every installed source is listed incl. NSFW ones, regardless of the admin's reader-side show_nsfw; each carries `isNsfw` for the UI to badge (requires isAdmin)

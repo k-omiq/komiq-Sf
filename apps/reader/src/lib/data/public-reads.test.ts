@@ -30,6 +30,8 @@ interface Sent {
 	name: string;
 	/** A GET that named a persisted document instead of carrying its text. */
 	persisted: boolean;
+	/** The shared NSFW pass the GET carried, if any. */
+	nsfw: string | null;
 	authorization: string | null;
 }
 
@@ -61,6 +63,7 @@ function server(answers: Record<string, Answer>) {
 			method: init?.method ?? 'GET',
 			name: '',
 			persisted: new URL(String(input)).searchParams.has('id'),
+			nsfw: new URL(String(input)).searchParams.get('nsfw'),
 			authorization: new Headers(init?.headers).get('authorization'),
 		});
 		return answer(input, init);
@@ -73,7 +76,10 @@ const shape = (sent: Sent[]) =>
 	sent
 		.map(
 			(s) =>
-				`${s.name} ${s.method}` + (s.authorization ? ' token' : '') + (s.persisted ? ' id' : ''),
+				`${s.name} ${s.method}` +
+				(s.authorization ? ' token' : '') +
+				(s.persisted ? ' id' : '') +
+				(s.nsfw ? ` nsfw=${s.nsfw}` : ''),
 		)
 		.sort();
 
@@ -170,15 +176,24 @@ test('a signed-in page load sends the catalogue as anonymous GETs and its own da
 	assert.deepEqual(shape(sent), ['Search POST token']);
 });
 
-for (const [name, answer] of [
-	['an NSFW opt-in', posture(true)],
-	['a block rule of their own', posture(false, [{ tags: ['gore'], ratings: [] }])],
-	['a failed posture read', { errors: [{ message: 'boom' }] }],
+const noPass = { data: { nsfwPass: null } };
+for (const [name, answer, pass] of [
+	['an NSFW opt-in but no pass', posture(true), noPass],
+	[
+		'an NSFW opt-in on a server without passes',
+		posture(true),
+		{
+			errors: [{ message: 'Unknown field "nsfwPass" on type "QueryRoot".' }],
+		},
+	],
+	['a block rule of their own', posture(false, [{ tags: ['gore'], ratings: [] }]), undefined],
+	['a failed posture read', { errors: [{ message: 'boom' }] }, undefined],
 ] as const) {
 	test(`a viewer with ${name} keeps every read signed in`, async () => {
 		const { sent, fetch } = server({
 			...catalogue,
 			ViewerPosture: answer,
+			...(pass ? { NsfwPass: pass } : {}),
 			SeriesPage: { data: { seriesPage: signedPage } },
 		});
 		const backend = new GraphQLBackend({
@@ -189,14 +204,83 @@ for (const [name, answer] of [
 		});
 		await backend.discovery();
 		assert.deepEqual(await backend.seriesPage('w_1', true), signedPage);
-		assert.deepEqual(shape(sent), [
-			'Discovery POST token',
-			'NumericEpoch POST token',
-			'SeriesPage POST token',
-			'ViewerPosture POST token',
-		]);
+		assert.deepEqual(
+			shape(sent),
+			[
+				'Discovery POST token',
+				'NumericEpoch POST token',
+				'SeriesPage POST token',
+				'ViewerPosture POST token',
+				...(pass ? ['NsfwPass POST token'] : []),
+			].sort(),
+		);
 	});
 }
+
+const PASS = 'ab'.repeat(32);
+
+test('an NSFW viewer with a pass reads the catalogue as cacheable GETs that carry it', async () => {
+	const { sent, fetch } = server({
+		...catalogue,
+		ViewerPosture: posture(true),
+		NsfwPass: { data: { nsfwPass: PASS } },
+		SeriesPage: { data: { seriesPage: anonymousPage } },
+		SeriesPageViewer: { data: { seriesPageViewer: viewer } },
+	});
+	const backend = new GraphQLBackend({
+		endpoint: endpoint(),
+		token: 'A',
+		publicReads: true,
+		fetch,
+	});
+	await backend.discovery();
+	assert.deepEqual(await backend.seriesPage('w_1', true), signedPage);
+	assert.deepEqual(shape(sent), [
+		`Discovery GET id nsfw=${PASS}`,
+		'NsfwPass POST token',
+		'NumericEpoch POST token',
+		`SeriesPage GET id nsfw=${PASS}`,
+		'SeriesPageViewer POST token',
+		'ViewerPosture POST token',
+	]);
+});
+
+test('an expired pass answers that read signed in and fetches a new pass next time', async () => {
+	let passes = 0;
+	const { sent, fetch } = server({
+		...catalogue,
+		ViewerPosture: posture(true),
+		NsfwPass: () => ({ data: { nsfwPass: String(++passes).repeat(64) } }),
+		Discovery: (_: unknown, authorization: string | null) =>
+			authorization || passes > 1
+				? { data: { discovery: [] } }
+				: {
+						data: null,
+						errors: [{ message: 'expired', extensions: { code: 'NSFW_PASS_EXPIRED' } }],
+					},
+	});
+	const backend = new GraphQLBackend({
+		endpoint: endpoint(),
+		token: 'A',
+		publicReads: true,
+		fetch,
+	});
+	assert.deepEqual(await backend.discovery(), []);
+	assert.deepEqual(shape(sent), [
+		'Discovery GET id nsfw=' + '1'.repeat(64),
+		'Discovery POST token',
+		'NsfwPass POST token',
+		'NumericEpoch POST token',
+		'ViewerPosture POST token',
+	]);
+	sent.length = 0;
+	await backend.discovery();
+	assert.deepEqual(shape(sent), [
+		'Discovery GET id nsfw=' + '2'.repeat(64),
+		'NsfwPass POST token',
+		'ViewerPosture POST token',
+	]);
+});
 
 test('without publicReads (the admin console) a signed-in viewer never reads anonymously', async () => {
 	const { sent, fetch } = server({
@@ -248,6 +332,7 @@ test('changing the NSFW opt-in here asks for the posture again', async () => {
 	const { sent, fetch } = server({
 		...catalogue,
 		ViewerPosture: () => posture(showNsfw),
+		NsfwPass: noPass,
 		SetShowNsfw: () => ({ data: { setShowNsfw: (showNsfw = true) } }),
 	});
 	const backend = new GraphQLBackend({
@@ -260,7 +345,11 @@ test('changing the NSFW opt-in here asks for the posture again', async () => {
 	await backend.setShowNsfw(true);
 	sent.length = 0;
 	await backend.discovery();
-	assert.deepEqual(shape(sent), ['Discovery POST token', 'ViewerPosture POST token']);
+	assert.deepEqual(shape(sent), [
+		'Discovery POST token',
+		'NsfwPass POST token',
+		'ViewerPosture POST token',
+	]);
 });
 
 test('a signed-out reader never asks for a posture', async () => {

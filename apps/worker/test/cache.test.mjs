@@ -257,3 +257,23 @@ test('a HEAD miss answers headers only and stores nothing; a later HEAD hit is h
 	);
 	assert.equal(log.fetches.length, 2, 'the HEAD miss did not fill the cache');
 });
+
+test('an upstream that forbids storing is passed through and never kept', async () => {
+	const src = 'https://cdn.example/legacy.png';
+	const log = await session([{ src }, { src }], {
+		upstream: async () =>
+			new Response(image, {
+				headers: { 'Content-Type': 'image/png', 'Cache-Control': 'private, no-store' },
+			}),
+	});
+	assert.deepEqual(log.writes, [], 'nothing is stored');
+	assert.equal(log.fetches.length, 2, 'every request goes upstream');
+	for (const { response, body } of log.responses) {
+		assert.equal(response.status, 200);
+		assert.equal(response.headers.get('Cache-Control'), 'no-store');
+		assert.deepEqual(body, image);
+	}
+	assert.equal(worker.forbidsStoring('public, max-age=300'), false);
+	assert.equal(worker.forbidsStoring('No-Store'), true);
+	assert.equal(worker.forbidsStoring(null), false);
+});

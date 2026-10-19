@@ -12,6 +12,12 @@
 //! endpoint cannot be used for arbitrary queries. That refusal is a 405, on which apps of
 //! every version send the document by POST. POST keeps taking full documents, for older
 //! apps, the admin console and documents the server does not know.
+//!
+//! The edge keys on the whole query string, so a GET by id must arrive in its one
+//! canonical form, `id=<id>[&variables=<compact JSON>][&nsfw=<pass>]`, encoded the way
+//! the apps encode it. Unknown parameters are refused, and any other spelling of a valid
+//! request is redirected to the canonical URL before it runs. Otherwise every extra
+//! parameter or re-spaced JSON would be a separate cache entry that runs the query.
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -42,14 +48,15 @@ pub(crate) struct PersistedOnly(pub bool);
 pub(crate) struct PersistedRequest {
     document: &'static str,
     variables: async_graphql::Variables,
-    operation_name: Option<String>,
+    /// The shared NSFW pass (`nsfw_pass.rs`), checked where the NSFW preference is read.
+    nsfw: Option<String>,
 }
 
 impl PersistedRequest {
     pub(crate) fn into_request(self) -> async_graphql::Request {
         let request = async_graphql::Request::new(self.document).variables(self.variables);
-        match self.operation_name {
-            Some(name) => request.operation_name(name),
+        match self.nsfw {
+            Some(pass) => request.data(crate::graphql::NsfwPass(pass)),
             None => request,
         }
     }
@@ -61,12 +68,48 @@ pub(crate) const NOT_FOUND: &str = "PERSISTED_QUERY_NOT_FOUND";
 pub(crate) const REQUIRED: &str = "PERSISTED_QUERY_REQUIRED";
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GetParams {
     id: Option<String>,
     query: Option<String>,
     variables: Option<String>,
     #[serde(rename = "operationName")]
     operation_name: Option<String>,
+    nsfw: Option<String>,
+}
+
+/// `encodeURIComponent` as the apps apply it, after `new URL(...).href` has also encoded
+/// `'`: every byte except `A-Z a-z 0-9 - _ . ! ~ * ( )` as uppercase `%XX`. The WHATWG
+/// URL parser leaves this form unchanged, so a redirect to it cannot loop.
+fn encode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.!~*()".contains(&byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// The canonical query string of a GET by id.
+fn canonical_query(id: &str, variables: Option<&serde_json::Value>, nsfw: Option<&str>) -> String {
+    let mut query = format!("id={}", encode_component(id));
+    if let Some(variables) = variables {
+        query.push_str("&variables=");
+        query.push_str(&encode_component(&variables.to_string()));
+    }
+    if let Some(pass) = nsfw {
+        query.push_str("&nsfw=");
+        query.push_str(&encode_component(pass));
+    }
+    query
+}
+
+/// A pass is the hex of an HMAC-SHA256 tag.
+fn pass_shape_ok(pass: &str) -> bool {
+    pass.len() == 64 && pass.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn refuse(status: StatusCode, code: &str, message: &str) -> Response {
@@ -95,10 +138,17 @@ pub(crate) async fn resolve_get(
         return refuse(
             StatusCode::BAD_REQUEST,
             "BAD_REQUEST",
-            "Malformed query string",
+            "Malformed query string, or a parameter this endpoint does not take",
         );
     };
     let Some(id) = params.id else {
+        if params.nsfw.is_some() {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "nsfw needs a persisted document id",
+            );
+        }
         if only {
             // 405, the answer on which apps that predate persisted documents already fall
             // back to POST.
@@ -114,19 +164,34 @@ pub(crate) async fn resolve_get(
         }
         return next.run(request).await;
     };
-    if params.query.is_some() {
+    if params.query.is_some() || params.operation_name.is_some() {
         return refuse(
             StatusCode::BAD_REQUEST,
             "BAD_REQUEST",
-            "Send either id or query, not both",
+            "With id, send only variables and nsfw",
+        );
+    }
+    if params
+        .nsfw
+        .as_deref()
+        .is_some_and(|pass| !pass_shape_ok(pass))
+    {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "Malformed nsfw pass",
         );
     }
     let Some(document) = document(&id) else {
         return refuse(StatusCode::BAD_REQUEST, NOT_FOUND, "PersistedQueryNotFound");
     };
-    let variables = match params.variables.as_deref().map(serde_json::from_str) {
-        None => async_graphql::Variables::default(),
-        Some(Ok(value)) => async_graphql::Variables::from_json(value),
+    let json = match params
+        .variables
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+    {
+        None => None,
+        Some(Ok(value)) => Some(value),
         Some(Err(_)) => {
             return refuse(
                 StatusCode::BAD_REQUEST,
@@ -135,10 +200,27 @@ pub(crate) async fn resolve_get(
             )
         }
     };
+    let canonical = canonical_query(&id, json.as_ref(), params.nsfw.as_deref());
+    if request.uri().query() != Some(canonical.as_str()) {
+        // A valid request in another spelling: send it to the one URL the edge keeps,
+        // before anything runs. Never cached, so a later canonical form can change it.
+        let location = format!("{}?{canonical}", request.uri().path());
+        return (
+            StatusCode::TEMPORARY_REDIRECT,
+            [
+                (header::LOCATION, location),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+            ],
+        )
+            .into_response();
+    }
+    let variables = json
+        .map(async_graphql::Variables::from_json)
+        .unwrap_or_default();
     request.extensions_mut().insert(PersistedRequest {
         document,
         variables,
-        operation_name: params.operation_name,
+        nsfw: params.nsfw,
     });
     next.run(request).await
 }
@@ -175,6 +257,27 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{id} does not parse: {e}"));
         }
         assert!(document("0".repeat(64).as_str()).is_none());
+    }
+
+    /// The canonical form is what the apps send: `encodeURIComponent` of compact JSON in
+    /// key order, with `'` encoded by the URL parser.
+    #[test]
+    fn the_canonical_query_matches_what_the_apps_send() {
+        let variables: serde_json::Value =
+            serde_json::from_str(r#"{ "q": "it's (a) ~test~!*", "page": 1, "b": null }"#).unwrap();
+        assert_eq!(
+            canonical_query("abc", Some(&variables), None),
+            "id=abc&variables=%7B%22q%22%3A%22it%27s%20(a)%20~test~!*%22%2C%22page%22%3A1%2C%22b%22%3Anull%7D"
+        );
+        assert_eq!(
+            canonical_query("abc", None, Some("ff")),
+            "id=abc&nsfw=ff",
+            "nsfw comes last"
+        );
+        assert_eq!(encode_component("ü/é"), "%C3%BC%2F%C3%A9");
+        assert!(pass_shape_ok(&"0a".repeat(32)));
+        assert!(!pass_shape_ok(&"0A".repeat(32)));
+        assert!(!pass_shape_ok("0a"));
     }
 
     /// The apps tell a server that predates persisted documents by this answer to an

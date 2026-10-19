@@ -68,6 +68,10 @@ async fn run(st: &AppState, shutdown: &mut watch::Receiver<bool>) -> Result<bool
         return Ok(true);
     }
     let split = split_merged(pool).await?;
+    if split > 0 {
+        // New works exist and old ones lost entries: the memoized feeds are stale.
+        crate::graphql::clear_feed_caches();
+    }
     let dismissed = crate::graphql::dismiss_distinct_reviews(pool).await?;
     tracing::info!(
         split,
@@ -210,6 +214,10 @@ pub(crate) async fn refetch(
         if let Err(error) = crate::cover_choice::reselect_work(&clients, work, true).await {
             tracing::warn!(work = %work, error = %format!("{error:#}"), "mangadex unmerge: cover choice failed");
         }
+    }
+    if !refetched.is_empty() {
+        // Titles, metadata and covers changed: drop the memoized feeds that show them.
+        crate::graphql::clear_feed_caches();
     }
     Ok(refetched.len())
 }

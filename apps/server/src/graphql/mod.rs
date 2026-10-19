@@ -448,6 +448,30 @@ pub struct RequestUserCache(pub std::sync::Arc<tokio::sync::OnceCell<Result<Opti
 #[derive(Clone, Default)]
 pub struct RequestNsfwPref(pub std::sync::Arc<tokio::sync::OnceCell<Result<bool>>>);
 
+/// Per-request: the shared NSFW pass a signed-out GET carried (`&nsfw=`, see
+/// `nsfw_pass.rs`). A valid pass makes an anonymous request read as opted in to NSFW;
+/// an expired one is an error the apps answer by fetching a fresh pass.
+#[derive(Clone)]
+pub struct NsfwPass(pub String);
+
+/// Per-request: set when an answer had to leave part of its data out (a source that
+/// failed to load), so the HTTP layer keeps it out of shared caches.
+#[derive(Clone, Default)]
+pub struct RequestDegraded(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl RequestDegraded {
+    pub fn is_set(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Mark this request's answer as degraded (see [`RequestDegraded`]).
+fn mark_degraded(ctx: &Context<'_>) {
+    if let Some(flag) = ctx.data_opt::<RequestDegraded>() {
+        flag.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The content block rules that apply to one request's viewer (`block.rs`).
 #[derive(Debug, Default)]
 pub struct ViewerBlocks {
@@ -1981,8 +2005,23 @@ async fn viewer_show_nsfw(ctx: &Context<'_>) -> Result<bool> {
 async fn resolve_viewer_show_nsfw(ctx: &Context<'_>) -> Result<bool> {
     match current_user(ctx).await? {
         Some(u) => user_show_nsfw(&state(ctx).pool, &u.id).await,
-        None => Ok(false),
+        None => anonymous_show_nsfw(ctx).await,
     }
+}
+
+/// A signed-out request sees NSFW works only with a valid shared pass (`nsfw_pass.rs`).
+async fn anonymous_show_nsfw(ctx: &Context<'_>) -> Result<bool> {
+    let Some(NsfwPass(pass)) = ctx.data_opt::<NsfwPass>() else {
+        return Ok(false);
+    };
+    if crate::nsfw_pass::valid(&state(ctx).pool, pass)
+        .await
+        .map_err(gql_read_err)?
+    {
+        return Ok(true);
+    }
+    Err(Error::new("The NSFW pass has expired; fetch a new one")
+        .extend_with(|_, extensions| extensions.set("code", crate::nsfw_pass::EXPIRED)))
 }
 
 /// The viewer's NSFW preference, with an ADMIN-CONSOLE override.
@@ -2145,7 +2184,7 @@ async fn list_blocks_or_admin(
 
 async fn viewer_show_nsfw_or_admin(ctx: &Context<'_>, include_nsfw: Option<bool>) -> Result<bool> {
     let Some(user) = current_user(ctx).await? else {
-        return Ok(false);
+        return viewer_show_nsfw(ctx).await;
     };
     if include_nsfw == Some(true) && user.is_admin != 0 {
         return Ok(true);
@@ -6808,17 +6847,25 @@ impl QueryRoot {
                             }
                             ne
                         }
-                        Err(_) => false,
+                        Err(_) => {
+                            mark_degraded(ctx);
+                            false
+                        }
                     };
                     if !non_english {
-                        if let Ok(list) = resolve_chapters_with_cached(
+                        let fetched = resolve_chapters_with_cached(
                             st,
                             n,
                             cached_chapters.remove(&n),
                             Some(&client),
                         )
-                        .await
-                        {
+                        .await;
+                        if fetched.is_err() {
+                            // Served without this source's chapters: fine for this viewer,
+                            // never for a shared cache.
+                            mark_degraded(ctx);
+                        }
+                        if let Ok(list) = fetched {
                             let progress = source_progress.remove(&n).unwrap_or_default();
                             chapters = list
                                 .into_iter()
@@ -7921,6 +7968,24 @@ impl QueryRoot {
     /// matching series from the viewer's lists (Browse, search, updates, discovery), on
     /// top of the site-wide rules. They do not lock a series the viewer opens by its
     /// link, and they do not filter the viewer's library.
+    /// Today's shared NSFW pass, for a signed-in viewer who opted in to NSFW; null for
+    /// everyone else. The apps send it as `&nsfw=` on catalogue GETs, which then show
+    /// NSFW works and stay cacheable (`nsfw_pass.rs`).
+    #[graphql(cache_control(no_cache))]
+    async fn nsfw_pass(&self, ctx: &Context<'_>) -> Result<Option<String>> {
+        let Some(user) = current_user(ctx).await? else {
+            return Ok(None);
+        };
+        let pool = &state(ctx).pool;
+        if !user_show_nsfw(pool, &user.id).await? {
+            return Ok(None);
+        }
+        crate::nsfw_pass::current(pool)
+            .await
+            .map(Some)
+            .map_err(gql_read_err)
+    }
+
     async fn my_block_rules(&self, ctx: &Context<'_>) -> Result<Vec<BlockRule>> {
         let user = require_user(ctx).await?;
         let rules = crate::block::list(&state(ctx).pool, crate::block::Scope::User(&user.id))
@@ -8230,7 +8295,11 @@ impl QueryRoot {
         crate::engine_generation::wait(&st.pool)
             .await
             .map_err(gql_err)?;
-        let n = chapter_id.0.parse::<i64>().map_err(gql_err)?;
+        // Engine chapters have numeric ids; anything else (a MangaDex chapter's UUID
+        // belongs to `canonicalPages`) names no chapter here.
+        let Ok(n) = chapter_id.0.parse::<i64>() else {
+            return Err(Error::new("No such chapter"));
+        };
         // The owner, list, locator decision and key rows must share one generation.
         let generation = st.suwayomi.read_generation();
         // Page URLs carry the engine's numeric epoch: once a new generation reuses this
@@ -24848,6 +24917,70 @@ mod tests {
         assert!(
             json.contains("Safe Work") && json.contains("Spicy Work"),
             "{json}"
+        );
+    }
+
+    /// The shared NSFW pass: only an opted-in viewer gets it, and a signed-out read that
+    /// carries it sees NSFW works (so it can be cached for every opted-in viewer); an
+    /// expired pass is an error the apps answer by fetching a new one.
+    #[tokio::test]
+    async fn nsfw_pass_lets_a_signed_out_read_see_nsfw_works() {
+        let (s, pool) = setup_full(100).await;
+        seed_canonical(&pool, "md-safe", "Safe Work", false, "2").await;
+        seed_canonical(&pool, "md-nsfw", "Spicy Work", true, "1").await;
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+        let pass_of = |r: &async_graphql::Response| {
+            serde_json::to_value(&r.data).unwrap()["nsfwPass"].clone()
+        };
+
+        let anonymous = exec(&s, "{ nsfwPass }", None, "1.1.1.1").await;
+        assert!(anonymous.errors.is_empty(), "{:?}", anonymous.errors);
+        assert_eq!(pass_of(&anonymous), serde_json::Value::Null);
+        let opted_out = exec(&s, "{ nsfwPass }", Some("bobtok"), "1.1.1.1").await;
+        assert_eq!(pass_of(&opted_out), serde_json::Value::Null);
+        exec(
+            &s,
+            "mutation { setShowNsfw(value: true) }",
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let opted_in = exec(&s, "{ nsfwPass }", Some("bobtok"), "1.1.1.1").await;
+        let pass = pass_of(&opted_in).as_str().expect("a pass").to_owned();
+        assert_eq!(pass.len(), 64, "{pass}");
+
+        let signed_out = |pass: Option<&str>| {
+            let mut req = async_graphql::Request::new("{ canonicalUpdates { title } }")
+                .data(RequestAuth(None))
+                .data(ClientIp(Some("2.2.2.2".into())))
+                .data(RequestUserCache::default())
+                .data(RequestLibraryCache::default());
+            if let Some(pass) = pass {
+                req = req.data(NsfwPass(pass.to_owned()));
+            }
+            s.execute(req)
+        };
+        let without = signed_out(None).await;
+        let json = data_json(&without);
+        assert!(
+            json.contains("Safe Work") && !json.contains("Spicy Work"),
+            "{json}"
+        );
+
+        let with = signed_out(Some(&pass)).await;
+        assert!(with.errors.is_empty(), "{:?}", with.errors);
+        let json = data_json(&with);
+        assert!(
+            json.contains("Safe Work") && json.contains("Spicy Work"),
+            "{json}"
+        );
+
+        let expired = signed_out(Some(&"0".repeat(64))).await;
+        let body = serde_json::to_value(&expired).unwrap();
+        assert_eq!(
+            body["errors"][0]["extensions"]["code"],
+            crate::nsfw_pass::EXPIRED,
+            "{body}"
         );
     }
 

@@ -23,7 +23,7 @@ The web reader runs in browsers. Cross-origin resource sharing (CORS) restricts 
 Data fetching takes two paths:
 
 - Anonymous reads use `GET /graphql`, falling back to POST on 404 or 405. They name the document by its persisted id. Error-free responses without non-cacheable fields allow browser and shared caching.
-- A signed-in viewer's catalogue reads also go out as anonymous GETs while the viewer has no NSFW opt-in and no own block rule. The series page then adds one `POST` for the viewer's own part. Read [Signed-in readers](/developers/edge-caching#signed-in-readers).
+- A signed-in viewer's catalogue reads also go out as anonymous GETs while the viewer has no own block rule. With NSFW content on, they carry the shared NSFW pass. The series page then adds one `POST` for the viewer's own part. Read [Signed-in readers](/developers/edge-caching#signed-in-readers).
 - Other authenticated requests, mutations, and user library updates use `POST /graphql`.
 
 Image fetching depends on the image origin:

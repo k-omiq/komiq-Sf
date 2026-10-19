@@ -61,6 +61,7 @@ mod media_routes;
 mod media_verify;
 mod node_fence;
 mod notify;
+mod nsfw_pass;
 mod page_locator;
 #[cfg(test)]
 mod page_locator_tests;
@@ -565,6 +566,7 @@ async fn graphql_get_handler(
     State(trusted): State<Arc<TrustedProxies>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     tls: Option<axum::Extension<cloudflare::origin_tls::OverTls>>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     req: request_budget::AdmittedGraphQLRequest,
 ) -> axum::response::Response {
@@ -574,11 +576,19 @@ async fn graphql_get_handler(
         upstream,
     } = req;
     let plain = plain_from_internet(tls, peer, &trusted.current(), &headers);
+    // Every edge render reaches us from the same few Workers addresses, so keyed by
+    // address they would all share one reader's upstream budget. They share one larger
+    // budget of their own instead (`request_budget::EDGE_RENDER_CLIENT`).
+    let client = if uri.path() == GRAPHQL_SSR_PATH {
+        request_budget::EDGE_RENDER_CLIENT.to_owned()
+    } else {
+        resolve_client_ip(&headers, peer, &trusted.current())
+    };
     // Its CORS answer (`*` when anonymous) is set by `public_cors`, outside `CorsLayer`.
     lease
         .run(upstream.scope_upstream(
-            resolve_client_ip(&headers, peer, &trusted.current()),
-            graphql_get_response(schema, trusted, peer, plain, headers, req),
+            client.clone(),
+            graphql_get_response(schema, client, plain, headers, req),
         ))
         .await
 }
@@ -620,8 +630,7 @@ fn allow_any_origin(headers: &mut HeaderMap) {
 /// wrapper can post-process every one of its exit paths in one place.
 async fn graphql_get_response(
     schema: ApiSchema,
-    trusted: Arc<TrustedProxies>,
-    peer: SocketAddr,
+    client: String,
     plain: graphql::PlainFromInternet,
     headers: HeaderMap,
     inner: async_graphql::Request,
@@ -639,11 +648,12 @@ async fn graphql_get_response(
     }
     let anonymous = bearer(&headers).is_none();
     let auth = RequestAuth(bearer(&headers));
-    let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted.current())));
+    let ip = ClientIp(Some(client));
     let user_cache = RequestUserCache::default();
     let nsfw_cache = RequestNsfwPref::default();
     let blocks_cache = RequestBlocks::default();
     let library_cache = RequestLibraryCache::default();
+    let degraded = graphql::RequestDegraded::default();
     let resp = schema
         .execute(
             inner
@@ -653,13 +663,14 @@ async fn graphql_get_response(
                 .data(user_cache)
                 .data(nsfw_cache)
                 .data(blocks_cache)
-                .data(library_cache),
+                .data(library_cache)
+                .data(degraded.clone()),
         )
         .await;
     // Only a clean anonymous response is cacheable: errors (rate limits, transient
-    // failures) must never be replayed from an edge cache for 60 s.
-    //
-    let cacheable = get_response_cacheable(anonymous, &resp);
+    // failures) and answers that left a failed source out must never be replayed from
+    // an edge cache for 60 s.
+    let cacheable = get_response_cacheable(anonymous, &resp, degraded.is_set());
     let unavailable = graphql_unavailable(&resp);
     let body = match serde_json::to_vec(&resp) {
         Ok(b) => b,
@@ -710,10 +721,14 @@ async fn graphql_get_response(
 }
 
 /// May a GET /graphql response be served with public `Cache-Control`? Only a
-/// clean anonymous answer, and never one that selected a `no_cache` field
-/// (`instance`: setup state and the sign-up switch change at runtime).
-fn get_response_cacheable(anonymous: bool, resp: &async_graphql::Response) -> bool {
-    anonymous && resp.is_ok() && resp.cache_control.max_age != -1
+/// clean, complete anonymous answer, and never one that selected a `no_cache` or
+/// `private` field (`instance`: setup state and the sign-up switch change at runtime).
+fn get_response_cacheable(anonymous: bool, resp: &async_graphql::Response, degraded: bool) -> bool {
+    anonymous
+        && !degraded
+        && resp.is_ok()
+        && resp.cache_control.public
+        && resp.cache_control.max_age != -1
 }
 
 /// Does a GET /graphql document contain ONLY query operations? An unparseable
@@ -732,13 +747,13 @@ fn get_document_is_query_only(query: &str) -> bool {
     }
 }
 
-/// Weak ETag from a fast 64-bit hash of the body: a validator, not a security
-/// boundary — a collision only risks one spurious 304 on content that changes
-/// within its own 30 s browser TTL anyway.
+/// Weak ETag from the first 64 bits of the body's SHA-256: a validator, not a security
+/// boundary. Stable across builds and nodes (unlike `DefaultHasher`), so a mixed-version
+/// rollout or a second API node still answers 304 for the same body.
 fn weak_etag(body: &[u8]) -> String {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hasher::write(&mut h, body);
-    format!("W/\"{:016x}\"", std::hash::Hasher::finish(&h))
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(body);
+    format!("W/\"{}\"", hex::encode(&digest[..8]))
 }
 
 /// RFC 9110 If-None-Match: a comma-separated list of entity tags (or `*`), compared
@@ -1379,7 +1394,7 @@ async fn serve_cover(
     }
     let Some(bytes) = fetched else {
         repair_lost();
-        return axum::response::Redirect::temporary(&cdn_fallback).into_response();
+        return cdn_fallback_redirect(&cdn_fallback);
     };
     // Decode + resize + WebP encode is CPU-bound — keep it off the async runtime.
     let resized = work.process(move || cover::process_cover(&bytes)).await;
@@ -1427,13 +1442,23 @@ async fn serve_cover(
         }
         Ok(Err(e)) => {
             tracing::warn!(error = %e, work_id, "lazy cover resize failed; redirecting to CDN");
-            axum::response::Redirect::temporary(&cdn_fallback).into_response()
+            cdn_fallback_redirect(&cdn_fallback)
         }
         Err(e) => {
             tracing::error!(error = %e, work_id, "lazy cover resize task panicked");
-            axum::response::Redirect::temporary(&cdn_fallback).into_response()
+            cdn_fallback_redirect(&cdn_fallback)
         }
     }
+}
+
+/// A cover we could not serve ourselves, sent to its CDN copy for this request only:
+/// the next request may find it stored, so no cache keeps the redirect.
+fn cdn_fallback_redirect(location: &str) -> axum::response::Response {
+    let mut response = axum::response::Redirect::temporary(location).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Whether `rest` — the path tail after `/api/v1/manga/` — is one of the exactly two
@@ -1495,7 +1520,7 @@ async fn serve_suwayomi_image_inner(
     query: Option<String>,
 ) -> axum::response::Response {
     if !is_suwayomi_image_path(&rest) {
-        return StatusCode::NOT_FOUND.into_response();
+        return image_failure_response(StatusCode::NOT_FOUND);
     }
     if app.suwayomi.wait_for_generation().await.is_err() {
         return page_busy_response();
@@ -1550,7 +1575,7 @@ async fn serve_suwayomi_image_inner(
             .await
             {
                 engine_route::Routed::Served((bytes, mime)) => {
-                    return raw_image_response(mime, bytes)
+                    return legacy_page_response(mime, bytes)
                 }
                 engine_route::Routed::Busy | engine_route::Routed::Refuse => {
                     return page_busy_response();
@@ -1560,7 +1585,7 @@ async fn serve_suwayomi_image_inner(
         }
     }
     match fetch_suwayomi_page(&app, manga_id, &path).await {
-        Ok((bytes, content_type)) => raw_image_response(content_type, bytes),
+        Ok((bytes, content_type)) => legacy_page_response(content_type, bytes),
         Err(response) => response,
     }
 }
@@ -2817,19 +2842,22 @@ const GRAPHQL_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 /// `/graphql` under a second path, for server-side renders (see `public_router`).
 const GRAPHQL_SSR_PATH: &str = "/graphql/ssr";
+/// How long a browser may reuse a CORS preflight answer.
+const CORS_PREFLIGHT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How many uploaded images are decoded at once, over all accounts. Decoding one large
 /// image takes hundreds of megabytes; the per-account upload limit alone would let one
 /// account start twenty at the same moment.
 static UPLOAD_DECODE_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
-/// Current proxied page bytes. Engine indices can be reused or their art replaced,
-/// so this locator must revalidate until exact revision URLs are implemented.
-fn raw_image_response(
+/// Page bytes on the legacy `/api/v1/manga/{m}/chapter/{order}/page/{i}` path. It names
+/// a page by the engine's chapter order, which a reorder or a new engine generation
+/// repoints, so no cache may keep it (current apps read `/media/v1/c/…`).
+fn legacy_page_response(
     content_type: String,
     bytes: impl Into<axum::body::Bytes>,
 ) -> axum::response::Response {
-    raw_image_response_with_cache(content_type, bytes.into(), image_delivery::MUTABLE_CACHE)
+    raw_image_response_with_cache(content_type, bytes.into(), "no-store")
 }
 
 fn raw_cover_fallback_response(content_type: String, bytes: Vec<u8>) -> axum::response::Response {
@@ -3238,7 +3266,10 @@ fn public_router(
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+        // Without it a browser keeps a preflight 5 s, so nearly every signed-in POST paid
+        // an extra uncacheable round trip to the origin. Safari caps this at 600 s.
+        .max_age(CORS_PREFLIGHT_MAX_AGE);
 
     // P3.1: GET /graphql is the CACHEABLE query endpoint (anonymous public reads get
     // Cache-Control + ETag so Cloudflare and browsers can serve/revalidate them —
@@ -4456,19 +4487,25 @@ mod tests {
     }
 
     #[test]
-    fn mutable_page_and_cover_locators_have_bounded_revalidating_cache_policy() {
-        let page = raw_image_response("image/jpeg".into(), crate::suwayomi::testsrv::jpeg(8, 8));
+    fn mutable_cover_locators_have_bounded_revalidating_cache_policy() {
         let cover = webp_cover_response(vec![1], image_delivery::MUTABLE_CACHE);
-        for response in [page, cover] {
-            assert_eq!(
-                response.headers()[header::CACHE_CONTROL],
-                image_delivery::MUTABLE_CACHE
-            );
-            assert!(!response.headers()[header::CACHE_CONTROL]
-                .to_str()
-                .unwrap()
-                .contains("immutable"));
-        }
+        assert_eq!(
+            cover.headers()[header::CACHE_CONTROL],
+            image_delivery::MUTABLE_CACHE
+        );
+        assert!(!cover.headers()[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .contains("immutable"));
+    }
+
+    /// A legacy page names its page by chapter order, which a reorder repoints: no
+    /// cache may keep it.
+    #[test]
+    fn legacy_order_keyed_pages_are_never_stored() {
+        let page = legacy_page_response("image/jpeg".into(), crate::suwayomi::testsrv::jpeg(8, 8));
+        assert_eq!(page.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(page.headers()[header::CONTENT_TYPE], "image/jpeg");
     }
 
     async fn own_origin_media_state() -> (TestDir, Arc<AppState>) {
@@ -6542,6 +6579,28 @@ mod tests {
                     "{case}: {with_variables:?}"
                 );
 
+                // Another spelling of the same request is sent to the canonical URL
+                // before it runs: re-spaced JSON, lowercase escapes, a reordered pair.
+                for spelling in [
+                    format!("variables=%7B%20%22chapterId%22%3A%22none%22%7D&id={chapter_work}"),
+                    format!("id={chapter_work}&variables=%7b%22chapterId%22%3a%22none%22%7d"),
+                ] {
+                    let moved = send(Method::GET, format!("{path}?{spelling}"), None)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        moved.status(),
+                        StatusCode::TEMPORARY_REDIRECT,
+                        "{case}: {spelling}"
+                    );
+                    assert_eq!(
+                        moved.headers()[header::LOCATION],
+                        format!("{path}?id={chapter_work}&variables={variables}").as_str(),
+                        "{case}: {spelling}"
+                    );
+                    assert_eq!(moved.headers()[header::CACHE_CONTROL], "no-store", "{case}");
+                }
+
                 for (uri, status, expected) in [
                     (
                         format!("{path}?id={unknown}"),
@@ -6555,6 +6614,21 @@ mod tests {
                     ),
                     (
                         format!("{path}?id={chapter_work}&variables=%7Bnot"),
+                        StatusCode::BAD_REQUEST,
+                        Some("BAD_REQUEST"),
+                    ),
+                    (
+                        format!("{path}?id={tags}&x=1"),
+                        StatusCode::BAD_REQUEST,
+                        Some("BAD_REQUEST"),
+                    ),
+                    (
+                        format!("{path}?id={tags}&nsfw=zz"),
+                        StatusCode::BAD_REQUEST,
+                        Some("BAD_REQUEST"),
+                    ),
+                    (
+                        format!("{path}?query=%7Btags%7Bid%7D%7D&nsfw={}", "a".repeat(64)),
                         StatusCode::BAD_REQUEST,
                         Some("BAD_REQUEST"),
                     ),
@@ -7262,14 +7336,21 @@ mod tests {
     #[test]
     fn no_cache_responses_are_never_edge_cacheable() {
         let ok = async_graphql::Response::new(async_graphql::Value::Null);
-        assert!(get_response_cacheable(true, &ok));
+        assert!(get_response_cacheable(true, &ok, false));
         assert!(
-            !get_response_cacheable(false, &ok),
+            !get_response_cacheable(false, &ok, false),
             "signed-in reads stay private"
+        );
+        assert!(
+            !get_response_cacheable(true, &ok, true),
+            "an answer that left a failed source out is not shared"
         );
         let mut no_cache = async_graphql::Response::new(async_graphql::Value::Null);
         no_cache.cache_control.max_age = -1;
-        assert!(!get_response_cacheable(true, &no_cache));
+        assert!(!get_response_cacheable(true, &no_cache, false));
+        let mut private = async_graphql::Response::new(async_graphql::Value::Null);
+        private.cache_control.public = false;
+        assert!(!get_response_cacheable(true, &private, false));
     }
 
     #[test]
@@ -7295,6 +7376,11 @@ mod tests {
         let a = weak_etag(b"body-one");
         assert_eq!(a, weak_etag(b"body-one"), "same body, same validator");
         assert_ne!(a, weak_etag(b"body-two"));
+        assert_eq!(
+            weak_etag(b""),
+            "W/\"e3b0c44298fc1c14\"",
+            "the same on every build"
+        );
         assert!(a.starts_with("W/\""), "weak validator form: {a}");
         assert!(if_none_match_matches(Some(&a), &a));
         assert!(if_none_match_matches(

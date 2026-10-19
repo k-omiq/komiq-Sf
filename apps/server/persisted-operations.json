@@ -142,6 +142,7 @@
 	"d636346b1b3100ef0e15ddc50a6ccf93e58c821aa7a4979f45c8772a7cbbbf57": "query MyActivity($limit: Int) { myActivity(limit: $limit) { id kind targetType targetId createdAt } }",
 	"d6500a490be06411a848aa0347b5df5a38b01105fc821ec41ea5dc93f5c84f48": "fragment ChapterFields on Chapter { id seriesId entryId entryOrder number label externalUrl title pageCount uploadedAt foundAt scanlator read lastPageRead bookmarked isDownloaded } query Chapters($seriesId: ID!) { chapters(seriesId: $seriesId) { ...ChapterFields } }",
 	"d714aaa5d134d663375c15ec2ef2d8755369f7e2465907d8ab175008d8849a59": "mutation StartNewEngineGeneration($generationId: ID!) { startNewEngineGeneration(generationId: $generationId) { id state reason since unfenced } }",
+	"d7e9cf5a8068c962894ac8206dc75cebbe8f7b6c46bd6499d94a88d40c68cded": "query NsfwPass { nsfwPass }",
 	"d9b50d718774dd7f2d73b0cb8286787ae1e8093a67f6e67e3d6ba793fca426c9": "query ScanlatorTags { scanlatorTags { name ai } }",
 	"dcaff2ad9c68794a7528d4ec7ed97809a40f2fbb54acd15c6586b339adef7bac": "query UnreadNotificationCount { unreadNotificationCount }",
 	"dff344ee992d7da7c520e3002cf86916988ccc5b870e4aa99feefef187c68895": "fragment AdminUserFields on AdminUser { id username email avatarUrl isAdmin isBanned createdAt } mutation BanUser($userId: ID! $banned: Boolean!) { banUser(userId: $userId banned: $banned) { ...AdminUserFields } }",

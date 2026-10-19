@@ -732,7 +732,13 @@ async fn path_validation_unknown_chapters_and_legacy_index_path() {
             .contains("no-store"));
     }
     assert_eq!(engine.calls.pages.load(Ordering::SeqCst), 0);
-    assert_page(get_page(app, "/api/v1/manga/7/chapter/0/page/0").await, 8).await;
+    // The legacy path names a page by chapter order, which a reorder repoints: never stored.
+    assert_page_with_cache(
+        get_page(app, "/api/v1/manga/7/chapter/0/page/0").await,
+        8,
+        "no-store",
+    )
+    .await;
 }
 
 #[tokio::test]

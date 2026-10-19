@@ -218,10 +218,17 @@ export default {
 			console.error(`img proxy: content hash mismatch for ${upstream.origin}`);
 			return errorResponse(502, 'Upstream image does not match its content hash');
 		}
-		const res = finalizeImage(bytes, type, page ? PAGE_EDGE_CACHE : MUTABLE_IMAGE_CACHE);
+		// An origin that forbids storing (a legacy Komika page keyed by chapter order,
+		// which a reorder can repoint) is passed through and never kept.
+		const keep = page || !forbidsStoring(originResp.headers.get('Cache-Control'));
+		const res = finalizeImage(
+			bytes,
+			type,
+			page ? PAGE_EDGE_CACHE : keep ? MUTABLE_IMAGE_CACHE : 'no-store',
+		);
 		// A HEAD miss answers with headers only and stores nothing.
-		if (request.method !== 'HEAD') ctx.waitUntil(edge.put(cacheKey, res.clone()));
-		return served(res, browserCache, request.method);
+		if (request.method !== 'HEAD' && keep) ctx.waitUntil(edge.put(cacheKey, res.clone()));
+		return served(res, keep ? browserCache : 'no-store', request.method);
 	},
 } satisfies ExportedHandler<Env>;
 
@@ -597,6 +604,14 @@ export function safeUpstreamUrl(url: URL): boolean {
 		url.password === '' &&
 		url.port === ''
 	);
+}
+
+/** Whether an upstream `Cache-Control` says the response must not be stored. */
+export function forbidsStoring(cacheControl: string | null): boolean {
+	return (cacheControl ?? '')
+		.split(',')
+		.map((directive) => directive.trim().toLowerCase())
+		.some((directive) => directive === 'no-store' || directive === 'private');
 }
 
 /** Parse a comma-separated allowlist var into a trimmed, non-empty list. */

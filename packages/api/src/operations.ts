@@ -2044,6 +2044,15 @@ export const VIEWER_POSTURE = /* GraphQL */ `
 	}
 `;
 
+// Today's shared NSFW pass, for a viewer who opted in (null otherwise). Their catalogue
+// reads then go out as anonymous GETs with `&nsfw=<pass>`, which the server answers with
+// NSFW works and the edge can keep for every opted-in viewer.
+export const NSFW_PASS = /* GraphQL */ `
+	query NsfwPass {
+		nsfwPass
+	}
+`;
+
 export const SET_MY_BLOCK_RULES = /* GraphQL */ `
 	mutation SetMyBlockRules($rules: [BlockRuleInput!]!) {
 		setMyBlockRules(rules: $rules) {
