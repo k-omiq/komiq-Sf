@@ -1,0 +1,63 @@
+# Solver comparison stack for docs/plans/2026-10-19-captcha-sources.md, Phase 0.
+# Test hosts only, never production. Everything binds to loopback; each browser
+# container is memory-capped so it cannot starve the host's other apps.
+name: komiq-solver
+
+services:
+  fs-pinned:
+    # The FlareSolverr image komiq.cc runs today (deploy/docker-compose.yml).
+    image: ghcr.io/flaresolverr/flaresolverr@sha256:139dfee1c6f89249c8d665d1333a42e8ec74ec0a86bc6bb1c8461e10d3a66a47
+    mem_limit: 2g
+    environment: { LOG_LEVEL: info, TZ: UTC }
+    ports: ['127.0.0.1:18191:8191']
+
+  fs-latest:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    mem_limit: 2g
+    environment: { LOG_LEVEL: info, TZ: UTC }
+    ports: ['127.0.0.1:18192:8191']
+
+  bw:
+    # BetterWright drives a stock arm64 Chromium (BetterChromium has no Linux arm64
+    # build). The runner script starts Chromium and the solve itself.
+    build: { context: ., dockerfile: Dockerfile.bw }
+    mem_limit: 2g
+    init: true
+    shm_size: 1g
+    command: ['sleep', 'infinity']
+
+  warp:
+    # The self-host WARP image (proxy mode, SOCKS5 and HTTP CONNECT on :1080). With
+    # WARP=1 every solver, both replays and the browser leave through it, so the
+    # clearance is earned and used from the same address. Starting it accepts
+    # Cloudflare's WARP terms and registers a free device.
+    # A copied kit sets WARP_CONTEXT to its own copy of deploy/selfhost/warp.
+    build: ${WARP_CONTEXT:-../../../../deploy/selfhost/warp}
+    cap_add: [NET_ADMIN]
+    mem_limit: 256m
+    volumes: ['warp-data:/var/lib/cloudflare-warp']
+    ports: ['127.0.0.1:11080:1080']
+
+  router:
+    # Per-site egress: gost sends only the domains in router.yaml through the upstream
+    # proxy and everything else direct (gen-router.py writes router.yaml). Solver,
+    # browser and replays all go through it, so a clearance is earned and used from
+    # the same address. No auth on this side: it is on the internal network and
+    # loopback only.
+    image: gogost/gost:3.2.6
+    mem_limit: 128m
+    command: ['-C', '/etc/gost/router.yaml']
+    volumes: ['./router.yaml:/etc/gost/router.yaml:ro']
+    ports: ['127.0.0.1:11081:1080', '127.0.0.1:18081:8080']
+
+  jvm:
+    # Replays a solver's cookies from the JVM TLS stack (Suwayomi's OkHttp runs on it).
+    image: eclipse-temurin:21-jdk
+    mem_limit: 512m
+    init: true
+    volumes: ['./Replay.java:/work/Replay.java:ro']
+    working_dir: /work
+    command: ['sleep', 'infinity']
+
+volumes:
+  warp-data:

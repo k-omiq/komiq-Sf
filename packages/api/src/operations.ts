@@ -2524,7 +2524,9 @@ const SOURCE_INGEST_JOB_FIELDS = /* GraphQL */ `
 	fragment SourceIngestJobFields on SourceIngestJob {
 		id
 		sourceId
+		kind
 		state
+		itemsQueued
 		pagesDone
 		itemsSeen
 		succeeded
@@ -2629,6 +2631,33 @@ export const START_SOURCE_INGEST = /* GraphQL */ `
 	mutation StartSourceIngest($sourceId: ID!) {
 		startSourceIngest(sourceId: $sourceId) {
 			...SourceIngestJobFields
+		}
+	}
+`;
+
+export const QUEUE_SOURCE_SERIES = /* GraphQL */ `
+	${SOURCE_INGEST_JOB_FIELDS}
+	mutation QueueSourceSeries($sourceId: ID!, $suwayomiMangaIds: [ID!]!) {
+		queueSourceSeries(sourceId: $sourceId, suwayomiMangaIds: $suwayomiMangaIds) {
+			...SourceIngestJobFields
+		}
+	}
+`;
+
+export const SOURCE_INGEST_ITEMS = /* GraphQL */ `
+	query SourceIngestItems($jobId: ID!) {
+		sourceIngestItems(jobId: $jobId) {
+			suwayomiMangaId
+			state
+			error
+			result {
+				decision
+				workId
+				matchedWorkId
+				score
+				method
+				sourceSeriesId
+			}
 		}
 	}
 `;

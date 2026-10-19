@@ -39,6 +39,7 @@ import type {
 	SeriesStatus,
 	SourceBrowsePage,
 	SourceBrowseType,
+	SourceIngestItem,
 	SourceIngestJob,
 	SourceInfo,
 	SourceScanHealth,
@@ -742,7 +743,9 @@ export interface Backend {
 	updateExtension?(pkgName: string): Promise<ExtensionInfo>;
 	/** Bulk Tier-2 catalogue ingest: for each Suwayomi manga id, library-track it
 	 * and run the dedup add flow. Per-id failures never abort the batch; at most
-	 * 100 ids per call. Optional. */
+	 * 100 ids per call. Optional.
+	 * @deprecated Use {@link queueSourceSeries}: a proxy cuts this one request when a
+	 * rate-limited source makes it wait. */
 	bulkAddSourceSeries?(suwayomiMangaIds: Id[]): Promise<BulkAddResult>;
 	/** Catalogue provenance for many Suwayomi series at once: which canonical
 	 * work each is linked to and every source mapping (with extension
@@ -773,6 +776,13 @@ export interface Backend {
 	 * dedup add flow. Refused while one is already running for the source, and for
 	 * an NSFW source unless the admin opted in. Optional. */
 	startSourceIngest?(sourceId: Id): Promise<SourceIngestJob>;
+	/** "Add picked": queue at most 100 series of one source. They join the source's
+	 * running ingest job, or start a `picked` one, and are added one by one inside the
+	 * source's request budget. Refused like {@link startSourceIngest}. Optional. */
+	queueSourceSeries?(sourceId: Id, suwayomiMangaIds: Id[]): Promise<SourceIngestJob>;
+	/** The series queued on an ingest job, in pick order, each with its outcome once
+	 * added. Optional. */
+	sourceIngestItems?(jobId: Id): Promise<SourceIngestItem[]>;
 	/** Request cancellation of a running ingest job; the runner stops between
 	 * items, preserving progress. Optional. */
 	cancelSourceIngest?(jobId: Id): Promise<SourceIngestJob>;

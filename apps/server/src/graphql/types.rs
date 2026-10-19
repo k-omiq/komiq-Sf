@@ -1926,8 +1926,14 @@ pub struct SourceBrowsePage {
 pub struct SourceIngestJob {
     pub id: ID,
     pub source_id: String,
+    /// `all` (walks the source's listings, then its queued series) | `picked` (only
+    /// its queued series).
+    pub kind: String,
     /// `running` | `completed` | `cancelled` | `failed`.
     pub state: String,
+    /// Series queued on the job by "add picked"; their outcomes are in
+    /// `sourceIngestItems`.
+    pub items_queued: i32,
     pub pages_done: i32,
     pub items_seen: i32,
     pub succeeded: i32,
@@ -1946,7 +1952,9 @@ impl From<crate::ingest::IngestJob> for SourceIngestJob {
         SourceIngestJob {
             id: ID(j.id),
             source_id: j.source_id,
+            kind: j.kind,
             state: j.state,
+            items_queued: j.items_queued as i32,
             pages_done: j.pages_done as i32,
             items_seen: j.items_seen as i32,
             succeeded: j.succeeded as i32,
@@ -1958,6 +1966,32 @@ impl From<crate::ingest::IngestJob> for SourceIngestJob {
             error: j.error,
             started_at: j.started_at,
             finished_at: j.finished_at,
+        }
+    }
+}
+
+/// One series queued on an ingest job by "add picked", and its outcome once added.
+#[derive(SimpleObject)]
+pub struct SourceIngestItem {
+    pub suwayomi_manga_id: ID,
+    /// `queued` | `done` | `failed`.
+    pub state: String,
+    pub result: Option<super::MatchResult>,
+    pub error: Option<String>,
+}
+
+impl From<crate::ingest::QueuedItem> for SourceIngestItem {
+    fn from(i: crate::ingest::QueuedItem) -> Self {
+        let state = match (i.finished, i.result.is_some()) {
+            (false, _) => "queued",
+            (true, true) => "done",
+            (true, false) => "failed",
+        };
+        SourceIngestItem {
+            suwayomi_manga_id: ID(i.manga_id.to_string()),
+            state: state.into(),
+            result: i.result,
+            error: i.error,
         }
     }
 }

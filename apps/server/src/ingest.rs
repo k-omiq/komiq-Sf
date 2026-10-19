@@ -1,4 +1,4 @@
-//! "Add all from source" bulk-ingest jobs (EXT-4 / S1).
+//! "Add all from source" bulk-ingest jobs (EXT-4 / S1), and the queue behind "add picked".
 //!
 //! A background tokio task that walks one Suwayomi source's listings page by page
 //! and runs every entry through the same Tier-2 add flow as `bulkAddSourceSeries`
@@ -9,6 +9,14 @@
 //!
 //! "ALL" MEANS EVERY LISTING, AND ONE BAD PAGE IS NOT THE END. Both are hard-won —
 //! see [`LISTINGS`] and [`PAGE_FETCH_ATTEMPTS`] for the production evidence.
+//!
+//! QUEUED ITEMS. A job also drains its `source_ingest_item` rows: the series an admin
+//! picked on the source's Browse page. A pick made while the source has a running job
+//! joins that job; otherwise it starts a `picked` job that only drains its items. Each
+//! item spends the source's request budget like a walked one, so a rate-limited source
+//! is never asked for more than its limit. "Add picked" used to add every series inside
+//! one HTTP request instead: on a rate-limited source each series waits for the budget,
+//! and the proxy cut the request at 100 s after one or two series.
 //!
 //! Control plane is the DB row itself: `cancelSourceIngest` flips the row to
 //! `cancelled` and the runner observes it between items — restart-safe with no
@@ -75,12 +83,20 @@ pub const STATE_COMPLETED: &str = "completed";
 pub const STATE_CANCELLED: &str = "cancelled";
 pub const STATE_FAILED: &str = "failed";
 
+/// Job kinds. `all` walks the source's listings, then drains its queued items; `picked`
+/// only drains its queued items.
+pub const KIND_ALL: &str = "all";
+pub const KIND_PICKED: &str = "picked";
+
 /// One persisted ingest job row (mirrors `source_ingest_job`).
 #[derive(Debug, Clone)]
 pub struct IngestJob {
     pub id: String,
     pub source_id: String,
+    pub kind: String,
     pub state: String,
+    /// Series queued on the job (picked), whether done or still waiting.
+    pub items_queued: i64,
     pub pages_done: i64,
     pub items_seen: i64,
     pub succeeded: i64,
@@ -100,7 +116,9 @@ impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for IngestJob {
         Ok(Self {
             id: row.try_get("id")?,
             source_id: row.try_get("source_id")?,
+            kind: row.try_get("kind")?,
             state: row.try_get("state")?,
+            items_queued: row.try_get("items_queued")?,
             pages_done: row.try_get("pages_done")?,
             items_seen: row.try_get("items_seen")?,
             succeeded: row.try_get("succeeded")?,
@@ -170,16 +188,23 @@ pub struct StartedJob {
 /// The lease is taken BEFORE the row exists, so every `running` row has had an
 /// owner holding its lease from the start: [`mark_interrupted_jobs`] relies on it.
 pub async fn try_start_job(pool: &Database, source_id: &str) -> Result<Option<StartedJob>> {
+    start_job(pool, source_id, KIND_ALL).await
+}
+
+/// [`try_start_job`] for a job of `kind`.
+async fn start_job(pool: &Database, source_id: &str, kind: &str) -> Result<Option<StartedJob>> {
     let Some(lease) = JobLease::try_acquire(pool, JobFamily::SourceIngest(source_id)).await? else {
         return Ok(None);
     };
     let id = format!("ing_{}", uuid::Uuid::new_v4().simple());
     let now = Utc::now();
     let res = sqlx::query(
-        "INSERT INTO source_ingest_job (id, source_id, state, started_at) VALUES ($1, $2, 'running', $3)",
+        "INSERT INTO source_ingest_job (id, source_id, kind, state, started_at) \
+         VALUES ($1, $2, $3, 'running', $4)",
     )
     .bind(&id)
     .bind(source_id)
+    .bind(kind)
     .bind(now)
     .execute(pool)
     .await;
@@ -315,6 +340,230 @@ pub async fn list_jobs(pool: &Database, active_only: bool) -> Result<Vec<IngestJ
     Ok(sqlx::query_as::<_, IngestJob>(sql).fetch_all(pool).await?)
 }
 
+/// One queued series of a job and, once added, its outcome.
+pub struct QueuedItem {
+    pub manga_id: i64,
+    /// `None` while the item waits, or when it failed (`error` is set then).
+    pub result: Option<crate::graphql::MatchResult>,
+    pub error: Option<String>,
+    pub finished: bool,
+}
+
+impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for QueuedItem {
+    fn from_row(row: &sqlx::postgres::PgRow) -> sqlx::Result<Self> {
+        use crate::db_types::Row;
+        let decision: Option<String> = row.try_get("decision")?;
+        let finished_at: Option<String> = row.try_get("finished_at")?;
+        let result = match decision {
+            Some(decision) => Some(crate::graphql::MatchResult {
+                decision,
+                work_id: row
+                    .try_get::<Option<String>, _>("work_id")?
+                    .unwrap_or_default(),
+                matched_work_id: row.try_get("matched_work_id")?,
+                score: row.try_get("score")?,
+                method: row.try_get("method")?,
+                source_series_id: row
+                    .try_get::<Option<String>, _>("source_series_id")?
+                    .unwrap_or_default(),
+            }),
+            None => None,
+        };
+        Ok(Self {
+            manga_id: row.try_get("manga_id")?,
+            result,
+            error: row.try_get("error")?,
+            finished: finished_at.is_some(),
+        })
+    }
+}
+
+/// A job's queued series in pick order.
+pub async fn load_items(pool: &Database, job_id: &str) -> Result<Vec<QueuedItem>> {
+    Ok(sqlx::query_as::<_, QueuedItem>(
+        "SELECT manga_id, decision, work_id, matched_work_id, score, method, source_series_id, \
+         error, finished_at FROM source_ingest_item WHERE job_id = $1 ORDER BY position",
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Queue picked series for a source. They join the source's running job, whatever its
+/// kind; with none running, a `picked` job is started for them, and its runner is
+/// returned for the caller to spawn. A series already on that job is not queued twice.
+pub async fn enqueue_picked(
+    pool: &Database,
+    source_id: &str,
+    manga_ids: &[i64],
+) -> Result<(IngestJob, Option<StartedJob>)> {
+    let mut ids = Vec::with_capacity(manga_ids.len());
+    for id in manga_ids {
+        if !ids.contains(id) {
+            ids.push(*id);
+        }
+    }
+    // The running job can finish between the two steps below, and a concurrent pick can
+    // start one: each lost race means the other step now succeeds, so a few rounds settle.
+    for _ in 0..5 {
+        if let Some(job) = append_to_running(pool, source_id, &ids).await? {
+            return Ok((job, None));
+        }
+        if let Some(started) = start_job(pool, source_id, KIND_PICKED).await? {
+            // No runner exists for the new job yet, so nothing can finish it under us.
+            append_items(pool, &started.job.id, &ids).await?;
+            let job = load_job(pool, &started.job.id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("ingest job {} vanished", started.job.id))?;
+            return Ok((job.clone(), Some(StartedJob { job, ..started })));
+        }
+        // A finished runner releases the source's lease right after its terminal write.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    anyhow::bail!("could not queue the series: this source's ingest job kept changing")
+}
+
+/// Add `ids` to the source's running job, holding its row lock. `None` when no job runs.
+///
+/// The runner completes a job only under the same lock and only once no item waits
+/// ([`complete_if_drained`]), so items added here are always drained: either they commit
+/// before its check, or the check comes first and this finds no running job.
+async fn append_to_running(
+    pool: &Database,
+    source_id: &str,
+    ids: &[i64],
+) -> Result<Option<IngestJob>> {
+    let mut tx = pool.begin().await?;
+    let job_id: Option<String> = crate::db_types::query_scalar(
+        "SELECT id FROM source_ingest_job WHERE source_id = $1 AND state = 'running' \
+         LIMIT 1 FOR UPDATE",
+    )
+    .bind(source_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(job_id) = job_id else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    insert_items(&mut tx, &job_id, ids).await?;
+    tx.commit().await?;
+    load_job(pool, &job_id).await
+}
+
+/// Add `ids` to a job no runner owns yet.
+async fn append_items(pool: &Database, job_id: &str, ids: &[i64]) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    insert_items(&mut tx, job_id, ids).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn insert_items(
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    job_id: &str,
+    ids: &[i64],
+) -> Result<()> {
+    let added = sqlx::query(
+        "INSERT INTO source_ingest_item (job_id, manga_id) \
+         SELECT $1, id FROM unnest($2::bigint[]) WITH ORDINALITY AS picked(id, ord) \
+         ORDER BY ord ON CONFLICT DO NOTHING",
+    )
+    .bind(job_id)
+    .bind(ids)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    sqlx::query("UPDATE source_ingest_job SET items_queued = items_queued + $1 WHERE id = $2")
+        .bind(added as i64)
+        .bind(job_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Store one queued item's outcome.
+async fn record_item(
+    pool: &Database,
+    job_id: &str,
+    manga_id: i64,
+    outcome: std::result::Result<&crate::graphql::MatchResult, &str>,
+) -> Result<()> {
+    let (r, error) = match outcome {
+        Ok(r) => (Some(r), None),
+        Err(e) => (None, Some(e)),
+    };
+    sqlx::query(
+        "UPDATE source_ingest_item SET decision = $1, work_id = $2, matched_work_id = $3, \
+         score = $4, method = $5, source_series_id = $6, error = $7, finished_at = $8 \
+         WHERE job_id = $9 AND manga_id = $10",
+    )
+    .bind(r.map(|r| r.decision.as_str()))
+    .bind(r.map(|r| r.work_id.as_str()))
+    .bind(r.and_then(|r| r.matched_work_id.as_deref()))
+    .bind(r.and_then(|r| r.score))
+    .bind(r.and_then(|r| r.method.as_deref()))
+    .bind(r.map(|r| r.source_series_id.as_str()))
+    .bind(error)
+    .bind(Utc::now())
+    .bind(job_id)
+    .bind(manga_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// How a completion attempt ended.
+enum Drain {
+    /// No item waited: the job is now `completed`.
+    Completed,
+    /// Items were queued meanwhile: drain them first.
+    MoreQueued,
+    /// The job is no longer running (cancelled).
+    Stopped,
+}
+
+/// Complete the job if no queued item waits, under the job's row lock (see
+/// [`append_to_running`] for why the lock makes a late pick safe).
+async fn complete_if_drained(
+    pool: &Database,
+    job_id: &str,
+    warning: Option<&str>,
+) -> Result<Drain> {
+    let mut tx = pool.begin().await?;
+    let state: Option<String> = crate::db_types::query_scalar(
+        "SELECT state FROM source_ingest_job WHERE id = $1 FOR UPDATE",
+    )
+    .bind(job_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if state.as_deref() != Some(STATE_RUNNING) {
+        tx.rollback().await?;
+        return Ok(Drain::Stopped);
+    }
+    // A new statement after the lock: it sees every pick committed before the lock.
+    let waiting: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM source_ingest_item WHERE job_id = $1 AND finished_at IS NULL)",
+    )
+    .bind(job_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if waiting {
+        tx.rollback().await?;
+        return Ok(Drain::MoreQueued);
+    }
+    sqlx::query(
+        "UPDATE source_ingest_job SET state = $1, error = $2, finished_at = $3 WHERE id = $4",
+    )
+    .bind(STATE_COMPLETED)
+    .bind(warning)
+    .bind(Utc::now())
+    .bind(job_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Drain::Completed)
+}
+
 /// Flush the in-memory progress counters onto the row. Progress-only — never
 /// touches `state`, so it can't resurrect a row the admin just cancelled.
 async fn write_progress(pool: &Database, job_id: &str, p: &Progress) -> Result<()> {
@@ -396,23 +645,14 @@ pub async fn mark_interrupted_jobs(pool: &Database) -> Result<u64> {
 /// after that terminal write.
 pub fn spawn_runner(state: Arc<AppState>, started: StartedJob) {
     let StartedJob { job, lease } = started;
-    let (job_id, source_id) = (job.id, job.source_id);
+    let (job_id, source_id, kind) = (job.id, job.source_id, job.kind);
     tokio::spawn(async move {
         let _lease = lease;
         let pool = state.pool.clone();
-        match run_job(state.clone(), &job_id, &source_id).await {
-            // `warning` is set when one listing failed but another finished — the walk
-            // covered real ground, so the job is completed rather than failed, and the
-            // note rides along in `error` so the admin can see the coverage is partial
-            // and re-run.
-            Ok(RunOutcome::Completed { warning }) => {
-                if let Err(e) =
-                    finish_job(&pool, &job_id, STATE_COMPLETED, warning.as_deref()).await
-                {
-                    let e = crate::db::observed_database_error(e);
-                    tracing::warn!(job_id, error = %e, "ingest: failed to mark job completed");
-                }
-                tracing::info!(job_id, source_id, warning, "ingest: job completed");
+        match run_job(state.clone(), &job_id, &source_id, &kind).await {
+            Ok(RunOutcome::Completed) => {
+                // `complete_if_drained` already wrote the terminal state.
+                tracing::info!(job_id, source_id, kind, "ingest: job completed");
             }
             Ok(RunOutcome::Cancelled) => {
                 // The cancel mutation already wrote the terminal state.
@@ -432,7 +672,8 @@ pub fn spawn_runner(state: Arc<AppState>, started: StartedJob) {
 }
 
 enum RunOutcome {
-    Completed { warning: Option<String> },
+    /// The terminal `completed` row is written.
+    Completed,
     Cancelled,
 }
 
@@ -450,8 +691,36 @@ enum ListingOutcome {
 /// assumptions are what made "add all from source" stop after a handful of series. A
 /// listing that fails outright after its retries is recorded and the next one is still
 /// walked; the job only fails if NO listing produced anything.
-async fn run_job(state: Arc<AppState>, job_id: &str, source_id: &str) -> Result<RunOutcome> {
+///
+/// A `picked` job skips the walk. Every job then drains its queued items.
+async fn run_job(
+    state: Arc<AppState>,
+    job_id: &str,
+    source_id: &str,
+    kind: &str,
+) -> Result<RunOutcome> {
     let mut progress = Progress::default();
+    // `warning` is set when one listing failed but another finished — the walk covered
+    // real ground, so the job is completed rather than failed, and the note rides along
+    // in `error` so the admin can see the coverage is partial and re-run.
+    let mut warning: Option<String> = None;
+    if kind == KIND_ALL {
+        match walk_listings(&state, job_id, source_id, &mut progress).await? {
+            Ok(w) => warning = w,
+            Err(cancelled) => return Ok(cancelled),
+        }
+    }
+    drain_queue(&state, job_id, source_id, &mut progress, warning.as_deref()).await
+}
+
+/// The listing walk of an `all` job: `Ok(warning)` when at least one listing finished,
+/// `Err(Cancelled)` when the job was cancelled during it.
+async fn walk_listings(
+    state: &Arc<AppState>,
+    job_id: &str,
+    source_id: &str,
+    progress: &mut Progress,
+) -> Result<std::result::Result<Option<String>, RunOutcome>> {
     // Manga ids already dispatched this job. The listings overlap heavily — on a source
     // whose POPULAR listing paginates the whole catalogue, LATEST is very nearly the same
     // set — and while `ingest_source_series` is idempotent (it short-circuits on an
@@ -463,8 +732,8 @@ async fn run_job(state: Arc<AppState>, job_id: &str, source_id: &str) -> Result<
     let mut warning: Option<String> = None;
     let mut last_error: Option<anyhow::Error> = None;
     for (ty, label) in LISTINGS {
-        match walk_listing(&state, job_id, source_id, ty, &mut progress, &mut seen).await {
-            Ok(ListingOutcome::Cancelled) => return Ok(RunOutcome::Cancelled),
+        match walk_listing(state, job_id, source_id, ty, progress, &mut seen).await {
+            Ok(ListingOutcome::Cancelled) => return Ok(Err(RunOutcome::Cancelled)),
             Ok(ListingOutcome::Done) => walked += 1,
             Err(e) => {
                 let e = crate::db::observed_database_error(e);
@@ -480,7 +749,91 @@ async fn run_job(state: Arc<AppState>, job_id: &str, source_id: &str) -> Result<
     if walked == 0 {
         return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no listing produced any pages")));
     }
-    Ok(RunOutcome::Completed { warning })
+    Ok(Ok(warning))
+}
+
+/// Add the job's queued items one by one, in pick order, until none waits; then complete
+/// the job. One item at a time: the source's request budget paces a limited source
+/// anyway, and the old "add picked" request was sequential too.
+async fn drain_queue(
+    state: &Arc<AppState>,
+    job_id: &str,
+    source_id: &str,
+    progress: &mut Progress,
+    warning: Option<&str>,
+) -> Result<RunOutcome> {
+    let pool = state.pool.clone();
+    let (shutdown, _watcher) = watch_job_cancellation(&pool, job_id);
+    loop {
+        if *shutdown.borrow() {
+            write_progress(&pool, job_id, progress).await?;
+            return Ok(RunOutcome::Cancelled);
+        }
+        let next: Option<i64> = crate::db_types::query_scalar(
+            "SELECT manga_id FROM source_ingest_item WHERE job_id = $1 AND finished_at IS NULL \
+             ORDER BY position LIMIT 1",
+        )
+        .bind(job_id)
+        .fetch_optional(&pool)
+        .await?;
+        let Some(manga_id) = next else {
+            match complete_if_drained(&pool, job_id, warning).await? {
+                Drain::Completed => return Ok(RunOutcome::Completed),
+                Drain::Stopped => return Ok(RunOutcome::Cancelled),
+                Drain::MoreQueued => continue,
+            }
+        };
+        match ingest_item(state, source_id, manga_id, &shutdown).await {
+            // Cut short by the cancel: the item stays queued, and is not a failure.
+            Ok(None) => {
+                write_progress(&pool, job_id, progress).await?;
+                return Ok(RunOutcome::Cancelled);
+            }
+            Err(_) if *shutdown.borrow() => {
+                write_progress(&pool, job_id, progress).await?;
+                return Ok(RunOutcome::Cancelled);
+            }
+            Ok(Some(r)) => {
+                progress.items_seen += 1;
+                progress.record_decision(&r.decision);
+                record_item(&pool, job_id, manga_id, Ok(&r)).await?;
+            }
+            Err(e) => {
+                progress.items_seen += 1;
+                progress.record_failure();
+                let e = crate::db::observed_database_error(e);
+                tracing::warn!(job_id, manga_id, error = %e, "ingest: queued item failed");
+                record_item(&pool, job_id, manga_id, Err(&e.to_string())).await?;
+            }
+        }
+        write_progress(&pool, job_id, progress).await?;
+    }
+}
+
+/// One series through the add flow, inside the source's request budget. `None` when the
+/// job was cancelled while waiting for the budget.
+async fn ingest_item(
+    st: &AppState,
+    source_id: &str,
+    manga_id: i64,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> Result<Option<crate::graphql::MatchResult>> {
+    let raw_id = manga_id.to_string();
+    // Already-linked ids return locally from ingest_source_series. Do the same
+    // pre-check before spending on its detail + chapter fetch.
+    if crate::catalog::find_source_series_by_key(&st.pool, "suwayomi", &raw_id)
+        .await?
+        .is_none()
+        && !st
+            .source_budgets
+            .spend(source_id, crate::source_budget::SourceUse::Ingest, shutdown)
+            .await
+    {
+        return Ok(None);
+    }
+    crate::graphql::ingest_source_series(st, &raw_id, shutdown)
+        .await
+        .map(Some)
 }
 
 /// Fetch one browse page, retrying transient upstream failures.
@@ -601,25 +954,7 @@ async fn walk_listing(
             let shutdown = shutdown.clone();
             set.spawn(async move {
                 let _permit = sem.acquire().await.ok();
-                let raw_id = mid.to_string();
-                let result = async {
-                    // Already-linked ids return locally from ingest_source_series. Do
-                    // the same pre-check before spending on its detail + chapter fetch.
-                    if crate::catalog::find_source_series_by_key(&st.pool, "suwayomi", &raw_id)
-                        .await?
-                        .is_none()
-                        && !st
-                            .source_budgets
-                            .spend(&sid, crate::source_budget::SourceUse::Ingest, &shutdown)
-                            .await
-                    {
-                        return Ok(None);
-                    }
-                    crate::graphql::ingest_source_series(&st, &raw_id, &shutdown)
-                        .await
-                        .map(Some)
-                }
-                .await;
+                let result = ingest_item(&st, &sid, mid, &shutdown).await;
                 // An item cut short by the cancel is not a failure; a finished one counts.
                 if result.is_err() && *shutdown.borrow() {
                     return (mid, Ok(None));
@@ -912,6 +1247,104 @@ mod tests {
         let active = list_jobs(&pool, true).await.unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].id, a.id);
+    }
+
+    fn added(decision: &str) -> crate::graphql::MatchResult {
+        crate::graphql::MatchResult {
+            decision: decision.into(),
+            work_id: "w_1".into(),
+            matched_work_id: None,
+            score: Some(0.9),
+            method: Some("title".into()),
+            source_series_id: "ss_1".into(),
+        }
+    }
+
+    /// "Add picked" queues on the source's job instead of adding inside one request, and
+    /// the job cannot complete while a queued series waits: a pick that lands while the
+    /// runner finishes is never dropped.
+    #[tokio::test]
+    async fn picked_series_queue_on_the_running_job_and_hold_its_completion() {
+        let pool = pool().await;
+        let (job, started) = enqueue_picked(&pool, "src", &[3, 1, 3]).await.unwrap();
+        let started = started.expect("no job ran: a picked job starts");
+        assert_eq!(job.kind, KIND_PICKED);
+        assert_eq!(job.state, STATE_RUNNING);
+        assert_eq!(job.items_queued, 2, "a repeated id is queued once");
+
+        // A second pick joins the running job; an id already on it is not queued again.
+        let (again, none) = enqueue_picked(&pool, "src", &[1, 2]).await.unwrap();
+        assert!(none.is_none(), "no second runner");
+        assert_eq!(again.id, job.id);
+        assert_eq!(again.items_queued, 3);
+        let items = load_items(&pool, &job.id).await.unwrap();
+        assert_eq!(
+            items.iter().map(|i| i.manga_id).collect::<Vec<_>>(),
+            vec![3, 1, 2],
+            "pick order"
+        );
+        assert!(items.iter().all(|i| !i.finished && i.result.is_none()));
+
+        assert!(matches!(
+            complete_if_drained(&pool, &job.id, None).await.unwrap(),
+            Drain::MoreQueued
+        ));
+        record_item(&pool, &job.id, 3, Ok(&added("new")))
+            .await
+            .unwrap();
+        record_item(&pool, &job.id, 1, Err("source said no"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            complete_if_drained(&pool, &job.id, None).await.unwrap(),
+            Drain::MoreQueued
+        ));
+        record_item(&pool, &job.id, 2, Ok(&added("existing")))
+            .await
+            .unwrap();
+        assert!(matches!(
+            complete_if_drained(&pool, &job.id, None).await.unwrap(),
+            Drain::Completed
+        ));
+        let row = load_job(&pool, &job.id).await.unwrap().unwrap();
+        assert_eq!(row.state, STATE_COMPLETED);
+        assert!(row.finished_at.is_some());
+
+        let items = load_items(&pool, &job.id).await.unwrap();
+        assert!(items.iter().all(|i| i.finished));
+        assert_eq!(items[0].result.as_ref().unwrap().decision, "new");
+        assert_eq!(items[0].result.as_ref().unwrap().score, Some(0.9));
+        assert!(items[1].result.is_none());
+        assert_eq!(items[1].error.as_deref(), Some("source said no"));
+
+        // The finished job takes no more picks: the next one starts a new job.
+        started.lease.release().await;
+        let (next, started) = enqueue_picked(&pool, "src", &[1]).await.unwrap();
+        assert_ne!(next.id, job.id);
+        assert_eq!(next.items_queued, 1);
+        started.expect("new job").lease.release().await;
+    }
+
+    /// A pick on a source whose "add all" job runs joins that job, and a cancelled job
+    /// is not completed by its runner.
+    #[tokio::test]
+    async fn picks_join_an_add_all_job_and_a_cancel_stops_completion() {
+        let pool = pool().await;
+        let all = try_start_job(&pool, "src").await.unwrap().unwrap();
+        let (joined, none) = enqueue_picked(&pool, "src", &[7]).await.unwrap();
+        assert!(none.is_none());
+        assert_eq!(joined.id, all.job.id);
+        assert_eq!(joined.kind, KIND_ALL);
+        assert_eq!(joined.items_queued, 1);
+
+        cancel_job(&pool, &all.job.id).await.unwrap();
+        assert!(matches!(
+            complete_if_drained(&pool, &all.job.id, None).await.unwrap(),
+            Drain::Stopped
+        ));
+        let row = load_job(&pool, &all.job.id).await.unwrap().unwrap();
+        assert_eq!(row.state, STATE_CANCELLED);
+        all.lease.release().await;
     }
 
     #[test]

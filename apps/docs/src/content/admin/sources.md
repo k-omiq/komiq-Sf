@@ -69,9 +69,12 @@ The grid shows each title returned by the source:
 
 ### Adding selected series
 
-Selecting titles displays a sticky bottom bar showing the count, a `Clear` button, and `Add selected to catalogue`. Submitting sends the batch to the deduplication pipeline.
+Selecting titles displays a sticky bottom bar showing the count, a `Clear` button, and `Add selected to catalogue`. Submitting queues the titles on your server, which adds them in the background through the deduplication pipeline.
 
-When complete, `Result of the last add` shows the outcome for each series: merged into an existing work, added as a new work, sent to [Duplicates](/admin/duplicates) for review, already present, or failed.
+- The titles are added one by one, as fast as the source's [request limit](/admin/settings) allows. A source with a limit can take about a minute per title.
+- If an `Add all from this source` job is running, the titles join that job. Otherwise an `Add selected series` job starts. Titles you select while it runs join it too.
+- The job panel lists each queued title with its outcome: merged into an existing work, added as a new work, sent to [Duplicates](/admin/duplicates) for review, already present, failed, or still waiting.
+- You can leave the page. The job keeps running, and the panel comes back when you open the source again. `Stop` leaves the waiting titles unadded.
 
 ## Search all
 

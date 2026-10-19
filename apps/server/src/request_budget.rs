@@ -565,7 +565,7 @@ fn field_class(name: &str) -> Class {
         | "uninstallExtension" | "updateExtension" | "backfillMangadexMetadata"
         | "persistCatalogue" | "materializeCatalogueCovers" | "reconcileCatalogue"
         | "startSourceIngest" | "startExtensionIngest" | "cancelExtensionIngest"
-        | "bulkAddSourceSeries" => Class::Maintenance,
+        | "bulkAddSourceSeries" | "queueSourceSeries" => Class::Maintenance,
         _ => Class::Local,
     }
 }

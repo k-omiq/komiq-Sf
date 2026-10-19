@@ -1,10 +1,10 @@
 <script lang="ts">
 	import { href } from '$lib/paths';
 	import type {
-		BulkAddResult,
 		ExtensionInfo,
 		SourceBrowseEntry,
 		SourceBrowseType,
+		SourceIngestItem,
 		SourceIngestJob,
 		SourceInfo,
 	} from '@komika/types';
@@ -23,12 +23,13 @@
 	import SourceReader from '$lib/components/SourceReader.svelte';
 	import {
 		browseSource,
-		bulkAddSourceSeries,
 		cancelExtensionIngest,
 		cancelSourceIngest,
 		loadExtensions,
+		loadSourceIngestItems,
 		loadSourceIngestJobs,
 		loadSources,
+		queueSourceSeries,
 		startExtensionIngest,
 		startSourceIngest,
 	} from '$lib/data';
@@ -93,12 +94,13 @@
 
 	/** Selected suwayomiMangaIds (insertion-ordered). */
 	let picked = $state<string[]>([]);
-	/** Titles for every id seen while browsing, so bulk results can be labelled. */
+	/** Titles for every id seen while browsing, so queued series can be labelled. */
 	let titles = $state<Record<string, string>>({});
 
 	let adding = $state(false);
-	let bulkResult = $state<BulkAddResult | null>(null);
-	let resultEl = $state<HTMLElement | null>(null);
+	/** The series queued on the shown job by "add selected", with their outcomes. */
+	let queuedItems = $state<SourceIngestItem[]>([]);
+	let jobEl = $state<HTMLElement | null>(null);
 	/** Source comic opened in the non-mutating admin reader preview. */
 	let reading = $state<{ id: string; title: string } | null>(null);
 	/** Covers the source refused to serve: fall back to the placeholder. */
@@ -274,34 +276,33 @@
 		else if (picked.length < MAX_PICKED) picked = [...picked, id];
 	}
 
+	/**
+	 * Queue the selection on the server. The source's ingest job adds the series one by
+	 * one, as fast as the source's request limit allows, so a rate-limited source never
+	 * makes this request wait. Progress and each outcome show in the job panel.
+	 */
 	async function addPicked(): Promise<void> {
-		if (adding || picked.length === 0) return;
+		if (adding || picked.length === 0 || !validSourceId) return;
 		adding = true;
-		bulkResult = null;
 		// What was actually sent. The grid stays usable while this runs, so by the time
-		// it answers the selection may hold new picks, or belong to another source.
+		// it answers the selection may hold new picks.
 		const submitted = picked;
-		const forSource = validSourceId;
+		const gen = jobGen;
 		try {
-			const result = await bulkAddSourceSeries(submitted);
+			const queued = await queueSourceSeries(validSourceId, submitted);
 			picked = picked.filter((id) => !submitted.includes(id));
-			if (result.failed > 0) {
-				toast.error(
-					`${result.failed} of ${result.total} series could not be added. See the result for why.`,
-				);
-			} else {
-				toast.success(
-					`${result.succeeded} series handled. See the result for what happened to each.`,
-				);
-			}
-			// The per-series result belongs to the source it was added from.
-			if (forSource !== validSourceId) return;
-			bulkResult = result;
-			// The result sits above the grid, and the admin is usually scrolled past it.
+			toast.success(
+				`${submitted.length} series queued. They are added in the background, as fast as the source allows.`,
+			);
+			// Another source was selected meanwhile: the job runs on, but it is not this panel's.
+			if (gen !== jobGen) return;
+			job = queued;
+			startPolling(0);
+			// The panel sits above the grid, and the admin is usually scrolled past it.
 			await tick();
-			resultEl?.scrollIntoView({ block: 'start' });
+			jobEl?.scrollIntoView({ block: 'start' });
 		} catch (err) {
-			toast.fromError(err, 'Could not add the selected series.');
+			toast.fromError(err, 'Could not queue the selected series.');
 		} finally {
 			adding = false;
 		}
@@ -441,11 +442,16 @@
 	}
 
 	/** (Re)start polling from a clean slate: clears any pending tick + failure state. */
-	function startPolling(): void {
+	function startPolling(delayMs = POLL_BASE_MS): void {
 		stopPolling();
 		pollFailures = 0;
 		pollStopped = false;
-		scheduleNextPoll(POLL_BASE_MS);
+		scheduleNextPoll(delayMs);
+	}
+
+	/** The shown job's queued series, or none when nothing was queued on it. */
+	async function jobItems(j: SourceIngestJob): Promise<SourceIngestItem[]> {
+		return j.itemsQueued > 0 ? loadSourceIngestItems(j.id) : [];
 	}
 
 	/** Restart polling after it gave up (Retry affordance), attempting immediately. */
@@ -479,7 +485,10 @@
 			if (stale()) return;
 			const mine = active.find((j) => String(j.id) === id);
 			if (mine) {
+				const items = await jobItems(mine);
+				if (stale()) return;
 				job = mine;
+				queuedItems = items;
 				pollFailures = 0;
 				jobError = null;
 				scheduleNextPoll(POLL_BASE_MS);
@@ -490,7 +499,12 @@
 			const all = await loadSourceIngestJobs(false);
 			if (stale()) return;
 			const term = all.find((j) => String(j.id) === id);
-			if (term) job = term;
+			if (term) {
+				const items = await jobItems(term);
+				if (stale()) return;
+				job = term;
+				queuedItems = items;
+			}
 			pollFailures = 0;
 			jobError = null;
 			stopPolling();
@@ -513,6 +527,7 @@
 	async function checkActiveJob(forSource: string): Promise<void> {
 		stopPolling();
 		job = null;
+		queuedItems = [];
 		jobError = null;
 		const gen = ++jobGen;
 		if (!forSource) return;
@@ -524,7 +539,7 @@
 			const mine = active.find((j) => String(j.sourceId) === forSource);
 			if (mine) {
 				job = mine;
-				startPolling();
+				startPolling(0);
 			}
 		} catch {
 			/* non-fatal — a missing job list shouldn't block browsing */
@@ -591,6 +606,7 @@
 	function dismissJob(): void {
 		stopPolling();
 		job = null;
+		queuedItems = [];
 		jobError = null;
 		pollFailures = 0;
 		pollStopped = false;
@@ -624,10 +640,13 @@
 		failed: number;
 	}
 
-	function jobCounts(c: JobCounts): CountItem[] {
+	/** `queued` replaces the page count for a job that only adds queued series. */
+	function jobCounts(c: JobCounts, queued?: number): CountItem[] {
 		return [
-			{ label: 'Pages read', value: c.pagesDone },
-			{ label: 'Series found', value: c.itemsSeen },
+			queued === undefined
+				? { label: 'Pages read', value: c.pagesDone }
+				: { label: 'Queued', value: queued },
+			{ label: queued === undefined ? 'Series found' : 'Done', value: c.itemsSeen },
 			{ label: 'Succeeded', value: c.succeeded },
 			{ label: 'Added as new', value: c.newWorks },
 			{ label: 'Merged', value: c.autoMerged },
@@ -938,7 +957,6 @@
 			browseError = null;
 			hasNext = false;
 			picked = [];
-			bulkResult = null;
 		}
 
 		if (!currentValidId) {
@@ -950,6 +968,7 @@
 			hasNext = false;
 			stopPolling();
 			job = null;
+			queuedItems = [];
 			jobGen++;
 			lastCheckedJobSource = '';
 			return;
@@ -1205,105 +1224,84 @@
 		{/if}
 
 		{#if job}
-			<IngestPanel
-				heading="Add all from source {job.sourceId}"
-				detail={sourceLabel(String(job.sourceId))}
-				stateLabel={JOB_STATE_LABEL[job.state] ?? job.state}
-				tone={jobTone(job.state)}
-				running={job.state === 'running'}
-				counts={jobCounts(job)}
-				error={job.error}
-				review={job.queuedForReview > 0}
-			>
-				{#snippet actions()}
-					{#if job?.state === 'running'}
-						<Button size="sm" variant="danger" busy={jobCancelling} onclick={cancelJob}>
-							{jobCancelling ? 'Stopping' : 'Stop'}
-						</Button>
-					{:else}
-						<Button size="sm" onclick={dismissJob}>Dismiss</Button>
-					{/if}
-				{/snippet}
-			</IngestPanel>
-		{/if}
-
-		{#if bulkResult}
-			<section class="result" bind:this={resultEl}>
-				<div class="result-head">
-					<div>
-						<h2>Result of the last add</h2>
-						<p class="k-hint k-num">
-							{bulkResult.succeeded} of {bulkResult.total} series handled without an error.
-						</p>
-					</div>
-					<Button size="sm" onclick={() => (bulkResult = null)}>Dismiss</Button>
-				</div>
-				<IngestCounts
-					items={[
-						{ label: 'Added as new', value: bulkResult.newWorks },
-						{ label: 'Merged', value: bulkResult.autoMerged },
-						{ label: 'Sent to Duplicates', value: bulkResult.queuedForReview },
-						{ label: 'Already in catalogue', value: bulkResult.alreadyExisting },
-						{
-							label: 'Failed',
-							value: bulkResult.failed,
-							tone: bulkResult.failed > 0 ? 'danger' : undefined,
-						},
-					]}
-				/>
-				<div
-					class="k-table"
-					role="table"
-					aria-label="Per-series ingest outcome"
-					aria-busy={jobStarting}
+			<div class="job" bind:this={jobEl}>
+				<IngestPanel
+					heading={job.kind === 'picked'
+						? 'Add selected series'
+						: `Add all from source ${job.sourceId}`}
+					detail={sourceLabel(String(job.sourceId))}
+					stateLabel={JOB_STATE_LABEL[job.state] ?? job.state}
+					tone={jobTone(job.state)}
+					running={job.state === 'running'}
+					counts={jobCounts(job, job.kind === 'picked' ? job.itemsQueued : undefined)}
+					error={job.error}
+					note={job.state === 'running' && job.itemsQueued > 0
+						? 'Selected series are added one by one, as fast as the source allows.'
+						: null}
+					review={job.queuedForReview > 0}
 				>
-					<div class="k-tr k-tr--head" role="row">
-						<span role="columnheader">Series</span>
-						<span role="columnheader">Decision</span>
-						<span role="columnheader">Work</span>
-						<span role="columnheader">Matched by</span>
-					</div>
-					{#each bulkResult.entries as en (en.suwayomiMangaId)}
-						<div class="k-tr" role="row">
-							<span class="series-cell" role="cell">
-								<span class="series-title">{entryTitle(String(en.suwayomiMangaId))}</span>
-								<span class="k-mono k-muted">Source id {en.suwayomiMangaId}</span>
-							</span>
-							<span role="cell" data-label="Decision">
-								{#if en.result}
-									<span class="k-badge decision" data-tone={decisionTone(en.result.decision)}
-										>{decisionLabel(en.result.decision)}</span
-									>
-								{:else}
-									<span class="k-badge decision" data-tone="danger">Failed</span>
-								{/if}
-							</span>
-							<span class="wrap" role="cell" data-label="Work">
-								{#if en.result}
-									<span class="k-mono">{en.result.workId}</span>
-								{:else}
-									<span class="fail-reason">{en.error ?? 'Unknown error'}</span>
-								{/if}
-							</span>
-							<span class="k-muted" role="cell" data-label="Matched by">
-								{#if en.result?.method}
-									{methodLabel(en.result.method)}{en.result.score != null
-										? `, ${Math.round(en.result.score * 100)}%`
-										: ''}
-								{:else}
-									None
-								{/if}
-							</span>
+					{#snippet actions()}
+						{#if job?.state === 'running'}
+							<Button size="sm" variant="danger" busy={jobCancelling} onclick={cancelJob}>
+								{jobCancelling ? 'Stopping' : 'Stop'}
+							</Button>
+						{:else}
+							<Button size="sm" onclick={dismissJob}>Dismiss</Button>
+						{/if}
+					{/snippet}
+					{#if queuedItems.length > 0}
+						<div
+							class="k-table"
+							role="table"
+							aria-label="Selected series and what happened to each"
+						>
+							<div class="k-tr k-tr--head" role="row">
+								<span role="columnheader">Series</span>
+								<span role="columnheader">Decision</span>
+								<span role="columnheader">Work</span>
+								<span role="columnheader">Matched by</span>
+							</div>
+							{#each queuedItems as it (it.suwayomiMangaId)}
+								<div class="k-tr" role="row">
+									<span class="series-cell" role="cell">
+										<span class="series-title">{entryTitle(String(it.suwayomiMangaId))}</span>
+										<span class="k-mono k-muted">Source id {it.suwayomiMangaId}</span>
+									</span>
+									<span role="cell" data-label="Decision">
+										{#if it.result}
+											<span class="k-badge decision" data-tone={decisionTone(it.result.decision)}
+												>{decisionLabel(it.result.decision)}</span
+											>
+										{:else if it.state === 'failed'}
+											<span class="k-badge decision" data-tone="danger">Failed</span>
+										{:else}
+											<span class="k-badge decision">Waiting</span>
+										{/if}
+									</span>
+									<span class="wrap" role="cell" data-label="Work">
+										{#if it.result}
+											<span class="k-mono">{it.result.workId}</span>
+										{:else if it.state === 'failed'}
+											<span class="fail-reason">{it.error ?? 'Unknown error'}</span>
+										{:else}
+											<span class="k-muted">Not added yet</span>
+										{/if}
+									</span>
+									<span class="k-muted" role="cell" data-label="Matched by">
+										{#if it.result?.method}
+											{methodLabel(it.result.method)}{it.result.score != null
+												? `, ${Math.round(it.result.score * 100)}%`
+												: ''}
+										{:else}
+											None
+										{/if}
+									</span>
+								</div>
+							{/each}
 						</div>
-					{/each}
-				</div>
-				{#if bulkResult.queuedForReview > 0}
-					<p class="k-hint">
-						Some series look like works already in the catalogue. Decide on them on the
-						<a class="k-link" href={href('/review')}>Duplicates</a> page.
-					</p>
-				{/if}
-			</section>
+					{/if}
+				</IngestPanel>
+			</div>
 		{/if}
 
 		{#if !scopeEmpty}
@@ -1406,7 +1404,7 @@
 											Clear
 										</Button>
 										<Button variant="primary" icon="plus" busy={adding} onclick={addPicked}>
-											{adding ? 'Adding' : 'Add selected to catalogue'}
+											{adding ? 'Queuing' : 'Add selected to catalogue'}
 										</Button>
 									</div>
 								</div>
@@ -1513,25 +1511,11 @@
 		margin-left: auto;
 	}
 
-	/* ---- result of "add selected" ---- */
-	.result {
-		display: grid;
-		grid-template-columns: minmax(0, 1fr);
-		gap: var(--k-space-4);
+	/* ---- the job panel and its queued series ---- */
+	.job {
 		min-width: 0;
 		/* Clears the sticky top bar on narrow screens when scrolled into view. */
 		scroll-margin-top: 72px;
-	}
-	.result-head {
-		display: flex;
-		align-items: flex-start;
-		justify-content: space-between;
-		flex-wrap: wrap;
-		gap: var(--k-space-3);
-	}
-	.result-head h2 {
-		font-size: var(--k-text-lg);
-		font-weight: 700;
 	}
 	.k-table {
 		--cols: minmax(0, 2fr) minmax(0, 1.5fr) minmax(0, 1.4fr) minmax(0, 1.1fr);

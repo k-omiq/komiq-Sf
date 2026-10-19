@@ -2105,6 +2105,35 @@ impl SuwayomiClient {
         Ok((d.source.display_name, d.source.is_nsfw, d.source.lang))
     }
 
+    /// The source of each manga id the engine has stored, from its own database: no
+    /// request reaches a source. An unknown id is absent from the map.
+    pub async fn manga_sources(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, String>> {
+        let doc = "query M($ids: [Int!]!) { mangas(filter: { id: { in: $ids } }) { nodes { id sourceId } } }";
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Node {
+            id: i64,
+            source_id: String,
+        }
+        #[derive(Deserialize)]
+        struct Nodes {
+            nodes: Vec<Node>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            mangas: Nodes,
+        }
+        let d: Data = self.gql(doc, json!({ "ids": ids })).await?;
+        Ok(d.mangas
+            .nodes
+            .into_iter()
+            .map(|n| (n.id, n.source_id))
+            .collect())
+    }
+
     pub async fn set_in_library(&self, id: i64, in_library: bool) -> Result<()> {
         let doc = "mutation U($id: Int!, $inLibrary: Boolean!) { updateManga(input: { id: $id, patch: { inLibrary: $inLibrary } }) { manga { id } } }";
         let _: Value = self

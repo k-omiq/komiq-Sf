@@ -427,11 +427,25 @@ export interface BulkAddEntry {
  * persisting progress counters on the row. Poll {@link Backend.sourceIngestJobs}
  * for updates.
  */
+/** One series queued on an ingest job by "add picked", and its outcome once added. */
+export interface SourceIngestItem {
+	suwayomiMangaId: Id;
+	/** `queued` | `done` | `failed`. */
+	state: string;
+	result: MatchResult | null;
+	error: string | null;
+}
+
 export interface SourceIngestJob {
 	id: Id;
 	sourceId: string;
+	/** `all` walks the source's listings, then its queued series; `picked` only adds its
+	 * queued series. */
+	kind: string;
 	/** `running` | `completed` | `cancelled` | `failed`. */
 	state: string;
+	/** Series queued on the job by "add picked"; see {@link SourceIngestItem}. */
+	itemsQueued: number;
 	pagesDone: number;
 	itemsSeen: number;
 	succeeded: number;

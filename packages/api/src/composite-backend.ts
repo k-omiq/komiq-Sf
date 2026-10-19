@@ -33,6 +33,7 @@ import type {
 	SeriesSourceGroup,
 	SourceBrowsePage,
 	SourceBrowseType,
+	SourceIngestItem,
 	SourceIngestJob,
 	SourceInfo,
 	SourceScanHealth,
@@ -1191,6 +1192,12 @@ export class CompositeBackend implements Backend {
 	}
 	startSourceIngest(sourceId: Id): Promise<SourceIngestJob> {
 		return this.opts.hosted.startSourceIngest!(sourceId);
+	}
+	queueSourceSeries(sourceId: Id, suwayomiMangaIds: Id[]): Promise<SourceIngestJob> {
+		return this.opts.hosted.queueSourceSeries!(sourceId, suwayomiMangaIds);
+	}
+	sourceIngestItems(jobId: Id): Promise<SourceIngestItem[]> {
+		return this.opts.hosted.sourceIngestItems!(jobId);
 	}
 	cancelSourceIngest(jobId: Id): Promise<SourceIngestJob> {
 		return this.opts.hosted.cancelSourceIngest!(jobId);

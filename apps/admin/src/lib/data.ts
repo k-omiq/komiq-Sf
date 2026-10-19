@@ -5,7 +5,6 @@
 import type {
 	AdminUser,
 	CoverIssue,
-	BulkAddResult,
 	CanonicalUpdate,
 	Chapter,
 	ExtensionInfo,
@@ -25,6 +24,7 @@ import type {
 	SeriesStatus,
 	SourceBrowsePage,
 	SourceBrowseType,
+	SourceIngestItem,
 	SourceIngestJob,
 	SourceInfo,
 	SourceScanHealth,
@@ -524,13 +524,24 @@ export async function loadSourceReader(
 }
 
 /**
- * Bulk Tier-2 catalogue ingest: library-track each Suwayomi manga and run the
- * dedup add flow. Per-id failures never abort the batch; at most 100 ids.
+ * "Add picked": queue at most 100 series of one source. They join the source's running
+ * ingest job, or start one, and the server adds them one by one inside the source's
+ * request budget. Poll the job, and {@link loadSourceIngestItems} for each outcome.
  */
-export async function bulkAddSourceSeries(suwayomiMangaIds: Id[]): Promise<BulkAddResult> {
-	if (!backend.bulkAddSourceSeries)
-		throw new Error('Bulk catalogue ingest is unavailable on this backend.');
-	return backend.bulkAddSourceSeries(suwayomiMangaIds);
+export async function queueSourceSeries(
+	sourceId: Id,
+	suwayomiMangaIds: Id[],
+): Promise<SourceIngestJob> {
+	if (!backend.queueSourceSeries)
+		throw new Error('Queued catalogue ingest is unavailable on this backend.');
+	return backend.queueSourceSeries(sourceId, suwayomiMangaIds);
+}
+
+/** The series queued on an ingest job, in pick order, each with its outcome once added. */
+export async function loadSourceIngestItems(jobId: Id): Promise<SourceIngestItem[]> {
+	if (!backend.sourceIngestItems)
+		throw new Error('Queued catalogue ingest is unavailable on this backend.');
+	return backend.sourceIngestItems(jobId);
 }
 
 /**

@@ -97,6 +97,7 @@ type Query {
 	sourceBrowse(sourceId: ID!, type: SourceBrowseType!, page: Int = 1, query: String): SourceBrowsePage! # [komika] browse/search one source's catalogue for bulk ingest (requires isAdmin)
 	seriesSourcesBatch(seriesIds: [ID!]!): [SeriesSourceGroup!]! # [komika] catalogue provenance per Suwayomi series — linked work + source mappings, input order, ≤200 ids (requires isAdmin)
 	sourceIngestJobs(active: Boolean = false): [SourceIngestJob!]! # [komika] "add all from source" ingest jobs, newest first; active:true for only running ones — poll for progress (requires isAdmin)
+	sourceIngestItems(jobId: ID!): [SourceIngestItem!]! # [komika] the series queued on an ingest job by "add picked", in pick order, with each outcome once added (requires isAdmin)
 	seriesAdminMeta(seriesId: ID!): SeriesAdminMeta! # [komika] raw metadata-override state of a series' canonical work (pinned title/description/type/NSFW + curated tags) for the series-detail editor (requires isAdmin)
 	workChaptersAdmin(workId: ID!): [AdminChapter!]! # [komika] a work's aggregated chapters WITH override state (hidden/renamed), unfiltered, for the series-detail editor (requires isAdmin)
 	workChapterList(workId: ID!): WorkChapterList! # [komika] the work's chapter-list entries and linked copies, including hidden entries and entries without copies (requires isAdmin)
@@ -151,7 +152,8 @@ type Mutation {
 	installExtension(pkgName: String!): ExtensionInfo! # [komika] install a store extension, then record its sources' coordinates and NSFW flag in source_extension; NSFW-gated by show_nsfw (requires isAdmin)
 	uninstallExtension(pkgName: String!): ExtensionInfo! # [komika] uninstall an extension (requires isAdmin)
 	updateExtension(pkgName: String!): ExtensionInfo! # [komika] update an installed extension, then re-record its sources in source_extension; NSFW-gated (requires isAdmin)
-	bulkAddSourceSeries(suwayomiMangaIds: [ID!]!): BulkAddResult! # [komika] bulk Tier-2 catalogue ingest, ≤100 ids; per-id failures don't abort (requires isAdmin)
+	bulkAddSourceSeries(suwayomiMangaIds: [ID!]!): BulkAddResult! @deprecated(reason: "Use queueSourceSeries: this adds every series inside one request, which a proxy cuts when a rate-limited source makes it wait") # [komika] bulk Tier-2 catalogue ingest, ≤100 ids; per-id failures don't abort (requires isAdmin)
+	queueSourceSeries(sourceId: ID!, suwayomiMangaIds: [ID!]!): SourceIngestJob! # [komika] "add picked": queue ≤100 series of one source on its running ingest job, or start a picked job; added one by one inside the source's request budget; refused like startSourceIngest (requires isAdmin)
 	setSeriesPaused(seriesId: ID!, paused: Boolean!): Series! # [komika] targeted pause/unpause of one series' scanning; unpause re-scans immediately (requires isAdmin)
 	startSourceIngest(sourceId: ID!): SourceIngestJob! # [komika] start a background "add all from source" ingest; refused if one already running or NSFW source not opted in (requires isAdmin)
 	cancelSourceIngest(jobId: ID!): SourceIngestJob! # [komika] request cancellation of a running ingest job; preserves progress (requires isAdmin)
@@ -1360,7 +1362,7 @@ enum SourceBrowseType {
 }
 
 # [komika] One manga returned by browsing a source; suwayomiMangaId is exactly
-# what bulkAddSourceSeries consumes.
+# what queueSourceSeries consumes.
 type SourceBrowseEntry {
 	suwayomiMangaId: ID!
 	title: String!
@@ -1383,13 +1385,16 @@ type BulkAddEntry {
 	error: String
 }
 
-# [komika] A background "add all from this source" ingest job (S1): walks a
-# source's listing page by page through the Tier-2 dedup add flow, persisting
-# progress counters. Poll sourceIngestJobs(active:true) for updates.
+# [komika] A background ingest job of one source: an "add all" job (S1) walks the
+# source's listings page by page through the Tier-2 dedup add flow; every job then
+# adds the series queued on it by "add picked". Persists progress counters. Poll
+# sourceIngestJobs(active:true) for updates.
 type SourceIngestJob {
 	id: ID!
 	sourceId: String!
+	kind: String! # all (walks the listings, then its queued series) | picked (only its queued series)
 	state: String! # running | completed | cancelled | failed
+	itemsQueued: Int! # series queued on the job by "add picked"; outcomes in sourceIngestItems
 	pagesDone: Int!
 	itemsSeen: Int!
 	succeeded: Int!
@@ -1401,6 +1406,15 @@ type SourceIngestJob {
 	error: String # set when state = failed
 	startedAt: String!
 	finishedAt: String # set once terminal (completed/cancelled/failed)
+}
+
+# [komika] One series queued on an ingest job by "add picked", and its outcome
+# once added.
+type SourceIngestItem {
+	suwayomiMangaId: ID!
+	state: String! # queued | done | failed
+	result: MatchResult
+	error: String
 }
 
 # [komika] Result of a bulk catalogue ingest: per-id entries + decision summary.

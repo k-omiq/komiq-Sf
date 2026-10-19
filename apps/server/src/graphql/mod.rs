@@ -51,6 +51,10 @@ use crate::scanner::scan_series;
 use crate::suwayomi::{FetchType, SuwayomiChapter, SuwayomiClient, SuwayomiManga};
 use types::*;
 
+/// How long `addSourceSeries` waits for its source's request budget. Well inside the
+/// 100 s a proxied request gets, with room for the add itself.
+const ADD_SOURCE_BUDGET_WAIT: Duration = Duration::from_secs(30);
+
 const PAGE_SIZE: i64 = 20;
 /// Rows per page of the reader's merged Updates feed (`updatesFeed`) only. Separate from
 /// [`PAGE_SIZE`], which ~24 unrelated sites share; mirrored by the reader's
@@ -2193,6 +2197,27 @@ async fn viewer_show_nsfw_or_admin(ctx: &Context<'_>, include_nsfw: Option<bool>
 }
 
 /// A failed preference read is an error, so it cannot seed a degraded feed cache.
+/// Refuse adding from a source the admin may not add from: an NSFW source for an admin
+/// who has not opted in, and every non-English source. Also fails for an unknown source.
+async fn check_ingest_source(st: &AppState, user: &User, source_id: &str) -> Result<()> {
+    let (_, source_nsfw, source_lang) =
+        st.suwayomi.source_meta(source_id).await.map_err(gql_err)?;
+    if source_nsfw && !user_show_nsfw(&st.pool, &user.id).await? {
+        return Err(Error::new(
+            "This source is NSFW — enable NSFW in your settings to ingest it",
+        ));
+    }
+    // English-only: ingesting a non-English source (e.g. a per-language MangaDex source)
+    // would enrol native-language series that the reader can't serve and that the
+    // reconcile purge would immediately delete. Refuse it up front.
+    if source_lang != "en" {
+        return Err(Error::new(
+            "Komika serves English only — this source is not an English source",
+        ));
+    }
+    Ok(())
+}
+
 async fn user_show_nsfw(pool: &Database, user_id: &str) -> Result<bool> {
     Ok(
         crate::db_types::query_scalar::<i64>("SELECT show_nsfw FROM users WHERE id = $1")
@@ -10035,6 +10060,22 @@ impl QueryRoot {
             .collect())
     }
 
+    /// Admin: the series queued on an ingest job by "add picked", in pick order, each
+    /// with its outcome once added. Poll alongside `sourceIngestJobs`.
+    async fn source_ingest_items(
+        &self,
+        ctx: &Context<'_>,
+        job_id: ID,
+    ) -> Result<Vec<SourceIngestItem>> {
+        require_admin(ctx).await?;
+        Ok(crate::ingest::load_items(&state(ctx).pool, &job_id.0)
+            .await
+            .map_err(gql_read_err)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
     /// Admin catalogue provenance, batched: for each Suwayomi series id, the
     /// canonical work it's linked to and every `source_series` mapping on that
     /// work with its extension coordinates — what the console needs to render an
@@ -15814,6 +15855,39 @@ impl MutationRoot {
             .0
             .parse()
             .map_err(|_| Error::new("suwayomiMangaId must be an integer id"))?;
+        // The add reaches the series' source (details, chapters, cover), so it takes that
+        // source's request budget like a queued add does. It waits only so long: the
+        // request must answer before the proxy in front of the server cuts it.
+        if let Some(source_id) = st
+            .suwayomi
+            .manga_sources(&[mid])
+            .await
+            .map_err(gql_err)?
+            .get(&mid)
+        {
+            let (_stop, shutdown) = tokio::sync::watch::channel(false);
+            let admitted = tokio::time::timeout(ADD_SOURCE_BUDGET_WAIT, async {
+                st.source_budgets
+                    .spend(
+                        source_id,
+                        crate::source_budget::SourceUse::Ingest,
+                        &shutdown,
+                    )
+                    .await
+                    && st
+                        .source_budgets
+                        .spend(source_id, crate::source_budget::SourceUse::Cover, &shutdown)
+                        .await
+            })
+            .await
+            .unwrap_or(false);
+            if !admitted {
+                return Err(Error::new(
+                    "This source is at its request limit. Add the series from the source's \
+                     Browse page instead: it is queued there and added when the limit allows.",
+                ));
+            }
+        }
         let m = st.suwayomi.series(mid).await.map_err(gql_err)?;
 
         // DD1: compute the cover pHash server-side (strongest cheap dedup signal).
@@ -16433,27 +16507,7 @@ impl MutationRoot {
     ) -> Result<SourceIngestJob> {
         let user = require_admin(ctx).await?;
         let st_arc = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
-        // Validates the source exists AND carries the NSFW posture gate + the
-        // English-only ingest policy (single-source sibling of `start_extension_ingest`,
-        // which filters languages at the extension level).
-        let (_, source_nsfw, source_lang) = st_arc
-            .suwayomi
-            .source_meta(&source_id.0)
-            .await
-            .map_err(gql_err)?;
-        if source_nsfw && !user_show_nsfw(&st_arc.pool, &user.id).await? {
-            return Err(Error::new(
-                "This source is NSFW — enable NSFW in your settings to ingest it",
-            ));
-        }
-        // English-only: ingesting a non-English source (e.g. a per-language MangaDex
-        // source) would enrol native-language series that the reader can't serve and
-        // that the reconcile purge would immediately delete. Refuse it up front.
-        if source_lang != "en" {
-            return Err(Error::new(
-                "Komika serves English only — this source is not an English source",
-            ));
-        }
+        check_ingest_source(&st_arc, &user, &source_id.0).await?;
         let Some(started) = crate::ingest::try_start_job(&st_arc.pool, &source_id.0)
             .await
             .map_err(gql_err)?
@@ -16464,6 +16518,46 @@ impl MutationRoot {
         };
         let job = started.job.clone();
         crate::ingest::spawn_runner(st_arc, started);
+        Ok(job.into())
+    }
+
+    /// Admin: queue picked series of one source for adding ("add picked"). They join the
+    /// source's running ingest job, or start a `picked` one, which adds them one by one
+    /// inside the source's request budget: a rate-limited source is never asked for more
+    /// than its limit, and no request waits on it. Poll `sourceIngestJobs` and
+    /// `sourceIngestItems` for progress. Refused like `startSourceIngest`.
+    async fn queue_source_series(
+        &self,
+        ctx: &Context<'_>,
+        source_id: ID,
+        suwayomi_manga_ids: Vec<ID>,
+    ) -> Result<SourceIngestJob> {
+        let user = require_admin(ctx).await?;
+        if suwayomi_manga_ids.is_empty() {
+            return Err(Error::new("suwayomiMangaIds must not be empty"));
+        }
+        if suwayomi_manga_ids.len() > 100 {
+            return Err(Error::new("At most 100 ids per queueSourceSeries call"));
+        }
+        let ids = suwayomi_manga_ids
+            .iter()
+            .map(|id| id.0.parse::<i64>())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::new("suwayomiMangaIds must be integer ids"))?;
+        let st_arc = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
+        check_ingest_source(&st_arc, &user, &source_id.0).await?;
+        // The job paces every item on THIS source's budget, so each series must be from
+        // it. The engine answers from its own database; no request reaches a source.
+        let sources = st_arc.suwayomi.manga_sources(&ids).await.map_err(gql_err)?;
+        if let Some(id) = ids.iter().find(|id| sources.get(id) != Some(&source_id.0)) {
+            return Err(Error::new(format!("Series {id} is not from this source")));
+        }
+        let (job, started) = crate::ingest::enqueue_picked(&st_arc.pool, &source_id.0, &ids)
+            .await
+            .map_err(gql_err)?;
+        if let Some(started) = started {
+            crate::ingest::spawn_runner(st_arc, started);
+        }
         Ok(job.into())
     }
 
@@ -16598,6 +16692,9 @@ impl MutationRoot {
     /// the manga is in the Suwayomi library (so the adaptive scanner tracks it)
     /// and run the Tier-2 dedup add flow (`add_source_series` semantics). A
     /// failing id is recorded in its entry — it never aborts the batch.
+    #[graphql(
+        deprecation = "Use queueSourceSeries: this adds every series inside one request, which a proxy cuts when a rate-limited source makes it wait"
+    )]
     async fn bulk_add_source_series(
         &self,
         ctx: &Context<'_>,

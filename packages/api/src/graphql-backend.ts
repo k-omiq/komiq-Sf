@@ -41,6 +41,7 @@ import type {
 	SeriesSourceGroup,
 	SourceBrowsePage,
 	SourceBrowseType,
+	SourceIngestItem,
 	SourceIngestJob,
 	SourceInfo,
 	SourceScanHealth,
@@ -2135,6 +2136,21 @@ export class GraphQLBackend implements Backend {
 			sourceId,
 		});
 		return d.startSourceIngest;
+	}
+
+	async queueSourceSeries(sourceId: Id, suwayomiMangaIds: Id[]): Promise<SourceIngestJob> {
+		const d = await this.gql<{ queueSourceSeries: SourceIngestJob }>(ops.QUEUE_SOURCE_SERIES, {
+			sourceId,
+			suwayomiMangaIds,
+		});
+		return d.queueSourceSeries;
+	}
+
+	async sourceIngestItems(jobId: Id): Promise<SourceIngestItem[]> {
+		const d = await this.gql<{ sourceIngestItems: SourceIngestItem[] }>(ops.SOURCE_INGEST_ITEMS, {
+			jobId,
+		});
+		return d.sourceIngestItems;
 	}
 
 	async cancelSourceIngest(jobId: Id): Promise<SourceIngestJob> {

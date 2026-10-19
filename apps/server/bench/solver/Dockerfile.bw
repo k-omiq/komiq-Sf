@@ -1,0 +1,6 @@
+FROM mcr.microsoft.com/playwright:v1.61.1-noble
+WORKDIR /work
+RUN npm init -y >/dev/null \
+ && npm install --no-audit --no-fund betterwright@2.8.9 playwright-core@1.61.1
+COPY bw-solve.mjs ./
+USER pwuser
