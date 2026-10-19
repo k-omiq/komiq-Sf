@@ -689,14 +689,14 @@ export class GraphQLBackend implements Backend {
 			nsfwPass = (await this.posture(authRevision)).nsfwPass;
 			this.assertAuthRevision(authRevision);
 		}
-		// The pass rides only on a persisted GET. Where that is not possible, an `auto`
-		// read keeps the token instead, so it still sees what this viewer opted in to.
+		// The pass rides only on a persisted GET. Where that is not possible, the read keeps
+		// the token instead, so it still sees what this viewer opted in to.
 		const persistable =
 			!this.capabilities.getUnsupported &&
 			!this.capabilities.persistedUnsupported &&
 			!this.capabilities.unknownPersisted.has(stripped);
 		if (nsfwPass && !persistable) {
-			if (transport === 'auto') sent = token;
+			sent = token;
 			nsfwPass = null;
 		}
 		// Anonymous READS go over GET so Cloudflare and the browser's HTTP cache can

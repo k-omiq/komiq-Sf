@@ -62,6 +62,10 @@ impl PersistedRequest {
     }
 }
 
+/// The `nsfw` pass a GET by id carried, for the handler to check before anything runs.
+#[derive(Clone)]
+pub(crate) struct NsfwPassParam(pub(crate) String);
+
 /// Refusal codes. The apps read them to fall back: on `PERSISTED_QUERY_NOT_FOUND` (400)
 /// they send the document text, on `PERSISTED_QUERY_REQUIRED` (405) they POST it.
 pub(crate) const NOT_FOUND: &str = "PERSISTED_QUERY_NOT_FOUND";
@@ -217,6 +221,9 @@ pub(crate) async fn resolve_get(
     let variables = json
         .map(async_graphql::Variables::from_json)
         .unwrap_or_default();
+    if let Some(pass) = &params.nsfw {
+        request.extensions_mut().insert(NsfwPassParam(pass.clone()));
+    }
     request.extensions_mut().insert(PersistedRequest {
         document,
         variables,

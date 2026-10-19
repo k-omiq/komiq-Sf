@@ -43,12 +43,13 @@ pub(crate) fn sign(key: &hmac::Key, day: i64) -> String {
     hex::encode(hmac::sign(key, message(day).as_bytes()).as_ref())
 }
 
-/// Whether `pass` is the pass of `today` or of the day before. Constant time per day.
+/// Whether `pass` is the pass of `today`, of the day before, or of the day after (a node
+/// whose clock runs a little behind another's at midnight). Constant time per day.
 pub(crate) fn verify(key: &hmac::Key, pass: &str, today: i64) -> bool {
     let Ok(tag) = hex::decode(pass) else {
         return false;
     };
-    [today, today - 1]
+    [today, today - 1, today + 1]
         .iter()
         .any(|d| hmac::verify(key, message(*d).as_bytes(), &tag).is_ok())
 }
@@ -112,7 +113,14 @@ mod tests {
             "a pass from just before midnight still works"
         );
         assert!(!verify(&k, &pass, 102), "two days later it has expired");
-        assert!(!verify(&k, &pass, 99), "a pass is not valid before its day");
+        assert!(
+            verify(&k, &pass, 99),
+            "a clock just behind midnight still accepts it"
+        );
+        assert!(
+            !verify(&k, &pass, 98),
+            "a pass is not valid well before its day"
+        );
     }
 
     #[test]

@@ -7964,10 +7964,6 @@ impl QueryRoot {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// The viewer's own content block rules, in the order they were saved. They hide
-    /// matching series from the viewer's lists (Browse, search, updates, discovery), on
-    /// top of the site-wide rules. They do not lock a series the viewer opens by its
-    /// link, and they do not filter the viewer's library.
     /// Today's shared NSFW pass, for a signed-in viewer who opted in to NSFW; null for
     /// everyone else. The apps send it as `&nsfw=` on catalogue GETs, which then show
     /// NSFW works and stay cacheable (`nsfw_pass.rs`).
@@ -7986,6 +7982,10 @@ impl QueryRoot {
             .map_err(gql_read_err)
     }
 
+    /// The viewer's own content block rules, in the order they were saved. They hide
+    /// matching series from the viewer's lists (Browse, search, updates, discovery), on
+    /// top of the site-wide rules. They do not lock a series the viewer opens by its
+    /// link, and they do not filter the viewer's library.
     async fn my_block_rules(&self, ctx: &Context<'_>) -> Result<Vec<BlockRule>> {
         let user = require_user(ctx).await?;
         let rules = crate::block::list(&state(ctx).pool, crate::block::Scope::User(&user.id))

@@ -74,8 +74,8 @@ A viewer with their own block rules sends every read by `POST` with the token. S
 
 The server signs one pass per UTC day with a key kept in `instance_setting` (`apps/server/src/nsfw_pass.rs`). `nsfwPass` returns it only to a signed-in viewer with NSFW content turned on, and null to everyone else. The reader adds it to its anonymous GETs as `&nsfw=<pass>`. A GET with a valid pass shows NSFW works, without a token.
 
-- Every viewer with NSFW content on sends the same pass, so they share one cached copy of each URL. Each URL has two copies at most: with and without the pass.
-- The server accepts the pass of today and of yesterday. An older pass gets the error code `NSFW_PASS_EXPIRED`, and that answer is never cached. The reader then sends that read by `POST` with the token and fetches a new pass for the next read.
+- Every viewer with NSFW content on sends the same pass, so they share one cached copy of each URL. Around midnight UTC a URL can have three copies: without a pass, with yesterday's and with today's.
+- The server checks the pass before it runs anything. It accepts the pass of today, of yesterday and of tomorrow (for a clock slightly behind). Any other pass gets the error code `NSFW_PASS_EXPIRED` with `private, no-store`, so a made-up pass cannot fill the cache. The reader then sends that read by `POST` with the token and fetches a new pass for the next read.
 - Without a valid pass, a GET reads as anonymous, which never shows NSFW works.
 - Chapter images need no pass: an image request carries no token, so the NSFW check sits on the page list. Anonymous answers carry no viewer data: the server fills library flags and read marks only for a request with a token.
 

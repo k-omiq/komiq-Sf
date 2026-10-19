@@ -561,11 +561,15 @@ const GRAPHQL_GET_S_MAXAGE_SECS: u32 = 60;
 /// - AUTHENTICATED responses are marked `private, no-store`: edge caches key on
 ///   the URL alone, and a cached authed body would leak one viewer's
 ///   `isMarked`/progress fields to the next requester of the same URL.
+// Each argument is an axum extractor.
+#[allow(clippy::too_many_arguments)]
 async fn graphql_get_handler(
     State(schema): State<ApiSchema>,
     State(trusted): State<Arc<TrustedProxies>>,
+    State(pool): State<crate::db::Database>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     tls: Option<axum::Extension<cloudflare::origin_tls::OverTls>>,
+    nsfw: Option<axum::Extension<persisted::NsfwPassParam>>,
     uri: axum::http::Uri,
     headers: HeaderMap,
     req: request_budget::AdmittedGraphQLRequest,
@@ -584,6 +588,20 @@ async fn graphql_get_handler(
     } else {
         resolve_client_ip(&headers, peer, &trusted.current())
     };
+    // A signed-out GET with an NSFW pass runs only if the pass is good. Checked before
+    // anything runs: a made-up pass is otherwise a fresh cache key for every request.
+    if let Some(axum::Extension(persisted::NsfwPassParam(pass))) = &nsfw {
+        if bearer(&headers).is_none() {
+            match nsfw_pass::valid(&pool, pass).await {
+                Ok(true) => {}
+                Ok(false) => return nsfw_pass_expired_response(),
+                Err(error) => {
+                    tracing::warn!(error = %error, "GET /graphql: NSFW pass key unavailable");
+                    return busy_response();
+                }
+            }
+        }
+    }
     // Its CORS answer (`*` when anonymous) is set by `public_cors`, outside `CorsLayer`.
     lease
         .run(upstream.scope_upstream(
@@ -591,6 +609,21 @@ async fn graphql_get_handler(
             graphql_get_response(schema, client, plain, headers, req),
         ))
         .await
+}
+
+/// The answer to a GET whose NSFW pass no longer verifies: a GraphQL error the apps
+/// answer by fetching a new pass, never kept by a cache.
+fn nsfw_pass_expired_response() -> axum::response::Response {
+    (
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(serde_json::json!({
+            "errors": [{
+                "message": "The NSFW pass has expired; fetch a new one",
+                "extensions": { "code": nsfw_pass::EXPIRED }
+            }]
+        })),
+    )
+        .into_response()
 }
 
 /// Answer a public request with `Access-Control-Allow-Origin: *`, replacing the
@@ -6578,6 +6611,19 @@ mod tests {
                     with_variables.3["data"].is_object(),
                     "{case}: {with_variables:?}"
                 );
+
+                // A made-up pass is refused before anything runs, and never cached.
+                let forged = send(
+                    Method::GET,
+                    format!("{path}?id={tags}&nsfw={}", "0".repeat(64)),
+                    None,
+                )
+                .await
+                .unwrap();
+                let forged = answer(forged).await;
+                assert_eq!(forged.0, StatusCode::OK, "{case}");
+                assert_eq!(forged.1.as_deref(), Some("private, no-store"), "{case}");
+                assert_eq!(code(&forged.3), nsfw_pass::EXPIRED, "{case}");
 
                 // Another spelling of the same request is sent to the canonical URL
                 // before it runs: re-spaced JSON, lowercase escapes, a reordered pair.
