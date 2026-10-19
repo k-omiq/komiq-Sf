@@ -10,10 +10,11 @@
 //! A shared title is never enough on its own. What else is required depends on who the
 //! two works are:
 //!
-//!   * Two MangaDex entries are separate works by construction. They merge only on the
-//!     same title plus a shared credit or cover, never across a sequel marker or a
-//!     language. Namesakes by different people, and entries that only share an alt
-//!     title (a franchise, a colored edition, a pre-serialization), are `Distinct`.
+//!   * Two MangaDex entries are separate works by construction and are always
+//!     `Distinct`, even under one title and one author (a mature and an erotic
+//!     version of one series are two entries).
+//!   * Two titles where one names an edition the other does not (colored, long strip,
+//!     promo, side story) are `Distinct`.
 //!   * A site's copy of a series is usually a duplicate of the entry that carries its
 //!     name. It merges on a shared credit, description, cover or native-script title —
 //!     or on the title alone when that title is long enough to be specific.
@@ -22,7 +23,7 @@
 //! qualifying target.
 
 use super::normalize::{
-    edition_mismatch, match_key, normalize_title, novel_mismatch, number_mismatch, sequel_mismatch,
+    edition_mismatch, match_key, normalize_title, novel_mismatch, number_mismatch,
 };
 use super::similarity::{
     credits_match, description_similarity, phash_similarity, title_shingles, title_similarity_pre,
@@ -220,34 +221,17 @@ pub fn assess(a: &WorkMatchData, b: &WorkMatchData) -> Assessment {
         return verdict(Distinct, "novel_mismatch");
     }
 
+    // Two MangaDex entries are never one work. MangaDex lists a sequel, a colored
+    // edition, a promo, and a mature and an erotic version of one series as separate
+    // entries, often under one name and by one author; folding any pair of them mixes
+    // two works' metadata and covers. `merge_works_on` refuses the merge as well.
     if a.mangadex_anchored && b.mangadex_anchored {
-        // Two entries of the spine. Anything short of the same title is how MangaDex
-        // relates a series to its sequel, colored edition, promo or anthology.
-        if !same_title {
-            return if author && (description >= DESCRIPTION_MATCH || cover) {
-                verdict(Review, "related_mangadex_entries")
-            } else {
-                verdict(Distinct, "separate_mangadex_entries")
-            };
-        }
-        if sequel_mismatch(title_a, title_b) {
-            return verdict(Distinct, "sequel_mismatch");
-        }
-        if language_conflict {
-            return verdict(Distinct, "language_mismatch");
-        }
-        if author || (cover && !short) {
-            return verdict(Merge, "same_title_and_credit");
-        }
-        if description >= DESCRIPTION_MATCH {
-            return verdict(Review, "same_description");
-        }
-        // Both credited, to different people: two adaptations, or two namesakes.
-        return if a.author.is_some() && b.author.is_some() {
-            verdict(Distinct, "namesake")
-        } else {
-            verdict(Review, "uncorroborated")
-        };
+        return verdict(Distinct, "separate_mangadex_entries");
+    }
+    // One title names an edition the other does not (colored, long strip, promo, side
+    // story): related, but never one work, and not a question worth asking either.
+    if edition_mismatch(title_a, title_b) {
+        return verdict(Distinct, "edition_mismatch");
     }
 
     // At least one side is a site's copy.
@@ -260,9 +244,6 @@ pub fn assess(a: &WorkMatchData, b: &WorkMatchData) -> Assessment {
     }
     if short && !author {
         return verdict(Review, "short_title");
-    }
-    if edition_mismatch(title_a, title_b) {
-        return verdict(Review, "edition_mismatch");
     }
     match link {
         Link::Exact => {
@@ -345,70 +326,66 @@ mod tests {
         (out.verdict, out.reason)
     }
 
+    /// Two MangaDex entries are never one work: not under one title and one credit
+    /// (a mature and an erotic version), not across an edition, a sequel or a language.
     #[test]
-    fn two_mangadex_entries_merge_only_on_the_same_title_and_credit() {
+    fn two_mangadex_entries_are_never_merged() {
         let author = Some("Fujimi Rio");
-        // A true MangaDex duplicate.
-        assert_eq!(
-            verdict(
-                &md(&["Pretty Rhythm - Aurora Dream"], author, Some(2011), "ja"),
-                &md(&["Pretty Rhythm: Aurora Dream"], author, None, "ja"),
-            ),
-            (Verdict::Merge, "same_title_and_credit")
-        );
-        // Two adaptations of one title, by different people.
-        assert_eq!(
-            verdict(
-                &md(&["Arslan Senki"], Some("Arakawa Hiromu"), Some(2013), "ja"),
-                &md(&["Arslan Senki"], Some("Tanaka Yoshiki"), Some(1991), "ja"),
-            ),
-            (Verdict::Distinct, "namesake")
-        );
-        // Namesakes from two countries, even with one credit line.
-        assert_eq!(
-            verdict(
-                &md(&["Sweet Home"], Some("Same Name"), Some(2017), "ko"),
-                &md(&["sweet home"], Some("Same Name"), Some(2019), "ja"),
-            ),
-            (Verdict::Distinct, "language_mismatch")
-        );
-        // A sequel and a remake are their own entries, same author or not.
-        let araki = Some("Ikeda Akihisa");
-        for other in [
-            "Rosario to Vampire Season II",
-            "Rosario to Vampire (Remake)",
-        ] {
-            assert_eq!(
-                verdict(
-                    &md(&["Rosario to Vampire"], araki, Some(2004), "ja"),
-                    &md(&[other], araki, Some(2007), "ja"),
-                ),
-                (Verdict::Distinct, "sequel_mismatch")
-            );
-        }
-        // A colored edition carries no sequel marker.
         let gege = Some("Akutami Gege");
-        assert_eq!(
-            verdict(
-                &md(&["Jujutsu Kaisen"], gege, Some(2018), "ja"),
-                &md(
+        let pairs = [
+            (
+                md(&["Pretty Rhythm - Aurora Dream"], author, Some(2011), "ja"),
+                md(&["Pretty Rhythm: Aurora Dream"], author, None, "ja"),
+            ),
+            (
+                md(
+                    &["Deriheru Yondara Moto Doukyuusei ga Kita"],
+                    author,
+                    Some(2020),
+                    "ja",
+                ),
+                md(
+                    &["Deriheru Yondara Moto Doukyuusei ga Kita"],
+                    author,
+                    Some(2020),
+                    "ja",
+                ),
+            ),
+            (
+                md(&["Arslan Senki"], Some("Arakawa Hiromu"), Some(2013), "ja"),
+                md(&["Arslan Senki"], Some("Tanaka Yoshiki"), Some(1991), "ja"),
+            ),
+            (
+                md(&["Rosario to Vampire"], author, Some(2004), "ja"),
+                md(&["Rosario to Vampire Season II"], author, Some(2007), "ja"),
+            ),
+            (
+                md(&["Jujutsu Kaisen"], gege, Some(2018), "ja"),
+                md(
                     &["Jujutsu Kaisen (Official Colored)"],
                     gege,
                     Some(2020),
-                    "ja"
+                    "ja",
                 ),
-            )
-            .0,
-            Verdict::Merge
-        );
-        // A missing credit on one side is a question, not an answer.
-        assert_eq!(
-            verdict(
-                &md(&["Naruto"], Some("Masashi Kishimoto"), None, "ja"),
-                &md(&["Naruto"], None, None, "ja"),
             ),
-            (Verdict::Review, "uncorroborated")
-        );
+            (
+                md(&["Naruto"], Some("Masashi Kishimoto"), None, "ja"),
+                md(&["Naruto"], None, None, "ja"),
+            ),
+        ];
+        for (a, b) in &pairs {
+            assert_eq!(
+                verdict(a, b),
+                (Verdict::Distinct, "separate_mangadex_entries")
+            );
+        }
+        // Not even when the blurb and the cover are the same.
+        let (mut a, mut b) = pairs[1].clone();
+        a.description = Some("The same blurb on both versions of the series".into());
+        b.description = a.description.clone();
+        a.cover_phash = Some("ff00ff00ff00ff00".into());
+        b.cover_phash = a.cover_phash.clone();
+        assert_eq!(verdict(&a, &b).0, Verdict::Distinct);
     }
 
     /// The pairs that flooded the review queue: two spine entries that only share an
@@ -442,16 +419,6 @@ mod tests {
                 ),
             ),
             (Verdict::Distinct, "separate_mangadex_entries")
-        );
-        // The same author AND the same blurb is worth a look: a re-upload or an edition.
-        let blurb = "The ordinary Mikami Satoru found himself dying after being stabbed";
-        let mut first = md(&["Series One", "Shared Name"], araki, None, "ja");
-        let mut second = md(&["Series Two", "Shared Name"], araki, None, "ja");
-        first.description = Some(blurb.into());
-        second.description = Some(blurb.into());
-        assert_eq!(
-            verdict(&first, &second),
-            (Verdict::Review, "related_mangadex_entries")
         );
     }
 
@@ -549,8 +516,28 @@ mod tests {
                     "ko"
                 ),
             ),
-            (Verdict::Review, "edition_mismatch")
+            (Verdict::Distinct, "edition_mismatch")
         );
+        // A colored or long-strip release is not offered as a duplicate of the series.
+        for edition in [
+            "Killing Stalking (Fan Colored)",
+            "Killing Stalking (Official Colored)",
+            "Killing Stalking [Long Strip]",
+            "Killing Stalking - Webtoon",
+        ] {
+            assert_eq!(
+                verdict(
+                    &site("Killing Stalking", Some("Koogi")),
+                    &md(
+                        &[edition, "Killing Stalking"],
+                        Some("Koogi"),
+                        Some(2016),
+                        "ko"
+                    ),
+                ),
+                (Verdict::Distinct, "edition_mismatch")
+            );
+        }
         // Only an alt title in common, even with the franchise's author.
         let araki = Some("Hirohiko Araki");
         let mut part = site("Battle Tendency", araki);

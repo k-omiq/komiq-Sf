@@ -4993,6 +4993,10 @@ pub async fn mark_work_nsfw_on(conn: &mut sqlx::PgConnection, work_id: &str) -> 
     Ok(())
 }
 
+/// Why [`merge_works_on`] refuses to fold two MangaDex entries together.
+pub const MANGADEX_MERGE_REFUSED: &str =
+    "Both series are MangaDex entries. MangaDex entries are never merged.";
+
 /// Outcome of folding one work into another (D1 admin merge).
 #[derive(Debug, Clone, Default)]
 pub struct MergeOutcome {
@@ -5361,6 +5365,21 @@ pub(crate) async fn merge_works_on(
         if exists.is_none() {
             anyhow::bail!("no such work: {id}");
         }
+    }
+    // Two MangaDex entries are never one work (`pair::assess` never proposes it). This
+    // holds for an admin merge too: MangaDex lists a mature and an erotic version, or a
+    // colored edition, as separate entries under one name, and a merge of them cannot be
+    // undone cleanly. The source mappings are locked, so the answer holds to COMMIT.
+    let anchored: i64 = crate::db_types::query_scalar(
+        "SELECT COUNT(DISTINCT work_id) FROM source_series \
+          WHERE work_id IN ($1, $2) AND source_type = 'mangadex'",
+    )
+    .bind(source_work)
+    .bind(target_work)
+    .fetch_one(&mut **tx)
+    .await?;
+    if anchored == 2 {
+        anyhow::bail!("{MANGADEX_MERGE_REFUSED}");
     }
     // Precondition re-check, inside the write lock: from here to COMMIT nothing else can
     // change these columns, so a gate that still holds now holds for the whole merge.
@@ -5972,6 +5991,9 @@ pub struct SplitOutcome {
     pub moved_sources: u64,
     /// Distinct readers whose progress follows the detached sources.
     pub progress_readers_moved: i64,
+    /// Whether a MangaDex mapping moved: the new work then needs its metadata fetched
+    /// (a MangaDex mapping's metadata stayed on the original work).
+    pub detached_mangadex: bool,
     /// Chapter-list entries that followed the detached copies (W3a).
     #[cfg(test)]
     pub entry_map: Vec<work_chapter::EntryMove>,
@@ -6095,7 +6117,8 @@ async fn split_source_series_attempt(
     // sub-select picks with `MIN(ss.id)`. Getting this wrong produces a link that 404s:
     // `canonical_series` rejects a work with no MangaDex anchor outright.
     let new_work_id = new_id("w_");
-    let new_reader_id = if detached.iter().any(|r| r.source_type == "mangadex") {
+    let detached_mangadex = detached.iter().any(|r| r.source_type == "mangadex");
+    let new_reader_id = if detached_mangadex {
         new_work_id.clone()
     } else {
         detached
@@ -6316,6 +6339,7 @@ async fn split_source_series_attempt(
         title,
         moved_sources: moved,
         progress_readers_moved,
+        detached_mangadex,
         #[cfg(test)]
         entry_map,
     })
@@ -8942,14 +8966,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let source = upsert_work_from_mangadex(
-            &pool,
-            "md-tracker-source",
-            &WorkInput {
-                external_ids: vec![("al".into(), "100".into()), ("mal".into(), "300".into())],
-                ..Default::default()
-            },
+        // A site's copy that carries another snapshot (two MangaDex entries never merge).
+        let source = create_work(&pool, &WorkInput::default()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO work_tracker_link (work_id, provider, external_id) \
+             VALUES ($1, 'al', '100'), ($1, 'mal', '300')",
         )
+        .bind(&source)
+        .execute(&pool)
         .await
         .unwrap();
         merge_works(&pool, &source, &target).await.unwrap();

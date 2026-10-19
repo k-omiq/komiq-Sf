@@ -39,6 +39,7 @@ mod legacy_sqlite;
 mod locks;
 mod maintenance;
 mod mangadex;
+mod mangadex_unmerge;
 mod media;
 mod media_cache;
 #[cfg(test)]
@@ -4138,6 +4139,10 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tracing::info!("catalogue sync disabled (set CATALOGUE_SYNC=on to enable)");
     }
+
+    // One-time repair: split MangaDex entries an older duplicate sweep merged into one
+    // work, then fetch each one's metadata again (parks while MangaDex is off).
+    mangadex_unmerge::spawn(state.clone(), shutdown_tx.subscribe());
 
     // Recurring auto-enrichment drainer (X1) — opt-in. Keeps newly-ingested
     // MangaDex-anchored works self-enriching (S2 metadata + F2 covers) in small

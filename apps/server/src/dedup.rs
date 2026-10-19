@@ -11,7 +11,8 @@
 //! Titles are compared article-insensitively ("The X" = "X"). Author names ignore
 //! case, punctuation and word order, and match through any listed person or
 //! parenthesised transliteration. Missing authors remain in review. A novel never
-//! matches a non-novel. External identities and admin split decisions retain precedence.
+//! matches a non-novel, and an edition (colored, long strip, promo) never matches a
+//! title that does not name it. External identities and admin split decisions retain precedence.
 
 use std::collections::HashSet;
 
@@ -20,7 +21,7 @@ use anyhow::Result;
 
 use crate::catalog::{
     self,
-    normalize::{match_key, normalize_title, novel_mismatch},
+    normalize::{edition_mismatch, match_key, normalize_title, novel_mismatch},
     pair::{is_discriminative_phash, PHASH_CORROBORATION},
     similarity::{
         description_shingles, description_similarity_pre, phash_similarity, title_shingles,
@@ -239,6 +240,11 @@ pub async fn resolve_on(
         // A novel and its comic adaptation share a title, alt titles and an author, so
         // they score as a perfect duplicate. They are not one: never offer the pair.
         if novel_mismatch(Some(&cand.title), md.primary_title.as_deref()) {
+            continue;
+        }
+        // A colored, long-strip or other edition is never the series itself, though the
+        // title key ignores "Official Colored": never merge or offer the pair.
+        if edition_mismatch(Some(&cand.title), md.primary_title.as_deref()) {
             continue;
         }
         if exact_ids.contains(wid)

@@ -15896,6 +15896,18 @@ impl MutationRoot {
             progress_readers_moved = outcome.progress_readers_moved,
             title = %outcome.title, "splitSourceSeries: detached sources onto a new work"
         );
+        // A MangaDex mapping leaves its metadata, covers and alt titles behind on the
+        // original. Fetch both works again from MangaDex, in the background.
+        if outcome.detached_mangadex && st.mangadex.is_enabled() {
+            let app = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
+            let pair = vec![(work_id.0.clone(), outcome.new_work_id.clone())];
+            tokio::spawn(async move {
+                let shutdown = tokio::sync::watch::channel(false).1;
+                if let Err(error) = crate::mangadex_unmerge::refetch(&app, &pair, &shutdown).await {
+                    tracing::warn!(error = %format!("{error:#}"), "splitSourceSeries: MangaDex refetch failed");
+                }
+            });
+        }
         Ok(SplitSourcesResult {
             new_work_id: ID(outcome.new_work_id),
             new_reader_id: ID(outcome.new_reader_id),
@@ -16868,6 +16880,21 @@ fn require_mangadex(st: &AppState) -> Result<()> {
 /// is marked (even if MangaDex returns nothing) so the drain terminates. Returns
 /// how many works were upserted.
 pub(crate) async fn enrich_works(st: &AppState, ids: &[String]) -> Result<i32> {
+    let mut refreshed = 0i32;
+    for chunk in ids.chunks(100) {
+        let prepared = fetch_enrichment(st, chunk).await.map_err(gql_err)?;
+        refreshed += persist_enrichment(&st.pool, &prepared).await?;
+    }
+    Ok(refreshed)
+}
+
+/// Fetch the MangaDex record and the full cover set of up to 100 MangaDex ids, as
+/// upsert-ready inputs: `(mangadex_id, input, covers_fetched)`. An id MangaDex does
+/// not return is left out. Writes nothing.
+pub(crate) async fn fetch_enrichment(
+    st: &AppState,
+    ids: &[String],
+) -> anyhow::Result<Vec<(String, catalog::WorkInput, bool)>> {
     use futures::StreamExt as _;
     // Overlap the per-work /cover fetches: metadata is already batched 100/req, but each
     // work's cover set is a separate round-trip. The shared TokenBucket still caps the
@@ -16877,45 +16904,39 @@ pub(crate) async fn enrich_works(st: &AppState, ids: &[String]) -> Result<i32> {
     // retain their existing concurrency.
     const COVER_FETCH_CONCURRENCY: usize = 6;
     let cover_concurrency = crate::request_budget::upstream_concurrency(COVER_FETCH_CONCURRENCY);
-    let mut refreshed = 0i32;
-    for chunk in ids.chunks(100) {
-        let mangas = st.mangadex.get_manga_by_ids(chunk).await.map_err(gql_err)?;
-        // Map to owned upsert inputs synchronously (no network) so the cover-fetch stream
-        // owns its items — streaming over `mangas.iter()` borrows would trip an HRTB
-        // lifetime error on the async closure.
-        let base: Vec<(String, catalog::WorkInput, Option<String>)> = mangas
-            .iter()
-            .map(|m| {
-                let (id, input) = crate::mangadex::to_work_input(m);
-                (id, input, crate::mangadex::cover_file_name(m))
-            })
-            .collect();
-        // Fetch every work's full cover set concurrently, yielding upsert-ready inputs.
-        let prepared: Vec<(String, catalog::WorkInput, bool)> = futures::stream::iter(base)
-            .map(|(id, mut input, primary)| async move {
-                // F2: fetch the full per-volume cover set and mark the primary (the one
-                // the sweep mirrors on work.cover_file_name). Best-effort — a /cover
-                // failure just leaves the sweep's primary cover.
-                let covers_ok = match st.mangadex.list_covers(&id, 100).await {
-                    Ok(fetched) if !fetched.is_empty() => {
-                        input.covers =
-                            crate::mangadex::covers_from_fetch(fetched, primary.as_deref());
-                        true
-                    }
-                    Ok(_) => true,
-                    Err(e) => {
-                        tracing::warn!(manga = %id, error = %e, "enrich: /cover fetch failed");
-                        false
-                    }
-                };
-                (id, input, covers_ok)
-            })
-            .buffer_unordered(cover_concurrency)
-            .collect()
-            .await;
-        refreshed += persist_enrichment(&st.pool, &prepared).await?;
-    }
-    Ok(refreshed)
+    let mangas = st.mangadex.get_manga_by_ids(ids).await?;
+    // Map to owned upsert inputs synchronously (no network) so the cover-fetch stream
+    // owns its items — streaming over `mangas.iter()` borrows would trip an HRTB
+    // lifetime error on the async closure.
+    let base: Vec<(String, catalog::WorkInput, Option<String>)> = mangas
+        .iter()
+        .map(|m| {
+            let (id, input) = crate::mangadex::to_work_input(m);
+            (id, input, crate::mangadex::cover_file_name(m))
+        })
+        .collect();
+    // Fetch every work's full cover set concurrently, yielding upsert-ready inputs.
+    Ok(futures::stream::iter(base)
+        .map(|(id, mut input, primary)| async move {
+            // F2: fetch the full per-volume cover set and mark the primary (the one
+            // the sweep mirrors on work.cover_file_name). Best-effort — a /cover
+            // failure just leaves the sweep's primary cover.
+            let covers_ok = match st.mangadex.list_covers(&id, 100).await {
+                Ok(fetched) if !fetched.is_empty() => {
+                    input.covers = crate::mangadex::covers_from_fetch(fetched, primary.as_deref());
+                    true
+                }
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(manga = %id, error = %e, "enrich: /cover fetch failed");
+                    false
+                }
+            };
+            (id, input, covers_ok)
+        })
+        .buffer_unordered(cover_concurrency)
+        .collect()
+        .await)
 }
 
 /// Only successfully persisted records receive completion markers. Missing upstream
@@ -17886,6 +17907,47 @@ async fn queue_review_once(
     } else {
         QueuedReview::Suppressed
     })
+}
+
+/// Close every waiting review the rules now call two different works (two MangaDex
+/// entries, an edition and its series), so the duplicates page stops offering them.
+/// Unlike [`sort_pending_reviews`] it never merges. Returns how many it closed.
+pub(crate) async fn dismiss_distinct_reviews(pool: &Database) -> anyhow::Result<u64> {
+    use catalog::pair::{assess, Verdict};
+    let mut after = String::new();
+    let mut closed = 0u64;
+    loop {
+        let rows: Vec<(String, String, String)> = crate::db_types::query_tuple(
+            "SELECT mc.id, ss.work_id, mc.candidate_work_id FROM merge_candidate mc \
+             JOIN source_series ss ON ss.id = mc.source_series_id \
+             WHERE mc.status = 'pending' AND mc.id > $1 ORDER BY mc.id LIMIT 200",
+        )
+        .bind(&after)
+        .fetch_all(pool)
+        .await?;
+        let Some((last, _, _)) = rows.last() else {
+            return Ok(closed);
+        };
+        after.clone_from(last);
+        for (id, source, target) in rows {
+            if source == target {
+                continue;
+            }
+            let data =
+                catalog::load_match_data_batch(pool, &[source.clone(), target.clone()]).await?;
+            let (Some(a), Some(b)) = (data.get(&source), data.get(&target)) else {
+                continue;
+            };
+            if assess(a, b).verdict != Verdict::Distinct {
+                continue;
+            }
+            if crate::db::retry_transaction(|| dismiss_review_once(pool, &id, &source, &target))
+                .await?
+            {
+                closed += 1;
+            }
+        }
+    }
 }
 
 /// Close one waiting review as `dismissed` in ONE transaction (the "two different
@@ -24521,7 +24583,15 @@ mod tests {
     async fn a_merged_away_work_id_redirects_on_every_canonical_resolver() {
         let (s, pool) = setup_full(100).await;
         seed_canonical(&pool, "md-keep", "Surviving Work", false, "1").await;
-        seed_canonical(&pool, "md-gone", "Folded Work", false, "2").await;
+        // A site's copy (two MangaDex entries are never merged).
+        sqlx::query(r#"INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) VALUES ('w_gone', 'Folded Work', FALSE, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) VALUES ('ss_7001', 'w_gone', 'suwayomi', 'src-a', '7001', '2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
         let id_of = |key: &'static str| {
             let pool = pool.clone();
             async move {
@@ -24535,7 +24605,7 @@ mod tests {
             }
         };
         let survivor = id_of("md-keep").await;
-        let retired = id_of("md-gone").await;
+        let retired = id_of("7001").await;
         catalog::merge_works_ex(&pool, None, &retired, &survivor)
             .await
             .unwrap();
@@ -29335,7 +29405,15 @@ mod tests {
 
         // Redirect: a merged-away id answers with the SURVIVOR's bundle and id.
         seed_canonical(&pool, "md-sp-keep", "Surviving Bundle", false, "1").await;
-        seed_canonical(&pool, "md-sp-gone", "Folded Bundle", false, "2").await;
+        // A site's copy (two MangaDex entries are never merged).
+        sqlx::query(r#"INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) VALUES ('w_sp_gone', 'Folded Bundle', FALSE, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) VALUES ('ss_7002', 'w_sp_gone', 'suwayomi', 'src-a', '7002', '2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
         let survivor: String = crate::db_types::query_scalar(
             "SELECT work_id FROM source_series WHERE source_key = 'md-sp-keep'",
         )
@@ -29343,7 +29421,7 @@ mod tests {
         .await
         .unwrap();
         let retired: String = crate::db_types::query_scalar(
-            "SELECT work_id FROM source_series WHERE source_key = 'md-sp-gone'",
+            "SELECT work_id FROM source_series WHERE source_key = '7002'",
         )
         .fetch_one(&pool)
         .await

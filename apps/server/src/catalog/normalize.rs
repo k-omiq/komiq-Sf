@@ -143,54 +143,9 @@ pub fn novel_mismatch(a: Option<&str>, b: Option<&str>) -> bool {
     novels(a) != novels(b)
 }
 
-/// Noise words that name an instalment rather than a format. "Overlord Season 2" and
-/// "Overlord" share a `normalize_title` key so a site's per-season listing finds its
-/// series, but the stripped marker still says they may be different works.
-const SEQUEL_TAIL: &[&str] = &[
-    "season",
-    "part",
-    "cour",
-    "arc",
-    "remake",
-    "remaster",
-    "remastered",
-];
-
-/// The instalment marker `normalize_title` strips from the end of `raw`: its sequel
-/// words and their numbers ("Rosario to Vampire Season II" -> `["season", "ii"]`),
-/// format words ("Official Colored") ignored. Empty for a title without one.
-fn sequel_marker(raw: &str) -> Vec<String> {
-    let folded = raw.replace(['&', '＆'], " and ").to_lowercase();
-    let tokens: Vec<String> = folded
-        .chars()
-        .map(fold_diacritic)
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .map(str::to_string)
-        .collect();
-    let kept = normalize_title(raw).split_whitespace().count();
-    tokens
-        .into_iter()
-        .skip(kept)
-        .filter(|t| {
-            SEQUEL_TAIL.contains(&t.as_str())
-                || t.chars().all(|c| c.is_ascii_digit())
-                || is_roman_numeral(t)
-        })
-        .collect()
-}
-
-/// True when two titles carry different instalment markers ("X" vs "X Season 2").
-/// MangaDex lists a sequel as its own entry, so between two MangaDex-anchored works a
-/// marker one side lacks means two works, not one. A missing title has no marker.
-pub fn sequel_mismatch(a: Option<&str>, b: Option<&str>) -> bool {
-    let marker = |t: Option<&str>| t.map(sequel_marker).unwrap_or_default();
-    marker(a) != marker(b)
-}
-
 /// Words that name a different edition of a series rather than the series itself: a
-/// promo, a pre-serialization, a doujinshi, an anthology, a one-shot, a side story.
+/// promo, a pre-serialization, a doujinshi, an anthology, a one-shot, a side story, a
+/// colored or a long-strip (webtoon) release.
 const EDITION_WORDS: &[&str] = &[
     "promo",
     "serialization",
@@ -207,6 +162,23 @@ const EDITION_WORDS: &[&str] = &[
     "fan",
 ];
 
+/// Spellings of one edition that name the same thing: "Colored", "Full Color" and
+/// "Colourised" are all the colored edition, "Webtoon" and "Long Strip" the long-strip
+/// one. Each maps to the one word the comparison uses.
+const EDITION_SYNONYMS: &[(&str, &str)] = &[
+    ("color", "color"),
+    ("colour", "color"),
+    ("colored", "color"),
+    ("coloured", "color"),
+    ("colorized", "color"),
+    ("colourized", "color"),
+    ("colorised", "color"),
+    ("colourised", "color"),
+    ("longstrip", "longstrip"),
+    ("webtoon", "longstrip"),
+    ("webtoons", "longstrip"),
+];
+
 /// Lowercased alphanumeric tokens of a raw title, diacritics folded.
 fn raw_tokens(raw: &str) -> Vec<String> {
     raw.to_lowercase()
@@ -219,21 +191,30 @@ fn raw_tokens(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// The edition words a raw title carries, each spelling folded to one word, sorted and
+/// without repeats. "Long Strip" counts as one word.
+fn editions(title: Option<&str>) -> Vec<&'static str> {
+    let tokens = title.map(raw_tokens).unwrap_or_default();
+    let mut found: Vec<&'static str> = Vec::new();
+    for (i, word) in tokens.iter().enumerate() {
+        if let Some(edition) = EDITION_WORDS.iter().find(|w| **w == word.as_str()) {
+            found.push(edition);
+        } else if let Some((_, edition)) = EDITION_SYNONYMS.iter().find(|(w, _)| *w == word) {
+            found.push(edition);
+        } else if word == "long" && tokens.get(i + 1).is_some_and(|next| next == "strip") {
+            found.push("longstrip");
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
 /// True when one title names an edition the other does not ("X" vs "X (Promo)",
-/// "X - Side Stories", "X (Fan Colored)"). Such a pair is related, but it is not one
-/// work, so it never merges automatically. A missing title names no edition.
+/// "X - Side Stories", "X (Fan Colored)", "X (Official Colored)", "X [Long Strip]").
+/// Such a pair is related, but it is not one work: it is never merged and never offered
+/// as a duplicate. A missing title names no edition.
 pub fn edition_mismatch(a: Option<&str>, b: Option<&str>) -> bool {
-    let editions = |t: Option<&str>| {
-        let mut found: Vec<String> = t
-            .map(raw_tokens)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|w| EDITION_WORDS.contains(&w.as_str()))
-            .collect();
-        found.sort();
-        found.dedup();
-        found
-    };
     editions(a) != editions(b)
 }
 
@@ -343,6 +324,35 @@ mod tests {
             Some("Yuri Erotic Anthology")
         ));
         assert!(!edition_mismatch(Some("Naruto"), None));
+        assert!(edition_mismatch(
+            Some("Deriheru Yondara Moto Doukyuusei ga Kita"),
+            Some("Deriheru Yondara Moto Doukyuusei ga Kita (Official Colored)")
+        ));
+        assert!(edition_mismatch(
+            Some("Killing Stalking"),
+            Some("Killing Stalking [Fan Colored]")
+        ));
+        assert!(edition_mismatch(
+            Some("Berserk (Official Colored)"),
+            Some("Berserk (Fan Colored)")
+        ));
+        assert!(edition_mismatch(
+            Some("Vagabond"),
+            Some("Vagabond (Long Strip)")
+        ));
+        assert!(edition_mismatch(
+            Some("Vagabond"),
+            Some("Vagabond - Webtoon")
+        ));
+        // Two spellings of one edition are the same edition.
+        assert!(!edition_mismatch(
+            Some("Akira (Colored)"),
+            Some("Akira - Full Colour")
+        ));
+        assert!(!edition_mismatch(
+            Some("Vagabond [Webtoon]"),
+            Some("Vagabond (Long Strip)")
+        ));
         assert!(number_mismatch(
             Some("My Stepmom Made Me Her Toy"),
             Some("My Stepmom Made Me Her Toy 2")
@@ -351,39 +361,11 @@ mod tests {
             Some("Starting With 13 Hidden Traits"),
             Some("Hidden Teukseong 13-gae Deulgo Sijakhanda")
         ));
-        // A remake is its own MangaDex entry, like a sequel.
-        assert!(sequel_mismatch(
-            Some("Lord of the Mysteries"),
-            Some("Lord of the Mysteries (Remake)")
-        ));
     }
 
     #[test]
     fn collapses_whitespace() {
         assert_eq!(normalize_title("  One    Piece  "), "one piece");
-    }
-
-    #[test]
-    fn sequel_mismatch_sees_the_marker_normalization_strips() {
-        assert!(sequel_mismatch(
-            Some("Rosario to Vampire"),
-            Some("Rosario to Vampire Season II")
-        ));
-        assert!(sequel_mismatch(Some("Kid Gang"), Some("Kid Gang Season 2")));
-        assert!(sequel_mismatch(Some("X Part 1"), Some("X Part 2")));
-        // Format words and punctuation are not instalments.
-        assert!(!sequel_mismatch(
-            Some("Jujutsu Kaisen"),
-            Some("Jujutsu Kaisen (Official Colored)")
-        ));
-        assert!(!sequel_mismatch(
-            Some("Pretty Rhythm - Aurora Dream"),
-            Some("Pretty Rhythm: Aurora Dream")
-        ));
-        assert!(!sequel_mismatch(Some("X Season 2"), Some("x: season 2")));
-        // A number that is part of the name is not stripped, so it is no marker.
-        assert!(!sequel_mismatch(Some("Area 51"), Some("Area 51")));
-        assert!(!sequel_mismatch(None, Some("Overlord")));
     }
 
     #[test]

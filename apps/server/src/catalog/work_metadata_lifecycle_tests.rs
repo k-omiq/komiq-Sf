@@ -353,61 +353,6 @@ async fn legacy_details_refresh_respects_the_mangadex_tag_bar() -> Result<()> {
 }
 
 #[tokio::test]
-async fn merge_projects_the_older_mangadex_tag_observation_including_empty() -> Result<()> {
-    for tag in [Some("Action"), None] {
-        let pool = pool().await;
-        let loser = upsert_work_from_mangadex(
-            &pool,
-            "md-old",
-            &WorkInput {
-                primary_title: Some("Older work".into()),
-                tags: tag.into_iter().map(str::to_owned).collect(),
-                tag_details: tag
-                    .into_iter()
-                    .map(|name| SourceTag {
-                        name: name.into(),
-                        id: Some("action-id".into()),
-                        group: "genre".into(),
-                    })
-                    .collect(),
-                ..Default::default()
-            },
-        )
-        .await?;
-        let survivor = upsert_work_from_mangadex(
-            &pool,
-            "md-new",
-            &WorkInput {
-                primary_title: Some("Newer work".into()),
-                tags: vec!["Romance".into()],
-                ..Default::default()
-            },
-        )
-        .await?;
-        sqlx::query("UPDATE source_series SET created_at = CASE source_key WHEN 'md-old' THEN '2020-01-01'::timestamptz ELSE '2021-01-01'::timestamptz END")
-            .execute(&pool).await?;
-        let before = contributions(&pool).await?;
-        merge_works(&pool, &loser, &survivor).await?;
-        assert_eq!(contributions(&pool).await?, before);
-        let tags: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT tag, tag_id, tag_group FROM work_tag WHERE work_id = $1 AND source = 'mangadex' ORDER BY ord",
-        ).bind(&survivor).fetch_all(&pool).await?;
-        let expected: Vec<_> = tag
-            .into_iter()
-            .map(|name| {
-                (
-                    name.to_string(),
-                    Some("action-id".to_string()),
-                    Some("genre".to_string()),
-                )
-            })
-            .collect();
-        assert_eq!(tags, expected);
-    }
-    Ok(())
-}
-
-#[tokio::test]
 async fn cover_gallery_is_hidden_by_mangadex_bar_and_restored_after_unbar() -> Result<()> {
     let pool = pool().await;
     let work = create_work(

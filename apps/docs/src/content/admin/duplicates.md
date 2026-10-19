@@ -29,6 +29,13 @@ Match uncertain -> candidate pair sent to Duplicates review queue
 
 Candidates with high confidence merge automatically. Unmatched titles become new works. Intermediate matches that require human judgment are placed in the Duplicates queue.
 
+### What is never merged
+
+Some pairs look alike but are different works. Your server never merges them and never lists them in the Duplicates queue:
+
+- **Two MangaDex entries.** MangaDex lists different versions of one series as separate entries, often under the same title and author. For example, a mature version and an erotic version, or a colored edition. A manual merge of two MangaDex entries is refused too.
+- **An edition and the series.** If one title names an edition and the other title does not, the pair stays separate. Edition words include colored (fan colored, official colored, full color), long strip, webtoon, promo, pre-serialization, one-shot, side story, and anthology.
+
 ## The Duplicates review queue
 
 The Duplicates page (`/review`) lists candidate pairs awaiting administrative review, ordered by confidence score.
@@ -130,3 +137,4 @@ Administrator confirms split -> new canonical work created with detached sources
 - **Chapters**: Chapters belong to source series records. All chapters belonging to the detached sources transfer to the new work cleanly.
 - **Reading progress**: Readers' reading progress on the detached sources moves with them to the new series. The exception is a chapter that also exists on a source that stays: it keeps its progress on the original series.
 - **Other user data**: Reviews, series comments, library entries and view counts stay on the original series. Chapter records stay attached to their sources.
+- **MangaDex sources**: If you split off a MangaDex source, both series fetch their metadata and covers from MangaDex again in the background. Each series then keeps only its own MangaDex entry's description, credits, covers, and alternative titles. This needs MangaDex to be on.

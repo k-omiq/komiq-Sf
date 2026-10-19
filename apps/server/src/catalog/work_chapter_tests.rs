@@ -31,6 +31,27 @@ pub(crate) async fn md_work(pool: &Database, title: &str) -> MdWork {
     MdWork { work, source, uuid }
 }
 
+/// A site's copy of a series: a work with one engine source and no MangaDex entry. A
+/// merge needs one, since two MangaDex entries are never merged. `uuid` is empty.
+pub(crate) async fn site_work(pool: &Database, title: &str) -> MdWork {
+    let work = catalog::create_work(
+        pool,
+        &WorkInput {
+            primary_title: Some(title.into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let key = (uuid::Uuid::new_v4().as_u128() % 1_000_000_000).to_string();
+    let source = source(pool, &work, &key).await;
+    MdWork {
+        work,
+        source,
+        uuid: String::new(),
+    }
+}
+
 pub(crate) async fn source(pool: &Database, work: &str, key: &str) -> String {
     catalog::upsert_source_series(pool, work, "suwayomi", "source", key, None, false)
         .await
@@ -719,7 +740,7 @@ async fn merge_maps_collisions_moves_unique_entries_and_combines_overrides_and_r
         [(true, true), (true, false), (false, true), (false, false)]
     {
         let pool = pool().await;
-        let loser = md_work(&pool, "Loser").await;
+        let loser = site_work(&pool, "Loser").await;
         let survivor = md_work(&pool, "Survivor").await;
         catalog::replace_source_chapters(
             &pool,
@@ -846,7 +867,12 @@ async fn merge_and_phase_f_split_apply_legacy_overrides_to_existing_destination_
     for merge in [false, true] {
         for destination_edit in [false, true] {
             let pool = pool().await;
-            let from = md_work(&pool, "Legacy source").await;
+            // Two MangaDex entries are never merged: the merged one is a site's copy.
+            let from = if merge {
+                site_work(&pool, "Legacy source").await
+            } else {
+                md_work(&pool, "Legacy source").await
+            };
             let to = md_work(&pool, "Existing destination").await;
             let moving = if merge {
                 from.source.clone()

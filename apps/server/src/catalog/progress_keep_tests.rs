@@ -1,6 +1,6 @@
 //! W3b identity changes preserve each reader's effective entry state.
 use super::work_chapter::tests::{
-    all_mangadex_source, chapter, entry, linked_entry, make_ready, md_work, source,
+    all_mangadex_source, chapter, entry, linked_entry, make_ready, md_work, site_work, source,
 };
 use super::*;
 use crate::catalog::phase4_tests::{pool, wait_for_lock};
@@ -61,7 +61,7 @@ async fn reads(pool: &Database, user: &str, work: &str) -> HashMap<String, bool>
 #[tokio::test]
 async fn merge_keeps_readers_including_numeric_only_progress() {
     let pool = pool().await;
-    let loser = md_work(&pool, "Progress loser").await;
+    let loser = site_work(&pool, "Progress loser").await;
     let survivor = md_work(&pool, "Progress survivor").await;
     replace_source_chapters(
         &pool,
@@ -796,7 +796,7 @@ async fn progress_row(pool: &Database, user: &str, work: &str) -> Option<(String
 #[tokio::test]
 async fn merge_and_split_keep_each_readers_last_read_time() {
     let pool = pool().await;
-    let loser = md_work(&pool, "Last read loser").await;
+    let loser = site_work(&pool, "Last read loser").await;
     let survivor = md_work(&pool, "Last read survivor").await;
     replace_source_chapters(
         &pool,
@@ -891,14 +891,15 @@ async fn merge_and_split_keep_each_readers_last_read_time() {
 async fn merge_keeps_a_ready_survivor_ready_when_every_loser_copy_is_linked() {
     for unlinked in [false, true] {
         let pool = pool().await;
-        let loser = md_work(&pool, "Ready loser").await;
+        // A site's copy: its chapter ids are the engine's numbers.
+        let loser = site_work(&pool, "Ready loser").await;
         let survivor = md_work(&pool, "Ready survivor").await;
         replace_source_chapters(
             &pool,
             &loser.source,
             &[
-                chapter("rl-loser-two", Some("2"), "Two"),
-                chapter("rl-loser-three", Some("3"), "Three"),
+                chapter("9002", Some("2"), "Two"),
+                chapter("9003", Some("3"), "Three"),
             ],
         )
         .await
@@ -919,7 +920,7 @@ async fn merge_keeps_a_ready_survivor_ready_when_every_loser_copy_is_linked() {
         if unlinked {
             sqlx::query(
                 "DELETE FROM work_chapter_link WHERE chapter_id = \
-                 (SELECT id FROM chapter WHERE source_series_id = $1 AND external_id = 'rl-loser-two')",
+                 (SELECT id FROM chapter WHERE source_series_id = $1 AND external_id = '9002')",
             )
             .bind(&loser.source)
             .execute(pool.write())
@@ -929,7 +930,7 @@ async fn merge_keeps_a_ready_survivor_ready_when_every_loser_copy_is_linked() {
         let user = reader(&pool).await;
         let s3 = entry(&pool, &survivor.work, "300").await.id;
         pointer(&pool, &user, &survivor.work, &s3).await;
-        untick(&pool, &user, "rl-loser-three").await;
+        untick(&pool, &user, "9003").await;
 
         merge_works(&pool, &loser.work, &survivor.work)
             .await
