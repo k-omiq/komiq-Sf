@@ -2385,6 +2385,16 @@ fn no_such_series(series_id: &str) -> &'static str {
     }
 }
 
+/// The engine (Suwayomi) series a numeric series id names. The one place that owns the
+/// numeric id shape: an id that is not a number (a `w_` work id, a UUID, a stray slug)
+/// names no engine series, so it gets the same "no such" answer as an unknown series
+/// instead of a logged internal error.
+fn engine_series_id(series_id: &str) -> Result<i64> {
+    series_id
+        .parse::<i64>()
+        .map_err(|_| Error::new(no_such_series(series_id)))
+}
+
 /// Whether a SITE-WIDE rule blocks the Suwayomi series `manga_id`. For the image routes,
 /// which have no GraphQL context. One small read when no rule exists, two when one does.
 #[cfg(test)]
@@ -3798,7 +3808,7 @@ async fn reload_series_in_shape(
         )
         .await
     } else {
-        let n = series_id.parse::<i64>().map_err(gql_err)?;
+        let n = engine_series_id(series_id)?;
         let m = resolve_series_cached(st, n).await.map_err(gql_err)?;
         map_series(st, m).await
     }
@@ -8118,7 +8128,7 @@ impl QueryRoot {
 
     async fn series(&self, ctx: &Context<'_>, id: ID) -> Result<Series> {
         let st = state(ctx);
-        let n = id.0.parse::<i64>().map_err(gql_err)?;
+        let n = engine_series_id(&id.0)?;
         // Suwayomi ids are sequential integers, so gate before the source round-trip:
         // an opted-out viewer must not read the detail of an NSFW series by id (N2).
         // Gated on the PARSED id: `0902` opens series 902 below, and the gates compare
@@ -8156,7 +8166,7 @@ impl QueryRoot {
         crate::engine_generation::wait(&st.pool)
             .await
             .map_err(gql_err)?;
-        let n = series_id.0.parse::<i64>().map_err(gql_err)?;
+        let n = engine_series_id(&series_id.0)?;
         // Gate the chapter list on the owning series' NSFW flag (same as `series`, N2).
         // On the parsed id, as in `series`.
         let key = n.to_string();
@@ -11427,7 +11437,7 @@ async fn reload_series(st: &AppState, user_id: &str, series_id: &str) -> Result<
         )
         .await;
     }
-    let n = series_id.parse::<i64>().map_err(gql_err)?;
+    let n = engine_series_id(series_id)?;
     // DB cache first, live source only on a miss — so filing a shelf / favouriting
     // a numeric series works even when the upstream source (Suwayomi) is offline
     // (the write has already landed; this only echoes the series back).
@@ -14414,7 +14424,7 @@ impl MutationRoot {
     ) -> Result<Series> {
         require_admin(ctx).await?;
         let st = state(ctx);
-        let n = series_id.0.parse::<i64>().map_err(gql_err)?;
+        let n = engine_series_id(&series_id.0)?;
         // Resolve the series first so a bogus id fails before any write.
         let m = st.suwayomi.series(n).await.map_err(gql_err)?;
         let now = Utc::now();
@@ -14440,7 +14450,7 @@ impl MutationRoot {
     async fn trigger_scan(&self, ctx: &Context<'_>, series_id: ID) -> Result<Series> {
         require_admin(ctx).await?;
         let st = state(ctx);
-        let n = series_id.0.parse::<i64>().map_err(gql_err)?;
+        let n = engine_series_id(&series_id.0)?;
         let m = st.suwayomi.series(n).await.map_err(gql_err)?;
         scan_series(st, &m, Utc::now()).await.map_err(gql_err)?;
         map_series(st, m).await
@@ -14490,7 +14500,7 @@ impl MutationRoot {
             )
             .await
         } else {
-            let n = input.series_id.0.parse::<i64>().map_err(gql_err)?;
+            let n = engine_series_id(&input.series_id.0)?;
             let m = resolve_series_cached(st, n).await.map_err(gql_err)?;
             map_series(st, m).await
         }
@@ -31481,6 +31491,44 @@ mod tests {
         )
         .await;
         assert_ne!(first_error(&r), "No such series");
+    }
+
+    /// A series id of neither shape (a stray slug, a UUID) names no series, so it is
+    /// answered like an unknown series: the plain "no such" error, never a logged
+    /// "Internal error". A `w_` id that names no work answers "No such work" on every
+    /// resolver, `series(id:)` included, exactly as `seriesPage` does.
+    #[tokio::test]
+    async fn malformed_series_id_answers_like_an_unknown_one() {
+        let (s, _pool) = setup_full(100).await;
+        let unknown_work = "w_0123456789abcdef0123456789abcdef";
+        let well_formed = exec(
+            &s,
+            &format!(r#"{{ seriesPage(workId: "{unknown_work}") {{ workId }} }}"#),
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&well_formed), "No such work");
+        let r = exec(
+            &s,
+            &format!(r#"{{ series(id: "{unknown_work}") {{ id }} }}"#),
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), first_error(&well_formed));
+        assert!(r.errors[0].extensions.is_none(), "{:?}", r.errors);
+
+        for id in ["kci-no-such-series", "6f1c2d3e-4b5a-4978-8a1b-2c3d4e5f6a7b"] {
+            for q in [
+                format!(r#"{{ series(id: "{id}") {{ id }} }}"#),
+                format!(r#"{{ chapters(seriesId: "{id}") {{ id }} }}"#),
+            ] {
+                let r = exec(&s, &q, None, "1.1.1.1").await;
+                assert_eq!(first_error(&r), "No such series", "{q}");
+                assert!(r.errors[0].extensions.is_none(), "{q}: {:?}", r.errors);
+            }
+        }
     }
 
     // ---- self-host setup + account management (phase 1) ----
