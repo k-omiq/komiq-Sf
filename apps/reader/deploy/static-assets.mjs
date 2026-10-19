@@ -29,9 +29,9 @@ export function writeStaticHeaders(directory, connectSources) {
 	// Chunks are content-hashed, so they are kept 7 days without revalidation. SPA
 	// fallback also serves index.html at a missing chunk URL (including non-navigation
 	// requests), and _headers cannot tell a real asset from that fallback, so a missing
-	// chunk would be cached as HTML for up to 7 days. A release therefore never drops a
-	// chunk: deploy/release.mjs copies every earlier release's chunks into the new
-	// output. `! Cache-Control` drops the wildcard's `no-cache` first, so the value is
+	// chunk would be cached as HTML for up to 7 days. A release therefore keeps every
+	// chunk an earlier release built in the last 30 days (deploy/release.mjs), longer
+	// than any browser keeps one. `! Cache-Control` drops the wildcard's `no-cache` first, so the value is
 	// replaced, not appended.
 	writeFileSync(
 		join(directory, '_headers'),

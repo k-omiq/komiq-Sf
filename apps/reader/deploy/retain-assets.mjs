@@ -9,21 +9,27 @@ import {
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-/** @param {string} previous @param {string} current */
-export function retainImmutableAssets(previous, current) {
+/**
+ * Copy `previous`'s immutable files into `current`. `keep(relativePath)` may leave a file
+ * out; the path is relative to `_app/immutable`, with `/` separators.
+ * @param {string} previous @param {string} current @param {(path: string) => boolean} [keep]
+ */
+export function retainImmutableAssets(previous, current, keep = () => true) {
 	const source = realpathSync(join(previous, '_app/immutable'));
 	const destination = realpathSync(join(current, '_app/immutable'));
 	if (source === destination) throw new Error('Previous and current builds must be different');
 	let copied = 0;
-	/** @param {string} from @param {string} to */
-	function copyDirectory(from, to) {
+	/** @param {string} from @param {string} to @param {string} prefix */
+	function copyDirectory(from, to, prefix) {
 		mkdirSync(to, { recursive: true });
 		for (const entry of readdirSync(from, { withFileTypes: true })) {
 			const sourceFile = join(from, entry.name);
 			const destinationFile = join(to, entry.name);
+			const relative = `${prefix}${entry.name}`;
 			if (entry.isDirectory()) {
-				copyDirectory(sourceFile, destinationFile);
+				copyDirectory(sourceFile, destinationFile, `${relative}/`);
 			} else if (entry.isFile()) {
+				if (!keep(relative)) continue;
 				try {
 					copyFileSync(sourceFile, destinationFile, constants.COPYFILE_EXCL);
 					copied++;
@@ -45,7 +51,7 @@ export function retainImmutableAssets(previous, current) {
 			}
 		}
 	}
-	copyDirectory(source, destination);
+	copyDirectory(source, destination, '');
 	return copied;
 }
 

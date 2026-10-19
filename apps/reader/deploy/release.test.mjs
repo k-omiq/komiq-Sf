@@ -86,3 +86,15 @@ test('the web build ignores a stray KOMIKA_TARGET; the static build sets its own
 		else process.env.KOMIKA_TARGET = stray;
 	}
 });
+
+test('a chunk no release has built for 30 days is dropped', () => {
+	const { app, record, exec, files } = fakeApp();
+	const day = 24 * 60 * 60 * 1000;
+	release({ app, record, previous: null, exec, now: 0 });
+	release({ app, record, exec, now: 20 * day });
+	assert.deepEqual(files(record), ['release-1.js', 'release-2.js', 'shared.js']);
+	// Day 31: release-1 was last built on day 0, release-2 on day 20, shared every time.
+	release({ app, record, exec, now: 31 * day });
+	assert.deepEqual(files(record), ['release-2.js', 'release-3.js', 'shared.js']);
+	assert.deepEqual(files(join(app, '.svelte-kit/cloudflare')), files(record));
+});
