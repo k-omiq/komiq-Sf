@@ -6625,8 +6625,38 @@ mod tests {
                 assert_eq!(forged.1.as_deref(), Some("private, no-store"), "{case}");
                 assert_eq!(code(&forged.3), nsfw_pass::EXPIRED, "{case}");
 
+                // The edge forwards the parameters sorted (`id`, `nsfw`, `variables`), so
+                // any order runs as it is: redirecting it would loop.
+                let sorted = answer(
+                    send(
+                        Method::GET,
+                        format!(
+                            "{path}?id={chapter_work}&nsfw={}&variables={variables}",
+                            "0".repeat(64)
+                        ),
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+                )
+                .await;
+                assert_eq!(sorted.0, StatusCode::OK, "{case}");
+                assert_eq!(code(&sorted.3), nsfw_pass::EXPIRED, "{case}");
+                let reordered = answer(
+                    send(
+                        Method::GET,
+                        format!("{path}?variables={variables}&id={chapter_work}"),
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+                )
+                .await;
+                assert_eq!(reordered.0, StatusCode::OK, "{case}");
+                assert!(reordered.3["data"].is_object(), "{case}: {reordered:?}");
+
                 // Another spelling of the same request is sent to the canonical URL
-                // before it runs: re-spaced JSON, lowercase escapes, a reordered pair.
+                // before it runs: re-spaced JSON, lowercase escapes.
                 for spelling in [
                     format!("variables=%7B%20%22chapterId%22%3A%22none%22%7D&id={chapter_work}"),
                     format!("id={chapter_work}&variables=%7b%22chapterId%22%3a%22none%22%7d"),

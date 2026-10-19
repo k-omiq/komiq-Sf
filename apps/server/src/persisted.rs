@@ -18,6 +18,8 @@
 //! the apps encode it. Unknown parameters are refused, and any other spelling of a valid
 //! request is redirected to the canonical URL before it runs. Otherwise every extra
 //! parameter or re-spaced JSON would be a separate cache entry that runs the query.
+//! Parameter order is the exception: the edge ignores it and forwards the parameters
+//! sorted, so any order is accepted ([`same_parameters`]).
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -109,6 +111,19 @@ fn canonical_query(id: &str, variables: Option<&serde_json::Value>, nsfw: Option
         query.push_str(&encode_component(pass));
     }
     query
+}
+
+/// Whether `raw` holds the parameters of `canonical`, spelled the same, in any order.
+/// The edge cache key ignores parameter order (cache rule R4), and Cloudflare forwards
+/// the query string sorted, so `id=..&variables=..&nsfw=..` reaches this server as
+/// `id=..&nsfw=..&variables=..`. Redirecting on order would send every such request
+/// round in a loop; order mints no extra edge entry, so it is not checked.
+fn same_parameters(raw: &str, canonical: &str) -> bool {
+    let mut raw: Vec<&str> = raw.split('&').collect();
+    let mut canonical: Vec<&str> = canonical.split('&').collect();
+    raw.sort_unstable();
+    canonical.sort_unstable();
+    raw == canonical
 }
 
 /// A pass is the hex of an HMAC-SHA256 tag.
@@ -205,7 +220,7 @@ pub(crate) async fn resolve_get(
         }
     };
     let canonical = canonical_query(&id, json.as_ref(), params.nsfw.as_deref());
-    if request.uri().query() != Some(canonical.as_str()) {
+    if !same_parameters(request.uri().query().unwrap_or(""), &canonical) {
         // A valid request in another spelling: send it to the one URL the edge keeps,
         // before anything runs. Never cached, so a later canonical form can change it.
         let location = format!("{}?{canonical}", request.uri().path());
@@ -282,6 +297,12 @@ mod tests {
             "nsfw comes last"
         );
         assert_eq!(encode_component("ü/é"), "%C3%BC%2F%C3%A9");
+        assert!(same_parameters(
+            "id=a&nsfw=p&variables=v",
+            "id=a&variables=v&nsfw=p"
+        ));
+        assert!(!same_parameters("id=a&variables=v&x=1", "id=a&variables=v"));
+        assert!(!same_parameters("id=a&variables=%7b", "id=a&variables=%7B"));
         assert!(pass_shape_ok(&"0a".repeat(32)));
         assert!(!pass_shape_ok(&"0A".repeat(32)));
         assert!(!pass_shape_ok("0a"));

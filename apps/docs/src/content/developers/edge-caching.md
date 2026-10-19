@@ -119,7 +119,7 @@ The id is the SHA-256, in hex, of the document's normalised text: comments and e
 - A GET with the document text works as before. With `KOMIKA_PERSISTED_ONLY=on`, the server refuses it with `405`, the code `PERSISTED_QUERY_REQUIRED` and `no-store`. The client then sends that document by POST. Older apps also fall back to POST on a `405`.
 - POST always takes full documents.
 
-A GET by id takes only `id`, `variables` and `nsfw`. Any other parameter answers `400` with `no-store`. The edge keys on the whole query string, so a valid request must arrive in its one canonical form: `id=<id>&variables=<json>&nsfw=<pass>`, in that order, with compact JSON and `encodeURIComponent` encoding. Any other spelling gets a `307` redirect to that form, with `no-store`, before anything runs.
+A GET by id takes only `id`, `variables` and `nsfw`. Any other parameter answers `400` with `no-store`. The edge keys on the whole query string, so each value must arrive in its one canonical spelling: compact JSON for `variables`, with `encodeURIComponent` encoding. Any other spelling gets a `307` redirect to `id=<id>&variables=<json>&nsfw=<pass>`, with `no-store`, before anything runs. Parameter order is not checked: the cache rule ignores it, and Cloudflare forwards the parameters sorted, so a redirect on order would loop.
 
 With `KOMIKA_PERSISTED_ONLY=on`, the cacheable GET path runs only the documents the apps ship, so its cache keys are a fixed set. It is off by default. Read [Configuration](/self-host/configuration).
 
