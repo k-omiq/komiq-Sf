@@ -92,3 +92,5 @@ scripts/tests/test_postgres_search_parity.py
 deploy/production-ips.local
 apps/docs/.impeccable/
 /*.zip
+# Site lists for the solver bench (never in git).
+apps/server/bench/solver/*.tsv

@@ -5,6 +5,7 @@
 # WARP=1 sends the solvers, the browser and both replays through the warp service.
 # Usage: [WARP=1] [OUT=file] ./run.sh [targets.tsv] [solver ...]
 #        (solvers: fs-pinned fs-latest bw)
+# targets.tsv stays local and out of git: one name<TAB>url line per site.
 set -uo pipefail
 cd "$(dirname "$0")"
 targets=${1:-targets.tsv}

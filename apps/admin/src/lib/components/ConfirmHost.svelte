@@ -21,8 +21,9 @@
 			<Button variant="ghost" onclick={() => settleConfirm(false)}
 				>{c.cancelLabel ?? 'Cancel'}</Button
 			>
-			<Button variant={c.danger ? 'danger-solid' : 'primary'} onclick={() => settleConfirm(true, dontAskAgain)}
-				>{c.confirmLabel ?? 'Confirm'}</Button
+			<Button
+				variant={c.danger ? 'danger-solid' : 'primary'}
+				onclick={() => settleConfirm(true, dontAskAgain)}>{c.confirmLabel ?? 'Confirm'}</Button
 			>
 		{/snippet}
 	</Dialog>
